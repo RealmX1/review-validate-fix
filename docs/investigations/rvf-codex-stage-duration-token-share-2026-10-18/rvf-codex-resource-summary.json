@@ -1,0 +1,2126 @@
+{
+  "schema_version": 1,
+  "cutoff_utc": "2026-10-18T23:30:59Z",
+  "primary_window_start_utc": "2026-10-11T23:30:59Z",
+  "comparison_window_start_utc": "2026-09-18T23:30:59Z",
+  "inventory_classification_counts": {
+    "dispatcher_or_no_prepared_scope_contract": 2744,
+    "included_codex_cline_kanban_rvf": 46,
+    "other_host": 79,
+    "unknown_host": 2
+  },
+  "primary_7_days": {
+    "run_count": 22,
+    "finalized_count": 19,
+    "completed_analyze_count": 18,
+    "principal_complete_run_count": 17,
+    "principal_complete_run_ids": [
+      "rvf-20261012T193340Z-agentic-initiation-start-ca750cf9",
+      "rvf-20261016T204918Z-agentic-initiation-start-3aa3ed36",
+      "rvf-20261017T210036Z-agentic-initiation-start-97ba0952",
+      "rvf-20261017T210527Z-agentic-initiation-start-a0644009",
+      "rvf-20261017T214430Z-agentic-initiation-start-7ec9cd87",
+      "rvf-20261017T215657Z-prepare-run-b1f04af7",
+      "rvf-20261017T220201Z-agentic-initiation-start-334d8e09",
+      "rvf-20261017T221421Z-agentic-initiation-start-7f35edec",
+      "rvf-20261018T004603Z-agentic-initiation-start-d1277a60",
+      "rvf-20261018T010000Z-agentic-initiation-start-ca00ec1f",
+      "rvf-20261018T194645Z-agentic-initiation-start-f3fa3a60",
+      "rvf-20261018T200856Z-agentic-initiation-start-9fdb5703",
+      "rvf-20261018T204434Z-agentic-initiation-start-c34d2857",
+      "rvf-20261018T220916Z-agentic-initiation-start-a76c63e5",
+      "rvf-20261018T221037Z-agentic-initiation-start-382fcb0c",
+      "rvf-20261018T225054Z-agentic-initiation-start-5ccbc507",
+      "rvf-20261018T225400Z-agentic-initiation-start-62c05d10"
+    ],
+    "finalized_without_recorded_analyze_count": 1,
+    "unfinished_at_cutoff_count": 3,
+    "all_component_complete_run_count": 0,
+    "principal_complete_coverage_of_completed_analyze": 0.9444444444444444,
+    "formal_archive_complete_analyze_count": 1,
+    "health_probe_attempt_count_in_principal_cohort": 102,
+    "observed_usage_principal_cohort": {
+      "input_tokens": 584801528,
+      "cached_input_tokens": 568306944,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 2695778,
+      "reasoning_output_tokens": 671623,
+      "total_tokens": 587497306,
+      "noncached_input_tokens": 16494584,
+      "noncached_input_plus_output_tokens": 19190362
+    },
+    "analyze_usage_principal_cohort": {
+      "input_tokens": 20163826,
+      "cached_input_tokens": 18107008,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 223423,
+      "reasoning_output_tokens": 63324,
+      "total_tokens": 20387249,
+      "noncached_input_tokens": 2056818,
+      "noncached_input_plus_output_tokens": 2280241
+    },
+    "analyze_observed_total_token_share": 0.0347018595520164,
+    "analyze_observed_noncached_plus_output_share": 0.1188221983514433,
+    "per_run_analyze_total_token_share_median": 0.03640742002807971,
+    "per_run_analyze_total_token_share_p90": 0.06048489613894443,
+    "analyze_wall_seconds_sum": 4412.911028385162,
+    "full_wall_seconds_sum": 46024.37536120415,
+    "main_wall_seconds_sum": 41610.7950322628,
+    "analyze_elapsed_share": 0.09588204063069128,
+    "analyze_wall_seconds_median": 236.03567349910736,
+    "analyze_wall_seconds_p90": 303.8118532419205,
+    "per_run_analyze_elapsed_share_median": 0.10322495507759781,
+    "per_run_analyze_elapsed_share_p90": 0.14494946760609423,
+    "existing_summary_includes_pre_rvf_count": 18,
+    "stages": {
+      "main_prepare": {
+        "label": "主 Agent：准备与派发",
+        "component_count": 17,
+        "usage": {
+          "input_tokens": 32049498,
+          "cached_input_tokens": 30996224,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 111801,
+          "reasoning_output_tokens": 26192,
+          "total_tokens": 32161299,
+          "noncached_input_tokens": 1053274,
+          "noncached_input_plus_output_tokens": 1165075
+        },
+        "process_wall_seconds_sum": 2450.4086190000003,
+        "process_wall_seconds_median": 142.999,
+        "process_wall_seconds_p90": 194.9446
+      },
+      "main_review_coordination": {
+        "label": "主 Agent：review 期间协调",
+        "component_count": 17,
+        "usage": {
+          "input_tokens": 130860001,
+          "cached_input_tokens": 130280576,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 199396,
+          "reasoning_output_tokens": 121892,
+          "total_tokens": 131059397,
+          "noncached_input_tokens": 579425,
+          "noncached_input_plus_output_tokens": 778821
+        },
+        "process_wall_seconds_sum": 17948.598557,
+        "process_wall_seconds_median": 944.935563,
+        "process_wall_seconds_p90": 2019.7253598
+      },
+      "main_post_review_combined": {
+        "label": "主 Agent：归并、验证修复与交接",
+        "component_count": 17,
+        "usage": {
+          "input_tokens": 144911562,
+          "cached_input_tokens": 142483456,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 576511,
+          "reasoning_output_tokens": 239620,
+          "total_tokens": 145488073,
+          "noncached_input_tokens": 2428106,
+          "noncached_input_plus_output_tokens": 3004617
+        },
+        "process_wall_seconds_sum": 19375.387947,
+        "process_wall_seconds_median": 971.505741,
+        "process_wall_seconds_p90": 1727.6102454000002
+      },
+      "external_reviewer": {
+        "label": "独立 reviewer（含 fallback）",
+        "component_count": 43,
+        "usage": {
+          "input_tokens": 151614490,
+          "cached_input_tokens": 145270784,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 894832,
+          "reasoning_output_tokens": 0,
+          "total_tokens": 152509322,
+          "noncached_input_tokens": 6343706,
+          "noncached_input_plus_output_tokens": 7238538
+        },
+        "process_wall_seconds_sum": 20837.363983,
+        "process_wall_seconds_median": 360.351552,
+        "process_wall_seconds_p90": 1071.5442000000003
+      },
+      "validation_subagent": {
+        "label": "独立验证修复子代理",
+        "component_count": 35,
+        "usage": {
+          "input_tokens": 104256271,
+          "cached_input_tokens": 100322304,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 684828,
+          "reasoning_output_tokens": 219534,
+          "total_tokens": 104941099,
+          "noncached_input_tokens": 3933967,
+          "noncached_input_plus_output_tokens": 4618795
+        },
+        "process_wall_seconds_sum": 17887.932,
+        "process_wall_seconds_median": 413.399,
+        "process_wall_seconds_p90": 736.7805999999999
+      },
+      "main_host_auxiliary_subagent": {
+        "label": "主会话的宿主辅助子代理",
+        "component_count": 1,
+        "usage": {
+          "input_tokens": 945880,
+          "cached_input_tokens": 846592,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 4987,
+          "reasoning_output_tokens": 1061,
+          "total_tokens": 950867,
+          "noncached_input_tokens": 99288,
+          "noncached_input_plus_output_tokens": 104275
+        },
+        "process_wall_seconds_sum": 2427.001,
+        "process_wall_seconds_median": 2427.001,
+        "process_wall_seconds_p90": 2427.001
+      },
+      "analyze": {
+        "label": "Analyze 后台 LLM",
+        "component_count": 20,
+        "usage": {
+          "input_tokens": 20163826,
+          "cached_input_tokens": 18107008,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 223423,
+          "reasoning_output_tokens": 63324,
+          "total_tokens": 20387249,
+          "noncached_input_tokens": 2056818,
+          "noncached_input_plus_output_tokens": 2280241
+        },
+        "process_wall_seconds_sum": 4228.220625,
+        "process_wall_seconds_median": 217.50201800000002,
+        "process_wall_seconds_p90": 295.60659110000006
+      },
+      "finalize": {
+        "label": "确定性 finalize（scaffold 前）",
+        "component_count": 17,
+        "usage": {
+          "input_tokens": 0,
+          "cached_input_tokens": 0,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 0,
+          "reasoning_output_tokens": 0,
+          "total_tokens": 0,
+          "noncached_input_tokens": 0,
+          "noncached_input_plus_output_tokens": 0
+        },
+        "process_wall_seconds_sum": 11.084177,
+        "process_wall_seconds_median": 0.446316,
+        "process_wall_seconds_p90": 0.8148200000000001
+      }
+    }
+  },
+  "comparison_30_days": {
+    "run_count": 46,
+    "finalized_count": 42,
+    "completed_analyze_count": 41,
+    "principal_complete_run_count": 18,
+    "principal_complete_run_ids": [
+      "rvf-20261011T210920Z-agentic-initiation-start-3378f83e",
+      "rvf-20261012T193340Z-agentic-initiation-start-ca750cf9",
+      "rvf-20261016T204918Z-agentic-initiation-start-3aa3ed36",
+      "rvf-20261017T210036Z-agentic-initiation-start-97ba0952",
+      "rvf-20261017T210527Z-agentic-initiation-start-a0644009",
+      "rvf-20261017T214430Z-agentic-initiation-start-7ec9cd87",
+      "rvf-20261017T215657Z-prepare-run-b1f04af7",
+      "rvf-20261017T220201Z-agentic-initiation-start-334d8e09",
+      "rvf-20261017T221421Z-agentic-initiation-start-7f35edec",
+      "rvf-20261018T004603Z-agentic-initiation-start-d1277a60",
+      "rvf-20261018T010000Z-agentic-initiation-start-ca00ec1f",
+      "rvf-20261018T194645Z-agentic-initiation-start-f3fa3a60",
+      "rvf-20261018T200856Z-agentic-initiation-start-9fdb5703",
+      "rvf-20261018T204434Z-agentic-initiation-start-c34d2857",
+      "rvf-20261018T220916Z-agentic-initiation-start-a76c63e5",
+      "rvf-20261018T221037Z-agentic-initiation-start-382fcb0c",
+      "rvf-20261018T225054Z-agentic-initiation-start-5ccbc507",
+      "rvf-20261018T225400Z-agentic-initiation-start-62c05d10"
+    ],
+    "finalized_without_recorded_analyze_count": 1,
+    "unfinished_at_cutoff_count": 4,
+    "all_component_complete_run_count": 0,
+    "principal_complete_coverage_of_completed_analyze": 0.43902439024390244,
+    "formal_archive_complete_analyze_count": 2,
+    "health_probe_attempt_count_in_principal_cohort": 109,
+    "observed_usage_principal_cohort": {
+      "input_tokens": 602052761,
+      "cached_input_tokens": 584992512,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 2787135,
+      "reasoning_output_tokens": 690654,
+      "total_tokens": 604839896,
+      "noncached_input_tokens": 17060249,
+      "noncached_input_plus_output_tokens": 19847384
+    },
+    "analyze_usage_principal_cohort": {
+      "input_tokens": 21505032,
+      "cached_input_tokens": 19328512,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 234345,
+      "reasoning_output_tokens": 66464,
+      "total_tokens": 21739377,
+      "noncached_input_tokens": 2176520,
+      "noncached_input_plus_output_tokens": 2410865
+    },
+    "analyze_observed_total_token_share": 0.03594236614312228,
+    "analyze_observed_noncached_plus_output_share": 0.12147016453150702,
+    "per_run_analyze_total_token_share_median": 0.03643486291124354,
+    "per_run_analyze_total_token_share_p90": 0.0663516542552858,
+    "analyze_wall_seconds_sum": 11480.166467189789,
+    "full_wall_seconds_sum": 643484.2141149044,
+    "main_wall_seconds_sum": 631955.6796290874,
+    "analyze_elapsed_share": 0.017840634183979874,
+    "analyze_wall_seconds_median": 266.4072880744934,
+    "analyze_wall_seconds_p90": 400.6869390010834,
+    "per_run_analyze_elapsed_share_median": 0.11663883204957848,
+    "per_run_analyze_elapsed_share_p90": 0.2193949693166052,
+    "existing_summary_includes_pre_rvf_count": 39,
+    "stages": {
+      "main_prepare": {
+        "label": "主 Agent：准备与派发",
+        "component_count": 18,
+        "usage": {
+          "input_tokens": 33057343,
+          "cached_input_tokens": 31977216,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 118415,
+          "reasoning_output_tokens": 27668,
+          "total_tokens": 33175758,
+          "noncached_input_tokens": 1080127,
+          "noncached_input_plus_output_tokens": 1198542
+        },
+        "process_wall_seconds_sum": 2669.355619,
+        "process_wall_seconds_median": 143.75549999999998,
+        "process_wall_seconds_p90": 205.47340000000003
+      },
+      "main_review_coordination": {
+        "label": "主 Agent：review 期间协调",
+        "component_count": 18,
+        "usage": {
+          "input_tokens": 133794410,
+          "cached_input_tokens": 133193856,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 206549,
+          "reasoning_output_tokens": 127144,
+          "total_tokens": 134000959,
+          "noncached_input_tokens": 600554,
+          "noncached_input_plus_output_tokens": 807103
+        },
+        "process_wall_seconds_sum": 18589.954142,
+        "process_wall_seconds_median": 918.5369175000001,
+        "process_wall_seconds_p90": 2015.2764211
+      },
+      "main_post_review_combined": {
+        "label": "主 Agent：归并、验证修复与交接",
+        "component_count": 18,
+        "usage": {
+          "input_tokens": 148352730,
+          "cached_input_tokens": 145811968,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 603428,
+          "reasoning_output_tokens": 247535,
+          "total_tokens": 148956158,
+          "noncached_input_tokens": 2540762,
+          "noncached_input_plus_output_tokens": 3144190
+        },
+        "process_wall_seconds_sum": 20234.061049,
+        "process_wall_seconds_median": 915.0894215,
+        "process_wall_seconds_p90": 1707.5884463000002
+      },
+      "external_reviewer": {
+        "label": "独立 reviewer（含 fallback）",
+        "component_count": 45,
+        "usage": {
+          "input_tokens": 158821594,
+          "cached_input_tokens": 152268032,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 928974,
+          "reasoning_output_tokens": 0,
+          "total_tokens": 159750568,
+          "noncached_input_tokens": 6553562,
+          "noncached_input_plus_output_tokens": 7482536
+        },
+        "process_wall_seconds_sum": 21765.739597,
+        "process_wall_seconds_median": 360.351552,
+        "process_wall_seconds_p90": 1058.9294000000002
+      },
+      "validation_subagent": {
+        "label": "独立验证修复子代理",
+        "component_count": 36,
+        "usage": {
+          "input_tokens": 105575772,
+          "cached_input_tokens": 101566336,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 690437,
+          "reasoning_output_tokens": 220782,
+          "total_tokens": 106266209,
+          "noncached_input_tokens": 4009436,
+          "noncached_input_plus_output_tokens": 4699873
+        },
+        "process_wall_seconds_sum": 18058.583,
+        "process_wall_seconds_median": 409.3415,
+        "process_wall_seconds_p90": 736.3095
+      },
+      "main_host_auxiliary_subagent": {
+        "label": "主会话的宿主辅助子代理",
+        "component_count": 1,
+        "usage": {
+          "input_tokens": 945880,
+          "cached_input_tokens": 846592,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 4987,
+          "reasoning_output_tokens": 1061,
+          "total_tokens": 950867,
+          "noncached_input_tokens": 99288,
+          "noncached_input_plus_output_tokens": 104275
+        },
+        "process_wall_seconds_sum": 2427.001,
+        "process_wall_seconds_median": 2427.001,
+        "process_wall_seconds_p90": 2427.001
+      },
+      "analyze": {
+        "label": "Analyze 后台 LLM",
+        "component_count": 21,
+        "usage": {
+          "input_tokens": 21505032,
+          "cached_input_tokens": 19328512,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 234345,
+          "reasoning_output_tokens": 66464,
+          "total_tokens": 21739377,
+          "noncached_input_tokens": 2176520,
+          "noncached_input_plus_output_tokens": 2410865
+        },
+        "process_wall_seconds_sum": 4535.900585,
+        "process_wall_seconds_median": 217.635577,
+        "process_wall_seconds_p90": 307.67996
+      },
+      "finalize": {
+        "label": "确定性 finalize（scaffold 前）",
+        "component_count": 18,
+        "usage": {
+          "input_tokens": 0,
+          "cached_input_tokens": 0,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 0,
+          "reasoning_output_tokens": 0,
+          "total_tokens": 0,
+          "noncached_input_tokens": 0,
+          "noncached_input_plus_output_tokens": 0
+        },
+        "process_wall_seconds_sum": 11.576455,
+        "process_wall_seconds_median": 0.460966,
+        "process_wall_seconds_p90": 0.8050245000000001
+      }
+    }
+  },
+  "primary_by_project": {
+    "Trace-of-Thought": {
+      "run_count": 3,
+      "finalized_count": 3,
+      "completed_analyze_count": 3,
+      "principal_complete_run_count": 3,
+      "principal_complete_run_ids": [
+        "rvf-20261017T215657Z-prepare-run-b1f04af7",
+        "rvf-20261018T194645Z-agentic-initiation-start-f3fa3a60",
+        "rvf-20261018T204434Z-agentic-initiation-start-c34d2857"
+      ],
+      "finalized_without_recorded_analyze_count": 0,
+      "unfinished_at_cutoff_count": 0,
+      "all_component_complete_run_count": 0,
+      "principal_complete_coverage_of_completed_analyze": 1.0,
+      "formal_archive_complete_analyze_count": 1,
+      "health_probe_attempt_count_in_principal_cohort": 18,
+      "observed_usage_principal_cohort": {
+        "input_tokens": 147231275,
+        "cached_input_tokens": 142717696,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 705208,
+        "reasoning_output_tokens": 205355,
+        "total_tokens": 147936483,
+        "noncached_input_tokens": 4513579,
+        "noncached_input_plus_output_tokens": 5218787
+      },
+      "analyze_usage_principal_cohort": {
+        "input_tokens": 4415775,
+        "cached_input_tokens": 3986944,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 45041,
+        "reasoning_output_tokens": 12278,
+        "total_tokens": 4460816,
+        "noncached_input_tokens": 428831,
+        "noncached_input_plus_output_tokens": 473872
+      },
+      "analyze_observed_total_token_share": 0.030153589632112586,
+      "analyze_observed_noncached_plus_output_share": 0.09080117659525097,
+      "per_run_analyze_total_token_share_median": 0.031986010593390755,
+      "per_run_analyze_total_token_share_p90": 0.03556704675420405,
+      "analyze_wall_seconds_sum": 829.1872429847717,
+      "full_wall_seconds_sum": 10999.578139066696,
+      "main_wall_seconds_sum": 10170.242060184479,
+      "analyze_elapsed_share": 0.07538354948721038,
+      "analyze_wall_seconds_median": 273.3526289463043,
+      "analyze_wall_seconds_p90": 286.21238656044005,
+      "per_run_analyze_elapsed_share_median": 0.09247238095664811,
+      "per_run_analyze_elapsed_share_p90": 0.09399657301765088,
+      "existing_summary_includes_pre_rvf_count": 3,
+      "stages": {
+        "main_prepare": {
+          "label": "主 Agent：准备与派发",
+          "component_count": 3,
+          "usage": {
+            "input_tokens": 7665316,
+            "cached_input_tokens": 7572992,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 22822,
+            "reasoning_output_tokens": 8262,
+            "total_tokens": 7688138,
+            "noncached_input_tokens": 92324,
+            "noncached_input_plus_output_tokens": 115146
+          },
+          "process_wall_seconds_sum": 534.473,
+          "process_wall_seconds_median": 191.775,
+          "process_wall_seconds_p90": 198.1142
+        },
+        "main_review_coordination": {
+          "label": "主 Agent：review 期间协调",
+          "component_count": 3,
+          "usage": {
+            "input_tokens": 19573466,
+            "cached_input_tokens": 19412224,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 65517,
+            "reasoning_output_tokens": 36813,
+            "total_tokens": 19638983,
+            "noncached_input_tokens": 161242,
+            "noncached_input_plus_output_tokens": 226759
+          },
+          "process_wall_seconds_sum": 2691.2587670000003,
+          "process_wall_seconds_median": 892.138272,
+          "process_wall_seconds_p90": 1016.3668696000001
+        },
+        "main_post_review_combined": {
+          "label": "主 Agent：归并、验证修复与交接",
+          "component_count": 3,
+          "usage": {
+            "input_tokens": 47091722,
+            "cached_input_tokens": 46080512,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 188220,
+            "reasoning_output_tokens": 79611,
+            "total_tokens": 47279942,
+            "noncached_input_tokens": 1011210,
+            "noncached_input_plus_output_tokens": 1199430
+          },
+          "process_wall_seconds_sum": 6944.510293,
+          "process_wall_seconds_median": 1647.523049,
+          "process_wall_seconds_p90": 3336.6624818
+        },
+        "external_reviewer": {
+          "label": "独立 reviewer（含 fallback）",
+          "component_count": 6,
+          "usage": {
+            "input_tokens": 38191162,
+            "cached_input_tokens": 36743936,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 182491,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 38373653,
+            "noncached_input_tokens": 1447226,
+            "noncached_input_plus_output_tokens": 1629717
+          },
+          "process_wall_seconds_sum": 4034.1959620000002,
+          "process_wall_seconds_median": 729.043723,
+          "process_wall_seconds_p90": 943.359
+        },
+        "validation_subagent": {
+          "label": "独立验证修复子代理",
+          "component_count": 9,
+          "usage": {
+            "input_tokens": 29347954,
+            "cached_input_tokens": 28074496,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 196130,
+            "reasoning_output_tokens": 67330,
+            "total_tokens": 29544084,
+            "noncached_input_tokens": 1273458,
+            "noncached_input_plus_output_tokens": 1469588
+          },
+          "process_wall_seconds_sum": 6323.8769999999995,
+          "process_wall_seconds_median": 581.818,
+          "process_wall_seconds_p90": 1142.2854000000002
+        },
+        "main_host_auxiliary_subagent": {
+          "label": "主会话的宿主辅助子代理",
+          "component_count": 1,
+          "usage": {
+            "input_tokens": 945880,
+            "cached_input_tokens": 846592,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 4987,
+            "reasoning_output_tokens": 1061,
+            "total_tokens": 950867,
+            "noncached_input_tokens": 99288,
+            "noncached_input_plus_output_tokens": 104275
+          },
+          "process_wall_seconds_sum": 2427.001,
+          "process_wall_seconds_median": 2427.001,
+          "process_wall_seconds_p90": 2427.001
+        },
+        "analyze": {
+          "label": "Analyze 后台 LLM",
+          "component_count": 6,
+          "usage": {
+            "input_tokens": 4415775,
+            "cached_input_tokens": 3986944,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 45041,
+            "reasoning_output_tokens": 12278,
+            "total_tokens": 4460816,
+            "noncached_input_tokens": 428831,
+            "noncached_input_plus_output_tokens": 473872
+          },
+          "process_wall_seconds_sum": 882.336243,
+          "process_wall_seconds_median": 145.488144,
+          "process_wall_seconds_p90": 281.3899775
+        },
+        "finalize": {
+          "label": "确定性 finalize（scaffold 前）",
+          "component_count": 3,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 4.570354,
+          "process_wall_seconds_median": 0.775638,
+          "process_wall_seconds_p90": 2.9458124000000003
+        }
+      }
+    },
+    "Trace-of-Thought-Landing-Page": {
+      "run_count": 2,
+      "finalized_count": 2,
+      "completed_analyze_count": 2,
+      "principal_complete_run_count": 2,
+      "principal_complete_run_ids": [
+        "rvf-20261016T204918Z-agentic-initiation-start-3aa3ed36",
+        "rvf-20261018T225054Z-agentic-initiation-start-5ccbc507"
+      ],
+      "finalized_without_recorded_analyze_count": 0,
+      "unfinished_at_cutoff_count": 0,
+      "all_component_complete_run_count": 0,
+      "principal_complete_coverage_of_completed_analyze": 1.0,
+      "formal_archive_complete_analyze_count": 0,
+      "health_probe_attempt_count_in_principal_cohort": 16,
+      "observed_usage_principal_cohort": {
+        "input_tokens": 46126249,
+        "cached_input_tokens": 44481280,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 288585,
+        "reasoning_output_tokens": 73832,
+        "total_tokens": 46414834,
+        "noncached_input_tokens": 1644969,
+        "noncached_input_plus_output_tokens": 1933554
+      },
+      "analyze_usage_principal_cohort": {
+        "input_tokens": 2098195,
+        "cached_input_tokens": 1869056,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 25448,
+        "reasoning_output_tokens": 7139,
+        "total_tokens": 2123643,
+        "noncached_input_tokens": 229139,
+        "noncached_input_plus_output_tokens": 254587
+      },
+      "analyze_observed_total_token_share": 0.04575354077534781,
+      "analyze_observed_noncached_plus_output_share": 0.13166790273248122,
+      "per_run_analyze_total_token_share_median": 0.04823757151189842,
+      "per_run_analyze_total_token_share_p90": 0.0575611435290942,
+      "analyze_wall_seconds_sum": 417.9332480430603,
+      "full_wall_seconds_sum": 4784.750391960144,
+      "main_wall_seconds_sum": 4366.748685121536,
+      "analyze_elapsed_share": 0.08734692801223592,
+      "analyze_wall_seconds_median": 208.96662402153015,
+      "analyze_wall_seconds_p90": 234.6061376094818,
+      "per_run_analyze_elapsed_share_median": 0.09385744523775816,
+      "per_run_analyze_elapsed_share_p90": 0.10898771143980138,
+      "existing_summary_includes_pre_rvf_count": 2,
+      "stages": {
+        "main_prepare": {
+          "label": "主 Agent：准备与派发",
+          "component_count": 2,
+          "usage": {
+            "input_tokens": 2627509,
+            "cached_input_tokens": 2529024,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 12679,
+            "reasoning_output_tokens": 3111,
+            "total_tokens": 2640188,
+            "noncached_input_tokens": 98485,
+            "noncached_input_plus_output_tokens": 111164
+          },
+          "process_wall_seconds_sum": 285.515,
+          "process_wall_seconds_median": 142.7575,
+          "process_wall_seconds_p90": 150.8819
+        },
+        "main_review_coordination": {
+          "label": "主 Agent：review 期间协调",
+          "component_count": 2,
+          "usage": {
+            "input_tokens": 11072436,
+            "cached_input_tokens": 11042560,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 13385,
+            "reasoning_output_tokens": 8465,
+            "total_tokens": 11085821,
+            "noncached_input_tokens": 29876,
+            "noncached_input_plus_output_tokens": 43261
+          },
+          "process_wall_seconds_sum": 2275.264661,
+          "process_wall_seconds_median": 1137.6323305,
+          "process_wall_seconds_p90": 1829.0701500999999
+        },
+        "main_post_review_combined": {
+          "label": "主 Agent：归并、验证修复与交接",
+          "component_count": 2,
+          "usage": {
+            "input_tokens": 14376657,
+            "cached_input_tokens": 13989632,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 58894,
+            "reasoning_output_tokens": 32417,
+            "total_tokens": 14435551,
+            "noncached_input_tokens": 387025,
+            "noncached_input_plus_output_tokens": 445919
+          },
+          "process_wall_seconds_sum": 1805.969024,
+          "process_wall_seconds_median": 902.984512,
+          "process_wall_seconds_p90": 969.3468568000001
+        },
+        "external_reviewer": {
+          "label": "独立 reviewer（含 fallback）",
+          "component_count": 6,
+          "usage": {
+            "input_tokens": 11317611,
+            "cached_input_tokens": 10659200,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 124389,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 11442000,
+            "noncached_input_tokens": 658411,
+            "noncached_input_plus_output_tokens": 782800
+          },
+          "process_wall_seconds_sum": 1954.138576,
+          "process_wall_seconds_median": 244.6274905,
+          "process_wall_seconds_p90": 727.2760465
+        },
+        "validation_subagent": {
+          "label": "独立验证修复子代理",
+          "component_count": 4,
+          "usage": {
+            "input_tokens": 4633841,
+            "cached_input_tokens": 4391808,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 53790,
+            "reasoning_output_tokens": 22700,
+            "total_tokens": 4687631,
+            "noncached_input_tokens": 242033,
+            "noncached_input_plus_output_tokens": 295823
+          },
+          "process_wall_seconds_sum": 1201.355,
+          "process_wall_seconds_median": 270.31899999999996,
+          "process_wall_seconds_p90": 386.2149
+        },
+        "main_host_auxiliary_subagent": {
+          "label": "主会话的宿主辅助子代理",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        },
+        "analyze": {
+          "label": "Analyze 后台 LLM",
+          "component_count": 2,
+          "usage": {
+            "input_tokens": 2098195,
+            "cached_input_tokens": 1869056,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 25448,
+            "reasoning_output_tokens": 7139,
+            "total_tokens": 2123643,
+            "noncached_input_tokens": 229139,
+            "noncached_input_plus_output_tokens": 254587
+          },
+          "process_wall_seconds_sum": 417.93324800000005,
+          "process_wall_seconds_median": 208.96662400000002,
+          "process_wall_seconds_p90": 234.6061376
+        },
+        "finalize": {
+          "label": "确定性 finalize（scaffold 前）",
+          "component_count": 2,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0.74856,
+          "process_wall_seconds_median": 0.37428,
+          "process_wall_seconds_p90": 0.4319088
+        }
+      }
+    },
+    "cline-kanban": {
+      "run_count": 16,
+      "finalized_count": 13,
+      "completed_analyze_count": 13,
+      "principal_complete_run_count": 12,
+      "principal_complete_run_ids": [
+        "rvf-20261012T193340Z-agentic-initiation-start-ca750cf9",
+        "rvf-20261017T210036Z-agentic-initiation-start-97ba0952",
+        "rvf-20261017T210527Z-agentic-initiation-start-a0644009",
+        "rvf-20261017T214430Z-agentic-initiation-start-7ec9cd87",
+        "rvf-20261017T220201Z-agentic-initiation-start-334d8e09",
+        "rvf-20261017T221421Z-agentic-initiation-start-7f35edec",
+        "rvf-20261018T004603Z-agentic-initiation-start-d1277a60",
+        "rvf-20261018T010000Z-agentic-initiation-start-ca00ec1f",
+        "rvf-20261018T200856Z-agentic-initiation-start-9fdb5703",
+        "rvf-20261018T220916Z-agentic-initiation-start-a76c63e5",
+        "rvf-20261018T221037Z-agentic-initiation-start-382fcb0c",
+        "rvf-20261018T225400Z-agentic-initiation-start-62c05d10"
+      ],
+      "finalized_without_recorded_analyze_count": 0,
+      "unfinished_at_cutoff_count": 3,
+      "all_component_complete_run_count": 0,
+      "principal_complete_coverage_of_completed_analyze": 0.9230769230769231,
+      "formal_archive_complete_analyze_count": 0,
+      "health_probe_attempt_count_in_principal_cohort": 68,
+      "observed_usage_principal_cohort": {
+        "input_tokens": 391444004,
+        "cached_input_tokens": 381107968,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 1701985,
+        "reasoning_output_tokens": 392436,
+        "total_tokens": 393145989,
+        "noncached_input_tokens": 10336036,
+        "noncached_input_plus_output_tokens": 12038021
+      },
+      "analyze_usage_principal_cohort": {
+        "input_tokens": 13649856,
+        "cached_input_tokens": 12251008,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 152934,
+        "reasoning_output_tokens": 43907,
+        "total_tokens": 13802790,
+        "noncached_input_tokens": 1398848,
+        "noncached_input_plus_output_tokens": 1551782
+      },
+      "analyze_observed_total_token_share": 0.0351085611609788,
+      "analyze_observed_noncached_plus_output_share": 0.12890673641456515,
+      "per_run_analyze_total_token_share_median": 0.03421883532116493,
+      "per_run_analyze_total_token_share_p90": 0.06069735958230268,
+      "analyze_wall_seconds_sum": 3165.7905373573303,
+      "full_wall_seconds_sum": 30240.046830177307,
+      "main_wall_seconds_sum": 27073.804286956787,
+      "analyze_elapsed_share": 0.10468867839841134,
+      "analyze_wall_seconds_median": 217.63557720184326,
+      "analyze_wall_seconds_p90": 324.3250088214875,
+      "per_run_analyze_elapsed_share_median": 0.11466207087983511,
+      "per_run_analyze_elapsed_share_p90": 0.1474331056095691,
+      "existing_summary_includes_pre_rvf_count": 13,
+      "stages": {
+        "main_prepare": {
+          "label": "主 Agent：准备与派发",
+          "component_count": 12,
+          "usage": {
+            "input_tokens": 21756673,
+            "cached_input_tokens": 20894208,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 76300,
+            "reasoning_output_tokens": 14819,
+            "total_tokens": 21832973,
+            "noncached_input_tokens": 862465,
+            "noncached_input_plus_output_tokens": 938765
+          },
+          "process_wall_seconds_sum": 1630.420619,
+          "process_wall_seconds_median": 125.3545,
+          "process_wall_seconds_p90": 163.02492420000002
+        },
+        "main_review_coordination": {
+          "label": "主 Agent：review 期间协调",
+          "component_count": 12,
+          "usage": {
+            "input_tokens": 100214099,
+            "cached_input_tokens": 99825792,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 120494,
+            "reasoning_output_tokens": 76614,
+            "total_tokens": 100334593,
+            "noncached_input_tokens": 388307,
+            "noncached_input_plus_output_tokens": 508801
+          },
+          "process_wall_seconds_sum": 12982.075129,
+          "process_wall_seconds_median": 1054.808761,
+          "process_wall_seconds_p90": 2028.4650173
+        },
+        "main_post_review_combined": {
+          "label": "主 Agent：归并、验证修复与交接",
+          "component_count": 12,
+          "usage": {
+            "input_tokens": 83443183,
+            "cached_input_tokens": 82413312,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 329397,
+            "reasoning_output_tokens": 127592,
+            "total_tokens": 83772580,
+            "noncached_input_tokens": 1029871,
+            "noncached_input_plus_output_tokens": 1359268
+          },
+          "process_wall_seconds_sum": 10624.90863,
+          "process_wall_seconds_median": 786.2164614999999,
+          "process_wall_seconds_p90": 1149.2945136
+        },
+        "external_reviewer": {
+          "label": "独立 reviewer（含 fallback）",
+          "component_count": 31,
+          "usage": {
+            "input_tokens": 102105717,
+            "cached_input_tokens": 97867648,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 587952,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 102693669,
+            "noncached_input_tokens": 4238069,
+            "noncached_input_plus_output_tokens": 4826021
+          },
+          "process_wall_seconds_sum": 14849.029445,
+          "process_wall_seconds_median": 323.402125,
+          "process_wall_seconds_p90": 1201.015644
+        },
+        "validation_subagent": {
+          "label": "独立验证修复子代理",
+          "component_count": 22,
+          "usage": {
+            "input_tokens": 70274476,
+            "cached_input_tokens": 67856000,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 434908,
+            "reasoning_output_tokens": 129504,
+            "total_tokens": 70709384,
+            "noncached_input_tokens": 2418476,
+            "noncached_input_plus_output_tokens": 2853384
+          },
+          "process_wall_seconds_sum": 10362.7,
+          "process_wall_seconds_median": 416.8455,
+          "process_wall_seconds_p90": 730.5910000000001
+        },
+        "main_host_auxiliary_subagent": {
+          "label": "主会话的宿主辅助子代理",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        },
+        "analyze": {
+          "label": "Analyze 后台 LLM",
+          "component_count": 12,
+          "usage": {
+            "input_tokens": 13649856,
+            "cached_input_tokens": 12251008,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 152934,
+            "reasoning_output_tokens": 43907,
+            "total_tokens": 13802790,
+            "noncached_input_tokens": 1398848,
+            "noncached_input_plus_output_tokens": 1551782
+          },
+          "process_wall_seconds_sum": 2927.951134,
+          "process_wall_seconds_median": 217.50201800000002,
+          "process_wall_seconds_p90": 328.42763990000003
+        },
+        "finalize": {
+          "label": "确定性 finalize（scaffold 前）",
+          "component_count": 12,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 5.765263,
+          "process_wall_seconds_median": 0.4584395,
+          "process_wall_seconds_p90": 0.622582
+        }
+      }
+    },
+    "review-validate-fix": {
+      "run_count": 1,
+      "finalized_count": 1,
+      "completed_analyze_count": 0,
+      "principal_complete_run_count": 0,
+      "principal_complete_run_ids": [],
+      "finalized_without_recorded_analyze_count": 1,
+      "unfinished_at_cutoff_count": 0,
+      "all_component_complete_run_count": 0,
+      "principal_complete_coverage_of_completed_analyze": null,
+      "formal_archive_complete_analyze_count": 0,
+      "health_probe_attempt_count_in_principal_cohort": 0,
+      "observed_usage_principal_cohort": {
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 0,
+        "noncached_input_tokens": 0,
+        "noncached_input_plus_output_tokens": 0
+      },
+      "analyze_usage_principal_cohort": {
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 0,
+        "noncached_input_tokens": 0,
+        "noncached_input_plus_output_tokens": 0
+      },
+      "analyze_observed_total_token_share": null,
+      "analyze_observed_noncached_plus_output_share": null,
+      "per_run_analyze_total_token_share_median": null,
+      "per_run_analyze_total_token_share_p90": null,
+      "analyze_wall_seconds_sum": 0,
+      "full_wall_seconds_sum": 0,
+      "main_wall_seconds_sum": 0,
+      "analyze_elapsed_share": null,
+      "analyze_wall_seconds_median": null,
+      "analyze_wall_seconds_p90": null,
+      "per_run_analyze_elapsed_share_median": null,
+      "per_run_analyze_elapsed_share_p90": null,
+      "existing_summary_includes_pre_rvf_count": 0,
+      "stages": {
+        "main_prepare": {
+          "label": "主 Agent：准备与派发",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        },
+        "main_review_coordination": {
+          "label": "主 Agent：review 期间协调",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        },
+        "main_post_review_combined": {
+          "label": "主 Agent：归并、验证修复与交接",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        },
+        "external_reviewer": {
+          "label": "独立 reviewer（含 fallback）",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        },
+        "validation_subagent": {
+          "label": "独立验证修复子代理",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        },
+        "main_host_auxiliary_subagent": {
+          "label": "主会话的宿主辅助子代理",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        },
+        "analyze": {
+          "label": "Analyze 后台 LLM",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        },
+        "finalize": {
+          "label": "确定性 finalize（scaffold 前）",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        }
+      }
+    }
+  },
+  "comparison_by_recorded_deployment_label": {
+    "0ac2e5955216": {
+      "run_count": 22,
+      "finalized_count": 19,
+      "completed_analyze_count": 18,
+      "principal_complete_run_count": 17,
+      "principal_complete_run_ids": [
+        "rvf-20261012T193340Z-agentic-initiation-start-ca750cf9",
+        "rvf-20261016T204918Z-agentic-initiation-start-3aa3ed36",
+        "rvf-20261017T210036Z-agentic-initiation-start-97ba0952",
+        "rvf-20261017T210527Z-agentic-initiation-start-a0644009",
+        "rvf-20261017T214430Z-agentic-initiation-start-7ec9cd87",
+        "rvf-20261017T215657Z-prepare-run-b1f04af7",
+        "rvf-20261017T220201Z-agentic-initiation-start-334d8e09",
+        "rvf-20261017T221421Z-agentic-initiation-start-7f35edec",
+        "rvf-20261018T004603Z-agentic-initiation-start-d1277a60",
+        "rvf-20261018T010000Z-agentic-initiation-start-ca00ec1f",
+        "rvf-20261018T194645Z-agentic-initiation-start-f3fa3a60",
+        "rvf-20261018T200856Z-agentic-initiation-start-9fdb5703",
+        "rvf-20261018T204434Z-agentic-initiation-start-c34d2857",
+        "rvf-20261018T220916Z-agentic-initiation-start-a76c63e5",
+        "rvf-20261018T221037Z-agentic-initiation-start-382fcb0c",
+        "rvf-20261018T225054Z-agentic-initiation-start-5ccbc507",
+        "rvf-20261018T225400Z-agentic-initiation-start-62c05d10"
+      ],
+      "finalized_without_recorded_analyze_count": 1,
+      "unfinished_at_cutoff_count": 3,
+      "all_component_complete_run_count": 0,
+      "principal_complete_coverage_of_completed_analyze": 0.9444444444444444,
+      "formal_archive_complete_analyze_count": 1,
+      "health_probe_attempt_count_in_principal_cohort": 102,
+      "observed_usage_principal_cohort": {
+        "input_tokens": 584801528,
+        "cached_input_tokens": 568306944,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 2695778,
+        "reasoning_output_tokens": 671623,
+        "total_tokens": 587497306,
+        "noncached_input_tokens": 16494584,
+        "noncached_input_plus_output_tokens": 19190362
+      },
+      "analyze_usage_principal_cohort": {
+        "input_tokens": 20163826,
+        "cached_input_tokens": 18107008,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 223423,
+        "reasoning_output_tokens": 63324,
+        "total_tokens": 20387249,
+        "noncached_input_tokens": 2056818,
+        "noncached_input_plus_output_tokens": 2280241
+      },
+      "analyze_observed_total_token_share": 0.0347018595520164,
+      "analyze_observed_noncached_plus_output_share": 0.1188221983514433,
+      "per_run_analyze_total_token_share_median": 0.03640742002807971,
+      "per_run_analyze_total_token_share_p90": 0.06048489613894443,
+      "analyze_wall_seconds_sum": 4412.911028385162,
+      "full_wall_seconds_sum": 46024.37536120415,
+      "main_wall_seconds_sum": 41610.7950322628,
+      "analyze_elapsed_share": 0.09588204063069128,
+      "analyze_wall_seconds_median": 236.03567349910736,
+      "analyze_wall_seconds_p90": 303.8118532419205,
+      "per_run_analyze_elapsed_share_median": 0.10322495507759781,
+      "per_run_analyze_elapsed_share_p90": 0.14494946760609423,
+      "existing_summary_includes_pre_rvf_count": 18,
+      "stages": {
+        "main_prepare": {
+          "label": "主 Agent：准备与派发",
+          "component_count": 17,
+          "usage": {
+            "input_tokens": 32049498,
+            "cached_input_tokens": 30996224,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 111801,
+            "reasoning_output_tokens": 26192,
+            "total_tokens": 32161299,
+            "noncached_input_tokens": 1053274,
+            "noncached_input_plus_output_tokens": 1165075
+          },
+          "process_wall_seconds_sum": 2450.4086190000003,
+          "process_wall_seconds_median": 142.999,
+          "process_wall_seconds_p90": 194.9446
+        },
+        "main_review_coordination": {
+          "label": "主 Agent：review 期间协调",
+          "component_count": 17,
+          "usage": {
+            "input_tokens": 130860001,
+            "cached_input_tokens": 130280576,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 199396,
+            "reasoning_output_tokens": 121892,
+            "total_tokens": 131059397,
+            "noncached_input_tokens": 579425,
+            "noncached_input_plus_output_tokens": 778821
+          },
+          "process_wall_seconds_sum": 17948.598557,
+          "process_wall_seconds_median": 944.935563,
+          "process_wall_seconds_p90": 2019.7253598
+        },
+        "main_post_review_combined": {
+          "label": "主 Agent：归并、验证修复与交接",
+          "component_count": 17,
+          "usage": {
+            "input_tokens": 144911562,
+            "cached_input_tokens": 142483456,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 576511,
+            "reasoning_output_tokens": 239620,
+            "total_tokens": 145488073,
+            "noncached_input_tokens": 2428106,
+            "noncached_input_plus_output_tokens": 3004617
+          },
+          "process_wall_seconds_sum": 19375.387947,
+          "process_wall_seconds_median": 971.505741,
+          "process_wall_seconds_p90": 1727.6102454000002
+        },
+        "external_reviewer": {
+          "label": "独立 reviewer（含 fallback）",
+          "component_count": 43,
+          "usage": {
+            "input_tokens": 151614490,
+            "cached_input_tokens": 145270784,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 894832,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 152509322,
+            "noncached_input_tokens": 6343706,
+            "noncached_input_plus_output_tokens": 7238538
+          },
+          "process_wall_seconds_sum": 20837.363983,
+          "process_wall_seconds_median": 360.351552,
+          "process_wall_seconds_p90": 1071.5442000000003
+        },
+        "validation_subagent": {
+          "label": "独立验证修复子代理",
+          "component_count": 35,
+          "usage": {
+            "input_tokens": 104256271,
+            "cached_input_tokens": 100322304,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 684828,
+            "reasoning_output_tokens": 219534,
+            "total_tokens": 104941099,
+            "noncached_input_tokens": 3933967,
+            "noncached_input_plus_output_tokens": 4618795
+          },
+          "process_wall_seconds_sum": 17887.932,
+          "process_wall_seconds_median": 413.399,
+          "process_wall_seconds_p90": 736.7805999999999
+        },
+        "main_host_auxiliary_subagent": {
+          "label": "主会话的宿主辅助子代理",
+          "component_count": 1,
+          "usage": {
+            "input_tokens": 945880,
+            "cached_input_tokens": 846592,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 4987,
+            "reasoning_output_tokens": 1061,
+            "total_tokens": 950867,
+            "noncached_input_tokens": 99288,
+            "noncached_input_plus_output_tokens": 104275
+          },
+          "process_wall_seconds_sum": 2427.001,
+          "process_wall_seconds_median": 2427.001,
+          "process_wall_seconds_p90": 2427.001
+        },
+        "analyze": {
+          "label": "Analyze 后台 LLM",
+          "component_count": 20,
+          "usage": {
+            "input_tokens": 20163826,
+            "cached_input_tokens": 18107008,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 223423,
+            "reasoning_output_tokens": 63324,
+            "total_tokens": 20387249,
+            "noncached_input_tokens": 2056818,
+            "noncached_input_plus_output_tokens": 2280241
+          },
+          "process_wall_seconds_sum": 4228.220625,
+          "process_wall_seconds_median": 217.50201800000002,
+          "process_wall_seconds_p90": 295.60659110000006
+        },
+        "finalize": {
+          "label": "确定性 finalize（scaffold 前）",
+          "component_count": 17,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 11.084177,
+          "process_wall_seconds_median": 0.446316,
+          "process_wall_seconds_p90": 0.8148200000000001
+        }
+      }
+    },
+    "76d068a3f23b": {
+      "run_count": 6,
+      "finalized_count": 6,
+      "completed_analyze_count": 6,
+      "principal_complete_run_count": 0,
+      "principal_complete_run_ids": [],
+      "finalized_without_recorded_analyze_count": 0,
+      "unfinished_at_cutoff_count": 0,
+      "all_component_complete_run_count": 0,
+      "principal_complete_coverage_of_completed_analyze": 0.0,
+      "formal_archive_complete_analyze_count": 0,
+      "health_probe_attempt_count_in_principal_cohort": 0,
+      "observed_usage_principal_cohort": {
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 0,
+        "noncached_input_tokens": 0,
+        "noncached_input_plus_output_tokens": 0
+      },
+      "analyze_usage_principal_cohort": {
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 0,
+        "noncached_input_tokens": 0,
+        "noncached_input_plus_output_tokens": 0
+      },
+      "analyze_observed_total_token_share": null,
+      "analyze_observed_noncached_plus_output_share": null,
+      "per_run_analyze_total_token_share_median": null,
+      "per_run_analyze_total_token_share_p90": null,
+      "analyze_wall_seconds_sum": 1999.6649827957153,
+      "full_wall_seconds_sum": 19810.571031093597,
+      "main_wall_seconds_sum": 17810.669058799744,
+      "analyze_elapsed_share": 0.10093929042515482,
+      "analyze_wall_seconds_median": 309.8987559080124,
+      "analyze_wall_seconds_p90": 411.57674157619476,
+      "per_run_analyze_elapsed_share_median": 0.11439651284732637,
+      "per_run_analyze_elapsed_share_p90": 0.17783783608906437,
+      "existing_summary_includes_pre_rvf_count": 6,
+      "stages": {
+        "main_prepare": {
+          "label": "主 Agent：准备与派发",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        },
+        "main_review_coordination": {
+          "label": "主 Agent：review 期间协调",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        },
+        "main_post_review_combined": {
+          "label": "主 Agent：归并、验证修复与交接",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        },
+        "external_reviewer": {
+          "label": "独立 reviewer（含 fallback）",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        },
+        "validation_subagent": {
+          "label": "独立验证修复子代理",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        },
+        "main_host_auxiliary_subagent": {
+          "label": "主会话的宿主辅助子代理",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        },
+        "analyze": {
+          "label": "Analyze 后台 LLM",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        },
+        "finalize": {
+          "label": "确定性 finalize（scaffold 前）",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        }
+      }
+    },
+    "80b65c1fba0e": {
+      "run_count": 2,
+      "finalized_count": 2,
+      "completed_analyze_count": 2,
+      "principal_complete_run_count": 0,
+      "principal_complete_run_ids": [],
+      "finalized_without_recorded_analyze_count": 0,
+      "unfinished_at_cutoff_count": 0,
+      "all_component_complete_run_count": 0,
+      "principal_complete_coverage_of_completed_analyze": 0.0,
+      "formal_archive_complete_analyze_count": 0,
+      "health_probe_attempt_count_in_principal_cohort": 0,
+      "observed_usage_principal_cohort": {
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 0,
+        "noncached_input_tokens": 0,
+        "noncached_input_plus_output_tokens": 0
+      },
+      "analyze_usage_principal_cohort": {
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 0,
+        "noncached_input_tokens": 0,
+        "noncached_input_plus_output_tokens": 0
+      },
+      "analyze_observed_total_token_share": null,
+      "analyze_observed_noncached_plus_output_share": null,
+      "per_run_analyze_total_token_share_median": null,
+      "per_run_analyze_total_token_share_p90": null,
+      "analyze_wall_seconds_sum": 774.648056268692,
+      "full_wall_seconds_sum": 3228.5271830558777,
+      "main_wall_seconds_sum": 2453.725779056549,
+      "analyze_elapsed_share": 0.2399385268720176,
+      "analyze_wall_seconds_median": 387.324028134346,
+      "analyze_wall_seconds_p90": 401.1788025140762,
+      "per_run_analyze_elapsed_share_median": 0.2579656325110218,
+      "per_run_analyze_elapsed_share_p90": 0.31698043370418827,
+      "existing_summary_includes_pre_rvf_count": 2,
+      "stages": {
+        "main_prepare": {
+          "label": "主 Agent：准备与派发",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        },
+        "main_review_coordination": {
+          "label": "主 Agent：review 期间协调",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        },
+        "main_post_review_combined": {
+          "label": "主 Agent：归并、验证修复与交接",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        },
+        "external_reviewer": {
+          "label": "独立 reviewer（含 fallback）",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        },
+        "validation_subagent": {
+          "label": "独立验证修复子代理",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        },
+        "main_host_auxiliary_subagent": {
+          "label": "主会话的宿主辅助子代理",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        },
+        "analyze": {
+          "label": "Analyze 后台 LLM",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        },
+        "finalize": {
+          "label": "确定性 finalize（scaffold 前）",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        }
+      }
+    },
+    "d778584575f1": {
+      "run_count": 2,
+      "finalized_count": 2,
+      "completed_analyze_count": 2,
+      "principal_complete_run_count": 1,
+      "principal_complete_run_ids": [
+        "rvf-20261011T210920Z-agentic-initiation-start-3378f83e"
+      ],
+      "finalized_without_recorded_analyze_count": 0,
+      "unfinished_at_cutoff_count": 0,
+      "all_component_complete_run_count": 0,
+      "principal_complete_coverage_of_completed_analyze": 0.5,
+      "formal_archive_complete_analyze_count": 1,
+      "health_probe_attempt_count_in_principal_cohort": 7,
+      "observed_usage_principal_cohort": {
+        "input_tokens": 17251233,
+        "cached_input_tokens": 16685568,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 91357,
+        "reasoning_output_tokens": 19031,
+        "total_tokens": 17342590,
+        "noncached_input_tokens": 565665,
+        "noncached_input_plus_output_tokens": 657022
+      },
+      "analyze_usage_principal_cohort": {
+        "input_tokens": 1341206,
+        "cached_input_tokens": 1221504,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 10922,
+        "reasoning_output_tokens": 3140,
+        "total_tokens": 1352128,
+        "noncached_input_tokens": 119702,
+        "noncached_input_plus_output_tokens": 130624
+      },
+      "analyze_observed_total_token_share": 0.0779657479073195,
+      "analyze_observed_noncached_plus_output_share": 0.19881221633369964,
+      "per_run_analyze_total_token_share_median": 0.0779657479073195,
+      "per_run_analyze_total_token_share_p90": 0.0779657479073195,
+      "analyze_wall_seconds_sum": 765.7100749015808,
+      "full_wall_seconds_sum": 3634.1425528526306,
+      "main_wall_seconds_sum": 2868.3202650547028,
+      "analyze_elapsed_share": 0.21069896509715463,
+      "analyze_wall_seconds_median": 382.8550374507904,
+      "analyze_wall_seconds_p90": 442.995099401474,
+      "per_run_analyze_elapsed_share_median": 0.2183794180581312,
+      "per_run_analyze_elapsed_share_p90": 0.2716336121422727,
+      "existing_summary_includes_pre_rvf_count": 2,
+      "stages": {
+        "main_prepare": {
+          "label": "主 Agent：准备与派发",
+          "component_count": 1,
+          "usage": {
+            "input_tokens": 1007845,
+            "cached_input_tokens": 980992,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 6614,
+            "reasoning_output_tokens": 1476,
+            "total_tokens": 1014459,
+            "noncached_input_tokens": 26853,
+            "noncached_input_plus_output_tokens": 33467
+          },
+          "process_wall_seconds_sum": 218.947,
+          "process_wall_seconds_median": 218.947,
+          "process_wall_seconds_p90": 218.947
+        },
+        "main_review_coordination": {
+          "label": "主 Agent：review 期间协调",
+          "component_count": 1,
+          "usage": {
+            "input_tokens": 2934409,
+            "cached_input_tokens": 2913280,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 7153,
+            "reasoning_output_tokens": 5252,
+            "total_tokens": 2941562,
+            "noncached_input_tokens": 21129,
+            "noncached_input_plus_output_tokens": 28282
+          },
+          "process_wall_seconds_sum": 641.355585,
+          "process_wall_seconds_median": 641.355585,
+          "process_wall_seconds_p90": 641.355585
+        },
+        "main_post_review_combined": {
+          "label": "主 Agent：归并、验证修复与交接",
+          "component_count": 1,
+          "usage": {
+            "input_tokens": 3441168,
+            "cached_input_tokens": 3328512,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 26917,
+            "reasoning_output_tokens": 7915,
+            "total_tokens": 3468085,
+            "noncached_input_tokens": 112656,
+            "noncached_input_plus_output_tokens": 139573
+          },
+          "process_wall_seconds_sum": 858.673102,
+          "process_wall_seconds_median": 858.673102,
+          "process_wall_seconds_p90": 858.673102
+        },
+        "external_reviewer": {
+          "label": "独立 reviewer（含 fallback）",
+          "component_count": 2,
+          "usage": {
+            "input_tokens": 7207104,
+            "cached_input_tokens": 6997248,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 34142,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 7241246,
+            "noncached_input_tokens": 209856,
+            "noncached_input_plus_output_tokens": 243998
+          },
+          "process_wall_seconds_sum": 928.375614,
+          "process_wall_seconds_median": 464.187807,
+          "process_wall_seconds_p90": 600.1548293999999
+        },
+        "validation_subagent": {
+          "label": "独立验证修复子代理",
+          "component_count": 1,
+          "usage": {
+            "input_tokens": 1319501,
+            "cached_input_tokens": 1244032,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 5609,
+            "reasoning_output_tokens": 1248,
+            "total_tokens": 1325110,
+            "noncached_input_tokens": 75469,
+            "noncached_input_plus_output_tokens": 81078
+          },
+          "process_wall_seconds_sum": 170.651,
+          "process_wall_seconds_median": 170.651,
+          "process_wall_seconds_p90": 170.651
+        },
+        "main_host_auxiliary_subagent": {
+          "label": "主会话的宿主辅助子代理",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        },
+        "analyze": {
+          "label": "Analyze 后台 LLM",
+          "component_count": 1,
+          "usage": {
+            "input_tokens": 1341206,
+            "cached_input_tokens": 1221504,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 10922,
+            "reasoning_output_tokens": 3140,
+            "total_tokens": 1352128,
+            "noncached_input_tokens": 119702,
+            "noncached_input_plus_output_tokens": 130624
+          },
+          "process_wall_seconds_sum": 307.67996,
+          "process_wall_seconds_median": 307.67996,
+          "process_wall_seconds_p90": 307.67996
+        },
+        "finalize": {
+          "label": "确定性 finalize（scaffold 前）",
+          "component_count": 1,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0.492278,
+          "process_wall_seconds_median": 0.492278,
+          "process_wall_seconds_p90": 0.492278
+        }
+      }
+    },
+    "f57cdf037911": {
+      "run_count": 14,
+      "finalized_count": 13,
+      "completed_analyze_count": 13,
+      "principal_complete_run_count": 0,
+      "principal_complete_run_ids": [],
+      "finalized_without_recorded_analyze_count": 0,
+      "unfinished_at_cutoff_count": 1,
+      "all_component_complete_run_count": 0,
+      "principal_complete_coverage_of_completed_analyze": 0.0,
+      "formal_archive_complete_analyze_count": 0,
+      "health_probe_attempt_count_in_principal_cohort": 0,
+      "observed_usage_principal_cohort": {
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 0,
+        "noncached_input_tokens": 0,
+        "noncached_input_plus_output_tokens": 0
+      },
+      "analyze_usage_principal_cohort": {
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 0,
+        "noncached_input_tokens": 0,
+        "noncached_input_plus_output_tokens": 0
+      },
+      "analyze_observed_total_token_share": null,
+      "analyze_observed_noncached_plus_output_share": null,
+      "per_run_analyze_total_token_share_median": null,
+      "per_run_analyze_total_token_share_p90": null,
+      "analyze_wall_seconds_sum": 3527.2323248386383,
+      "full_wall_seconds_sum": 570786.5979866982,
+      "main_wall_seconds_sum": 567212.1694939137,
+      "analyze_elapsed_share": 0.006179599060804925,
+      "analyze_wall_seconds_median": 230.8200809955597,
+      "analyze_wall_seconds_p90": 379.3279119968415,
+      "per_run_analyze_elapsed_share_median": 0.13351472622163701,
+      "per_run_analyze_elapsed_share_p90": 0.21041637706814073,
+      "existing_summary_includes_pre_rvf_count": 11,
+      "stages": {
+        "main_prepare": {
+          "label": "主 Agent：准备与派发",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        },
+        "main_review_coordination": {
+          "label": "主 Agent：review 期间协调",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        },
+        "main_post_review_combined": {
+          "label": "主 Agent：归并、验证修复与交接",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        },
+        "external_reviewer": {
+          "label": "独立 reviewer（含 fallback）",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        },
+        "validation_subagent": {
+          "label": "独立验证修复子代理",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        },
+        "main_host_auxiliary_subagent": {
+          "label": "主会话的宿主辅助子代理",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        },
+        "analyze": {
+          "label": "Analyze 后台 LLM",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        },
+        "finalize": {
+          "label": "确定性 finalize（scaffold 前）",
+          "component_count": 0,
+          "usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            "noncached_input_tokens": 0,
+            "noncached_input_plus_output_tokens": 0
+          },
+          "process_wall_seconds_sum": 0,
+          "process_wall_seconds_median": null,
+          "process_wall_seconds_p90": null
+        }
+      }
+    }
+  },
+  "limitations": [
+    "健康探测 usage 未完整归档，主要组件占比是已观测口径，不能称为所有调用的精确占比。",
+    "目录创建时间作为 RVF 起点，精度为秒；不把它之前的实现与发起决策对话计入。",
+    "归并、验证修复、最终验证与交接缺乏可靠阶段事件，合并展示。",
+    "正式归档状态在采集时检查，不伪装成截止时刻的历史快照。",
+    "finalize.completed_at 在 scaffold 之前写入，不能当作 scaffold 完成耗时。",
+    "summary 的部署标签可能在后续操作中重写，仅作为记录标签分组，不能证明每个阶段运行相同代码。",
+    "主 Agent 阶段按 reviewer 活动时间窗归属，属于时间窗分类，不是逐条语义判断。"
+  ]
+}

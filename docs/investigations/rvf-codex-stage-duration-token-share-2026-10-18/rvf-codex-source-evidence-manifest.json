@@ -1,0 +1,2734 @@
+{
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260921T232409Z-agentic-initiation-start-5618538e/summary.json": {
+    "size_bytes": 14987,
+    "sha256": "1125fb92779af4b95a773c745b1a5297da7f66b7b8c52fa0485949fb04557433"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260921T232409Z-agentic-initiation-start-5618538e/events.jsonl": {
+    "size_bytes": 61682,
+    "sha256": "d8122615ac54497aea636ef113adeef5485fb2c7d16ee1fac010cc859fff4421"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260921T232409Z-agentic-initiation-start-5618538e/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 627,
+    "sha256": "f6e3ed96520d9cd9fd9e086574695f726711d26c9888704d8d2164c78cb5f1a5"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260921T232409Z-agentic-initiation-start-5618538e/artifacts/reviewers/claude-code/reviewer.stdout.txt": {
+    "size_bytes": 1609764,
+    "sha256": "85b3ef5954c51f0ff8d267d03b16f3a38b16b94e384e7c9ed914ee0e8631dfbf"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260921T232409Z-agentic-initiation-start-5618538e/artifacts/reviewers/claude-code/reviewer.summary.json": {
+    "size_bytes": 7033,
+    "sha256": "0b0668a234fb0362d1da668365383594d77594c33ab6177de882cb998126c4a3"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260921T232409Z-agentic-initiation-start-5618538e/artifacts/reviewers/cursor-cli/reviewer.stdout.txt": {
+    "size_bytes": 359959,
+    "sha256": "f1e7e256494635f0a4af6d69955acf715436d3e74bbc4121b9184afafa85fc0e"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260921T232409Z-agentic-initiation-start-5618538e/artifacts/reviewers/cursor-cli/reviewer.summary.json": {
+    "size_bytes": 2349,
+    "sha256": "b0baf0bdd83a54349f37bd1f187f756eccc135011b67a26068673dcc3fa3b489"
+  },
+  "/Users/bominzhang/.kimi-code/sessions/wd_cline-kanban_b7d57a5411b5/session_f20a8885-9963-4726-9270-441b6a35b59a/agents/main/wire.jsonl": {
+    "size_bytes": 186358,
+    "sha256": "f912d87b69076bf022084fa3a4f29381c7619384b2e0b8ded2d0986760f0b81d"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260921T232409Z-agentic-initiation-start-5618538e/artifacts/reviewers/kimi-code/reviewer.summary.json": {
+    "size_bytes": 2943,
+    "sha256": "382c9b274f94c231a7b2483d6de959f6082b8e6fdddbde8f2ab7203041ca9be1"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260921T232409Z-agentic-initiation-start-5618538e/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 14118607,
+    "sha256": "ae1b7503b1d20e644e6e517f4c05f3de2217dac8cf52f224cc9f23af080620da"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260921T232409Z-agentic-initiation-start-5618538e/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "2af92aca1668149c45b4a98c51ed3909447bc7904cce34b1fdd1aae1b58c1771"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260921T232409Z-agentic-initiation-start-5618538e/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 1339460,
+    "sha256": "ba26c6162aa6e9dee8df3ba7c7be976e6df9759da9712184d2b6282a27d9177b"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260921T232409Z-agentic-initiation-start-5618538e/artifacts/analysis/summary.md": {
+    "size_bytes": 3088,
+    "sha256": "eec2f546c21e4f58a357faa9d79737a8f66600287e3631da5ed38a10366211ce"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260921T232409Z-agentic-initiation-start-5618538e/artifacts/analysis/causality.json": {
+    "size_bytes": 36778,
+    "sha256": "2d3fd3e38af054c840cb321f3d3617168392d689758601999dae197a0deed265"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260921T232409Z-agentic-initiation-start-5618538e/artifacts/usage/usage-summary.json": {
+    "size_bytes": 818,
+    "sha256": "db05589ccebd158863d7b363e400d39d9d98d73f194cfd47282a17cda703cbce"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T122340Z-agentic-initiation-start-f66244a9/summary.json": {
+    "size_bytes": 12111,
+    "sha256": "6b5243a9bb08f8ee6a70919bef08f3bb567260ace60236fbf14181e2d3a111b9"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T122340Z-agentic-initiation-start-f66244a9/events.jsonl": {
+    "size_bytes": 40901,
+    "sha256": "72e72b293478f6420b9f2628268f3d060ad58d2060b6fee9b44ee096f3bfeddb"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T122340Z-agentic-initiation-start-f66244a9/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 627,
+    "sha256": "b888242bf70b7f862cf7722187813a4bd987d9ffd101bae00730cbccbc0f6b44"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T122340Z-agentic-initiation-start-f66244a9/artifacts/reviewers/claude-code/reviewer.stdout.txt": {
+    "size_bytes": 772715,
+    "sha256": "c779692e2e51e70321c248641a1072bcc31a1829b23c01fb99448b392a2476b5"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T122340Z-agentic-initiation-start-f66244a9/artifacts/reviewers/claude-code/reviewer.summary.json": {
+    "size_bytes": 3802,
+    "sha256": "4f02d251fb18c82b8b4e1ff85312125c8d6d0fadc2151aea5a1515ef9410bd53"
+  },
+  "/Users/bominzhang/.kimi-code/sessions/wd_cline-kanban_b7d57a5411b5/session_23618156-4b4a-482e-8884-6e2e96d9341c/agents/main/wire.jsonl": {
+    "size_bytes": 393320,
+    "sha256": "396cb6e6f8c501ae52f651419cefb41700d17970495f4b2b86d5570c965d78a6"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T122340Z-agentic-initiation-start-f66244a9/artifacts/reviewers/kimi-code/reviewer.summary.json": {
+    "size_bytes": 4631,
+    "sha256": "edd3cc0c3981d1c57bf81b903b2b3ab761c1ac6a2258c3f9d6fd9070f014efc8"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T122340Z-agentic-initiation-start-f66244a9/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 17520045,
+    "sha256": "704fc66bc249158d15ee8147e5b23941d69cbe2acd08772774a232ced35d890b"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T122340Z-agentic-initiation-start-f66244a9/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "a8c58cdcd9e7040b43600bcd682077c409f3e181aa51b0f63cd9b1bf835948aa"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T122340Z-agentic-initiation-start-f66244a9/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 475526,
+    "sha256": "a387208c77b97cb623682f1de88c29e447c9e9303ad00f37985aa4d06cbdebd5"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T122340Z-agentic-initiation-start-f66244a9/artifacts/analysis/summary.md": {
+    "size_bytes": 3014,
+    "sha256": "1f95120f054e31baec8e557ec413a18a8eb667cc0ab6b32de394fc3d8e214a8f"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T122340Z-agentic-initiation-start-f66244a9/artifacts/analysis/causality.json": {
+    "size_bytes": 4914,
+    "sha256": "ded176df9b06cc5ba392f34aec60f3af5261e95503e029b530ea0efb8a472e88"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T122340Z-agentic-initiation-start-f66244a9/artifacts/usage/usage-summary.json": {
+    "size_bytes": 818,
+    "sha256": "409a62522cdace9388e3f6877d1196454bdaf9cd27e1e20585522a988f60a784"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T124436Z-agentic-initiation-start-aa861c49/summary.json": {
+    "size_bytes": 11577,
+    "sha256": "ad2f386428ea0de72918a9001eb92f2d3bd2c8284114821faaac0b68f466f9c5"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T124436Z-agentic-initiation-start-aa861c49/events.jsonl": {
+    "size_bytes": 23748,
+    "sha256": "865f503127151b874d504c2fbf55cfef32c010649828504e52465d2970e84bc9"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T124436Z-agentic-initiation-start-aa861c49/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 625,
+    "sha256": "acecb07c6875562f1ea5f4f4db16c2f5e90c8bb46ce0c8b2ad812b840a136223"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T124436Z-agentic-initiation-start-aa861c49/artifacts/reviewers/cursor-cli/reviewer.stdout.txt": {
+    "size_bytes": 447658,
+    "sha256": "c95d6c40395c07a2cd5edbf533488d20f9456e9b0db04cee3605f9473f1e0ca4"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T124436Z-agentic-initiation-start-aa861c49/artifacts/reviewers/cursor-cli/reviewer.summary.json": {
+    "size_bytes": 4642,
+    "sha256": "882ed57116ba26e789282446b7a1d939406d4a9d20bce7f58b52a68a321e1599"
+  },
+  "/Users/bominzhang/.kimi-code/sessions/wd_trace-of-thought-legal_b8773ccfe6e4/session_735c7b80-f528-455c-ba65-697cd142d164/agents/main/wire.jsonl": {
+    "size_bytes": 609745,
+    "sha256": "6e600c15a87850fdaf4530612b4ccb52b789d287657be1d29db9f1c2b07de613"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T124436Z-agentic-initiation-start-aa861c49/artifacts/reviewers/kimi-code/reviewer.summary.json": {
+    "size_bytes": 4089,
+    "sha256": "d55aacf4c89283f121ac5db43c8c0abb1d677fe2827616cdff8335bc0f159873"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T124436Z-agentic-initiation-start-aa861c49/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 2010787,
+    "sha256": "a0c6329eb4a5beb2efc81eb32b30c760d85dd938a986e68a87501baff4dc2ca2"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T124436Z-agentic-initiation-start-aa861c49/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "91378465725a5b3db334fec42472ca7096ac5eff5b541ac54aed0d44727a227b"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T124436Z-agentic-initiation-start-aa861c49/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 204469,
+    "sha256": "571ab5371886e9cc7d69c1a07dd0f24b84432533850dd1080ff4b7bf258a20a8"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T124436Z-agentic-initiation-start-aa861c49/artifacts/analysis/summary.md": {
+    "size_bytes": 3011,
+    "sha256": "477d496567a17039c9e6588d68c785b80cba97cfa2b7a5922216e260ebcc8c11"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T124436Z-agentic-initiation-start-aa861c49/artifacts/analysis/causality.json": {
+    "size_bytes": 13280,
+    "sha256": "fcdbf3a0485c22fc8f099dc38636778dff32b64afaa3f683f5439ffa4eb914f4"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T124436Z-agentic-initiation-start-aa861c49/artifacts/usage/usage-summary.json": {
+    "size_bytes": 816,
+    "sha256": "1f53e112783f74bd691c7c55aedd50e4755fc886ec947e883be24b89ab580f70"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T125148Z-agentic-initiation-start-419e3ba5/summary.json": {
+    "size_bytes": 3287,
+    "sha256": "37e1aca6bfe6c45640cbf2917cdac57187da7c49b3730236872e19c5c6cec556"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T125148Z-agentic-initiation-start-419e3ba5/events.jsonl": {
+    "size_bytes": 12777,
+    "sha256": "9746e92c0fb2c6dda92fa0b6043811fee53686b1b11cbcdd9bbabffb9b818979"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T144727Z-agentic-initiation-start-ac0d6774/summary.json": {
+    "size_bytes": 12155,
+    "sha256": "a07aa33f9b18eb1d9ac76d2513e52a68ba7224c4e4c693cc655d274e5aa8c402"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T144727Z-agentic-initiation-start-ac0d6774/events.jsonl": {
+    "size_bytes": 48093,
+    "sha256": "8d59d896b94bba94ab74cd3f5b9bcda84cf7723c0a717b821e248d7bcd4cbc7d"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T144727Z-agentic-initiation-start-ac0d6774/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 181,
+    "sha256": "4b4aa884922213d8da2903dfdaacd4dcb4e18071c71044339e0f469f5b79dac4"
+  },
+  "/Users/bominzhang/.kimi-code/sessions/wd_cline-kanban_861de2d8086d/session_240a48b2-60d4-48e0-a044-5daec282d5ea/agents/main/wire.jsonl": {
+    "size_bytes": 730628,
+    "sha256": "c9f4e322041b2b845b7ba8166c99f126d8196f0082d7b9fdb81ae31cb853d0d8"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T144727Z-agentic-initiation-start-ac0d6774/artifacts/reviewers/kimi-code/reviewer.summary.json": {
+    "size_bytes": 5149,
+    "sha256": "ce7a8ef7fe32815b908513a1d2f328b6ea74896ec405b78b8dbe29ba5bb01734"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T144727Z-agentic-initiation-start-ac0d6774/artifacts/reviewers/oh-my-pi/reviewer.stdout.txt": {
+    "size_bytes": 4034484,
+    "sha256": "f1f2ddb39ea316e8da479403d4c31f720c3d88cddd693cb8cc208f4a6befbff7"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T144727Z-agentic-initiation-start-ac0d6774/artifacts/reviewers/oh-my-pi/reviewer.summary.json": {
+    "size_bytes": 3691,
+    "sha256": "17866699608721fa4a7266c33c3eceea46482bd6f08a79e62449391aa689849a"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T144727Z-agentic-initiation-start-ac0d6774/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "ec1f597ed6434ccaa490869e36e2045a993b20002484430c96f0e41fadc2da62"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T144727Z-agentic-initiation-start-ac0d6774/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 336133,
+    "sha256": "690d373e527994619b271f42f1a3f5323a2595fcb8c13f3e41fefa693a7840e4"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T144727Z-agentic-initiation-start-ac0d6774/artifacts/analysis/summary.md": {
+    "size_bytes": 2707,
+    "sha256": "b4ef03ab30f4f5b22a0f185425299769ec3843e793ad78186597dd602893bb08"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T144727Z-agentic-initiation-start-ac0d6774/artifacts/analysis/causality.json": {
+    "size_bytes": 5706,
+    "sha256": "a5a9054bb10e8487d1b052811e1f3d9d2405d1b037142808b41382425c689049"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T144727Z-agentic-initiation-start-ac0d6774/artifacts/usage/usage-summary.json": {
+    "size_bytes": 701,
+    "sha256": "1e921a368ddc43e36f1119a150557277f667667e8436741dec2203dc2c69b5aa"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T164826Z-agentic-initiation-start-4856982a/summary.json": {
+    "size_bytes": 11350,
+    "sha256": "9e80a0977ee3fd8b3587ec6a050c4ebf959864edfe5ff946142ff5b815bca412"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T164826Z-agentic-initiation-start-4856982a/events.jsonl": {
+    "size_bytes": 42683,
+    "sha256": "aee0fb87f339a36b786d7786a8052f14cc0068d41fa988bf1da4ef6132d4fce3"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T164826Z-agentic-initiation-start-4856982a/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 625,
+    "sha256": "c6ea5b46b10458af1f286dc2dfb352598e892a6f3770d3e2376692185470f299"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T164826Z-agentic-initiation-start-4856982a/artifacts/reviewers/claude-code/reviewer.stdout.txt": {
+    "size_bytes": 566193,
+    "sha256": "680557079f342fa4c5c9d41a7c96608466aeb8bed98d7b51db06594121da4f27"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T164826Z-agentic-initiation-start-4856982a/artifacts/reviewers/claude-code/reviewer.summary.json": {
+    "size_bytes": 3512,
+    "sha256": "a19c2351abc44466adb0e9d86832fc95b6e789b5b08b7c38e371fbfbc5c777a0"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T164826Z-agentic-initiation-start-4856982a/artifacts/reviewers/cursor-cli/reviewer.stdout.txt": {
+    "size_bytes": 356067,
+    "sha256": "baf067bfe521fa8ba4ef31a95fc2aac9512d54c931a09f99629f885f6ce7a21f"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T164826Z-agentic-initiation-start-4856982a/artifacts/reviewers/cursor-cli/reviewer.summary.json": {
+    "size_bytes": 3275,
+    "sha256": "60037532b089ab0ca1a1bde6348d2f1abe86957c2b954885db371ec7b909a107"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T164826Z-agentic-initiation-start-4856982a/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 3862213,
+    "sha256": "a3fd49a9ce3db7021c34733b8624467abcb94af4d7d888ba41030d237c0b9f60"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T164826Z-agentic-initiation-start-4856982a/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "33d031794c664a488171527f294fa53ce87f93ba12a26e439974f64dd364188a"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T164826Z-agentic-initiation-start-4856982a/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 514304,
+    "sha256": "e3603b8e419ca2579eef669aa841e8182b39db0cc52f594c1533c8e5b15e0d9e"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T164826Z-agentic-initiation-start-4856982a/artifacts/analysis/summary.md": {
+    "size_bytes": 3017,
+    "sha256": "7da53468c058795b7f48dc8beca91989576ea258a9b951e571e1848cb41e2600"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T164826Z-agentic-initiation-start-4856982a/artifacts/analysis/causality.json": {
+    "size_bytes": 3560,
+    "sha256": "376e4c8ee49a291f0ffe884d1dd5d1c5c97ed72bd8072d5a3097d88ef83df321"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260922T164826Z-agentic-initiation-start-4856982a/artifacts/usage/usage-summary.json": {
+    "size_bytes": 811,
+    "sha256": "ca6448d5c63653ad9687e339fa90466202cb19abeef7744c9a749b9e9679fbcd"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260923T074906Z-agentic-initiation-start-4619314f/summary.json": {
+    "size_bytes": 11765,
+    "sha256": "5505cf9da19b2b58fe62429717b9ca76ec9c20bba6d6b364a8a992154519814d"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260923T074906Z-agentic-initiation-start-4619314f/events.jsonl": {
+    "size_bytes": 46290,
+    "sha256": "22cb3134d6081387334d300a92a38ff7375f3c6bc254081f7fe4fc9c3db7ff40"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260923T074906Z-agentic-initiation-start-4619314f/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 625,
+    "sha256": "64cd12ea82a015c8af551e35ee819a8504feff61ab923d46e83f14aa3dd9a662"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260923T074906Z-agentic-initiation-start-4619314f/artifacts/reviewers/claude-code/reviewer.stdout.txt": {
+    "size_bytes": 2043262,
+    "sha256": "f837b0a5a33f88986c12511406be9f29bf575f618f153bd3a63c43926324863c"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260923T074906Z-agentic-initiation-start-4619314f/artifacts/reviewers/claude-code/reviewer.summary.json": {
+    "size_bytes": 3757,
+    "sha256": "de3ac9b31380e21c7aa6fa12f02cfa0545e25b924ef8c4604eeb6eee0e317994"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260923T074906Z-agentic-initiation-start-4619314f/artifacts/reviewers/oh-my-pi/reviewer.stdout.txt": {
+    "size_bytes": 7159198,
+    "sha256": "f7930d69ac2bbac3283593a0bf2ac491039c1a2a91f50c5f8269ae1e406328ab"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260923T074906Z-agentic-initiation-start-4619314f/artifacts/reviewers/oh-my-pi/reviewer.summary.json": {
+    "size_bytes": 4048,
+    "sha256": "d36a23e826e83c44cb2a20f1cfec31eb688f6638b81f145a68d5b6ac2d0428d4"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260923T074906Z-agentic-initiation-start-4619314f/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 5310823,
+    "sha256": "650d4641afc539829bcf860f73ead1a37e58301f8a2d8cab8569ce5736862eab"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260923T074906Z-agentic-initiation-start-4619314f/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "141ba367105fed08aadf420190cccb59c9a2e0272bcd4aa004513d40561b7e6a"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260923T074906Z-agentic-initiation-start-4619314f/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 274224,
+    "sha256": "09f2e54b5d38d1b41402ca58d4e236b4a4252ffc3e6491b795f149f85182411f"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260923T074906Z-agentic-initiation-start-4619314f/artifacts/analysis/summary.md": {
+    "size_bytes": 3162,
+    "sha256": "4ada656fe73a65b4616c782e69623ad48569923c46c0168442fb51fbf45eed5f"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260923T074906Z-agentic-initiation-start-4619314f/artifacts/analysis/causality.json": {
+    "size_bytes": 13072,
+    "sha256": "27d9fd0641416f7ee429791ecacc517897e88aa4819b2ef4c30aaebfd8d8073e"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260923T074906Z-agentic-initiation-start-4619314f/artifacts/usage/usage-summary.json": {
+    "size_bytes": 814,
+    "sha256": "42874c4c87e86ba73698d43faf2b22a0b6d3d913eb53e14ea845d19711a93ea8"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T060300Z-agentic-initiation-start-cf68933e/summary.json": {
+    "size_bytes": 11519,
+    "sha256": "40bbad7100c6b6f1a3b8bb6b3361bd1d069f879d911fa652e3225e2f93584b75"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T060300Z-agentic-initiation-start-cf68933e/events.jsonl": {
+    "size_bytes": 43142,
+    "sha256": "86f2995eb2b3fd6353a67003eae2317bf080c08704536598b6fa4907fbad8527"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T060300Z-agentic-initiation-start-cf68933e/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 625,
+    "sha256": "d01b7a12e5a66bf0ce9c1d019cf6ce617e20ef19bb3019b74f04b0420bea5f9e"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T060300Z-agentic-initiation-start-cf68933e/artifacts/reviewers/cursor-cli/reviewer.stdout.txt": {
+    "size_bytes": 498959,
+    "sha256": "af4f0cc140da5fb365deaafa00436307fc7e5c0db9217ff41417fff51945f3b2"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T060300Z-agentic-initiation-start-cf68933e/artifacts/reviewers/cursor-cli/reviewer.summary.json": {
+    "size_bytes": 3249,
+    "sha256": "690e58be64a672ff1e51db98f9304b63b4b9da4f8a1864ce595536b0dd630de0"
+  },
+  "/Users/bominzhang/.kimi-code/sessions/wd_cline-kanban_b7d57a5411b5/session_6aa6623e-026e-4fe1-9303-8f6ab1611470/agents/main/wire.jsonl": {
+    "size_bytes": 473863,
+    "sha256": "f4de0b4cb0697e8963eaba2df5fe87355072e2172bedd720bd789856b4dd4d4f"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T060300Z-agentic-initiation-start-cf68933e/artifacts/reviewers/kimi-code/reviewer.summary.json": {
+    "size_bytes": 4022,
+    "sha256": "50f5a10f9293e633b1303f3b42e751ef32bd475bc8c891f28c39a855ae9dc8e9"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T060300Z-agentic-initiation-start-cf68933e/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 2533190,
+    "sha256": "31d82e35babec59b29fb1f38bacd9882734830822b910403e5fd72f93624d7ee"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T060300Z-agentic-initiation-start-cf68933e/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "f6932bd5fe20c3ac99f9cc1ac3a6a314a57fd1a5ab1bdd38033c644b65f26b1f"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T060300Z-agentic-initiation-start-cf68933e/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 477946,
+    "sha256": "d9246c83974e0041159a4785410edcfcafa10c0ccfb6f3518a720bcdc03c62f8"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T060300Z-agentic-initiation-start-cf68933e/artifacts/analysis/summary.md": {
+    "size_bytes": 3029,
+    "sha256": "32e2efec401ae5eca07cb6d6809567e98c98c07da7ac5914d4b1ce5a3b5d1e76"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T060300Z-agentic-initiation-start-cf68933e/artifacts/analysis/causality.json": {
+    "size_bytes": 4873,
+    "sha256": "3fdb12dc6e24a34bc5705ca509cae9957ead6f43862e29481ecdce2f7a212e01"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T060300Z-agentic-initiation-start-cf68933e/artifacts/usage/usage-summary.json": {
+    "size_bytes": 817,
+    "sha256": "676629e0fb423ee6f6f1aa16ea87223d12503c502b1aa5a3341e2b771bce7c36"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T084951Z-agentic-initiation-start-16ef8b92/summary.json": {
+    "size_bytes": 11890,
+    "sha256": "c6cca711ddc2680ea77592a2ed5ca0d0f249b77f23069cae5697eb8d22d69981"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T084951Z-agentic-initiation-start-16ef8b92/events.jsonl": {
+    "size_bytes": 43041,
+    "sha256": "69e99ed6d652c97f706a7c2cf5c498a6c559d59281b98a540180ff2f7ba80488"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T084951Z-agentic-initiation-start-16ef8b92/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 625,
+    "sha256": "337b555f44a7845053c1d45766741284782436537d4d8225023bdc5540ce73b0"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T084951Z-agentic-initiation-start-16ef8b92/artifacts/reviewers/cursor-cli/reviewer.stdout.txt": {
+    "size_bytes": 774492,
+    "sha256": "3a6ef2517619ad3dad5c15d3bfb29ef6da089b931f0d698c15c52b4b994eec51"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T084951Z-agentic-initiation-start-16ef8b92/artifacts/reviewers/cursor-cli/reviewer.summary.json": {
+    "size_bytes": 3435,
+    "sha256": "f3e548af92631f8f97edb8b51106d2deb95371df28dc52bcf82721e3b213a3bc"
+  },
+  "/Users/bominzhang/.kimi-code/sessions/wd_cline-kanban_81bccfdaf21b/session_824ae87d-a789-4880-b7fe-52e37ac93d6a/agents/main/wire.jsonl": {
+    "size_bytes": 613049,
+    "sha256": "9eb3e3fb1c0dbc2eb3cbfcc476702a5f4d4a3b79f9e4505e539b96ee24d300e2"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T084951Z-agentic-initiation-start-16ef8b92/artifacts/reviewers/kimi-code/reviewer.summary.json": {
+    "size_bytes": 4555,
+    "sha256": "0c530e98a8f2b3662eff31e9616ad30825b89d779b2551433aa59d1175173156"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T084951Z-agentic-initiation-start-16ef8b92/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 8863719,
+    "sha256": "5d7f85c989d2ac24596f6ef6cf37b92c0ac594a400aae43339e1cd38f1d06cf1"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T084951Z-agentic-initiation-start-16ef8b92/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "cd976a9793a432cb1f92fd6849be47893f72daa9ed52a4c56d3ca1536c3ca54e"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T084951Z-agentic-initiation-start-16ef8b92/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 167599,
+    "sha256": "9a7b2533eb1aebb36faff803dabaceb62f061cf8d2a94f60bfc47ff07563d091"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T084951Z-agentic-initiation-start-16ef8b92/artifacts/analysis/summary.md": {
+    "size_bytes": 2981,
+    "sha256": "d57bb919a3e83daf90764fd9b941779c402d38a28bfecaa0164ee4fcceec75a8"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T084951Z-agentic-initiation-start-16ef8b92/artifacts/analysis/causality.json": {
+    "size_bytes": 243,
+    "sha256": "df10e2ae7473a40e5dcc20eb6050871764e2f23a20b926cbfa7354f4006f1089"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T084951Z-agentic-initiation-start-16ef8b92/artifacts/usage/usage-summary.json": {
+    "size_bytes": 814,
+    "sha256": "723abe28123ff3e7551548fcb26e1e0efc5c08eae4ca4abcb7f1ea23b18d3c5a"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T090748Z-agentic-initiation-start-10c69398/summary.json": {
+    "size_bytes": 12002,
+    "sha256": "e470bb52a101974953a3f13441795b54cf1f6c989eae8b7704634c941d940bb3"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T090748Z-agentic-initiation-start-10c69398/events.jsonl": {
+    "size_bytes": 40579,
+    "sha256": "e1e2ae4a5e7e40e4d3088f5bd8fcf04c5654a1f575468aedf6846c84707fdec9"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T090748Z-agentic-initiation-start-10c69398/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 662,
+    "sha256": "7dd5d7df4f11960886715117b92c59af2e874e8f97ee8479baa2ddffc950f070"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T090748Z-agentic-initiation-start-10c69398/artifacts/reviewers/cursor-cli/reviewer.stdout.txt": {
+    "size_bytes": 453757,
+    "sha256": "b15d8664494cdbc4de9321b712fe19491835b7e4cef0dae9d185d7c978ce2ada"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T090748Z-agentic-initiation-start-10c69398/artifacts/reviewers/cursor-cli/reviewer.summary.json": {
+    "size_bytes": 3393,
+    "sha256": "8cfecf5217b1c258ac6990c0a05d204d0c662fced635eb251a06725b315691e1"
+  },
+  "/Users/bominzhang/.kimi-code/sessions/wd_cline-kanban_db5083c047f8/session_040b2c91-1153-4f7c-ad89-6799adfac45a/agents/main/wire.jsonl": {
+    "size_bytes": 425968,
+    "sha256": "71d636cd317966913b952441ac3f3c044c49c58c0ede71a424d356dabf0fd5c0"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T090748Z-agentic-initiation-start-10c69398/artifacts/reviewers/kimi-code/reviewer.summary.json": {
+    "size_bytes": 4667,
+    "sha256": "0c9c73a807eb26cd137c054891635589fa68239e73e8c48be19c032522b9a19c"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T090748Z-agentic-initiation-start-10c69398/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 9081311,
+    "sha256": "0369750b2b1c1988507effe562ab9473bc5418258fdef0e4061cab7c8ba4d4a7"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T090748Z-agentic-initiation-start-10c69398/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "264df29d90b13ed8c701e69e9fab6cb21c40cfdd5f9af4221b5be4b32b7208f8"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T090748Z-agentic-initiation-start-10c69398/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 254161,
+    "sha256": "e7b7f7a4a0fd5b76ac4d619afd548e55c897a5488975f76df6605ef4649c2636"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T090748Z-agentic-initiation-start-10c69398/artifacts/analysis/summary.md": {
+    "size_bytes": 2981,
+    "sha256": "e52536db83cdba13bb4a27965f3325b9d484a305769f9442e0b021837b49c9d0"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T090748Z-agentic-initiation-start-10c69398/artifacts/analysis/causality.json": {
+    "size_bytes": 243,
+    "sha256": "444ac9a428cd0be94d04c8b686d48ab2054de90d9f00f2fb11075135f8ebe62f"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T090748Z-agentic-initiation-start-10c69398/artifacts/usage/usage-summary.json": {
+    "size_bytes": 814,
+    "sha256": "31bedeb301737ad2439ff283f808211abf3c3ab8322a2126f15ffddb053066dd"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T094801Z-agentic-initiation-start-f36bb355/summary.json": {
+    "size_bytes": 11380,
+    "sha256": "9a6b01d527e7a75ac0f9887887b80e70e70ab83625b423e21f6915c517cc9699"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T094801Z-agentic-initiation-start-f36bb355/events.jsonl": {
+    "size_bytes": 44254,
+    "sha256": "14fea3bcd90fb9b24d7b86074ef19b5269dc7d4d0d7569c3ce830fc2a8cd22ad"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T094801Z-agentic-initiation-start-f36bb355/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 625,
+    "sha256": "bd1333a0fd862e6bda7d30ec53026dd48446a1e1b9e03fe458842777ce62cdcc"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T094801Z-agentic-initiation-start-f36bb355/artifacts/reviewers/claude-code/reviewer.stdout.txt": {
+    "size_bytes": 1286309,
+    "sha256": "8258f65ba5410f08a85c5f55d489ddf71f755b1ae7b0f15db9ffa3c27acecd0e"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T094801Z-agentic-initiation-start-f36bb355/artifacts/reviewers/claude-code/reviewer.summary.json": {
+    "size_bytes": 3734,
+    "sha256": "37b73888b2b50585d8837a751219f5eeb3f3ca7af450d87036255b5ecdb38c13"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T094801Z-agentic-initiation-start-f36bb355/artifacts/reviewers/oh-my-pi/reviewer.stdout.txt": {
+    "size_bytes": 3807295,
+    "sha256": "cf2b5a7d3d07a0db93d132d3bb2ea4fd1b9930848d795ea7e0a939b17d61b8cf"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T094801Z-agentic-initiation-start-f36bb355/artifacts/reviewers/oh-my-pi/reviewer.summary.json": {
+    "size_bytes": 3781,
+    "sha256": "344a497915a32458594c87a0caa23d6a085fb2fd35d4fa153b56c770d6b27e76"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T094801Z-agentic-initiation-start-f36bb355/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 5650067,
+    "sha256": "a8ce941eaa783f9c021571ed3c6fb11bef9eee56aa638adc1b3bbd399698ee8b"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T094801Z-agentic-initiation-start-f36bb355/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "17065aa9831ff0228855680a8cc3df8286f39504e90e8ea895546a265845c5b3"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T094801Z-agentic-initiation-start-f36bb355/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 405371,
+    "sha256": "b6f430c455cfe99ad637227d99481ca68bbd3e52dcc3b2e8b0e7467394468731"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T094801Z-agentic-initiation-start-f36bb355/artifacts/analysis/summary.md": {
+    "size_bytes": 2984,
+    "sha256": "8c8ff35bb76523d6c2487e9460e1e181a5a7f17dc4d5e54e956b9fa5a70b640b"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T094801Z-agentic-initiation-start-f36bb355/artifacts/analysis/causality.json": {
+    "size_bytes": 11196,
+    "sha256": "86e3fff95c1e120702ffa18e225b5da3e81fa85689e952c1c9b8f5811d573307"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T094801Z-agentic-initiation-start-f36bb355/artifacts/usage/usage-summary.json": {
+    "size_bytes": 814,
+    "sha256": "fd229c59f3cc0d900271792f61ac81cda7a451d9b2f21779131205c2940d860f"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T111559Z-agentic-initiation-start-97ea82ba/summary.json": {
+    "size_bytes": 11008,
+    "sha256": "ec981ca3231b7c3096b5d8be457535ebea2f25ae1650ec9e0d0b7b69cf4f43a6"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T111559Z-agentic-initiation-start-97ea82ba/events.jsonl": {
+    "size_bytes": 46731,
+    "sha256": "536e13738ed16a95825890909cc6cd7204012bed4272651c94b3b669ad6a9eba"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T111559Z-agentic-initiation-start-97ea82ba/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 181,
+    "sha256": "c678d58f692facef756d95b55720d172d4a03a2520d2b08e97fb1261fa267c41"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T111559Z-agentic-initiation-start-97ea82ba/artifacts/reviewers/cursor-cli-fb2/reviewer.stdout.txt": {
+    "size_bytes": 802991,
+    "sha256": "eecd861bc92f6d0274c9b67274b1a8ae6e1cadff563b044de6e5b3f6f094d9b6"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T111559Z-agentic-initiation-start-97ea82ba/artifacts/reviewers/cursor-cli-fb2/reviewer.summary.json": {
+    "size_bytes": 3379,
+    "sha256": "fdb39c31fd107dcad1736dba1533204b8e4573e64aabf41e6feda8b989ccb8b3"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T111559Z-agentic-initiation-start-97ea82ba/artifacts/reviewers/oh-my-pi/reviewer.stdout.txt": {
+    "size_bytes": 6414742,
+    "sha256": "a5aaf069e668f7683f882fc8e8a6971f2ee823108db7e38d683eb0ff9f2f2915"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T111559Z-agentic-initiation-start-97ea82ba/artifacts/reviewers/oh-my-pi/reviewer.summary.json": {
+    "size_bytes": 4314,
+    "sha256": "da772a9515270fff11085b314f53d9e46df41fd624022b9cbb7061d126193e31"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T111559Z-agentic-initiation-start-97ea82ba/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "38eba26625ba477d7f8b6e5cab7181ae7e2749e4e7d4a6c544a00ee91a89d56f"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T111559Z-agentic-initiation-start-97ea82ba/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 1055744,
+    "sha256": "1d0871a424e3ffb0b580cca38acf17aa141bdef151f206e0f9e2f895482d3680"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T111559Z-agentic-initiation-start-97ea82ba/artifacts/analysis/summary.md": {
+    "size_bytes": 2723,
+    "sha256": "a6972a620c24d83a630dba9f37a9a25289ac6060b016c1109cea0b46ac436a7b"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T111559Z-agentic-initiation-start-97ea82ba/artifacts/analysis/causality.json": {
+    "size_bytes": 16186,
+    "sha256": "ff867ee6f0f7e053ab16dba2406aa925595c3cf0d68615ec097e3de1eab3e19c"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20260924T111559Z-agentic-initiation-start-97ea82ba/artifacts/usage/usage-summary.json": {
+    "size_bytes": 701,
+    "sha256": "1e921a368ddc43e36f1119a150557277f667667e8436741dec2203dc2c69b5aa"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261001T015853Z-agentic-initiation-start-8b7389ea/summary.json": {
+    "size_bytes": 13910,
+    "sha256": "b801a33a0c10f59b7fc3eebefdef2e7df2f0365afdd0499e2c9b464b2bc0ba2e"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261001T015853Z-agentic-initiation-start-8b7389ea/events.jsonl": {
+    "size_bytes": 71352,
+    "sha256": "7d8ce499b68200e3d26267eb634e6538378b43f2f047111c7f80312dfc2b4e11"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261001T015853Z-agentic-initiation-start-8b7389ea/artifacts/session-manifest.json": {
+    "size_bytes": 10240,
+    "sha256": "60c3644854407f79047cc15ffe165e5acee50055830d9b25e4d1a8bf287db8b0"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261001T015853Z-agentic-initiation-start-8b7389ea/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 625,
+    "sha256": "41ea0bb549c540c9f0cf1b5cada0fdae37788d68a4090097db6f49230124c469"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261001T015853Z-agentic-initiation-start-8b7389ea/artifacts/reviewers/claude-code/reviewer.stdout.txt": {
+    "size_bytes": 652905,
+    "sha256": "5b49c9fb00ded252be4dd49ab892dedabc82a19ca2a882a863494fc3e5073e9c"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261001T015853Z-agentic-initiation-start-8b7389ea/artifacts/reviewers/claude-code/reviewer.summary.json": {
+    "size_bytes": 3944,
+    "sha256": "1d16a050a5ac2ae0fd5f3d9150628454e125fab15bdd675428460871f3c019a9"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261001T015853Z-agentic-initiation-start-8b7389ea/artifacts/reviewers/cursor-cli/reviewer.stdout.txt": {
+    "size_bytes": 1029793,
+    "sha256": "2559387724d292db7f4c486e20f2f964c2584ca6693bad940ff6e24b6c794c98"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261001T015853Z-agentic-initiation-start-8b7389ea/artifacts/reviewers/cursor-cli/reviewer.summary.json": {
+    "size_bytes": 3408,
+    "sha256": "b5a9bef230e8dab9d8660e3e608b69302cb2086ecc7b1f1e4acb4694847f911c"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261001T015853Z-agentic-initiation-start-8b7389ea/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 6533167,
+    "sha256": "18b010f4249de06c7e5a00a87926f35e65cf056ab862a0821cf4be3c17fb9e68"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261001T015853Z-agentic-initiation-start-8b7389ea/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "ee273c84a8e5111c1ba60049bb0c3fafe6dcf207d1d8996c0a5b6c52367dcb08"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261001T015853Z-agentic-initiation-start-8b7389ea/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 316083,
+    "sha256": "36cadbff9a952c5cf7d6f3fab70397ca48dfc2650605900a2bcb74cb4e9e92af"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261001T015853Z-agentic-initiation-start-8b7389ea/artifacts/analysis/summary.md": {
+    "size_bytes": 3137,
+    "sha256": "19f94e1ade35ab33db8961a4f22a9651d23937edfbac04b570aa34313a69e785"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261001T015853Z-agentic-initiation-start-8b7389ea/artifacts/analysis/causality.json": {
+    "size_bytes": 243,
+    "sha256": "2cfe1fcf10d5b048abfc6da440484502e32518d3fdb42fa449c3c3770659d10f"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261001T015853Z-agentic-initiation-start-8b7389ea/artifacts/usage/usage-summary.json": {
+    "size_bytes": 815,
+    "sha256": "50d84690a797343736ff53de006523caa41f2f3a4c8b3e21671a59094f2177f4"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261001T155716Z-agentic-initiation-start-99b26962/summary.json": {
+    "size_bytes": 11673,
+    "sha256": "4918d415fab3e99394b4b4967af5820c7cb7f9ed8201ade4042e561ec59b0d02"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261001T155716Z-agentic-initiation-start-99b26962/events.jsonl": {
+    "size_bytes": 64363,
+    "sha256": "8b7b75758d1e00e7e7f16934be980dd80e59f935ba0bf00a46343549f21ddab5"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261001T155716Z-agentic-initiation-start-99b26962/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 625,
+    "sha256": "4d76d028a4884c1bcc06fea6ada4f69b5f5e52d4cdf3e7a993ecfd979cbe3722"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261001T155716Z-agentic-initiation-start-99b26962/artifacts/reviewers/claude-code/reviewer.stdout.txt": {
+    "size_bytes": 833274,
+    "sha256": "818fcfa4ff1c2e3e4e8c0939000c32eadbe4c5746267431aa4044d32d0723577"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261001T155716Z-agentic-initiation-start-99b26962/artifacts/reviewers/claude-code/reviewer.summary.json": {
+    "size_bytes": 3593,
+    "sha256": "ff6d7bb416f85ca374bf3f5ed7860ab241c9d4061bdaf7b21f4bffdbef5472e7"
+  },
+  "/Users/bominzhang/.kimi-code/sessions/wd_cline-kanban_6ca0fd430e3a/session_97d708ab-28f7-45a3-9295-70570d5a503b/agents/main/wire.jsonl": {
+    "size_bytes": 715875,
+    "sha256": "034c94c10714a4a689d25a7ab5f53aeb3ecb683e714d856e9ed3096a6e9a91ba"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261001T155716Z-agentic-initiation-start-99b26962/artifacts/reviewers/kimi-code/reviewer.summary.json": {
+    "size_bytes": 4199,
+    "sha256": "597562e452ecd4c6ba5db61c61658d505834386ae864e0ad6047b9c72e43d7de"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261001T155716Z-agentic-initiation-start-99b26962/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 5795386,
+    "sha256": "0a789174344a3b6023906ad4d9512c2c206c57c4fbe3171d686cdb900d3bc5bb"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261001T155716Z-agentic-initiation-start-99b26962/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "1745c9ace7204c2ebf17e1c85eeeca62a102c3accc49c03277c2bccfc4cd3e4a"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261001T155716Z-agentic-initiation-start-99b26962/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 1213558,
+    "sha256": "3d834b42107b3e5ad058d78d582bb860f8444dadd503e824194170bb98c6f71c"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261001T155716Z-agentic-initiation-start-99b26962/artifacts/analysis/summary.md": {
+    "size_bytes": 3165,
+    "sha256": "bc3ac1023435281c7efa7cbfd23e7fd559bc1b0d746285ee4fb59ee1ea16ed42"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261001T155716Z-agentic-initiation-start-99b26962/artifacts/analysis/causality.json": {
+    "size_bytes": 9996,
+    "sha256": "9d53c49c27ef878ac9c4a36d47e197bee308c609158da0b4e0169ae07c853353"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261001T155716Z-agentic-initiation-start-99b26962/artifacts/usage/usage-summary.json": {
+    "size_bytes": 815,
+    "sha256": "5faf2618fec4c78e97a10d1e50a0eb6787c79bc85d743eaaa4c0045a516dbe9b"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261004T164022Z-agentic-initiation-start-d9db4064/summary.json": {
+    "size_bytes": 11640,
+    "sha256": "83329756b9b94a666d0ce1cc4db993b6b51f3900fd125c419db43231c235ec36"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261004T164022Z-agentic-initiation-start-d9db4064/events.jsonl": {
+    "size_bytes": 40275,
+    "sha256": "167231cfb95c73529d6de11c6e2cb44994879298338dd10a4efe4cfc41b49547"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261004T164022Z-agentic-initiation-start-d9db4064/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 625,
+    "sha256": "2c1d4a4557396a42e479a95ee765af78e4a21520872d8b1ca7720382d5d868a7"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261004T164022Z-agentic-initiation-start-d9db4064/artifacts/reviewers/claude-code/reviewer.stdout.txt": {
+    "size_bytes": 635064,
+    "sha256": "4d4dd4624cbcea0c8ac6a94b8e78f2a21121db35854536a6f1c10ff5db168681"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261004T164022Z-agentic-initiation-start-d9db4064/artifacts/reviewers/claude-code/reviewer.summary.json": {
+    "size_bytes": 3888,
+    "sha256": "7b6fe3a6b53a0f7f56b39ed71e90cce489a6e0a5ce44dbef145a7feffc254f73"
+  },
+  "/Users/bominzhang/.kimi-code/sessions/wd_cline-kanban_0e270165861f/session_b8b803e6-6e46-4471-8284-7dfb0bbf5c65/agents/main/wire.jsonl": {
+    "size_bytes": 454025,
+    "sha256": "d43b1ca3a58e5aa2da96c3804f110f4bec7bef5152610479036cddff2bfb04cd"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261004T164022Z-agentic-initiation-start-d9db4064/artifacts/reviewers/kimi-code/reviewer.summary.json": {
+    "size_bytes": 4315,
+    "sha256": "ed277a7fac9678af70dc2557913cbb03e9681f828a6b9a503bcff3a840a2263e"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261004T164022Z-agentic-initiation-start-d9db4064/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 3908055,
+    "sha256": "20b9fb4353f28450a1d70676209a444e4de49835904ca0c652a63c052ae1a62d"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261004T164022Z-agentic-initiation-start-d9db4064/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "8a125a8ae07ad5677de52e6b2a251d2161659f4a253ef66bf3e9d040d5cd0157"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261004T164022Z-agentic-initiation-start-d9db4064/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 320482,
+    "sha256": "77790554d80ecfd47afb800fb64e9f13a54137ca1adaadf7f9a0e6bbc3f69ed7"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261004T164022Z-agentic-initiation-start-d9db4064/artifacts/analysis/summary.md": {
+    "size_bytes": 3131,
+    "sha256": "b0bca65c6ce15fd4ac30d189f99dd6f9ccea9b84893049297091a61d3f6175de"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261004T164022Z-agentic-initiation-start-d9db4064/artifacts/analysis/causality.json": {
+    "size_bytes": 273,
+    "sha256": "929fa720dd2b293e1d86e6eead70d038e9f2fd1f95608bc32399eb5c41d8d854"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261004T164022Z-agentic-initiation-start-d9db4064/artifacts/usage/usage-summary.json": {
+    "size_bytes": 808,
+    "sha256": "1b3e2af28ed3f26cd0530206083dba31cf7ee55e24572e5499a68b319a407abd"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261004T171928Z-agentic-initiation-start-f778d4be/summary.json": {
+    "size_bytes": 11976,
+    "sha256": "cec5310cb03a4b9d2ff75912ac7ea3b19dd36071a4a9a8123f135072206b5183"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261004T171928Z-agentic-initiation-start-f778d4be/events.jsonl": {
+    "size_bytes": 49384,
+    "sha256": "9162168c85c21cfc214f2b230d0875263eee028250dbba3bd979323b4e15d4a2"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261004T171928Z-agentic-initiation-start-f778d4be/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 625,
+    "sha256": "421a10cb863fe06fc00466cffc036e72a36c80db114a20204be96db7e9a0544c"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261004T171928Z-agentic-initiation-start-f778d4be/artifacts/reviewers/claude-code/reviewer.stdout.txt": {
+    "size_bytes": 884706,
+    "sha256": "5ff096bc899fd2542bc7f662b70d357ab74a06c9e1c3d683d5171dae18987267"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261004T171928Z-agentic-initiation-start-f778d4be/artifacts/reviewers/claude-code/reviewer.summary.json": {
+    "size_bytes": 3796,
+    "sha256": "3822bc16445a05aa8b82c981be2331bfeb48c15412c875229df17b475a82ca38"
+  },
+  "/Users/bominzhang/.kimi-code/sessions/wd_cline-kanban_ac546b9dea1a/session_89ea3807-610e-4a4c-95aa-40f95be658ad/agents/main/wire.jsonl": {
+    "size_bytes": 538771,
+    "sha256": "6d1bffbf02b89fb04cac13f21e582804793a3c8abc63ddeb292eeadef2f73b98"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261004T171928Z-agentic-initiation-start-f778d4be/artifacts/reviewers/kimi-code/reviewer.summary.json": {
+    "size_bytes": 4509,
+    "sha256": "7687a13fddeeac98c290da0e054e077999c87b05bc2f414ecb3798ff8b2e1929"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261004T171928Z-agentic-initiation-start-f778d4be/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 3110077,
+    "sha256": "e51f458782920d16e06b535d1b49ffcb064890f2ff5608881dc44e725880ac77"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261004T171928Z-agentic-initiation-start-f778d4be/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "cca28b4a7b3cf81aa358d68881e9a991c998193fa8fbd055b5a1da309526ae30"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261004T171928Z-agentic-initiation-start-f778d4be/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 627505,
+    "sha256": "b8f5d31c12cc1a330a3c9a29aa5e03df1fff449f674657f7d414330b4d24d660"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261004T171928Z-agentic-initiation-start-f778d4be/artifacts/analysis/summary.md": {
+    "size_bytes": 3163,
+    "sha256": "53d099301020a6bada02db793c1ecd3b592f425fc28df38a831621f5d4593d9d"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261004T171928Z-agentic-initiation-start-f778d4be/artifacts/analysis/causality.json": {
+    "size_bytes": 9529,
+    "sha256": "c4fe5f1e7bf5fff357cfc802953e9173c3a84a5502bf11d79fb2503c1d870506"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261004T171928Z-agentic-initiation-start-f778d4be/artifacts/usage/usage-summary.json": {
+    "size_bytes": 811,
+    "sha256": "78ac670550e900c697d32f1de9f4a20a3d6e724231166388f9feac339de2f34e"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T073557Z-agentic-initiation-start-637822d6/summary.json": {
+    "size_bytes": 13526,
+    "sha256": "bcd9c4b75d0508ae9f0a7f2e645f2fa160e8081841f49d8084e4afb0c1dc35f8"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T073557Z-agentic-initiation-start-637822d6/events.jsonl": {
+    "size_bytes": 29070,
+    "sha256": "e58f2b3c48e3cc562c3e48ec1e7fcb3db844a7459de9175fdac53798ba7285f8"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T073557Z-agentic-initiation-start-637822d6/artifacts/session-manifest.json": {
+    "size_bytes": 6674,
+    "sha256": "cf7623b3eaf5f0dedd9635c11b7cdb9cca424650beace81f633d2d87d7d14f76"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T073557Z-agentic-initiation-start-637822d6/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 625,
+    "sha256": "0097c4bc01e199830a32fdd779e3c6c733051218b2e71ff80acf31b8b6929336"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T073557Z-agentic-initiation-start-637822d6/artifacts/reviewers/cursor-cli/reviewer.stdout.txt": {
+    "size_bytes": 183238,
+    "sha256": "a07fc3db40da2f922eeb8772ab7b4452b704fa11eab5ab241ee81eb624254ff0"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T073557Z-agentic-initiation-start-637822d6/artifacts/reviewers/cursor-cli/reviewer.summary.json": {
+    "size_bytes": 3313,
+    "sha256": "ae9313b83bcfba9bf26314e60a2da44b3ae6f2ec3850ecc58bb66ebab234119d"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T073557Z-agentic-initiation-start-637822d6/artifacts/reviewers/oh-my-pi/reviewer.stdout.txt": {
+    "size_bytes": 1131636,
+    "sha256": "dfc4390dd4e836ccdc1cdb0664f4a2e487091704984bdb51b95bf91819d428a5"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T073557Z-agentic-initiation-start-637822d6/artifacts/reviewers/oh-my-pi/reviewer.summary.json": {
+    "size_bytes": 4004,
+    "sha256": "fa307922ff61bd7423a50d0a1d80c8afd6fc7e80cdbbed14898489b4be97cf34"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T073557Z-agentic-initiation-start-637822d6/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 2865804,
+    "sha256": "26fcd92b36b51959aa151378f04f9653c62fd3bcb2fa5e754f204abca256070d"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T073557Z-agentic-initiation-start-637822d6/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "c40154b3945a147dc293e0593f1d6eec0101e498403dfc48b7d2d0bcbf710691"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T073557Z-agentic-initiation-start-637822d6/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 377973,
+    "sha256": "de60d0e0daa0526da2b34f58ca9343f8bf01cb19f139c01ab4720db59bc9ae81"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T073557Z-agentic-initiation-start-637822d6/artifacts/analysis/summary.md": {
+    "size_bytes": 3157,
+    "sha256": "af85bba33f66c8ee6d8886c564361117d2878126e8f40adbf25d7b8e241393ac"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T073557Z-agentic-initiation-start-637822d6/artifacts/analysis/causality.json": {
+    "size_bytes": 6385,
+    "sha256": "7b5d72fe85efdf17ec80135c8aa7726a6f36e8affc6c34476bee1f120b825dcd"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T073557Z-agentic-initiation-start-637822d6/artifacts/usage/usage-summary.json": {
+    "size_bytes": 805,
+    "sha256": "1a92dc61a6b44fd5fdbff13188e0b93cf69b68ea5b4467e58b30f6f83ae0cea0"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T110758Z-agentic-initiation-start-329bccf1/summary.json": {
+    "size_bytes": 19111,
+    "sha256": "70d7d569e36000102b2baff7d61dbd14108082122a08b8bb31d7543c68067615"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T110758Z-agentic-initiation-start-329bccf1/events.jsonl": {
+    "size_bytes": 34284,
+    "sha256": "6b88d2f3555e7a09de9b2315770673e8018a75002760a1109d9ab39bf3274daa"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T110758Z-agentic-initiation-start-329bccf1/artifacts/session-manifest.json": {
+    "size_bytes": 44442,
+    "sha256": "674d079597247b4ff5bf06a6d90b862e3dfbab70738fda9e052b7edfcf24101a"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T110758Z-agentic-initiation-start-329bccf1/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 627,
+    "sha256": "bc892abce2e7a7a04e74011f67656bedce43e1e79eb767362532670e20ac9b46"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T110758Z-agentic-initiation-start-329bccf1/artifacts/reviewers/claude-code/reviewer.stdout.txt": {
+    "size_bytes": 1737349,
+    "sha256": "e77c55d466bfa72943f17ce42011a17886692af704d475874c36f1800b3f3a8b"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T110758Z-agentic-initiation-start-329bccf1/artifacts/reviewers/claude-code/reviewer.summary.json": {
+    "size_bytes": 5750,
+    "sha256": "4ac1e673093a474e1f456277cc5b7269689027c4bbb26a7f09a4d21ea6b6a1fb"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T110758Z-agentic-initiation-start-329bccf1/artifacts/reviewers/cursor-cli/reviewer.stdout.txt": {
+    "size_bytes": 493129,
+    "sha256": "d3cfbfbd92ac229a7fcc437999bc703936c3b7258c48758f920fa206872a399a"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T110758Z-agentic-initiation-start-329bccf1/artifacts/reviewers/cursor-cli/reviewer.summary.json": {
+    "size_bytes": 3891,
+    "sha256": "25a90015326e844adbb1d2e80bb944347484ee67f8a99babf77c15360ad5773d"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T110758Z-agentic-initiation-start-329bccf1/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 10850405,
+    "sha256": "c8b347b76564643ee0faeee32f999b493362b1140aaab9d9cc04db77bacfac01"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T110758Z-agentic-initiation-start-329bccf1/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "c4ff79d1b36a3db4326aeeafef78b68cd95124728f4d5499bc47c07cd1b699ed"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T110758Z-agentic-initiation-start-329bccf1/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 1290001,
+    "sha256": "7204d119ee110dd582766b5206b8ff758d93411f4b7a2b86d5086bb3cc6266d0"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T110758Z-agentic-initiation-start-329bccf1/artifacts/analysis/summary.md": {
+    "size_bytes": 3168,
+    "sha256": "25f439e8749ec837f91b6f1fa44c8356572260394b10f1aab607df4a0398f2d0"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T110758Z-agentic-initiation-start-329bccf1/artifacts/analysis/causality.json": {
+    "size_bytes": 25542,
+    "sha256": "75a3f9fd10943e74b972623e7c23b4eb9c23ead26c1df619db8f84e3dbf0274c"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T110758Z-agentic-initiation-start-329bccf1/artifacts/usage/usage-summary.json": {
+    "size_bytes": 818,
+    "sha256": "fdb9db946c667fe6cb6db9f6e5f683dbcae417acdf0773cb108cbe8554b03e4e"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T185210Z-agentic-initiation-start-e5b68e1e/summary.json": {
+    "size_bytes": 15316,
+    "sha256": "abf526597836da8d28c526825a662a89f85b9429da21501de8e72f8e6c2d4364"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T185210Z-agentic-initiation-start-e5b68e1e/events.jsonl": {
+    "size_bytes": 38731,
+    "sha256": "bbc1928675adff85cbab5110697dff6edf5fa0c5e669fdbdbe791b84cc48610d"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T185210Z-agentic-initiation-start-e5b68e1e/artifacts/session-manifest.json": {
+    "size_bytes": 35510,
+    "sha256": "325ea13195484457328e67da4fd0e9357d45eeff236c15daa16e5dcb79cc6e57"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T185210Z-agentic-initiation-start-e5b68e1e/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 625,
+    "sha256": "c31848558ab33afb057c488ab3c6e40d92c6f5e2a8a1bcd3249f69bdde8f70f3"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T185210Z-agentic-initiation-start-e5b68e1e/artifacts/reviewers/cursor-cli/reviewer.stdout.txt": {
+    "size_bytes": 673059,
+    "sha256": "57e4c4cd16063605dde828ff0979a6ee3c61eeef6f759766eb28d9b0b020be13"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T185210Z-agentic-initiation-start-e5b68e1e/artifacts/reviewers/cursor-cli/reviewer.summary.json": {
+    "size_bytes": 3751,
+    "sha256": "d509cf6ba64fd7bea31cf4b6347ec906242665f596e7460e02d17a219d6ff2df"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T185210Z-agentic-initiation-start-e5b68e1e/artifacts/reviewers/oh-my-pi/reviewer.stdout.txt": {
+    "size_bytes": 4814887,
+    "sha256": "33460ae0f998bc1b6fa08e0e71f95a13834ac57d793c6144a48dfc89440bd91e"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T185210Z-agentic-initiation-start-e5b68e1e/artifacts/reviewers/oh-my-pi/reviewer.summary.json": {
+    "size_bytes": 3943,
+    "sha256": "5d75b726f4123cc98693f766df9605f38861fc867cb6f402fc9cfeedb07c3b40"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T185210Z-agentic-initiation-start-e5b68e1e/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 9176155,
+    "sha256": "e61f2179017778d4f38a5298c98e2ad8af21595bbb775112325f168680b44b51"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T185210Z-agentic-initiation-start-e5b68e1e/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "60e9d4daf70b4910ce10187ae8903571df249b7e06871707a1115d69a72a2302"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T185210Z-agentic-initiation-start-e5b68e1e/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 679147,
+    "sha256": "603641bceea62540ddf026c58b151763e09972627fb01b90c0951678d12af6bb"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T185210Z-agentic-initiation-start-e5b68e1e/artifacts/analysis/summary.md": {
+    "size_bytes": 3148,
+    "sha256": "b1f0802daeaa27badd0445c07eb87babb3e2694bb9a52a5530b9dd4cc05403ce"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T185210Z-agentic-initiation-start-e5b68e1e/artifacts/analysis/causality.json": {
+    "size_bytes": 6411,
+    "sha256": "2a7423ec6f9eef6c51208a3458a17fe62d25ef8097bd3a0804656db39f36fbef"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261005T185210Z-agentic-initiation-start-e5b68e1e/artifacts/usage/usage-summary.json": {
+    "size_bytes": 816,
+    "sha256": "d759dd80aa8efaebba525d177947a29d6e81f39fb46b9c5244df30405839ae35"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261006T215909Z-agentic-initiation-start-d9eb87dc/summary.json": {
+    "size_bytes": 17029,
+    "sha256": "75597f6e4917b88c0cfbff562f9e1f786887103dd7dfb3e8119826f5f13d4bd2"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261006T215909Z-agentic-initiation-start-d9eb87dc/events.jsonl": {
+    "size_bytes": 78516,
+    "sha256": "347476c5f294baac5abad285229c5a616a216338d063d17405108aadb56ee74e"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261006T215909Z-agentic-initiation-start-d9eb87dc/artifacts/session-manifest.json": {
+    "size_bytes": 44524,
+    "sha256": "cb686f038a3a750bb448cc9c074399e00c873389b19b4e7a96f6e6cda8803d01"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261006T215909Z-agentic-initiation-start-d9eb87dc/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 625,
+    "sha256": "a52701d3ed6c7e16d68e8fa40e6afd8671e37ca4deab63194e2d9ffec42d4636"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261006T215909Z-agentic-initiation-start-d9eb87dc/artifacts/reviewers/cursor-cli/reviewer.stdout.txt": {
+    "size_bytes": 805415,
+    "sha256": "406e522c66009aad9ba9c7e77f1ef753f0b042c70ee6f1c21b63fc8e34deac16"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261006T215909Z-agentic-initiation-start-d9eb87dc/artifacts/reviewers/cursor-cli/reviewer.summary.json": {
+    "size_bytes": 3873,
+    "sha256": "fe899f828f00d360441e2c5913ed8f1a7b68820813cad744b1c21b18f58d1a56"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261006T215909Z-agentic-initiation-start-d9eb87dc/artifacts/reviewers/oh-my-pi/reviewer.stdout.txt": {
+    "size_bytes": 8327360,
+    "sha256": "bb3adb4b4f84526f0817900e686789a435ef799d4af02bac96be166039d29761"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261006T215909Z-agentic-initiation-start-d9eb87dc/artifacts/reviewers/oh-my-pi/reviewer.summary.json": {
+    "size_bytes": 4378,
+    "sha256": "05028a9919565b3f0c92a67d883a897454aef7cbdef35fdacf6af5daa4c10c7a"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261006T215909Z-agentic-initiation-start-d9eb87dc/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 7992325,
+    "sha256": "cb50ee9113d338ca377e24ce3d5e46a6e733833c431c4a6fdb041dd307367b16"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261006T215909Z-agentic-initiation-start-d9eb87dc/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "ac28085e8e68e09f21067b39828d9b3ea306c2d54b92ff99465cb2b59cfc444c"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261006T215909Z-agentic-initiation-start-d9eb87dc/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 1341599,
+    "sha256": "da0bf8a19c65d0036f9762b589ac7502a5c5ede62be20b4a2e4aaa5698348cfb"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261006T215909Z-agentic-initiation-start-d9eb87dc/artifacts/analysis/summary.md": {
+    "size_bytes": 3177,
+    "sha256": "b7d96359190f6a1e023a1b0232e8be5a979b35d2caa6ae4ba2841add02dcc913"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261006T215909Z-agentic-initiation-start-d9eb87dc/artifacts/analysis/causality.json": {
+    "size_bytes": 19644,
+    "sha256": "5f10e6e85ad1eed8b06c86b54a7dc6f381d0abaa794d06d140769f8cf13970cb"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261006T215909Z-agentic-initiation-start-d9eb87dc/artifacts/usage/usage-summary.json": {
+    "size_bytes": 814,
+    "sha256": "2338e1f583dcf090976e822ea02ab6200afaaab5ee60697e5974ebb3e7a7b0b5"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T004307Z-agentic-initiation-start-b8817910/summary.json": {
+    "size_bytes": 24550,
+    "sha256": "b86ac99404766deb892cf92d76d28e2ccd33da7469fa6f3c971631a54f5b31fe"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T004307Z-agentic-initiation-start-b8817910/events.jsonl": {
+    "size_bytes": 122557,
+    "sha256": "5019fe4d98077ded9474a302a6db8cc7176e0e4de91a57ec59beb836b18c9314"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T004307Z-agentic-initiation-start-b8817910/artifacts/session-manifest.json": {
+    "size_bytes": 115124,
+    "sha256": "6c299d79812765b25dcf7da278f56ec603c1653fce1dce7bade8b3fa947ceff8"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T004307Z-agentic-initiation-start-b8817910/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 627,
+    "sha256": "5a010137c53bc2dd59a2e41fd22aa4b2913296e1d69572f040d59ce906c859d6"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T004307Z-agentic-initiation-start-b8817910/artifacts/reviewers/cursor-cli/reviewer.stdout.txt": {
+    "size_bytes": 1343918,
+    "sha256": "26476a995231a567cfad7b1b651118f6cbd5f95b5a24cfeeef43ff5fc9819d39"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T004307Z-agentic-initiation-start-b8817910/artifacts/reviewers/cursor-cli/reviewer.summary.json": {
+    "size_bytes": 4929,
+    "sha256": "3280b94cacecc3e95f3ef0f06f4cb62473818e3f51523249be81f90e0c0bbd5a"
+  },
+  "/Users/bominzhang/.kimi-code/sessions/wd_cline-kanban_dc6607fadc40/session_7f827e64-9898-4c8a-a696-99b0c92e7e8b/agents/main/wire.jsonl": {
+    "size_bytes": 1992813,
+    "sha256": "2f063b5777488c67028c68c5fddba9a1bd58b91f1d953806032850ca2f9829ca"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T004307Z-agentic-initiation-start-b8817910/artifacts/reviewers/kimi-code/reviewer.summary.json": {
+    "size_bytes": 5799,
+    "sha256": "34f3165576745a2eed4d233e94a7091355fe1eb522e798e5ab06861fe5b6e640"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T004307Z-agentic-initiation-start-b8817910/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 19329571,
+    "sha256": "87a6dcc3b59dbd868317295fdf3fed34300dfe8b413234b2c0c061a1c336ca2c"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T004307Z-agentic-initiation-start-b8817910/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "10f6f3747836826719d76f8ecb56516e0b42a8bb65cb998a31f8df61d46f76b2"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T004307Z-agentic-initiation-start-b8817910/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 1347450,
+    "sha256": "3526498ca461cd08b9fd90a6ed5496738891b10a9cc304d416fd3eb08c7e8c5f"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T004307Z-agentic-initiation-start-b8817910/artifacts/analysis/summary.md": {
+    "size_bytes": 3180,
+    "sha256": "24df192eb8242c27caca116f50863197fa51e5d636f9670104e5485fb3c559f4"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T004307Z-agentic-initiation-start-b8817910/artifacts/analysis/causality.json": {
+    "size_bytes": 33639,
+    "sha256": "b868dd838df2b7b67e625bc606c2dd408fedd2a5ff70f5519d6139cb99b6069c"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T004307Z-agentic-initiation-start-b8817910/artifacts/usage/usage-summary.json": {
+    "size_bytes": 818,
+    "sha256": "c68c9e06051dc5fabb9474254860bf4baa46a77cf008cc8b273196de7dc8b9f6"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T012504Z-agentic-initiation-start-2c15d4d1/summary.json": {
+    "size_bytes": 16686,
+    "sha256": "04f871c8df23f1a06d67a8a4641578d83d7f7b8f8d70859fe6583f972bfa0087"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T012504Z-agentic-initiation-start-2c15d4d1/events.jsonl": {
+    "size_bytes": 81596,
+    "sha256": "4fd83498ae5c017d9f0cf3de040c8a4b587789756d08310d2ddd6e33e3a5d289"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T012504Z-agentic-initiation-start-2c15d4d1/artifacts/session-manifest.json": {
+    "size_bytes": 34888,
+    "sha256": "f07faa3fbbb6902447f39b487b81422af25378ce2371c42c3f68d0d961836c94"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T012504Z-agentic-initiation-start-2c15d4d1/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 627,
+    "sha256": "b252f8f5ec803a1f5cfa9c62150d256293a23eb17bf7a222788287dd26c39d99"
+  },
+  "/Users/bominzhang/.kimi-code/sessions/wd_cline-kanban_b6311c7677b7/session_371597c1-cf78-4d34-9416-d21405972f9c/agents/main/wire.jsonl": {
+    "size_bytes": 1483961,
+    "sha256": "571ba9a3db7f2c2be05be25a263ed7468700bf2423e135161783c6d60c4ebd35"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T012504Z-agentic-initiation-start-2c15d4d1/artifacts/reviewers/kimi-code/reviewer.summary.json": {
+    "size_bytes": 4155,
+    "sha256": "35b37deae6919c60c760b9bf823bfeff26c5a346872c494145237ecd6b67c9e2"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T012504Z-agentic-initiation-start-2c15d4d1/artifacts/reviewers/oh-my-pi/reviewer.stdout.txt": {
+    "size_bytes": 8531500,
+    "sha256": "1e38a6ac9caf76ca82f631eebabd6a4b8815f7377436b98ee1a41d0b3a51c68d"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T012504Z-agentic-initiation-start-2c15d4d1/artifacts/reviewers/oh-my-pi/reviewer.summary.json": {
+    "size_bytes": 4974,
+    "sha256": "aca4e0b7a5d6c69d554d0a1dd79a7f2d5b2749567619aa9ff871669251ddbc2a"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T012504Z-agentic-initiation-start-2c15d4d1/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 11640873,
+    "sha256": "f30f592346729a4ae85a1991959c39cc03c44cc572e6b5fbb80117cc251ef7e4"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T012504Z-agentic-initiation-start-2c15d4d1/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "278e8c52df884b3cad379607c5a650c6ffcf2310d07159788ad41a38bfb3ccf0"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T012504Z-agentic-initiation-start-2c15d4d1/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 1359469,
+    "sha256": "a4bc0f26cc7d30a18a81350d8d2786afdc30d1b5bc6fc9ed7c05dbce1705dec2"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T012504Z-agentic-initiation-start-2c15d4d1/artifacts/analysis/summary.md": {
+    "size_bytes": 3156,
+    "sha256": "d100a1fd5634486bc18b5bbe4fb3b989ca59938b1f60f0e7bb133b843983b36d"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T012504Z-agentic-initiation-start-2c15d4d1/artifacts/analysis/causality.json": {
+    "size_bytes": 22923,
+    "sha256": "5f84b379fc0352324f762af67cdd9002f73f764e4d1e4a7846774c8e01a70d0b"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T012504Z-agentic-initiation-start-2c15d4d1/artifacts/usage/usage-summary.json": {
+    "size_bytes": 820,
+    "sha256": "cde562cbbd3df9550bb26ae90578b8f5bf86276a2c62a5fb6d17d544b46f5adb"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T113452Z-agentic-initiation-start-66b82304/summary.json": {
+    "size_bytes": 15321,
+    "sha256": "cf24e4229a03dd609f4d8c8729fa6f46466bedd45d1465025e05de40039c9b4b"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T113452Z-agentic-initiation-start-66b82304/events.jsonl": {
+    "size_bytes": 44520,
+    "sha256": "7d227c8fefbf4c1a569360cd4e7325c5cdc7e79d8d425ce95a728e8bab60fdb7"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T113452Z-agentic-initiation-start-66b82304/artifacts/session-manifest.json": {
+    "size_bytes": 41475,
+    "sha256": "c10ebf0111eee96137e5927b575cd98ed5887e94dd5aa280e1ebb23678e291de"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T113452Z-agentic-initiation-start-66b82304/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 625,
+    "sha256": "bfc27e9ff67bddde1218c3e1b1fda904917341588874f6c27ebc58c430743706"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T113452Z-agentic-initiation-start-66b82304/artifacts/reviewers/cursor-cli/reviewer.stdout.txt": {
+    "size_bytes": 481269,
+    "sha256": "5371c1e3327d7fe4a13ae2a201cc96de5de775f7beecfc7004e89bbc8554623c"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T113452Z-agentic-initiation-start-66b82304/artifacts/reviewers/cursor-cli/reviewer.summary.json": {
+    "size_bytes": 3525,
+    "sha256": "d3cf0aaf694b733e186cdfa585f19ad44b0730b14b1a6d997fbb884bd176e67f"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T113452Z-agentic-initiation-start-66b82304/artifacts/reviewers/oh-my-pi/reviewer.stdout.txt": {
+    "size_bytes": 4001008,
+    "sha256": "24918afe7a31f8e5dae4c23e2c9866e3d6354c92a35b8025af420377b4dbca2f"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T113452Z-agentic-initiation-start-66b82304/artifacts/reviewers/oh-my-pi/reviewer.summary.json": {
+    "size_bytes": 3671,
+    "sha256": "97c48d218566f01387209021426a654112c0be55e4e7642f767cd5b59d4dfc38"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T113452Z-agentic-initiation-start-66b82304/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 3285471,
+    "sha256": "527cdf0860a0d7991a85e22a2ad864fc1e86945d4c7db31e8587665eea55f57e"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T113452Z-agentic-initiation-start-66b82304/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "4648dbfe94a3e9f44df64d9e9e7523f08412a2fb04da2656a6145332dbeddc88"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T113452Z-agentic-initiation-start-66b82304/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 344163,
+    "sha256": "0143e7f1968d773f8f8c78d7f0f8d717b3275be9150670848e41bb1f0993d2dc"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T113452Z-agentic-initiation-start-66b82304/artifacts/analysis/summary.md": {
+    "size_bytes": 10853,
+    "sha256": "53c2a017288d2e8f94a19c29d4399a9ec9f47697dd0f5ba9734c4496112b366f"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T113452Z-agentic-initiation-start-66b82304/artifacts/analysis/causality.json": {
+    "size_bytes": 273,
+    "sha256": "ff8445b1acb8d2d2c23cee715603aa41f68d4bf8163d520655a74a9484ae8460"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261007T113452Z-agentic-initiation-start-66b82304/artifacts/usage/usage-summary.json": {
+    "size_bytes": 812,
+    "sha256": "5b1e7eb67795e5b25f4be4755cfb2ecd4915fcbad6c3914dd131047708ab14f4"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261011T210920Z-agentic-initiation-start-3378f83e/summary.json": {
+    "size_bytes": 14410,
+    "sha256": "0831e1cf2cfc6c62d192e04ede1ac153bee819aca751095ce219700a203d9321"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261011T210920Z-agentic-initiation-start-3378f83e/events.jsonl": {
+    "size_bytes": 54472,
+    "sha256": "a809f006ce55a7b07ed60939fe0d70bfe061a149d664d380ae87e804a7ab7b61"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261011T210920Z-agentic-initiation-start-3378f83e/artifacts/session-manifest.json": {
+    "size_bytes": 18187,
+    "sha256": "e1ccd8c3199744500c77cbbb151e9d0243aa860f7c7e1a09f271c8198d19892b"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261011T210920Z-agentic-initiation-start-3378f83e/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 625,
+    "sha256": "571cfe8d3e57c490a905b3fbca9bb66be99a33ed51b575c22909efa1814402b3"
+  },
+  "/Users/bominzhang/.kimi-code/sessions/wd_cline-kanban_53eb9c93667d/session_bb86dbfc-d553-46ab-ba86-92f34a911a02/agents/main/wire.jsonl": {
+    "size_bytes": 967970,
+    "sha256": "45e9edd194c2fefc731ead1dea0d87a577c8edc6f9644327a74499c5d7f4cffd"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261011T210920Z-agentic-initiation-start-3378f83e/artifacts/reviewers/kimi-code/reviewer.summary.json": {
+    "size_bytes": 4293,
+    "sha256": "1075733c5b54e7c703128034a1c8de6a7e7d295cb3bd24a996410eeff6cc331d"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261011T210920Z-agentic-initiation-start-3378f83e/artifacts/reviewers/oh-my-pi/reviewer.stdout.txt": {
+    "size_bytes": 3037794,
+    "sha256": "c30f6ea1392439f33d500f90487c99cc4498f89a56788b1afc9dcba11001f27c"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261011T210920Z-agentic-initiation-start-3378f83e/artifacts/reviewers/oh-my-pi/reviewer.summary.json": {
+    "size_bytes": 3692,
+    "sha256": "39e2542edc20e48c278c11309440aa7788bd4ddd7dab470ff3d4939e4aa9a7d0"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261011T210920Z-agentic-initiation-start-3378f83e/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 5637740,
+    "sha256": "646f08adf7772f0bea7152012463f346e25b8177435797fa30804c44ea1e45b0"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/12/rollout-2026-10-12T05-25-31-01a12cdb-4aac-71d1-bdaa-0f9508f129b8.jsonl": {
+    "size_bytes": 660007,
+    "sha256": "963e5d6faa95b50c8c242fbe9ea9d066ba8340afc9debabea2878615899d4d1c"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261011T210920Z-agentic-initiation-start-3378f83e/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "0fe0ba132853d9c7cde6182e5591e1a4263e6ac6716a7a9b9d974544ecafb588"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261011T210920Z-agentic-initiation-start-3378f83e/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 768076,
+    "sha256": "7d9745e14e6fdba346b167c502bf11820c63c68eea65a7f934f07874f21c556b"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261011T210920Z-agentic-initiation-start-3378f83e/artifacts/analysis/summary.md": {
+    "size_bytes": 3173,
+    "sha256": "b3351c42afd1cc0fb1ea8bbd02c1f216bb56af9cd88cef44757523ce2d639f3d"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261011T210920Z-agentic-initiation-start-3378f83e/artifacts/analysis/causality.json": {
+    "size_bytes": 6810,
+    "sha256": "3ccabc3ec404c4cfe7604d58a5e3f44d4220b1b15307934048057d550ce85a14"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/12/rollout-2026-10-12T05-37-59-01a12ce6-b3ea-7c12-a6aa-fa124db1d733.jsonl": {
+    "size_bytes": 1048047,
+    "sha256": "9670ef11c2121328636fdcd65919482c918055fb7e35f58a059081ffaf5bcbb7"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261011T210920Z-agentic-initiation-start-3378f83e/artifacts/usage/usage-summary.json": {
+    "size_bytes": 816,
+    "sha256": "e908aa79a5cfda2c9ca674dd3ffb879ea61029459a02f3993bfc35a237a3419b"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261012T193340Z-agentic-initiation-start-ca750cf9/summary.json": {
+    "size_bytes": 13877,
+    "sha256": "019e17e1087f7bdcab48258c344f48dcccddf6bdacefcda6565d7643fc06be3e"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261012T193340Z-agentic-initiation-start-ca750cf9/events.jsonl": {
+    "size_bytes": 46530,
+    "sha256": "f9bd64d685e4b50c89c6e538c3ae975aed14e482c5a39da463be7eefb4220983"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261012T193340Z-agentic-initiation-start-ca750cf9/artifacts/session-manifest.json": {
+    "size_bytes": 17590,
+    "sha256": "5e67eb6992c88644ce74c316a941de734a23455f66b4ea3315825f56f1878d49"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261012T193340Z-agentic-initiation-start-ca750cf9/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 625,
+    "sha256": "d6034d38c9add95a5ca24d80281112ba53aa0ff52ad2e9ff97675c4b038b48b2"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261012T193340Z-agentic-initiation-start-ca750cf9/artifacts/reviewers/claude-code/reviewer.stdout.txt": {
+    "size_bytes": 12725,
+    "sha256": "c7a3e0bf12872bddbbfaad35fa2ea02531dca2179c5eb3c818310d93ea7950bb"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261012T193340Z-agentic-initiation-start-ca750cf9/artifacts/reviewers/claude-code/reviewer.summary.json": {
+    "size_bytes": 2614,
+    "sha256": "bb5000c387e998f690aec5117940f433f41d6a7a899be4cc2539d0e7ec41e825"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261012T193340Z-agentic-initiation-start-ca750cf9/artifacts/reviewers/cursor-cli-fb2/reviewer.stdout.txt": {
+    "size_bytes": 1225707,
+    "sha256": "5e541b01329db00d085d5565cbcdebc04503f511a92a73e0a46b1bd20707381c"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261012T193340Z-agentic-initiation-start-ca750cf9/artifacts/reviewers/cursor-cli-fb2/reviewer.summary.json": {
+    "size_bytes": 3446,
+    "sha256": "3b9ddec6ef02d1a2f6c0f71cd4c2b04802f764b120d3b4a9c44a8faf77d73504"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261012T193340Z-agentic-initiation-start-ca750cf9/artifacts/reviewers/oh-my-pi/reviewer.stdout.txt": {
+    "size_bytes": 3377226,
+    "sha256": "62f28fbf549a6f6312409ec675b08c4ac41c98ffe5ff967c7ae47b9f2873b31a"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261012T193340Z-agentic-initiation-start-ca750cf9/artifacts/reviewers/oh-my-pi/reviewer.summary.json": {
+    "size_bytes": 3909,
+    "sha256": "c26361f8b2d437a1aff53f6ddc5206907f317ae2ac647295554dcc2f0a70c9d1"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261012T193340Z-agentic-initiation-start-ca750cf9/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 5505370,
+    "sha256": "a4da2585876b5025bea587e4c6f3480fe5a54b57d56b485751a22d0d625c1416"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/13/rollout-2026-10-13T03-57-07-01a131b0-b979-72d3-a1fb-59921908eef8.jsonl": {
+    "size_bytes": 572489,
+    "sha256": "f3924178e5c59f42c0c9d0aca2391a5d724524c8d059bedae079a2b910e1f773"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261012T193340Z-agentic-initiation-start-ca750cf9/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "6b8819f4d2877b8cc2457a52a9990dee55a9b6408d55a39578835532134e601b"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261012T193340Z-agentic-initiation-start-ca750cf9/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 733974,
+    "sha256": "46696adddaa346c6bf7710ca7af629367e1df976d780eee81a2312c13c3b9b81"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261012T193340Z-agentic-initiation-start-ca750cf9/artifacts/analysis/summary.md": {
+    "size_bytes": 3225,
+    "sha256": "1b417105fc4acb9cd0b8ec45e2b4936fd54903f7ef2a25f3ef4b9a5eb108f095"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261012T193340Z-agentic-initiation-start-ca750cf9/artifacts/analysis/causality.json": {
+    "size_bytes": 7635,
+    "sha256": "608cc1a9cd73df7eff7fbeafdd58c53e20e54a4bc347985c089d3f326ac7b128"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/13/rollout-2026-10-13T04-06-14-01a131b9-0e50-7070-a917-b77100bd4c41.jsonl": {
+    "size_bytes": 991535,
+    "sha256": "932eede95a2a74843ee48e2e146b12f0c9c7d18c04ef14d37d76a162fb8d7b65"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261012T193340Z-agentic-initiation-start-ca750cf9/artifacts/usage/usage-summary.json": {
+    "size_bytes": 817,
+    "sha256": "e6f25928bc7d9184a94922a9081fc24979c4275b45e728a8d4c84480d4838fba"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261016T204918Z-agentic-initiation-start-3aa3ed36/summary.json": {
+    "size_bytes": 18881,
+    "sha256": "c81dad39635a5772f7281985af6caeecc37e7975d1c4aa060878791e6c90260d"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261016T204918Z-agentic-initiation-start-3aa3ed36/events.jsonl": {
+    "size_bytes": 53154,
+    "sha256": "dd986c8db0908b0e0f95c60be4d9b6d1c80afc76997e0f14c17e36f7aa99887b"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261016T204918Z-agentic-initiation-start-3aa3ed36/artifacts/session-manifest.json": {
+    "size_bytes": 44940,
+    "sha256": "dac3d03a6d4983d5808a1db3d42ee1f02f5fad6cba582497f39f87a3b8f64ac1"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261016T204918Z-agentic-initiation-start-3aa3ed36/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 625,
+    "sha256": "16f8a9053ea224b0c76792559012a663ea77ced8890b2586ac85a44478e91963"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261016T204918Z-agentic-initiation-start-3aa3ed36/artifacts/reviewers/claude-code-fb2/reviewer.stdout.txt": {
+    "size_bytes": 12012,
+    "sha256": "ac3e8d2332ab9ad8a6d7470e9781a2dc67db92ad67787374e1d6efbd5a355f66"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261016T204918Z-agentic-initiation-start-3aa3ed36/artifacts/reviewers/claude-code-fb2/reviewer.summary.json": {
+    "size_bytes": 2659,
+    "sha256": "658d15d12695c6920d264ed5cfa880e9061233028933861f33d652df3a13cc13"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261016T204918Z-agentic-initiation-start-3aa3ed36/artifacts/reviewers/cursor-cli-fb2/reviewer.stdout.txt": {
+    "size_bytes": 3463697,
+    "sha256": "964d9245b6c8a31ffc66d5636d924fd6754f8a1836bcca0e2c4d5e07d197507a"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261016T204918Z-agentic-initiation-start-3aa3ed36/artifacts/reviewers/cursor-cli-fb2/reviewer.summary.json": {
+    "size_bytes": 3625,
+    "sha256": "4b8d4ce912d597eab63b805e18a7ff95b8f23efa680661d3468f9202113a8c87"
+  },
+  "/Users/bominzhang/.kimi-code/sessions/wd_trace-of-thought-landing-page_a5503c177fd9/session_dec65da1-9842-496a-a593-13bdf566f2f7/agents/agent-0/wire.jsonl": {
+    "size_bytes": 461872,
+    "sha256": "ce61af8c408061cbf796212bb65f4753cabb09d286884b507b170abc6fd50f45"
+  },
+  "/Users/bominzhang/.kimi-code/sessions/wd_trace-of-thought-landing-page_a5503c177fd9/session_dec65da1-9842-496a-a593-13bdf566f2f7/agents/agent-1/wire.jsonl": {
+    "size_bytes": 562251,
+    "sha256": "cc1f2443480b6d68bb4f8e1f9d8540ea56315de4cc249ede5c0bfe93dea2fb86"
+  },
+  "/Users/bominzhang/.kimi-code/sessions/wd_trace-of-thought-landing-page_a5503c177fd9/session_dec65da1-9842-496a-a593-13bdf566f2f7/agents/agent-2/wire.jsonl": {
+    "size_bytes": 550995,
+    "sha256": "5d3019de7215ea895d2cb87f0ca802fc550e6e9f8065f969d9784391725edf3e"
+  },
+  "/Users/bominzhang/.kimi-code/sessions/wd_trace-of-thought-landing-page_a5503c177fd9/session_dec65da1-9842-496a-a593-13bdf566f2f7/agents/main/wire.jsonl": {
+    "size_bytes": 1383424,
+    "sha256": "f0afb2bc7211fdee0ea529c0d06e353f6522039a070da051ef26ed82e9c98a30"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261016T204918Z-agentic-initiation-start-3aa3ed36/artifacts/reviewers/kimi-code/reviewer.summary.json": {
+    "size_bytes": 4811,
+    "sha256": "166032f5d4ae919bbacee02d72948e6874df9ba5886cafcfe54113931f17f927"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261016T204918Z-agentic-initiation-start-3aa3ed36/artifacts/reviewers/oh-my-pi/reviewer.stdout.txt": {
+    "size_bytes": 5433454,
+    "sha256": "2c8983dd4ff074da4a38817aef942bd5ee2e35d4d968870953eaaa8854dd4f23"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261016T204918Z-agentic-initiation-start-3aa3ed36/artifacts/reviewers/oh-my-pi/reviewer.summary.json": {
+    "size_bytes": 3197,
+    "sha256": "2b36dc947eec6e90877acbf9b30e1922a7db60722e4faca02f20d707f5cf9a8f"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261016T204918Z-agentic-initiation-start-3aa3ed36/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 8827475,
+    "sha256": "b581c860fe5c05c1ddf8f9803713e7fb485c218560adbe8d55a7e42c39090b53"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/16/rollout-2026-10-16T17-26-50-01a1469c-4b5b-7182-8b3a-7182d6173138.jsonl": {
+    "size_bytes": 599794,
+    "sha256": "f2cbae1cba1efb4cbbbec76a5a88cb1c1329edb230aeae3b2cb63f36e003c4c3"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/16/rollout-2026-10-16T17-26-56-01a1469c-62b7-7fc1-90f8-89fe62f06f47.jsonl": {
+    "size_bytes": 612688,
+    "sha256": "3c18b838ac3a941a11c2d15a3a65d07a6588c636f16d0c5525b24dfdf834ce99"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261016T204918Z-agentic-initiation-start-3aa3ed36/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "384bbaffbd189ad63510ece1a1bb011104105fd98360df17d32e542f4519c7de"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261016T204918Z-agentic-initiation-start-3aa3ed36/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 552629,
+    "sha256": "6bcb2f771923a8042b69a9d12e8dc9c13731c853ae2e52faaa31e54cac96c4d9"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261016T204918Z-agentic-initiation-start-3aa3ed36/artifacts/analysis/summary.md": {
+    "size_bytes": 3286,
+    "sha256": "54cdf10d75440e9a31439b440676cd50b04470f9736e12fa73afa62a5113f74e"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261016T204918Z-agentic-initiation-start-3aa3ed36/artifacts/analysis/causality.json": {
+    "size_bytes": 16256,
+    "sha256": "47a4564e3690798dddab6f88b620af3c7cfc44315f23cc76fa1038872be06acc"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/16/rollout-2026-10-16T17-38-55-01a146a7-520e-7a43-a7a0-6dc40f266212.jsonl": {
+    "size_bytes": 1067115,
+    "sha256": "d4e85763c306756cbe8bec0e73a2fd0407edaf34e584df52278c5108f87b69a7"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261016T204918Z-agentic-initiation-start-3aa3ed36/artifacts/usage/usage-summary.json": {
+    "size_bytes": 817,
+    "sha256": "a51e7d56d953e5166a3203d63dd83811eac962af025f2d3b5c70f58ea1dd0e89"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210036Z-agentic-initiation-start-97ba0952/summary.json": {
+    "size_bytes": 15880,
+    "sha256": "f4f45d16df9750e49e1eaf1cd4aab538972f507b2640304d1a849ccf46f47940"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210036Z-agentic-initiation-start-97ba0952/events.jsonl": {
+    "size_bytes": 115894,
+    "sha256": "c192bb285318de16e3dcc570748ce1879ddfa0b6aea8d192ec7037b3b0dbf00e"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210036Z-agentic-initiation-start-97ba0952/artifacts/session-manifest.json": {
+    "size_bytes": 23066,
+    "sha256": "9b2f88511b560650adad435b06dad9c1d71d432d619c33a74548d7c854ece363"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210036Z-agentic-initiation-start-97ba0952/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 662,
+    "sha256": "9c0b3c0f100c9c569c7fc6ff8e25e0eaf8c8c3502c47d0e10bf9700198b5a141"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210036Z-agentic-initiation-start-97ba0952/artifacts/reviewers/claude-code/reviewer.stdout.txt": {
+    "size_bytes": 10618,
+    "sha256": "27fb0a57247e1ef841211f1b79dd4a5d2b993c9f6a5d54251297cedebb3992a3"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210036Z-agentic-initiation-start-97ba0952/artifacts/reviewers/claude-code/reviewer.summary.json": {
+    "size_bytes": 2614,
+    "sha256": "93c2439940a6fc99a05ff7c104023905dd510cc27cb25907abacd9eb44efb1ed"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210036Z-agentic-initiation-start-97ba0952/artifacts/reviewers/cursor-cli-fb1/reviewer.stdout.txt": {
+    "size_bytes": 933056,
+    "sha256": "d23e2f4c6d3e29ba6b1ff6f06b0b7d5947b663c8da8f391a09dfd7393b2589bd"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210036Z-agentic-initiation-start-97ba0952/artifacts/reviewers/cursor-cli-fb1/reviewer.summary.json": {
+    "size_bytes": 3560,
+    "sha256": "cc9e8670950aa6bcdb9ca7036da37dff83581d531171df5f55bd408d38ba5d2d"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210036Z-agentic-initiation-start-97ba0952/artifacts/reviewers/oh-my-pi/reviewer.stdout.txt": {
+    "size_bytes": 1042399,
+    "sha256": "b611125d08c4d5063d6453f7a0081f4b49dbcba33a8e3af1c7624ff64b11e6ae"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210036Z-agentic-initiation-start-97ba0952/artifacts/reviewers/oh-my-pi/reviewer.summary.json": {
+    "size_bytes": 4136,
+    "sha256": "e67162a6786b2f244dd3b43e71a92af0c6dab7fca0af789903e6d7228a7c1274"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210036Z-agentic-initiation-start-97ba0952/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 3738335,
+    "sha256": "1da81912c0d3649fb85645c5525d86db7c90977cb250ff06a69b7331aa5c1818"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/17/rollout-2026-10-17T17-23-38-01a14bbf-b875-7b80-b8e3-2922dc653250.jsonl": {
+    "size_bytes": 1264966,
+    "sha256": "6773bcd8cd367ec85ce3ae854cba9a32efda2f87feff91267b7d36cc4343ff81"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210036Z-agentic-initiation-start-97ba0952/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "e869c3abcd91dbd6889246f9c1a8e26eb358503045b26d1e22051409cd59cdc7"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210036Z-agentic-initiation-start-97ba0952/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 699393,
+    "sha256": "5f1255e55f13c55c54ab3c72c4c198bc0e880cfdb29107399e1ad94c25620856"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210036Z-agentic-initiation-start-97ba0952/artifacts/analysis/summary.md": {
+    "size_bytes": 3244,
+    "sha256": "fe8e853cb9a6890f822f0ee4e1227767361d94b0af77ba9e217efa5232445901"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210036Z-agentic-initiation-start-97ba0952/artifacts/analysis/causality.json": {
+    "size_bytes": 9790,
+    "sha256": "9c392ac0f5718c8a06a64cba107179c4aa9e602806974cde041faf85607d85eb"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/17/rollout-2026-10-17T17-34-02-01a14bc9-3dff-7b23-bcbe-6b6cf3d864ae.jsonl": {
+    "size_bytes": 915329,
+    "sha256": "a406d5285335ab7bb65188301a76e45081486a9c74039890b0d60e424d959095"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210036Z-agentic-initiation-start-97ba0952/artifacts/usage/usage-summary.json": {
+    "size_bytes": 814,
+    "sha256": "f3f7124152ef9979880f9e0bfe54c32375054ed61bcc3f37deb1947b9d5c8a21"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210527Z-agentic-initiation-start-a0644009/summary.json": {
+    "size_bytes": 19919,
+    "sha256": "e9f7b51f7713fe11467588f51e788f05a599def0ad87c2badf733bf8e06a5128"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210527Z-agentic-initiation-start-a0644009/events.jsonl": {
+    "size_bytes": 69478,
+    "sha256": "6edc2542535e0085720ab71fa22ef57e0b30f8fd4521d69b6b431570c2d009de"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210527Z-agentic-initiation-start-a0644009/artifacts/session-manifest.json": {
+    "size_bytes": 72500,
+    "sha256": "9915119e25a35dfb6c623189db7f45bf3706ce5fd30ae9b780911b94b9bba2a3"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210527Z-agentic-initiation-start-a0644009/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 625,
+    "sha256": "6c1e9d5634e41b486a24a8ed06eef14be29b8f3d003372f7f68be030e73f0230"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210527Z-agentic-initiation-start-a0644009/artifacts/reviewers/claude-code/reviewer.stdout.txt": {
+    "size_bytes": 10617,
+    "sha256": "ab65d18b17ec36b84cf72b5cd1e2da347c4de6194fc5d0f12838b7c7805a73d8"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210527Z-agentic-initiation-start-a0644009/artifacts/reviewers/claude-code/reviewer.summary.json": {
+    "size_bytes": 2614,
+    "sha256": "acd2885cebe4c590028940adb4a90e9d82e647f151ebc670e962943c309374ef"
+  },
+  "/Users/bominzhang/.kimi-code/sessions/wd_cline-kanban_449cb66358d3/session_dc9f2f20-7ffc-4139-8ae5-c709703214fa/agents/main/wire.jsonl": {
+    "size_bytes": 2695993,
+    "sha256": "031ee1cf9a5f731f699223d83b58e90e3f66050b852ac3e0d2560d698eb107c2"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210527Z-agentic-initiation-start-a0644009/artifacts/reviewers/kimi-code/reviewer.summary.json": {
+    "size_bytes": 4625,
+    "sha256": "790a1ab3dbf751da901bf05db51811a795aecc39020c88d8aa8ce6850aca9557"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210527Z-agentic-initiation-start-a0644009/artifacts/reviewers/oh-my-pi-fb1/reviewer.stdout.txt": {
+    "size_bytes": 4722727,
+    "sha256": "cfab4476e58325c6407ba2f43f509357b82b1f104a6963cc9f0552407939d18b"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210527Z-agentic-initiation-start-a0644009/artifacts/reviewers/oh-my-pi-fb1/reviewer.summary.json": {
+    "size_bytes": 4763,
+    "sha256": "d7315021211544a5f8b7cc0b5a2fd679ef6efa6b216f2cf5b358db89b4ba42bf"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210527Z-agentic-initiation-start-a0644009/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 7156046,
+    "sha256": "61ceb967c47e6ec760108097f5e8991b484923be9c2a6a589bf8dd6cd8a45bbd"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/17/rollout-2026-10-17T17-24-13-01a14bc0-43c4-78a0-9523-283a0734df9a.jsonl": {
+    "size_bytes": 987241,
+    "sha256": "40abed8f302d9db8f6e5039dea909c7ca43d926e1440dbf67d0a5f751b80dccf"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/17/rollout-2026-10-17T17-24-09-01a14bc0-30f1-75d3-ae8e-3da61b6edc24.jsonl": {
+    "size_bytes": 1080370,
+    "sha256": "cc38d004074bca793d54c5b50bf07c330b067ee3eebd6b94b2791205ae0bf5d4"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210527Z-agentic-initiation-start-a0644009/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "214b1a117d9f0b5105ca3e6bbcf88a386b0bbc5e29f759a13bf38d5d345c5b6c"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210527Z-agentic-initiation-start-a0644009/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 1460288,
+    "sha256": "770505c1dc64f6e50ce3114066c563bb56cbff215f827dd79f17a809df85749a"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210527Z-agentic-initiation-start-a0644009/artifacts/analysis/summary.md": {
+    "size_bytes": 3223,
+    "sha256": "ba8e6c974c02cdc147ff3b64644e11acafaa388bcdf9d703eaba3166663c945c"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210527Z-agentic-initiation-start-a0644009/artifacts/analysis/causality.json": {
+    "size_bytes": 25305,
+    "sha256": "9b629d54e13cbf225134e37a8a38fe60e9ec39852eef40fa5fc81995fb94778b"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/17/rollout-2026-10-17T17-36-27-01a14bcb-6f6b-78f2-a137-bd4d0a57985b.jsonl": {
+    "size_bytes": 1025249,
+    "sha256": "54c0b89513264f134de6ad5dd52680b5d4c9147bb8639071c9d4bf6c2ed10ae5"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210527Z-agentic-initiation-start-a0644009/artifacts/usage/usage-summary.json": {
+    "size_bytes": 817,
+    "sha256": "0ad15cb0137ff56a6518b2d76ed58150e83a0f5f616f1cc54220f34f96c9c0bf"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T214430Z-agentic-initiation-start-7ec9cd87/summary.json": {
+    "size_bytes": 19951,
+    "sha256": "84f1a1ff0fa94c6b07f2488c59d497805481229f5277c9e90e8f1cf4eaf5d5f9"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T214430Z-agentic-initiation-start-7ec9cd87/events.jsonl": {
+    "size_bytes": 48986,
+    "sha256": "576167d2e45d1dfc976779b787c3664e10fb6787082e217ae3df17b7c92b6fc0"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T214430Z-agentic-initiation-start-7ec9cd87/artifacts/session-manifest.json": {
+    "size_bytes": 71222,
+    "sha256": "ed64a74acdee3a3299db874937caed615610419f470c10b759fe7f038ba88c58"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T214430Z-agentic-initiation-start-7ec9cd87/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 625,
+    "sha256": "5d5ea6980465ad40c1ef12f8a5405b511bbdb4e2eaca40c21729e918aa44ee09"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T214430Z-agentic-initiation-start-7ec9cd87/artifacts/reviewers/claude-code/reviewer.stdout.txt": {
+    "size_bytes": 10616,
+    "sha256": "3f474a634b7c672d2ad35f3d6f3cb188e28cffb5e98a22aa23e5336a09a0b42b"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T214430Z-agentic-initiation-start-7ec9cd87/artifacts/reviewers/claude-code/reviewer.summary.json": {
+    "size_bytes": 2614,
+    "sha256": "e97c360ed89c8520ca4986b3465b975ebb303191bb5293eb4d115f622bdeffff"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T214430Z-agentic-initiation-start-7ec9cd87/artifacts/reviewers/cursor-cli/reviewer.stdout.txt": {
+    "size_bytes": 1322212,
+    "sha256": "cb7d6bda36ca95a3ebf22c8924caeb3e873e00ce5966bef0498e68c8f1f2b874"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T214430Z-agentic-initiation-start-7ec9cd87/artifacts/reviewers/cursor-cli/reviewer.summary.json": {
+    "size_bytes": 4139,
+    "sha256": "bc2e05f8ff3a14d8cfeef4f1b86eba0be63faf2e41e00564e3c312f2b0a7153e"
+  },
+  "/Users/bominzhang/.kimi-code/sessions/wd_cline-kanban_b2f35cfebac4/session_c469bd39-dd0d-42be-a6e9-eb5fdf0e64d7/agents/main/wire.jsonl": {
+    "size_bytes": 2632574,
+    "sha256": "f07ab32e4fdd8f92b538eed27d5824e100a111964b5151ef5c941c03826e1d4d"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T214430Z-agentic-initiation-start-7ec9cd87/artifacts/reviewers/kimi-code-fb1/reviewer.summary.json": {
+    "size_bytes": 5413,
+    "sha256": "2c240a41806f4fd438e0b82d7fb787100304c91a15ab57fc9aa6fecc1779f908"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T214430Z-agentic-initiation-start-7ec9cd87/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 6390754,
+    "sha256": "7b1572203de992cbeb957cc745ab65e8f735c97f4a96d44337cd0da0015699e4"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/17/rollout-2026-10-17T18-21-43-01a14bf4-e6e3-70e0-83a2-c824d5089dfc.jsonl": {
+    "size_bytes": 1255217,
+    "sha256": "945a37e103502772a0f61630e233957b83c2b48020eae065142187c375c00493"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/17/rollout-2026-10-17T18-21-31-01a14bf4-b74b-7e42-93b3-ce1cfe3a8fe7.jsonl": {
+    "size_bytes": 1440205,
+    "sha256": "4706825496ec20678c88513e4247453b23f222eff025f268e82ace646bac1d23"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/17/rollout-2026-10-17T18-21-57-01a14bf5-1bdd-7ce3-a469-57045eb228f7.jsonl": {
+    "size_bytes": 1486667,
+    "sha256": "561965fd9f27fc21992891a1db85492e17165667a067b1fdd069a2fc3a64d8a7"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T214430Z-agentic-initiation-start-7ec9cd87/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "9300418a2908274bb6d9973257938d562fc3848d8f5a65319c05eb96f1236514"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T214430Z-agentic-initiation-start-7ec9cd87/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 1412928,
+    "sha256": "a1be1a4e0fcd71e42c73aae45160f6c5f767677c52694a1a30d046e81b449860"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T214430Z-agentic-initiation-start-7ec9cd87/artifacts/analysis/summary.md": {
+    "size_bytes": 3231,
+    "sha256": "d75577c5d36cefb396f154f9cf6f1af54daf6840dc6931311093c663a43afaf0"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T214430Z-agentic-initiation-start-7ec9cd87/artifacts/analysis/causality.json": {
+    "size_bytes": 34055,
+    "sha256": "2785f03d898b654e56744c16fb516c1dbc48e8fe82488b8a7bb6f5ca76867c30"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/17/rollout-2026-10-17T18-37-56-01a14c03-bee2-75b3-9ad2-8524990002b8.jsonl": {
+    "size_bytes": 1123194,
+    "sha256": "cd4894e44a21a926f7717448c598dbd0e90382864cd5584be04e08ea90684886"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T214430Z-agentic-initiation-start-7ec9cd87/artifacts/usage/usage-summary.json": {
+    "size_bytes": 816,
+    "sha256": "0b72f2ee871a8a78c3b1219ad58b16b337fab723cd7fead890362c703103f973"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T215657Z-prepare-run-b1f04af7/summary.json": {
+    "size_bytes": 11496,
+    "sha256": "789a49dc1119734b9527dd5a5df3616d88c07e4a9a3564a1b2364d5cd242b943"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T215657Z-prepare-run-b1f04af7/events.jsonl": {
+    "size_bytes": 28857,
+    "sha256": "67580fdc09aa52e9a81574e9893a971c9ffa5f61331ce1775ebde98bed6023f5"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T215657Z-prepare-run-b1f04af7/artifacts/session-manifest.json": {
+    "size_bytes": 43358,
+    "sha256": "6bcef9f144b57d252825a37f0a7c52978f13c0f0f13601986c8bc85aefb76125"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T215657Z-prepare-run-b1f04af7/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 625,
+    "sha256": "5bdd2f11fef9733da02336deaa857610f9225d1fd35ae1e91a407b9473faafd9"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T215657Z-prepare-run-b1f04af7/artifacts/reviewers/cursor-cli/reviewer.stdout.txt": {
+    "size_bytes": 1272020,
+    "sha256": "5cc852c04b198df4e9264fd9b04b5729cb5162eff3267159de577ef73f308b3b"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T215657Z-prepare-run-b1f04af7/artifacts/reviewers/cursor-cli/reviewer.summary.json": {
+    "size_bytes": 3410,
+    "sha256": "b1ca95b300e1b604dda6ec8bc6acf11e448ce3f2f28a4eb8016fe48630dcc674"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T215657Z-prepare-run-b1f04af7/artifacts/reviewers/oh-my-pi/reviewer.stdout.txt": {
+    "size_bytes": 7032899,
+    "sha256": "f3ad7b848e97c68b04de4c3854110d0aaa12f06dea5b1f0c3edc604c4846f4a8"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T215657Z-prepare-run-b1f04af7/artifacts/reviewers/oh-my-pi/reviewer.summary.json": {
+    "size_bytes": 5824,
+    "sha256": "504dd8866f2c88bd2a0e0994766f6e34327e9fa39475e7559660e005daed45da"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T215657Z-prepare-run-b1f04af7/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 8730991,
+    "sha256": "4b20f896803f91cc51d295151028150b07ae95d5cddf52dd9cb690318ca9164a"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/17/rollout-2026-10-17T18-19-18-01a14bf2-b055-7b53-bc3b-a642f33dd3c3.jsonl": {
+    "size_bytes": 783470,
+    "sha256": "7772a0d4ded412b5f6f5cda6ff15b7ac7396f29bcec625b3d3c3c6dd3d999e70"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/17/rollout-2026-10-17T18-19-12-01a14bf2-9853-7c42-8235-e237c64d61bd.jsonl": {
+    "size_bytes": 1273796,
+    "sha256": "905785b355302bfec8feab4cf1607d6e0bfe51797ba27453f8f01fedce1dae57"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/17/rollout-2026-10-17T18-19-08-01a14bf2-8938-78c1-a83b-cc8604dfde04.jsonl": {
+    "size_bytes": 851044,
+    "sha256": "db5ad01e9483af54ca34db2bd990aca870d95a68d5e4674631d53adcd2ed944c"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/17/rollout-2026-10-17T18-00-22-01a14be1-5aea-7331-b024-881f8f7284c9.jsonl": {
+    "size_bytes": 1206114,
+    "sha256": "54233773a2980280f07f42af2f8a2935fb5cbc7950e87975fff81804da30818f"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T215657Z-prepare-run-b1f04af7/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 644,
+    "sha256": "cac75b3efb08fa95b270de728a4700f71477b5a2030a1030698fc56eacbbcb02"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T215657Z-prepare-run-b1f04af7/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 1119437,
+    "sha256": "3b696972eb2851b7e8ac8f9bfd736485a6fac500d53c8ac6ba8ac9f55a186b4c"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T215657Z-prepare-run-b1f04af7/artifacts/analysis/summary.md": {
+    "size_bytes": 19541,
+    "sha256": "301aa171e4302a40cdeab02661cab568581dcd8c0cee957896348e284ccefa51"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T215657Z-prepare-run-b1f04af7/artifacts/analysis/causality.json": {
+    "size_bytes": 28392,
+    "sha256": "c79de37e616de7e84ee62eef4012ca2e285b01ab35617e7c1bf6e73811cf07f2"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/17/rollout-2026-10-17T18-43-14-01a14c08-9934-7540-97a0-a6b4d6fc00d2.jsonl": {
+    "size_bytes": 1072246,
+    "sha256": "b52e1ddd870c94d23f13385d17496fb737802f192296432f0b734a51db4c4a50"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/17/rollout-2026-10-17T18-47-18-01a14c0c-53f4-7940-aa4e-2081cf139ec2.jsonl": {
+    "size_bytes": 235434,
+    "sha256": "c373cb8bd55f06ca87ad6316b0f240556ca0693440cfcdd67268383fe4a629c0"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T215657Z-prepare-run-b1f04af7/artifacts/usage/usage-summary.json": {
+    "size_bytes": 816,
+    "sha256": "b205f9ccb2847f430ab87d7e25bd81de75f4be9b21461198f1539e3a9b36ee52"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T220201Z-agentic-initiation-start-334d8e09/summary.json": {
+    "size_bytes": 13927,
+    "sha256": "780453a2560a6d9186bde2c5c62293a8a178b17a4a5f2a1507b2f89f2f6ddfc5"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T220201Z-agentic-initiation-start-334d8e09/events.jsonl": {
+    "size_bytes": 37573,
+    "sha256": "b9ee2444aaf0315f7a10e4f0edf9a97ba9cb201dde832e0c367f2faf1843568c"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T220201Z-agentic-initiation-start-334d8e09/artifacts/session-manifest.json": {
+    "size_bytes": 10817,
+    "sha256": "b44bbef2f1da1b0912481602fd64b4279e94e24bd875f45bf0ab16245fb582d4"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T220201Z-agentic-initiation-start-334d8e09/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 625,
+    "sha256": "3ce4a326fda12b710b737920898a9010abf7885b5fb9e6d60c8ed3b833390cc9"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T220201Z-agentic-initiation-start-334d8e09/artifacts/reviewers/claude-code/reviewer.stdout.txt": {
+    "size_bytes": 10617,
+    "sha256": "99c01cf847443d09aab5caa39277a7c9eff6bad1391de44c4680b695a6b6bfff"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T220201Z-agentic-initiation-start-334d8e09/artifacts/reviewers/claude-code/reviewer.summary.json": {
+    "size_bytes": 2614,
+    "sha256": "9d86d33b570796bc6ff5f00fe553f6c67fea496a098ebc8dc27509cb3c339c52"
+  },
+  "/Users/bominzhang/.kimi-code/sessions/wd_cline-kanban_9d5a7a2f6ff3/session_3f2a7a0a-e2ac-455f-b1a0-d21b9f4e2f16/agents/main/wire.jsonl": {
+    "size_bytes": 581618,
+    "sha256": "bc8971809e37a9bbdff7013f0cda38bbddbd3d018793062b36abac4b51e102bf"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T220201Z-agentic-initiation-start-334d8e09/artifacts/reviewers/kimi-code/reviewer.summary.json": {
+    "size_bytes": 4716,
+    "sha256": "de02ec4be556a4c6b47c264eab64a7164584b048b7a2414d0ec73eb9fecb37c0"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T220201Z-agentic-initiation-start-334d8e09/artifacts/reviewers/oh-my-pi-fb1/reviewer.stdout.txt": {
+    "size_bytes": 2494676,
+    "sha256": "3167369cc6920a0a6c3ed96c3621b45cfc12d4a8cbc28db4820c1c6cb52f8d14"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T220201Z-agentic-initiation-start-334d8e09/artifacts/reviewers/oh-my-pi-fb1/reviewer.summary.json": {
+    "size_bytes": 4260,
+    "sha256": "58cdd29e2aa296ce0cf201943af8e62b1899d1599969ad25880fbea03463d569"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T220201Z-agentic-initiation-start-334d8e09/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 2339597,
+    "sha256": "97d49c9b202d338db57166b857699dd5396aad57bce691d85b39644f876911b5"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/17/rollout-2026-10-17T18-10-57-01a14beb-0ac0-7801-9dee-74168f64855b.jsonl": {
+    "size_bytes": 430184,
+    "sha256": "9a1edcaca76480883f9aacda5b7fdc9fedce86fd8c7f9f7dde8a215eefdc8760"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T220201Z-agentic-initiation-start-334d8e09/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "9cfd5ceeb0899f8fb1650438b12fbbe43945ef8188dba480758de30418ffc103"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T220201Z-agentic-initiation-start-334d8e09/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 356361,
+    "sha256": "37cb92fad8e0590f6467e75b9326dcab40137e1939035f1684ee3f41552cc62e"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T220201Z-agentic-initiation-start-334d8e09/artifacts/analysis/summary.md": {
+    "size_bytes": 3222,
+    "sha256": "87cc2e9fe735bb8313eefa20b9ebedfb69f767e27c50d1c52d7443e7609a9fdd"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T220201Z-agentic-initiation-start-334d8e09/artifacts/analysis/causality.json": {
+    "size_bytes": 11406,
+    "sha256": "22f54f4a54052b37bc38e9b45d9b4febf0e08b63f3bc229310f22c8adc955ba9"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/17/rollout-2026-10-17T18-17-16-01a14bf0-d4f5-7ca2-9cfa-402c1bffae9c.jsonl": {
+    "size_bytes": 847094,
+    "sha256": "d4526f428b6037d5401d4c545094e04f2f38de3bf0981db46ac1e0250a884f07"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T220201Z-agentic-initiation-start-334d8e09/artifacts/usage/usage-summary.json": {
+    "size_bytes": 807,
+    "sha256": "8987b40e97a324fda2f7f2d90171e31b44e93af9ee0a3cc173dd55e1defc1d50"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T221421Z-agentic-initiation-start-7f35edec/summary.json": {
+    "size_bytes": 15653,
+    "sha256": "4a2e1847c5d81a606318229086ac9529ec5dd4f0529d16cb19effb70ae243e32"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T221421Z-agentic-initiation-start-7f35edec/events.jsonl": {
+    "size_bytes": 38688,
+    "sha256": "75498181242297c9e96bdc16da38b28e6ad1cd3a0521a05294f701ca9078fd94"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T221421Z-agentic-initiation-start-7f35edec/artifacts/session-manifest.json": {
+    "size_bytes": 31871,
+    "sha256": "88b7692f211855aa7ba7240cafbec4d4c50853db6570e85369515b30248270f0"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T221421Z-agentic-initiation-start-7f35edec/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 625,
+    "sha256": "d8f98c6e4e430d6373e6538578990e14488c87ae5caaca4601c2cec59e511977"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T221421Z-agentic-initiation-start-7f35edec/artifacts/reviewers/claude-code/reviewer.stdout.txt": {
+    "size_bytes": 11575,
+    "sha256": "fa6bcc414877a50b1ba4cf589eb71651e451d58ef29ec669915acc3d2fd58555"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T221421Z-agentic-initiation-start-7f35edec/artifacts/reviewers/claude-code/reviewer.summary.json": {
+    "size_bytes": 2614,
+    "sha256": "d0d1897badddfad76072077fe1ae9be419031afd9a8fe2fe779a46f26d5dba3f"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T221421Z-agentic-initiation-start-7f35edec/artifacts/reviewers/cursor-cli/reviewer.stdout.txt": {
+    "size_bytes": 1409041,
+    "sha256": "7c4c2ab8007a5b8f2dd4bf7fa825375c136102ece4f57dfd02663711e4b640b0"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T221421Z-agentic-initiation-start-7f35edec/artifacts/reviewers/cursor-cli/reviewer.summary.json": {
+    "size_bytes": 3368,
+    "sha256": "8258cc05254f36d3cf54194481afd2fd68580eaacd495d96829f18600cf722dc"
+  },
+  "/Users/bominzhang/.kimi-code/sessions/wd_cline-kanban_252a4a6ba4e6/session_19dd7962-300d-411f-902f-ab212017c413/agents/main/wire.jsonl": {
+    "size_bytes": 2057115,
+    "sha256": "5e42f5a1120bbb9c244bdcbaaf8252a567d4cf8c7e74c027936d2ec19ea9eaab"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T221421Z-agentic-initiation-start-7f35edec/artifacts/reviewers/kimi-code-fb2/reviewer.summary.json": {
+    "size_bytes": 3978,
+    "sha256": "4f6a156404e8194f8287de58ca26be86a92ee2e93cf2fd3a3160b5bfc4096102"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T221421Z-agentic-initiation-start-7f35edec/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 4683796,
+    "sha256": "6618fd37382b7f0b1984270fe0752954e2de127193ff543099e436779b8870da"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/17/rollout-2026-10-17T18-51-03-01a14c0f-c20e-7022-a278-16cc1c213d15.jsonl": {
+    "size_bytes": 777375,
+    "sha256": "5205fe650cfd45454e56f4bd3c9fa31e6fe3df02f5dce39fdf2a511e7ee48906"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T221421Z-agentic-initiation-start-7f35edec/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "c87d271036d4c980f4225f9666dddf4601e28e86ecb19a7c72033f2dbbdc0335"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T221421Z-agentic-initiation-start-7f35edec/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 726544,
+    "sha256": "43d565a625e8e3cd14df17b3ad675dee3faa4f58cab2f5d782a11aca09a2cb48"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T221421Z-agentic-initiation-start-7f35edec/artifacts/analysis/summary.md": {
+    "size_bytes": 3246,
+    "sha256": "e78dc6d640d2ffbbf879a972c4ab53e1e897bb30ca9e7d02e24263ad6f4ae95e"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T221421Z-agentic-initiation-start-7f35edec/artifacts/analysis/causality.json": {
+    "size_bytes": 8697,
+    "sha256": "f27af451ea31302a65679066760804fbad114e4fb60a110eaa964c3acb9c6b1c"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/17/rollout-2026-10-17T18-58-45-01a14c16-cf36-7df3-b7ed-897f5129ec75.jsonl": {
+    "size_bytes": 927728,
+    "sha256": "6e1c4eb7d5d06ee4e8f2dffe147031c2e641361269dce6c82c6fdfbcd4a1e716"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T221421Z-agentic-initiation-start-7f35edec/artifacts/usage/usage-summary.json": {
+    "size_bytes": 813,
+    "sha256": "f928fd437f888a6cbe072de3e0ce5f1582dab6c39d010d7f3e60b2d41c9b77d8"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T222629Z-agentic-initiation-start-be571a86/summary.json": {
+    "size_bytes": 22231,
+    "sha256": "f5e40a26a0e1cf1ee60ad87a28e92926db61af0e7db67a708b58e80f63a5fc8e"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T222629Z-agentic-initiation-start-be571a86/events.jsonl": {
+    "size_bytes": 38324,
+    "sha256": "e70fe3d32c4fc425449fd8eecf955f046340e78f6078c61904d2d3c1f964a71d"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T222629Z-agentic-initiation-start-be571a86/artifacts/session-manifest.json": {
+    "size_bytes": 97716,
+    "sha256": "a6597e00dfa1d7ac238f373564b4194f976097031a7cdcbbb9ff90db1e3ee7a7"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T222629Z-agentic-initiation-start-be571a86/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 625,
+    "sha256": "f0ff168f10c63fe63ae185a121f64ebbf33c9576ca2253da20128f027dc03897"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T222629Z-agentic-initiation-start-be571a86/artifacts/reviewers/claude-code/reviewer.stdout.txt": {
+    "size_bytes": 11576,
+    "sha256": "853e516dac28e03206f1f1e9db99ee0c6a5e900b4f8b850be146dc4783f85c31"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T222629Z-agentic-initiation-start-be571a86/artifacts/reviewers/claude-code/reviewer.summary.json": {
+    "size_bytes": 2614,
+    "sha256": "9161d3796d48bc9efeef7a233fb38c45ad018bfb20c95ad448bdcc7511df8463"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T222629Z-agentic-initiation-start-be571a86/artifacts/reviewers/cursor-cli-fb1/reviewer.stdout.txt": {
+    "size_bytes": 1013814,
+    "sha256": "36f1ca230de84b01fb2d9cd86ad32d79141d4defeb95deb12568220c94f3c6f6"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T222629Z-agentic-initiation-start-be571a86/artifacts/reviewers/cursor-cli-fb1/reviewer.summary.json": {
+    "size_bytes": 4016,
+    "sha256": "4207547c7880079b8ae187fea94e3f533f76bb8d6524834ef2ad1d5eaee28396"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T222629Z-agentic-initiation-start-be571a86/artifacts/reviewers/kimi-code/reviewer.stdout.txt": {
+    "size_bytes": 252081,
+    "sha256": "6da24d11bc9b3ca345038b8365a78b80ecd3880a610ff12e90fb17a3d800f1da"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T222629Z-agentic-initiation-start-be571a86/artifacts/reviewers/kimi-code/reviewer.summary.json": {
+    "size_bytes": 2943,
+    "sha256": "c43852341bd5c7e9781ea4c444918eaa8a761219163e22798006c818ab099384"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T222629Z-agentic-initiation-start-be571a86/artifacts/reviewers/oh-my-pi-fb2/reviewer.stdout.txt": {
+    "size_bytes": 6957867,
+    "sha256": "c743c7f51499398f9e0f10b6679a6ec045f29f87e4645c85ff310a8d8b06db9f"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T222629Z-agentic-initiation-start-be571a86/artifacts/reviewers/oh-my-pi-fb2/reviewer.summary.json": {
+    "size_bytes": 4880,
+    "sha256": "b18d4002e1e6bd97fdf10ebf372bf5ce2d64aa3b38fd497c8ade650a8bf87e2d"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T222629Z-agentic-initiation-start-be571a86/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 7923819,
+    "sha256": "8d3e887d2eaf40ba792d0844d1560bdd304a047cec5d35ff88a6169db5d3bfd0"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/17/rollout-2026-10-17T18-46-42-01a14c0b-c6a5-70c2-b6f7-1ed9095051f9.jsonl": {
+    "size_bytes": 1037690,
+    "sha256": "033e9b25663ff42848e9af99613ef7f21e3da0c5b8e7b914553154918f720b9c"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/17/rollout-2026-10-17T18-46-24-01a14c0b-8134-7f12-a335-4bbc199accea.jsonl": {
+    "size_bytes": 1606679,
+    "sha256": "159b4c169cf1c899bb0298aa09f65c90a589ccb81c0488a77ddcefa7b1948c53"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T222629Z-agentic-initiation-start-be571a86/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "990ee18b2fe9bcd68445eb417f4d8b10481d1e723002b84101f6620ca0b82ed8"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T222629Z-agentic-initiation-start-be571a86/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 1343837,
+    "sha256": "102957dc98820673b2183bc85322b1ae9e32f382c5c06cd38eb971856b7daa84"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T222629Z-agentic-initiation-start-be571a86/artifacts/analysis/summary.md": {
+    "size_bytes": 3293,
+    "sha256": "048262ca19466fc3182045792800e509ec14a8a051b5484893923cc92b085224"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T222629Z-agentic-initiation-start-be571a86/artifacts/analysis/causality.json": {
+    "size_bytes": 23088,
+    "sha256": "fbd881320bd186d2dfe39bf4136e213a8a58de425777e19a3311a543b4355f49"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/17/rollout-2026-10-17T18-57-05-01a14c15-47fc-7723-9a44-2ff9a06548cd.jsonl": {
+    "size_bytes": 1236203,
+    "sha256": "29ce8cc825e4f9039de55664e55ed72f4194649d5c769a9d12552f2f42a4419d"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T222629Z-agentic-initiation-start-be571a86/artifacts/usage/usage-summary.json": {
+    "size_bytes": 816,
+    "sha256": "2018ba825bf9a615470a1d9491f8b0f9c5fec9e6a15e9e16f22fd71187dc86e3"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T004603Z-agentic-initiation-start-d1277a60/summary.json": {
+    "size_bytes": 16680,
+    "sha256": "07c064bdd1b5d47654a275c9c415440dcbf0299b14f9bf7b59aaa0b4d626bdea"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T004603Z-agentic-initiation-start-d1277a60/events.jsonl": {
+    "size_bytes": 51779,
+    "sha256": "f95783a24f89e795182882a307cbd103ef531e09b81c9d4075806c7593d5229d"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T004603Z-agentic-initiation-start-d1277a60/artifacts/session-manifest.json": {
+    "size_bytes": 47555,
+    "sha256": "296a4792f5e98492933cc6a1f0a7827c5aec06594841cec9b7fc9d67ff3579e3"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T004603Z-agentic-initiation-start-d1277a60/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 625,
+    "sha256": "d049f7a85988e6afb9b1371b57d933b669305effea816f008839dfb366fb339a"
+  },
+  "/Users/bominzhang/.kimi-code/sessions/wd_cline-kanban_f7e3be6a6285/session_631a4702-3ccd-49dd-ae15-daddc6887fd4/agents/main/wire.jsonl": {
+    "size_bytes": 1795528,
+    "sha256": "0deee13eb92c7a624e8c30ad293a2d45f657fdf8119404745a2463b596d34ab5"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T004603Z-agentic-initiation-start-d1277a60/artifacts/reviewers/kimi-code/reviewer.summary.json": {
+    "size_bytes": 4236,
+    "sha256": "6d8f1c64d53f55b08f8b966c0552060922aae2d5eb6b6f8297d1b9783f2a721b"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T004603Z-agentic-initiation-start-d1277a60/artifacts/reviewers/oh-my-pi/reviewer.stdout.txt": {
+    "size_bytes": 5625927,
+    "sha256": "bc62e8184ccb18be7a8e8150ef5343b3daa48c34cd5a9f450d5cbd6f4889a259"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T004603Z-agentic-initiation-start-d1277a60/artifacts/reviewers/oh-my-pi/reviewer.summary.json": {
+    "size_bytes": 4788,
+    "sha256": "a80ceeb57b57c8fca693d17c9281ac22689dfc8ba463ea0efa8b3705c7b8a6c2"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T004603Z-agentic-initiation-start-d1277a60/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 5066546,
+    "sha256": "9d3d39d5b38caa84c189191835a9b91818b3a03b504b0a2d89a0a7dd1ee1c70f"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/17/rollout-2026-10-17T21-02-02-01a14c87-ae1f-7890-8840-efe8b2c09afe.jsonl": {
+    "size_bytes": 1124588,
+    "sha256": "46c5247722a7d691279b1faf0798985559eb966ac1c2d3fe0736bd84bbe21df9"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T004603Z-agentic-initiation-start-d1277a60/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "8c3bcc3a5520685028fd0e9c34061a1df348491d91691ec6ed0086aec71360e8"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T004603Z-agentic-initiation-start-d1277a60/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 1331994,
+    "sha256": "858507d881bf8274a569f53273d4e655c61f69c398fa2270cbd3bbc7e7cc684e"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T004603Z-agentic-initiation-start-d1277a60/artifacts/analysis/summary.md": {
+    "size_bytes": 3156,
+    "sha256": "2b1b84f20315025f81d90b53836eb9a8dcde1d706e31b987d5efaee8c3349943"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T004603Z-agentic-initiation-start-d1277a60/artifacts/analysis/causality.json": {
+    "size_bytes": 15763,
+    "sha256": "ae14b4d98e736d7f146ab2e13ab1c0b33419e01820a8e7f00f7cc69f3e03e611"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/17/rollout-2026-10-17T21-11-21-01a14c90-340c-7c53-b348-662db9082485.jsonl": {
+    "size_bytes": 1144258,
+    "sha256": "99868649cc1b45bada66f93d099197b0ce5497613487c0a01eb82ae1fa90b64d"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T004603Z-agentic-initiation-start-d1277a60/artifacts/usage/usage-summary.json": {
+    "size_bytes": 815,
+    "sha256": "5589eab8c4152b356629a1f54a2e778e3bd88e54afb5eb367e9782c11ccc802e"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T010000Z-agentic-initiation-start-ca00ec1f/summary.json": {
+    "size_bytes": 18225,
+    "sha256": "3e4310001aa4bcdda5e3adc4e420fbfc40557c7dee48b0342b3f17a0e6fa5ca0"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T010000Z-agentic-initiation-start-ca00ec1f/events.jsonl": {
+    "size_bytes": 37348,
+    "sha256": "09edf76a4421dd1044a17ed6f69fc187c880016440b48b41548745a2a716b49f"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T010000Z-agentic-initiation-start-ca00ec1f/artifacts/session-manifest.json": {
+    "size_bytes": 59399,
+    "sha256": "1b0f0db44123667ab4b48c1cb5a89ab54babbb395ab356d8ccfe4d92850f975b"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T010000Z-agentic-initiation-start-ca00ec1f/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 625,
+    "sha256": "d6d737facc445fb737a8144bf31c6495bd96ce76ce3f0abb86b4d5b88756e3df"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T010000Z-agentic-initiation-start-ca00ec1f/artifacts/reviewers/claude-code/reviewer.stdout.txt": {
+    "size_bytes": 11576,
+    "sha256": "3cfcb46986a4c4da5d1e35871f596a6ac82c7eda1c65f87695affc7c3b09915a"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T010000Z-agentic-initiation-start-ca00ec1f/artifacts/reviewers/claude-code/reviewer.summary.json": {
+    "size_bytes": 2614,
+    "sha256": "2099b764d4b79da9f6a22da7f8d2fabd340d73b502906a8361821d988e3cabb7"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T010000Z-agentic-initiation-start-ca00ec1f/artifacts/reviewers/cursor-cli-fb1/reviewer.stdout.txt": {
+    "size_bytes": 1692874,
+    "sha256": "83127a46cf85c9ec85d8c3dd016cb3d8e2728096aa715fa7c469afe739549be9"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T010000Z-agentic-initiation-start-ca00ec1f/artifacts/reviewers/cursor-cli-fb1/reviewer.summary.json": {
+    "size_bytes": 4217,
+    "sha256": "76aaad34e16e618a049c18c016aca430446d2e6836a2b0b6d71e5895fe05eb14"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T010000Z-agentic-initiation-start-ca00ec1f/artifacts/reviewers/oh-my-pi/reviewer.stdout.txt": {
+    "size_bytes": 8127089,
+    "sha256": "2231bdf2f6eb92a7af4ca2313de47d39d23c640b0dc19d68dae3cea36a097e0f"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T010000Z-agentic-initiation-start-ca00ec1f/artifacts/reviewers/oh-my-pi/reviewer.summary.json": {
+    "size_bytes": 3886,
+    "sha256": "fa85faf8853ce802263424f67d0ac53402009aa3478f636ea4d7721546682a67"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T010000Z-agentic-initiation-start-ca00ec1f/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 7254700,
+    "sha256": "018908fc733aafed600d93f98bad9fff05207b3169bfb71a198448a0c48b2a84"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/17/rollout-2026-10-17T21-38-25-01a14ca8-fa95-73f0-8fdf-b854c09a1e6a.jsonl": {
+    "size_bytes": 1147160,
+    "sha256": "d5a41478223bdc6c4fcace071edbadea3cc541772ba693b3176cd89a74c1e5e3"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/17/rollout-2026-10-17T21-38-12-01a14ca8-c91f-7cc0-8ec3-2ee395fa7429.jsonl": {
+    "size_bytes": 1113277,
+    "sha256": "a15ca6db00ab32d6fcacde82d8e1abf8d45a78a4fc7628f8e79e510210cd89b6"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/17/rollout-2026-10-17T21-38-18-01a14ca8-e167-7352-8b62-ede173324c5e.jsonl": {
+    "size_bytes": 659974,
+    "sha256": "369d69ef842e3a0ee26cebef1638a9b40fb6e2208417b3dc05b22e40e0abd9d0"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T010000Z-agentic-initiation-start-ca00ec1f/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "e57272a571300a73599e1f431a6f761b65fca1ce7f5b1971a3f7b06d4bf73bac"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T010000Z-agentic-initiation-start-ca00ec1f/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 1131699,
+    "sha256": "d6f426c71aa72a755f227d78ea4287370973e232b086cc47f0ed17378fdb5881"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T010000Z-agentic-initiation-start-ca00ec1f/artifacts/analysis/summary.md": {
+    "size_bytes": 3228,
+    "sha256": "3313aa517238845d9a2791eeaa8032194fccf40afd41e97bcb4b5ac2ceea632d"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T010000Z-agentic-initiation-start-ca00ec1f/artifacts/analysis/causality.json": {
+    "size_bytes": 23822,
+    "sha256": "b3f34d370d5df6f89f35bb403545dc33a3472d82893bb1fe80d9478a9220ae91"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/17/rollout-2026-10-17T21-53-23-01a14cb6-af03-7e83-83a1-10a3b93ea5a2.jsonl": {
+    "size_bytes": 1042638,
+    "sha256": "0e5ffb66608a1a022a0c8a30b1583d3e1ed86a1810e8f57fcf37948f6c5ee6b7"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T010000Z-agentic-initiation-start-ca00ec1f/artifacts/usage/usage-summary.json": {
+    "size_bytes": 817,
+    "sha256": "dbd361c719cea1e5faa5f5c6622b677cb40f6a74052c78cc8e7564f517d7bf40"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T194645Z-agentic-initiation-start-f3fa3a60/summary.json": {
+    "size_bytes": 26345,
+    "sha256": "ed452426821015f5dd442e5b83a9feb400f1a9188c35bfc0e1112a97c54cf299"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T194645Z-agentic-initiation-start-f3fa3a60/events.jsonl": {
+    "size_bytes": 43112,
+    "sha256": "110b0035b7aa47f706ac7d6ba5c253a8c1600085e9e797d0793469d2c7430e08"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T194645Z-agentic-initiation-start-f3fa3a60/artifacts/session-manifest.json": {
+    "size_bytes": 67443,
+    "sha256": "b48454c05a3815450e5f8447c8f3e9b39431c6873a6dc458f709346892ba44b6"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T194645Z-agentic-initiation-start-f3fa3a60/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 625,
+    "sha256": "74987cb90e79098fb95cfa7463a7f2b547dae0f881dea983ebe2d9734b105c02"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T194645Z-agentic-initiation-start-f3fa3a60/artifacts/reviewers/cursor-cli/reviewer.stdout.txt": {
+    "size_bytes": 985620,
+    "sha256": "a3a431bfafeb2f237eff5f3d51157b05a6a12d9fd8180e9ae3dcb7f679721d6d"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T194645Z-agentic-initiation-start-f3fa3a60/artifacts/reviewers/cursor-cli/reviewer.summary.json": {
+    "size_bytes": 3664,
+    "sha256": "18f07a27e1e0534003c76a1ee162a2eef27f76ff33fc08d6a7c5aa773c7f1d1e"
+  },
+  "/Users/bominzhang/.kimi-code/sessions/wd_trace-of-thought_ba8720d0910b/session_4fa3a2da-b51a-41b1-9c3d-28eaaf5b5f50/agents/main/wire.jsonl": {
+    "size_bytes": 2245991,
+    "sha256": "54536486afdb0e313c9b8fa4ab762061ca78005364fd3f6a5a25ff1abeb27cbf"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T194645Z-agentic-initiation-start-f3fa3a60/artifacts/reviewers/kimi-code/reviewer.summary.json": {
+    "size_bytes": 5129,
+    "sha256": "e71169ba795d98a0c4804b707ce55780f9da6cad1f33fceec382961bafc12a49"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T194645Z-agentic-initiation-start-f3fa3a60/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 4704868,
+    "sha256": "dc12e4ca4d3ca8cef557872b2d0a34ad05ae717c334ac8080bc59810ec2b951d"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/18/rollout-2026-10-18T16-06-45-01a1509f-b3ca-77b2-a4fb-456e1a6a3845.jsonl": {
+    "size_bytes": 651193,
+    "sha256": "bdc1bd738d3d74ea44df897d9771e2b062a1da2a92b04930caa889ca98ad0a74"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/18/rollout-2026-10-18T16-05-49-01a1509e-d73c-74b3-9924-c1449c0f830a.jsonl": {
+    "size_bytes": 1332833,
+    "sha256": "2af2492c0c1838149a8104b6258d04c37d8c51448abc952e74e4284033521bc3"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/18/rollout-2026-10-18T16-06-16-01a1509f-418f-7211-903e-4f22cbb519f0.jsonl": {
+    "size_bytes": 467156,
+    "sha256": "72be9714ceb5dc3d6b6c08358673ea1e2c9301886e330876c6dad2cb10f835a4"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T194645Z-agentic-initiation-start-f3fa3a60/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "b51c4b2e659ad9b5739be63d837cf293380838071f40dc1f1c8c4be1f27cb199"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T194645Z-agentic-initiation-start-f3fa3a60/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 1194494,
+    "sha256": "98b3602ed3311d1d768b6b8d76d907d49441601d7e4a76b8dd44303c7005ecd3"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T194645Z-agentic-initiation-start-f3fa3a60/artifacts/analysis/summary.md": {
+    "size_bytes": 3180,
+    "sha256": "71fa2869d572f0e63adc905eb68a9e2c34ce0ae01865e193f7f9ff12dea10eb1"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T194645Z-agentic-initiation-start-f3fa3a60/artifacts/analysis/causality.json": {
+    "size_bytes": 21258,
+    "sha256": "74ea7a7680d6693121d1e471ff43f2b5024ad6d17952bfd92e00718c71803fe8"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/18/rollout-2026-10-18T16-31-30-01a150b6-5078-74f3-b5e5-6806be4e1480.jsonl": {
+    "size_bytes": 1040059,
+    "sha256": "0f34de657c225d9dc6b2b83b871dcdab675e4e54d026e1c442df5ed10390be28"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/18/rollout-2026-10-18T16-33-29-01a150b8-2bc8-7311-b8c5-648c0b66fbeb.jsonl": {
+    "size_bytes": 201052,
+    "sha256": "0d15faa82feafbb5a3ad749d120a5cfa50de59651dd015d239567604cece490f"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T194645Z-agentic-initiation-start-f3fa3a60/artifacts/usage/usage-summary.json": {
+    "size_bytes": 816,
+    "sha256": "e243054073500e996c2372a3093f671a32baaa09a7c80d7dc0c226ea9cd1c673"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T200856Z-agentic-initiation-start-9fdb5703/summary.json": {
+    "size_bytes": 21414,
+    "sha256": "055f7fe1584b96b0a19893819a1a9673f888a8ebb12afdebfc0c657dfd156a3c"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T200856Z-agentic-initiation-start-9fdb5703/events.jsonl": {
+    "size_bytes": 41837,
+    "sha256": "7d8727660ffbedf08bf1ad88f885d574bf835476023c74a2cab477435001f915"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T200856Z-agentic-initiation-start-9fdb5703/artifacts/session-manifest.json": {
+    "size_bytes": 100474,
+    "sha256": "6c0cf485549d35386ed234961f4cebfb3800b947752363614fc6a1887e5aaaf6"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T200856Z-agentic-initiation-start-9fdb5703/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 627,
+    "sha256": "42b057549171c60b0d255c6e95d53f9373f1974b9504eb190325d1cb72f02224"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T200856Z-agentic-initiation-start-9fdb5703/artifacts/reviewers/cursor-cli/reviewer.stdout.txt": {
+    "size_bytes": 1533422,
+    "sha256": "251541df071f501e504fd5786626c18bdb27acc7e8be1aa385a875a74f70fedc"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T200856Z-agentic-initiation-start-9fdb5703/artifacts/reviewers/cursor-cli/reviewer.summary.json": {
+    "size_bytes": 3390,
+    "sha256": "b53fc52abda996cfc85c5b8a7d8a917c1dcb5da43c41fb27cefa6f2d9add0cbf"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T200856Z-agentic-initiation-start-9fdb5703/artifacts/reviewers/oh-my-pi/reviewer.stdout.txt": {
+    "size_bytes": 5107009,
+    "sha256": "9a6002536558463c74bdcc9362fea2341691c4ff49f6e6f33033d2f11f57851c"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T200856Z-agentic-initiation-start-9fdb5703/artifacts/reviewers/oh-my-pi/reviewer.summary.json": {
+    "size_bytes": 5886,
+    "sha256": "80ce63e54ec95a8843c13fd1f87ca5afac6174041c8acc0d33efdb759c05f357"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T200856Z-agentic-initiation-start-9fdb5703/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 10296847,
+    "sha256": "23ce1d7355088c02852727d1389230c56a264f567895ab0e06c2987d6032ed60"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/18/rollout-2026-10-18T16-36-49-01a150bb-37eb-7d60-a9a3-16d5a6e5db60.jsonl": {
+    "size_bytes": 1401791,
+    "sha256": "bc420fd13ffbbe74202b9591e5d5bcd630a034376b6709cd08e2cb8214b0b49c"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/18/rollout-2026-10-18T16-36-55-01a150bb-4e3e-7df3-9e47-81eb01f93107.jsonl": {
+    "size_bytes": 1059567,
+    "sha256": "820379cb340962e823e38706583eeba407dca1e890d69bfe0b96a6817e5f05ba"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/18/rollout-2026-10-18T16-36-59-01a150bb-60ae-7373-8287-2ce2192fe132.jsonl": {
+    "size_bytes": 1263534,
+    "sha256": "b2e02756a000cf1314fc4f1e67010454ca495782b476fe9f778a22aa89a1ae23"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T200856Z-agentic-initiation-start-9fdb5703/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "4ba9ce679d8b9be88e2b8671bac4db5730101764f16847177051c056f1c3519a"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T200856Z-agentic-initiation-start-9fdb5703/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 1451351,
+    "sha256": "ef5246d4c10fdb6c202a89494dd027ed34ccd7cc00ab819862f670746a3f7652"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T200856Z-agentic-initiation-start-9fdb5703/artifacts/analysis/summary.md": {
+    "size_bytes": 3177,
+    "sha256": "c66da3edc403fcd670cf12311926609cee119c64ab01961a20e24bb4ab74384b"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T200856Z-agentic-initiation-start-9fdb5703/artifacts/analysis/causality.json": {
+    "size_bytes": 41026,
+    "sha256": "4ad12f0d3e45b3a44973796c4bda78205baeeac1572f43e15290a12146a0dd33"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/18/rollout-2026-10-18T16-51-55-01a150c9-00a0-7021-8688-af7f84290e47.jsonl": {
+    "size_bytes": 1143742,
+    "sha256": "4d46a086302536ceeae33b6f2cb762af213a84e3f785e3bfce88d8ab8dcc754c"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T200856Z-agentic-initiation-start-9fdb5703/artifacts/usage/usage-summary.json": {
+    "size_bytes": 817,
+    "sha256": "e61364979ea9fb14c100919b5818580e5447079a2a01091b0ecafc55226c2254"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T204434Z-agentic-initiation-start-c34d2857/summary.json": {
+    "size_bytes": 20965,
+    "sha256": "14fdff60fd01ac8c37046b07b66f9bac69894516e214556d1d0b25413e8687e2"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T204434Z-agentic-initiation-start-c34d2857/events.jsonl": {
+    "size_bytes": 71377,
+    "sha256": "d37eb5a6e563c170aa6422eca65c2253ab64e86ddf4ee0713f13479b885e1257"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T204434Z-agentic-initiation-start-c34d2857/artifacts/session-manifest.json": {
+    "size_bytes": 72867,
+    "sha256": "0e54a9e3666fd3d5cbffb76f0d280e71290d07b6ca877660fbcd97a317652972"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T204434Z-agentic-initiation-start-c34d2857/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 627,
+    "sha256": "a2e88b57a32bb311008bd8583bf8952ee892424a4831f5534721f9308e16c7a6"
+  },
+  "/Users/bominzhang/.kimi-code/sessions/wd_trace-of-thought_f11e0814ee47/session_ae242c8e-435e-4ccc-ae40-fe27319058fb/agents/main/wire.jsonl": {
+    "size_bytes": 2991171,
+    "sha256": "18a2849e1fe1bff9ebeb8720215a3db2c3e24998cc03f756058d7e4f83e2fe1a"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T204434Z-agentic-initiation-start-c34d2857/artifacts/reviewers/kimi-code/reviewer.summary.json": {
+    "size_bytes": 4053,
+    "sha256": "eaa053a655564be4b17fb27df384c00f5390fbf8f2e18aefd77b04931656a176"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T204434Z-agentic-initiation-start-c34d2857/artifacts/reviewers/oh-my-pi/reviewer.stdout.txt": {
+    "size_bytes": 4758914,
+    "sha256": "826c54323ea91ade2744d6dff2389971d35591314b40a2fb1550ec4214a8b6cd"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T204434Z-agentic-initiation-start-c34d2857/artifacts/reviewers/oh-my-pi/reviewer.summary.json": {
+    "size_bytes": 5398,
+    "sha256": "bca69bacef9426eb5e2dfbde01f47b8a675830a98427d9902e5f9a601cc3e98e"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T204434Z-agentic-initiation-start-c34d2857/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 11220331,
+    "sha256": "2e900c230785aaa8de1dc82c931794b3212bd7ecfe01999eb421aaeb711a8168"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/18/rollout-2026-10-18T17-05-52-01a150d5-d023-7a23-b13a-d4e7e8b60d4f.jsonl": {
+    "size_bytes": 1771560,
+    "sha256": "97921d364b26fe88762c03a77083ba253f3c223541b917ba1b87b11d1394300e"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/18/rollout-2026-10-18T17-06-03-01a150d5-fca3-7a53-903f-8c524b3f54fb.jsonl": {
+    "size_bytes": 1101478,
+    "sha256": "bf444901db5244e032c00a0d3e45e6742c77f0e3f5677249b1afa0f32760d860"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/18/rollout-2026-10-18T17-05-57-01a150d5-e546-73f3-9896-5159b77bc1ed.jsonl": {
+    "size_bytes": 1291818,
+    "sha256": "dafa50eb499a6aeab3886eb6630d3a8ca2f7eae1169a35278b9c409ca057933f"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T204434Z-agentic-initiation-start-c34d2857/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "985df6ba0640014b715ccf050d629541b38791d7c655a254d85aa99afd5b6c4a"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T204434Z-agentic-initiation-start-c34d2857/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 1502893,
+    "sha256": "58351a85de3e62da8694a0d4e61ac0e8884c88e3e1351edbf2758d0f1e717d58"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T204434Z-agentic-initiation-start-c34d2857/artifacts/analysis/summary.md": {
+    "size_bytes": 3177,
+    "sha256": "91aba091bc667f98e3de735c1708d27e0030497af28380bcef7b70526f43f092"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T204434Z-agentic-initiation-start-c34d2857/artifacts/analysis/causality.json": {
+    "size_bytes": 53110,
+    "sha256": "59615ff271eab545928aaacf1b54d110a24974eb1d05acaa9365f6bf5ca7a770"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/18/rollout-2026-10-18T18-03-05-01a1510a-3245-7311-9543-7d51827238ee.jsonl": {
+    "size_bytes": 1147769,
+    "sha256": "ef9fbc7548fec03dad42c368f03f8c2a4e786094a057f32b6e4801b1aa0f6265"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/18/rollout-2026-10-18T18-05-00-01a1510b-f4cd-7bb3-88f3-c5d9a4711c2a.jsonl": {
+    "size_bytes": 199945,
+    "sha256": "c0c5afb0f7e7c66ec8cd7962eb757f69d2524acac57a2a0da666ed72eb01ddda"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T204434Z-agentic-initiation-start-c34d2857/artifacts/usage/usage-summary.json": {
+    "size_bytes": 820,
+    "sha256": "19e9775ae64e90971993bcc9be7945c3c9f2161370a81ba5927627e4e9eb52f7"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T220916Z-agentic-initiation-start-a76c63e5/summary.json": {
+    "size_bytes": 16207,
+    "sha256": "87bd1afcae48531bb82e60dc5d79b79f789862d3c4d9ca5ccc056c4027a64b0b"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T220916Z-agentic-initiation-start-a76c63e5/events.jsonl": {
+    "size_bytes": 40378,
+    "sha256": "2832e5d37edcdac5419b4e69065066fde932025927cdb2e195412291b8e0c774"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T220916Z-agentic-initiation-start-a76c63e5/artifacts/session-manifest.json": {
+    "size_bytes": 43005,
+    "sha256": "7bce235f7bb4ddf910978824ecbf6b6319eb183e903c00e3fdeb48c79b6f1d87"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T220916Z-agentic-initiation-start-a76c63e5/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 625,
+    "sha256": "3250fb4ff03ef03db16818a4185cd867615e18d449f4999be81e23af3cb60ce3"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T220916Z-agentic-initiation-start-a76c63e5/artifacts/reviewers/cursor-cli/reviewer.stdout.txt": {
+    "size_bytes": 676511,
+    "sha256": "033d61b59b4f15e9cbb8f252807be17a233e884040f988fb3ea2477577ba66f9"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T220916Z-agentic-initiation-start-a76c63e5/artifacts/reviewers/cursor-cli/reviewer.summary.json": {
+    "size_bytes": 3439,
+    "sha256": "1d87f7896e4fce62eb3c334f93845f73f7f80bda2a61a9db3eba1a3d3d560a43"
+  },
+  "/Users/bominzhang/.kimi-code/sessions/wd_cline-kanban_37e02a17bb8a/session_03bd67d0-e44d-4520-aaaa-de668370135f/agents/main/wire.jsonl": {
+    "size_bytes": 1625566,
+    "sha256": "986e7f9de2adb5d720a66a15e20e4424364c2d76466ee53b5ab870556c980024"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T220916Z-agentic-initiation-start-a76c63e5/artifacts/reviewers/kimi-code/reviewer.summary.json": {
+    "size_bytes": 4145,
+    "sha256": "f87c21a39b2f9cca390f212ba9aabd9bff7d316cf831c0d31055393713e89145"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T220916Z-agentic-initiation-start-a76c63e5/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 3195685,
+    "sha256": "5154ae4eb45324c55d0df7c09ceb2ea7d69fb37339e4d914058b0241aed0ef84"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/18/rollout-2026-10-18T18-19-37-01a15119-5495-7732-933e-d14e752b0084.jsonl": {
+    "size_bytes": 939106,
+    "sha256": "e0d33a18e6b4b4b76eea22603c6a91e7cbfa4dd8dc49a856ebab754c070a97c9"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T220916Z-agentic-initiation-start-a76c63e5/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "63f289bf493365eaaca858526ca26d9a9fb3a7d82370cb0c0f02603fec04fbd9"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T220916Z-agentic-initiation-start-a76c63e5/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 795149,
+    "sha256": "88155e7ae542ad857d0dcc606e1d006a9468938fd9326bb071f54e33df58534d"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T220916Z-agentic-initiation-start-a76c63e5/artifacts/analysis/summary.md": {
+    "size_bytes": 3160,
+    "sha256": "b7c774ac539be7e9f1a37e17e71721928ead44309f7b6a463dfbcdca291ca315"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T220916Z-agentic-initiation-start-a76c63e5/artifacts/analysis/causality.json": {
+    "size_bytes": 8530,
+    "sha256": "9499ed57644db17a0eed535badc224d950cb41d0cbb7c427879740a6e1a04108"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/18/rollout-2026-10-18T18-30-53-01a15123-a625-7e82-9e89-4e0d470a79cd.jsonl": {
+    "size_bytes": 969989,
+    "sha256": "83cf5f02f47f5e0d888246d4640d92a12d482ceefe8e5be50a99147e3fd31f6d"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T220916Z-agentic-initiation-start-a76c63e5/artifacts/usage/usage-summary.json": {
+    "size_bytes": 814,
+    "sha256": "ccb064917123eb0691a52ada8daf97539252cfe74b11c16064c7ba9033164f89"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T221037Z-agentic-initiation-start-382fcb0c/summary.json": {
+    "size_bytes": 20704,
+    "sha256": "f886008f96e9ddc2c7e6667a567b6f218949d29b959346e251637ae344612a85"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T221037Z-agentic-initiation-start-382fcb0c/events.jsonl": {
+    "size_bytes": 27064,
+    "sha256": "3dfc29d9ad5a1178fcc20a695cad9793c2966e1471574cad1dd80ad584a841aa"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T221037Z-agentic-initiation-start-382fcb0c/artifacts/session-manifest.json": {
+    "size_bytes": 75413,
+    "sha256": "2af7b732b8f8e70c136a0d6fb14d98029ab982839005953a6096ca0c022f2acd"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T221037Z-agentic-initiation-start-382fcb0c/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 625,
+    "sha256": "06fb22b2b477e4f30015fc60bca60be08e51ef6a8ff09a6a32d362fa2bf62f11"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T221037Z-agentic-initiation-start-382fcb0c/artifacts/reviewers/cursor-cli/reviewer.stdout.txt": {
+    "size_bytes": 841163,
+    "sha256": "61679203f8c8edaeac754e7de20b4c5d6bbfe544cf5b3a5334f5f9fa3be98af8"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T221037Z-agentic-initiation-start-382fcb0c/artifacts/reviewers/cursor-cli/reviewer.summary.json": {
+    "size_bytes": 4360,
+    "sha256": "525072cdb5686d375153641cd3a5b071a2e0aabe4d0aab2ddf000163dcd2e7d1"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T221037Z-agentic-initiation-start-382fcb0c/artifacts/reviewers/oh-my-pi/reviewer.stdout.txt": {
+    "size_bytes": 6658367,
+    "sha256": "ae42f4d52ff752bc4ef173c65cc454b64a6aa236ac04a9a542d2d56b20f8e993"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T221037Z-agentic-initiation-start-382fcb0c/artifacts/reviewers/oh-my-pi/reviewer.summary.json": {
+    "size_bytes": 5398,
+    "sha256": "5b0bded87c46765d6554ed78c8b119c292930c2f28b606f8a39f72cc3664e775"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T221037Z-agentic-initiation-start-382fcb0c/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 5763321,
+    "sha256": "2cc600807a9b2d25c47cc003048b5aae6ed354b2af3b06bfde4ceb8598ec633e"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/18/rollout-2026-10-18T18-24-25-01a1511d-b9e1-7182-91fe-4c9046194a56.jsonl": {
+    "size_bytes": 2029775,
+    "sha256": "3701182818daaed409a8a5564350f78393962f8099b2530f7ff147684d50b49c"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/18/rollout-2026-10-18T18-23-57-01a1511d-4c7f-72f3-b4ed-efdf225efe9f.jsonl": {
+    "size_bytes": 1719767,
+    "sha256": "48dea687685b7fe79644f9d702d90d2f795676dc921a4aaf18e324b631bb3ecc"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/18/rollout-2026-10-18T18-24-56-01a1511e-3367-7872-9d24-26c49fabfeda.jsonl": {
+    "size_bytes": 1019498,
+    "sha256": "cd6b994c7d3ec9e362685e2d7ca715d00cd303d4033815cef72f2b0632189555"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T221037Z-agentic-initiation-start-382fcb0c/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "3c8450b27e2ca064d471b22cd9722dfcb1de4cecd6c33b010acf3c006a5bf151"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T221037Z-agentic-initiation-start-382fcb0c/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 1468327,
+    "sha256": "13fbe450f4fc64667f714928b8eb480cea46f9b66818f3621d2f6dda0d5aa628"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T221037Z-agentic-initiation-start-382fcb0c/artifacts/analysis/summary.md": {
+    "size_bytes": 3178,
+    "sha256": "e9c7cbb45534f3cf7397bf7eeb6dc9ceeca9d34481c9b357fe238862275ee727"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T221037Z-agentic-initiation-start-382fcb0c/artifacts/analysis/causality.json": {
+    "size_bytes": 49279,
+    "sha256": "430abfeb4769cc259188f7f5674dafaebfa66d3baf19a68b34de9a74e21a66bc"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/18/rollout-2026-10-18T18-51-12-01a15136-4146-73d1-bc14-2caf84ad5489.jsonl": {
+    "size_bytes": 1174901,
+    "sha256": "60cea9ac79f66e29be3be6c62013861c65ab89759ed0107e53608e1e2b6bbaef"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T221037Z-agentic-initiation-start-382fcb0c/artifacts/usage/usage-summary.json": {
+    "size_bytes": 816,
+    "sha256": "f7f44da6a4ab7d6ffc60ffa72e9625ad835cee16bf99a1c26c31d6c016e652f3"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T225054Z-agentic-initiation-start-5ccbc507/summary.json": {
+    "size_bytes": 14960,
+    "sha256": "2234032c1d6e39b6300a51ea8b1df10ffca77d8570526b5f1e0344c741efa738"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T225054Z-agentic-initiation-start-5ccbc507/events.jsonl": {
+    "size_bytes": 37257,
+    "sha256": "52d937121261e36f1a6d55156db921ea27b1dad7fd5ef7812fe16395360de3ab"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T225054Z-agentic-initiation-start-5ccbc507/artifacts/session-manifest.json": {
+    "size_bytes": 6640,
+    "sha256": "9c0e828ea4d8354b478f39ffe7dea0c8bf9cee28b81ae57198d293af584638be"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T225054Z-agentic-initiation-start-5ccbc507/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 662,
+    "sha256": "a51b971776fef7a7c1a259ee042bc2e4fc517cf153badd3abcf183bd74da3dba"
+  },
+  "/Users/bominzhang/.kimi-code/sessions/wd_trace-of-thought-landing-page_a5503c177fd9/session_777f3a64-9508-4c66-aa64-aac8a890a010/agents/main/wire.jsonl": {
+    "size_bytes": 1066600,
+    "sha256": "84be5ab44126e9e60be10ef83af58908644ac65d1ea9a35acfc7ec66d177bc5b"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T225054Z-agentic-initiation-start-5ccbc507/artifacts/reviewers/kimi-code/reviewer.summary.json": {
+    "size_bytes": 5316,
+    "sha256": "2b5d1a2b4bf71ed9a8b3715dc7c8ae1f82a856263c671b576775befc0b2d5261"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T225054Z-agentic-initiation-start-5ccbc507/artifacts/reviewers/oh-my-pi/reviewer.stdout.txt": {
+    "size_bytes": 4144981,
+    "sha256": "92ee19680e8246a3afa7544b58b449f4d9d69502ee9123d4ed3c495b220cb1ee"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T225054Z-agentic-initiation-start-5ccbc507/artifacts/reviewers/oh-my-pi/reviewer.summary.json": {
+    "size_bytes": 4005,
+    "sha256": "1004609d1fe7658f7c7e69349cdd8b7652a9175fa2d78346653e254727039537"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T225054Z-agentic-initiation-start-5ccbc507/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 6324175,
+    "sha256": "04584d684a00b933a76cde989badb52edb3050beeabd74f1ef5c19d8558c3e18"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/18/rollout-2026-10-18T18-59-40-01a1513e-010d-78d3-ae15-63282905dc85.jsonl": {
+    "size_bytes": 763419,
+    "sha256": "18500c1c7fcc3ee12293a41cc792174b802118b7d03140f777dfcc56292c68ff"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/18/rollout-2026-10-18T19-00-06-01a1513e-66af-7470-8101-b5d974b08916.jsonl": {
+    "size_bytes": 616272,
+    "sha256": "473f8cbdaf8c06f23291b92ae9f71c572bf029a37880dcf68b84e202f95b1940"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T225054Z-agentic-initiation-start-5ccbc507/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "f9cfa859be4f1a3e85862a8b2dac56f06606b4581455a00b203d98a185dd5b78"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T225054Z-agentic-initiation-start-5ccbc507/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 382720,
+    "sha256": "4994ca2e26fe8872d237ebc8332ff522daf9732bbd96a6fa326fa4857ca60a6a"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T225054Z-agentic-initiation-start-5ccbc507/artifacts/analysis/summary.md": {
+    "size_bytes": 3155,
+    "sha256": "75c8ef0ae51c1277487b55ace7195d18b365d8878f0268cbfd7673e3a9b97cd6"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T225054Z-agentic-initiation-start-5ccbc507/artifacts/analysis/causality.json": {
+    "size_bytes": 13967,
+    "sha256": "91abd8f85e6383684d32685e386ddf134a3d41ca1e66b3e1af8e55e8bf69160f"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/18/rollout-2026-10-18T19-14-06-01a1514b-36cf-7bf1-97dd-7eff217b0857.jsonl": {
+    "size_bytes": 884838,
+    "sha256": "3e55a3466c142dce7ab3e3b0da587ce279a88ba1bd7388e46ae46b35852995c1"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T225054Z-agentic-initiation-start-5ccbc507/artifacts/usage/usage-summary.json": {
+    "size_bytes": 821,
+    "sha256": "89d21299e71039b524162e236c28e988f84afb47111e03fa5ed1fe26fe0345fb"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T225400Z-agentic-initiation-start-62c05d10/summary.json": {
+    "size_bytes": 16844,
+    "sha256": "4cf577263e63f391922ae76f4581416d5d554c5958fe79b448f91894ddf76831"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T225400Z-agentic-initiation-start-62c05d10/events.jsonl": {
+    "size_bytes": 55768,
+    "sha256": "ffe275b3f86819e766a3e711f870535d94fa7a6299cb6235970534bae2697d72"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T225400Z-agentic-initiation-start-62c05d10/artifacts/session-manifest.json": {
+    "size_bytes": 49965,
+    "sha256": "4d45d235dd5f2dc71f819c96751d12759265d0701a0d27fbc68ba5c759a06d72"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T225400Z-agentic-initiation-start-62c05d10/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 662,
+    "sha256": "f3cd7df64da8f225737cd7e368c85f69cc1ea977a064ea5cc1fda0a1b8e39023"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T225400Z-agentic-initiation-start-62c05d10/artifacts/reviewers/cursor-cli/reviewer.stdout.txt": {
+    "size_bytes": 896941,
+    "sha256": "526ff14d2bec4eb7236aa724f87411ef0781da006a5d2f1c4a09b2c8cfa73a29"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T225400Z-agentic-initiation-start-62c05d10/artifacts/reviewers/cursor-cli/reviewer.summary.json": {
+    "size_bytes": 3618,
+    "sha256": "2c9cc428eaa77b0d59c967301869faf17d2e70e734e1bc81e616b49b1debd83c"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T225400Z-agentic-initiation-start-62c05d10/artifacts/reviewers/oh-my-pi/reviewer.stdout.txt": {
+    "size_bytes": 4920510,
+    "sha256": "9a3cfb19cec1232b3541e394fb4ae77fa0a30a603a6dc5e987df03d652ad1be0"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T225400Z-agentic-initiation-start-62c05d10/artifacts/reviewers/oh-my-pi/reviewer.summary.json": {
+    "size_bytes": 4844,
+    "sha256": "ff170452090bf13600c730ed090ec0938df09e90073147638933f685f9518b2c"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T225400Z-agentic-initiation-start-62c05d10/artifacts/trajectory/rvf/rollout.jsonl": {
+    "size_bytes": 5094243,
+    "sha256": "faa00629ce347600cb07e656797de829bdcf6982236a7ef657faab9e1cb51d1b"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/18/rollout-2026-10-18T19-04-11-01a15142-2317-7af1-9bf0-73e254d9332d.jsonl": {
+    "size_bytes": 607449,
+    "sha256": "573f23a8e103c4e507ec826b6b95cf75534c85696e95fa52c018521e2243c034"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/18/rollout-2026-10-18T19-03-50-01a15141-d269-79a1-bde8-a4d132797363.jsonl": {
+    "size_bytes": 1137532,
+    "sha256": "9ab462cdc316c2523d9424505127789373385908fd64366df52e25aab92102a5"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T225400Z-agentic-initiation-start-62c05d10/artifacts/analysis/.analyze-thread.status.json": {
+    "size_bytes": 683,
+    "sha256": "55127201810a09997c41abf36e3d763faa6221cac32f973965c310633599821c"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T225400Z-agentic-initiation-start-62c05d10/artifacts/analysis/.analyze-thread.log": {
+    "size_bytes": 1432032,
+    "sha256": "42c83cb8ef289fc0ac01d9c2e2366cf7fd86e56a37497f13c9c20a7fddcd1df6"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T225400Z-agentic-initiation-start-62c05d10/artifacts/analysis/summary.md": {
+    "size_bytes": 3160,
+    "sha256": "71d97d02fdeae0288be18bfa7592391386a7b1ce749dba515df8d21f982c2728"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T225400Z-agentic-initiation-start-62c05d10/artifacts/analysis/causality.json": {
+    "size_bytes": 25682,
+    "sha256": "266468eb2266bd2ba698c46b0d8616979b64eee8c5963d88f0ffd3ce84c3b386"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/18/rollout-2026-10-18T19-20-43-01a15151-4573-7580-819d-3ac8390f3abc.jsonl": {
+    "size_bytes": 1140009,
+    "sha256": "422bbcbfc07f17e9b7ed646cbc560889778e7d06abf8e8bf0617fd4e0891c4c3"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T225400Z-agentic-initiation-start-62c05d10/artifacts/usage/usage-summary.json": {
+    "size_bytes": 816,
+    "sha256": "4f0177a487eec56aec7a6d9813c0c8ab0e50eac344d30aec589895e9e1f464b5"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T230102Z-prepare-run-fde35e8f/summary.json": {
+    "size_bytes": 12271,
+    "sha256": "211aa2d65d50893ed90b01039e4d7a07a74c407dcf1738d11491b824c439f401"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T230102Z-prepare-run-fde35e8f/events.jsonl": {
+    "size_bytes": 101409,
+    "sha256": "2fc951884af3f15efcf5501411843324e51c48cc44f53ca0a2959bf29e19bfed"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T230102Z-prepare-run-fde35e8f/artifacts/session-manifest.json": {
+    "size_bytes": 16103,
+    "sha256": "3ba36027ace65276d7f96d1b35535ebf78fb169956931d3e6459765548a09ac7"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T230102Z-prepare-run-fde35e8f/artifacts/trajectory/rvf/rollout.manifest.json": {
+    "size_bytes": 181,
+    "sha256": "f21a2add7e894b5176a2085cead827309b8ef76492234f2d5b4f3bf475c32ece"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T230102Z-prepare-run-fde35e8f/artifacts/reviewers/cursor-cli/reviewer.stdout.txt": {
+    "size_bytes": 825994,
+    "sha256": "946504ef339366d2f353f8ba6ad9f14f079d15cb9939d4fe03f6a9ce9a75121e"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T230102Z-prepare-run-fde35e8f/artifacts/reviewers/cursor-cli/reviewer.summary.json": {
+    "size_bytes": 3618,
+    "sha256": "996cc19d16fa8718ae93a3e4953a2520b89dcaa38bab25c173bfc854e80e8aeb"
+  },
+  "/Users/bominzhang/.kimi-code/sessions/wd_review-validate-fix_3b08c00ea2f8/session_89d6da5e-2358-408e-aead-8d4d920698e3/agents/main/wire.jsonl": {
+    "size_bytes": 1837447,
+    "sha256": "a81e7047d78ae53c2dba31d72d85a168b5c1c1d951b531e976195a9f66fcb869"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T230102Z-prepare-run-fde35e8f/artifacts/reviewers/kimi-code/reviewer.summary.json": {
+    "size_bytes": 5183,
+    "sha256": "c1d45990fce0b8495379a12d2a4a4ac0b7085f644568db1107e4ebf7a2cac4dc"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/18/rollout-2026-10-18T18-42-36-01a1512e-6060-75c3-9211-255f6360e957.jsonl": {
+    "size_bytes": 4657905,
+    "sha256": "689f0266fa03666d3fb47bd5ae31ede0299387e9f564bdf078f70a6c8095c0ee"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/18/rollout-2026-10-18T19-16-41-01a1514d-93b1-7970-adc2-65cc56e8afd6.jsonl": {
+    "size_bytes": 1000473,
+    "sha256": "04c35767568b28371a5897b82f1493313d4c85f14bfcec192201f5a58a445aae"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T230102Z-prepare-run-fde35e8f/artifacts/usage/usage-summary.json": {
+    "size_bytes": 701,
+    "sha256": "1e921a368ddc43e36f1119a150557277f667667e8436741dec2203dc2c69b5aa"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T231614Z-agentic-initiation-start-59c031c5/summary.json": {
+    "size_bytes": 8237,
+    "sha256": "a23fde90a9c5548efd8745f60263cb39a07bd355731969d98d8d41a9efa65d9f"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T231614Z-agentic-initiation-start-59c031c5/events.jsonl": {
+    "size_bytes": 291506,
+    "sha256": "78982f5bac6215073a6dd02cafe64cb5b86ba1de8e48c99eca7dcca213589a5b"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T231614Z-agentic-initiation-start-59c031c5/artifacts/session-manifest.json": {
+    "size_bytes": 161114,
+    "sha256": "6040625877b9f1f8c20402391f6eaf500c2e0f8d0f927aa5bcaf1026f0be9e4e"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T231614Z-agentic-initiation-start-59c031c5/artifacts/reviewers/cursor-cli/reviewer.stdout.txt": {
+    "size_bytes": 1893615,
+    "sha256": "827ea3fe93bf7ccaf6c570e7b624d79332e551ace4763b63978c551b2c3b43c5"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T231614Z-agentic-initiation-start-59c031c5/artifacts/reviewers/cursor-cli/reviewer.summary.json": {
+    "size_bytes": 4130,
+    "sha256": "7bf59ec42b548cc3d4c00b5b7d87c68e90d535814d2e7bad65f0eaeb3687accc"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T231614Z-agentic-initiation-start-59c031c5/artifacts/reviewers/oh-my-pi/reviewer.stdout.txt": {
+    "size_bytes": 8043788,
+    "sha256": "4a1d73f86d85ac82d5c10887095a214d4654c77a553c3995407ec770e43fb994"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T231614Z-agentic-initiation-start-59c031c5/artifacts/reviewers/oh-my-pi/reviewer.summary.json": {
+    "size_bytes": 5475,
+    "sha256": "873c826ce9bef6ea71aa8b2929d501a788afb0136f76a787db4ce29ea010526a"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/18/rollout-2026-10-18T17-05-17-01a150d5-49d8-7500-8ba8-ded3355a3a72.jsonl": {
+    "size_bytes": 9948331,
+    "sha256": "498b321ba83d941cfffca69c7afa4dabb50422dfcd305239a047e1c47560784d"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T232001Z-agentic-initiation-start-35ef033c/summary.json": {
+    "size_bytes": 8253,
+    "sha256": "12171beb5b6f2590b4d6cb8ed6174d5007e24f0a0233112387e73baf7b0de6e3"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T232001Z-agentic-initiation-start-35ef033c/events.jsonl": {
+    "size_bytes": 64116,
+    "sha256": "8434341a151daffb8727679a7527e125e564332e7c33b58d2842c41ea4b068a5"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T232001Z-agentic-initiation-start-35ef033c/artifacts/session-manifest.json": {
+    "size_bytes": 46058,
+    "sha256": "69a4fe6e69c779654ccd3971cc3f9a4f8ddb30547b4589d2dbc6a326e7bf7b58"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T232001Z-agentic-initiation-start-35ef033c/artifacts/reviewers/cursor-cli/reviewer.stdout.txt": {
+    "size_bytes": 818446,
+    "sha256": "afe14ff18e01045d8542f164752f249444502ae0aa37ee081d2ca5dba50f5913"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T232001Z-agentic-initiation-start-35ef033c/artifacts/reviewers/cursor-cli/reviewer.summary.json": {
+    "size_bytes": 3582,
+    "sha256": "caa6651fd19033877379b932c0f2e0603baf6f460fad7be020b19bc9a5260fab"
+  },
+  "/Users/bominzhang/.kimi-code/sessions/wd_cline-kanban_e2e9995d9239/session_1da17ee4-dc1a-4bb7-9909-5a5d47e56acb/agents/main/wire.jsonl": {
+    "size_bytes": 2175121,
+    "sha256": "082f2c0f58ce8a50cfb17a1853739264c0d4a0637584416d673e103878e16e27"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T232001Z-agentic-initiation-start-35ef033c/artifacts/reviewers/kimi-code/reviewer.summary.json": {
+    "size_bytes": 4752,
+    "sha256": "7b045dd376c0c8ff2cc37b02c024637dd919e4d546ef0248baab2f2c0d128465"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/18/rollout-2026-10-18T18-32-06-01a15124-c561-77e1-9121-61ac1700c4d7.jsonl": {
+    "size_bytes": 5712300,
+    "sha256": "f94c69758210686f46ae39754993ffe7e34d4f94c987d7ba9687a102e26219a5"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T232132Z-agentic-initiation-start-fa093a38/summary.json": {
+    "size_bytes": 7636,
+    "sha256": "62b3ba1e2a4ca1e0a16585afe37b3409689daea38be52e97fac4235a1e518d07"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T232132Z-agentic-initiation-start-fa093a38/events.jsonl": {
+    "size_bytes": 61897,
+    "sha256": "f3261a48c2d1bfc58465296da44b1de7da7b2ff44f56466d6c028ff0a3df377e"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T232132Z-agentic-initiation-start-fa093a38/artifacts/session-manifest.json": {
+    "size_bytes": 99335,
+    "sha256": "1ed7d97e0ffa90f9bc673fe3ff36c9ca95051a4b33d758cbe200e3764002c66e"
+  },
+  "/Users/bominzhang/.kimi-code/sessions/wd_cline-kanban_84debd609acd/session_828c26b0-5cc5-4461-a82b-c309a4875d59/agents/main/wire.jsonl": {
+    "size_bytes": 2277133,
+    "sha256": "6c85f8c9ad8cc1e18a43994342c06fa2c1ac5316d347c27b6ff629095c1c064e"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T232132Z-agentic-initiation-start-fa093a38/artifacts/reviewers/kimi-code/reviewer.summary.json": {
+    "size_bytes": 4132,
+    "sha256": "4d148458617b588acc8a49a8461023a12beaccf6ddb3f047f8362ce36023580a"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T232132Z-agentic-initiation-start-fa093a38/artifacts/reviewers/oh-my-pi/reviewer.stdout.txt": {
+    "size_bytes": 4948998,
+    "sha256": "391f9b76c981532841aa84d001898c457c69fe6cafb95ac8d8aa8ffe47850569"
+  },
+  "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T232132Z-agentic-initiation-start-fa093a38/artifacts/reviewers/oh-my-pi/reviewer.summary.json": {
+    "size_bytes": 4617,
+    "sha256": "24fd96188b0acf93995739492d8005789721e9892d7d6cbd38e7010714ccc305"
+  },
+  "/Users/bominzhang/.codex/sessions/2026/10/18/rollout-2026-10-18T19-19-43-01a15107-227a-77f0-bac0-e3763fcb749b_01a15150-5c50-7c12-838a-731ffdeabe5a.jsonl": {
+    "size_bytes": 1595399,
+    "sha256": "06d0bf1100046d925cafcc4d1571626e67170be1e3c88e345299fd920e68a405"
+  }
+}

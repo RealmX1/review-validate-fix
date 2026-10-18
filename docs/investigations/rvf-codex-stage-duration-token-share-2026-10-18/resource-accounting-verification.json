@@ -1,0 +1,179 @@
+{
+  "cutoff_utc": "2026-10-18T23:30:59Z",
+  "status": "passed",
+  "checks": [
+    {
+      "check": "继承基线、计数重置、重复快照、响应去重与缓存口径的合成自检",
+      "passed": true
+    },
+    {
+      "check": "所有组件之间不存在重复的 Codex response_id",
+      "passed": true
+    },
+    {
+      "check": "每条用量满足输入加输出等于总量，缓存及 reasoning 为子集",
+      "passed": true
+    },
+    {
+      "check": "逐响应明细与逐组件总量相等",
+      "passed": true
+    },
+    {
+      "check": "每条核算记录的来源均有 SHA256 清单",
+      "passed": true
+    },
+    {
+      "check": "主样本分母等于所有已归属组件之和",
+      "passed": true
+    },
+    {
+      "check": "Analyze 分子包括后台主线程和其派生子代理",
+      "passed": true
+    },
+    {
+      "check": "所有已结束 Analyze 页脚与该主线程非缓存输入加输出一致",
+      "passed": true
+    },
+    {
+      "check": "全流程墙钟由主流程、派发间隔和 Analyze 主线程组成",
+      "passed": true
+    },
+    {
+      "check": "主样本所有主流程与 Analyze 均在截止前结束",
+      "passed": true
+    },
+    {
+      "check": "原始响应独立抽样：最新轮次 rvf-20261018T225400Z-agentic-initiation-start-62c05d10",
+      "passed": true
+    },
+    {
+      "check": "原始响应独立抽样：总 Token 中位附近轮次 rvf-20261017T210527Z-agentic-initiation-start-a0644009",
+      "passed": true
+    },
+    {
+      "check": "原始响应独立抽样：总 Token 最大轮次 rvf-20261018T204434Z-agentic-initiation-start-c34d2857",
+      "passed": true
+    }
+  ],
+  "self_check_stdout": "核算自检通过：继承基线、重复快照、计数重置、响应去重、缓存桶、reasoning 子集、并行时间并集与分位数。\n",
+  "ledger_record_count": 6827,
+  "distinct_codex_response_id_count": 5009,
+  "analyze_footer_cross_checks": [
+    {
+      "run_id": "rvf-20261012T193340Z-agentic-initiation-start-ca750cf9",
+      "footer_tokens_used": 133566,
+      "noncached_input_plus_output": 133566
+    },
+    {
+      "run_id": "rvf-20261016T204918Z-agentic-initiation-start-3aa3ed36",
+      "footer_tokens_used": 133059,
+      "noncached_input_plus_output": 133059
+    },
+    {
+      "run_id": "rvf-20261017T210036Z-agentic-initiation-start-97ba0952",
+      "footer_tokens_used": 118158,
+      "noncached_input_plus_output": 118158
+    },
+    {
+      "run_id": "rvf-20261017T210527Z-agentic-initiation-start-a0644009",
+      "footer_tokens_used": 124149,
+      "noncached_input_plus_output": 124149
+    },
+    {
+      "run_id": "rvf-20261017T214430Z-agentic-initiation-start-7ec9cd87",
+      "footer_tokens_used": 140329,
+      "noncached_input_plus_output": 140329
+    },
+    {
+      "run_id": "rvf-20261017T215657Z-prepare-run-b1f04af7",
+      "footer_tokens_used": 131264,
+      "noncached_input_plus_output": 131264
+    },
+    {
+      "run_id": "rvf-20261017T220201Z-agentic-initiation-start-334d8e09",
+      "footer_tokens_used": 104799,
+      "noncached_input_plus_output": 104799
+    },
+    {
+      "run_id": "rvf-20261017T221421Z-agentic-initiation-start-7f35edec",
+      "footer_tokens_used": 116727,
+      "noncached_input_plus_output": 116727
+    },
+    {
+      "run_id": "rvf-20261017T222629Z-agentic-initiation-start-be571a86",
+      "footer_tokens_used": 147899,
+      "noncached_input_plus_output": 147899
+    },
+    {
+      "run_id": "rvf-20261018T004603Z-agentic-initiation-start-d1277a60",
+      "footer_tokens_used": 141802,
+      "noncached_input_plus_output": 141802
+    },
+    {
+      "run_id": "rvf-20261018T010000Z-agentic-initiation-start-ca00ec1f",
+      "footer_tokens_used": 129320,
+      "noncached_input_plus_output": 129320
+    },
+    {
+      "run_id": "rvf-20261018T194645Z-agentic-initiation-start-f3fa3a60",
+      "footer_tokens_used": 139695,
+      "noncached_input_plus_output": 139695
+    },
+    {
+      "run_id": "rvf-20261018T200856Z-agentic-initiation-start-9fdb5703",
+      "footer_tokens_used": 138470,
+      "noncached_input_plus_output": 138470
+    },
+    {
+      "run_id": "rvf-20261018T204434Z-agentic-initiation-start-c34d2857",
+      "footer_tokens_used": 137044,
+      "noncached_input_plus_output": 137044
+    },
+    {
+      "run_id": "rvf-20261018T220916Z-agentic-initiation-start-a76c63e5",
+      "footer_tokens_used": 125666,
+      "noncached_input_plus_output": 125666
+    },
+    {
+      "run_id": "rvf-20261018T221037Z-agentic-initiation-start-382fcb0c",
+      "footer_tokens_used": 139017,
+      "noncached_input_plus_output": 139017
+    },
+    {
+      "run_id": "rvf-20261018T225054Z-agentic-initiation-start-5ccbc507",
+      "footer_tokens_used": 121528,
+      "noncached_input_plus_output": 121528
+    },
+    {
+      "run_id": "rvf-20261018T225400Z-agentic-initiation-start-62c05d10",
+      "footer_tokens_used": 139779,
+      "noncached_input_plus_output": 139779
+    }
+  ],
+  "independent_raw_response_samples": [
+    {
+      "run_id": "rvf-20261018T225400Z-agentic-initiation-start-62c05d10",
+      "selection_reason": "最新轮次",
+      "source": "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T225400Z-agentic-initiation-start-62c05d10/artifacts/trajectory/rvf/rollout.jsonl",
+      "source_sha256": "faa00629ce347600cb07e656797de829bdcf6982236a7ef657faab9e1cb51d1b",
+      "raw_response_total_tokens": 12976434,
+      "reported_main_total_tokens": 12976434
+    },
+    {
+      "run_id": "rvf-20261017T210527Z-agentic-initiation-start-a0644009",
+      "selection_reason": "总 Token 中位附近轮次",
+      "source": "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261017T210527Z-agentic-initiation-start-a0644009/artifacts/trajectory/rvf/rollout.jsonl",
+      "source_sha256": "61ceb967c47e6ec760108097f5e8991b484923be9c2a6a589bf8dd6cd8a45bbd",
+      "raw_response_total_tokens": 16191237,
+      "reported_main_total_tokens": 16191237
+    },
+    {
+      "run_id": "rvf-20261018T204434Z-agentic-initiation-start-c34d2857",
+      "selection_reason": "总 Token 最大轮次",
+      "source": "/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-20261018T204434Z-agentic-initiation-start-c34d2857/artifacts/trajectory/rvf/rollout.jsonl",
+      "source_sha256": "2e900c230785aaa8de1dc82c931794b3212bd7ecfe01999eb421aaeb711a8168",
+      "raw_response_total_tokens": 30074677,
+      "reported_main_total_tokens": 30074677
+    }
+  ]
+}
