@@ -1,0 +1,197 @@
+[
+  {
+    "case": "first-review-before-prompt",
+    "candidate_path_count": 1,
+    "review_state_filtered": 0,
+    "other_owner_filtered": 0,
+    "known_defect": false
+  },
+  {
+    "case": "ordinary-prompt-before-handback",
+    "candidate_path_count": 1,
+    "review_state_filtered": 0,
+    "other_owner_filtered": 0,
+    "known_defect": false
+  },
+  {
+    "case": "manual-before-handback",
+    "candidate_path_count": 1,
+    "known_defect": false
+  },
+  {
+    "case": "handback-current-baseline",
+    "candidate_path_count": 0,
+    "review_state_filtered": 0,
+    "other_owner_filtered": 0,
+    "known_defect": true
+  },
+  {
+    "case": "handback-frozen-initial-only",
+    "candidate_path_count": 0,
+    "review_state_filtered": 0,
+    "other_owner_filtered": 0,
+    "known_defect": true
+  },
+  {
+    "case": "handback-both-overrides",
+    "candidate_path_count": 1,
+    "review_state_filtered": 0,
+    "other_owner_filtered": 0,
+    "known_defect": false
+  },
+  {
+    "case": "handback-with-available-owned-units",
+    "candidate_path_count": 0,
+    "review_state_filtered": 0,
+    "other_owner_filtered": 0,
+    "known_defect": true
+  },
+  {
+    "case": "allocation-after-handback",
+    "candidate_unit_count": 0,
+    "known_defect": true
+  },
+  {
+    "case": "handback-older-highwater",
+    "candidate_path_count": 0,
+    "review_state_filtered": 0,
+    "other_owner_filtered": 0,
+    "known_defect": true
+  },
+  {
+    "case": "manual-after-handback",
+    "candidate_path_count": 0,
+    "known_defect": true
+  },
+  {
+    "case": "base-ff-absorption",
+    "candidate_path_count": 0,
+    "review_state_filtered": 0,
+    "other_owner_filtered": 0,
+    "known_defect": false
+  },
+  {
+    "case": "detached-base-ff-absorption",
+    "candidate_path_count": 0,
+    "review_state_filtered": 0,
+    "other_owner_filtered": 0,
+    "known_defect": false
+  },
+  {
+    "case": "merge-absorption",
+    "candidate_path_count": 1,
+    "review_state_filtered": 0,
+    "other_owner_filtered": 0,
+    "known_defect": false
+  },
+  {
+    "case": "rebase-absorption",
+    "candidate_path_count": 1,
+    "review_state_filtered": 0,
+    "other_owner_filtered": 0,
+    "known_defect": false
+  },
+  {
+    "case": "on-main-before-next-prompt",
+    "candidate_path_count": 1,
+    "review_state_filtered": 0,
+    "other_owner_filtered": 0,
+    "known_defect": false
+  },
+  {
+    "case": "on-main-after-next-prompt",
+    "candidate_path_count": 0,
+    "review_state_filtered": 0,
+    "other_owner_filtered": 0,
+    "known_defect": true
+  },
+  {
+    "case": "on-main-manual-before-first-review",
+    "candidate_path_count": 0,
+    "known_defect": true
+  },
+  {
+    "case": "available-owned",
+    "candidate_path_count": 1,
+    "review_state_filtered": 0,
+    "other_owner_filtered": 0,
+    "known_defect": false
+  },
+  {
+    "case": "tracker-reviewed-owned",
+    "candidate_path_count": 0,
+    "review_state_filtered": 1,
+    "other_owner_filtered": 0,
+    "known_defect": false
+  },
+  {
+    "case": "reviewed-highwater-at-head",
+    "candidate_path_count": 0,
+    "review_state_filtered": 0,
+    "other_owner_filtered": 0,
+    "known_defect": false
+  },
+  {
+    "case": "strong-other-owner",
+    "candidate_path_count": 0,
+    "review_state_filtered": 0,
+    "other_owner_filtered": 1,
+    "known_defect": false
+  },
+  {
+    "case": "weak-other-owner",
+    "candidate_path_count": 1,
+    "review_state_filtered": 0,
+    "other_owner_filtered": 0,
+    "known_defect": false
+  },
+  {
+    "case": "nonancestor-highwater-fallback",
+    "candidate_path_count": 1,
+    "review_state_filtered": 0,
+    "other_owner_filtered": 0,
+    "known_defect": false
+  },
+  {
+    "case": "merge-handback",
+    "candidate_path_count": 0,
+    "review_state_filtered": 0,
+    "other_owner_filtered": 0,
+    "known_defect": true
+  },
+  {
+    "case": "squash-handback",
+    "candidate_path_count": 1,
+    "review_state_filtered": 0,
+    "other_owner_filtered": 0,
+    "known_defect": false
+  },
+  {
+    "case": "source-default",
+    "candidate_path_count": 0,
+    "review_state_filtered": 0,
+    "other_owner_filtered": 0,
+    "known_defect": true
+  },
+  {
+    "case": "source-fixed-baseline-only",
+    "candidate_path_count": 0,
+    "review_state_filtered": 0,
+    "other_owner_filtered": 0,
+    "known_defect": true
+  },
+  {
+    "case": "source-fixed-baseline-no-base-exclusion",
+    "candidate_path_count": 10,
+    "review_state_filtered": 0,
+    "other_owner_filtered": 0,
+    "known_defect": false
+  },
+  {
+    "case": "source-persisted-initial-still-excluded",
+    "candidate_path_count": 0,
+    "review_state_filtered": 0,
+    "other_owner_filtered": 0,
+    "known_defect": true
+  }
+]
