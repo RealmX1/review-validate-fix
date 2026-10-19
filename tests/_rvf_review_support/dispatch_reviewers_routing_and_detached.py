@@ -16,6 +16,7 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
+from independent_review_start_boundary_fixture import environment_with_synthetic_independent_review_start_boundary
 
 # 由 aggregator（tests/test_review_support_scripts.py）在导入后 inject 注入共享依赖。
 __all__ = [
@@ -659,6 +660,9 @@ def test_dispatch_reviewers_execute_backfills_review_env(root: Path) -> None:
     # probe 结果缓存落在 $RVF_USER_LOCAL_DATA_ROOT 下；不隔离的话这些用例会读写**真实**
     # 状态根，并且互相删对方写进去的条目（--execute 那些用例在 reroute 时会 invalidate）。
     env["RVF_USER_LOCAL_DATA_ROOT"] = str(root / "user-local-state")
+    repo = init_repo(root / "reviewed-repository")
+    env["RVF_REPO"] = str(repo)
+    env = environment_with_synthetic_independent_review_start_boundary(repo=repo, environment=env, run_id="env-backfill", run_dir=run_dir)
     completed = subprocess.run(
         [
             sys.executable,
@@ -1030,6 +1034,7 @@ def test_dispatch_reviewers_blocked_on_reviewer_request_exit_code_frees_detached
     # probe 结果缓存落在 $RVF_USER_LOCAL_DATA_ROOT 下；不隔离的话这些用例会读写**真实**
     # 状态根，并且互相删对方写进去的条目（--execute 那些用例在 reroute 时会 invalidate）。
     env["RVF_USER_LOCAL_DATA_ROOT"] = str(tmp_path / "user-local-state")
+    env = environment_with_synthetic_independent_review_start_boundary(repo=repo, environment=env, run_id="blocked-exit-code-test", run_dir=run_dir)
     completed = subprocess.run(
         [
             sys.executable,

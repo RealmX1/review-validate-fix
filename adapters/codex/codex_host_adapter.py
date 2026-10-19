@@ -56,6 +56,11 @@ CODEX_HOOK_EVENT_AGENT_TURN_IDENTIFIER_FIELD = "turn_id"
 class CodexHostAdapter:
     """Codex 的 ``HostAdapter`` 具体实现（满足 ``core.host_adapter.HostAdapter`` Protocol）。"""
 
+    def read_independent_user_turn_boundary_evidence(self, *, receipt):
+        from adapters.codex.review_start_independent_user_turn_evidence import read_independent_user_turn_boundary_evidence
+
+        return read_independent_user_turn_boundary_evidence(receipt=receipt)
+
     def host_display_name(self) -> str:
         return "Codex"
 

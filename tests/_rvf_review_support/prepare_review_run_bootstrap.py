@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from independent_review_start_boundary_fixture import environment_with_synthetic_independent_review_start_boundary
 
 # 由 aggregator（tests/test_review_support_scripts.py）在导入后 inject 注入共享依赖。
 __all__ = [
@@ -35,7 +36,7 @@ __all__ = [
     'test_bootstrap_gate_never_carries_environment_or_credential_values',
     'test_agent_cli_start_parks_on_bootstrap_then_resumes_same_run',
     'test_ups_stamps_waiting_bootstrap_onto_armed_kanban_followup_lock',
-    'test_bootstrap_replay_after_receipt_reuses_the_same_run_end_to_end',
+    'test_bootstrap_replay_after_base_absorption_requires_new_review_start_boundary',
     'test_held_bootstrap_gate_persists_verified_receipt_digest_so_swapped_receipt_is_tampered',
     'test_bootstrap_gate_g0_rejects_forged_origin_run_lineage_and_lost_run_artifacts',
     'test_bootstrap_gate_recovers_when_local_base_advances_during_the_wait',
@@ -413,6 +414,7 @@ def test_prepare_review_run_blocks_opted_in_repo_until_local_base_is_absorbed(tm
         "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(sacrificial_repo / ".git" / "objects"),
     }
 
+    poisoned_environment = environment_with_synthetic_independent_review_start_boundary(repo=repo, environment=poisoned_environment)
     completed = subprocess.run(
         [
             sys.executable,
@@ -543,6 +545,7 @@ def test_prepare_review_run_rejects_invalid_local_base_ref(tmp_path: Path) -> No
         capture_output=True,
         text=True,
         check=False,
+        env=environment_with_synthetic_independent_review_start_boundary(repo=repo),
     )
     assert completed.returncode == 2
     assert "invalid local base ref" in completed.stderr
@@ -1491,13 +1494,8 @@ def test_held_bootstrap_gate_persists_verified_receipt_digest_so_swapped_receipt
     assert refused.detail["bootstrap_reason"] == "bootstrap_receipt_digest_changed"
 
 
-def test_bootstrap_replay_after_receipt_reuses_the_same_run_end_to_end(tmp_path: Path) -> None:
-    """T7 真链路：吸收完成 + receipt 可信后，按 gate 记录的 prep 重放 prepare —— **复用同一个
-    run_id/run_dir** 跑完全套（不 stub 重放），且不会派生第二个 run 目录。
-
-    这是「恢复不得变成第二轮独立 RVF」的端到端证据：prep 的 ``rvf_run`` 里钉死的 run 身份被
-    原样透传给 prepare_run，重放后 shared_workflow_state 变 completed、artifacts 落在原 run 下。
-    """
+def test_bootstrap_replay_after_base_absorption_requires_new_review_start_boundary(tmp_path: Path) -> None:
+    """可信 bootstrap receipt 不能替代吸收之后的新开审消息；旧 prep 保留、不得自动进入 review。"""
     gate_module = load_rvf_bootstrap_gate_module()
     prep_file = load_rvf_prep_file_module()
     fixture = _bootstrap_opt_in_repo(tmp_path)
@@ -1518,15 +1516,10 @@ def test_bootstrap_replay_after_receipt_reuses_the_same_run_end_to_end(tmp_path:
         assert reconciliation.resume_run_id == "bootstrap-run"
 
         replay = gate_module.replay_prepare_for_gate(gate, timeout_seconds=180.0)
-        assert replay.get("status") == "completed", replay
-        assert replay["run_id"] == "bootstrap-run"  # 同一个 run，不是新开的第二轮
-        assert Path(replay["run_dir"]) == tmp_path / "runs" / "bootstrap-run"
-        assert gate_module.gate_of(replay) is None  # 进入 REVIEWING，gate 退场
-
-        # prep 上的 shared_workflow_state 已就地推进为 completed（下一次读到即幂等短路）。
+        assert replay.get("status") == "review_start_boundary_pending", replay
+        assert "分界" in replay.get("error", "") or "checkpoint" in replay.get("error", "")
         reread = json.loads(record.path.read_text(encoding="utf-8"))
-        assert reread["rvf_run"]["shared_workflow_state"]["status"] == "completed"
-        # runs 根下只有这一个 run 目录：整轮从等待到恢复只用了一个 run。
+        assert reread["rvf_run"]["shared_workflow_state"]["status"] != "completed"
         assert sorted(p.name for p in (tmp_path / "runs").iterdir()) == ["bootstrap-run"]
     finally:
         if previous_prep_root is None:
@@ -1953,6 +1946,7 @@ def test_bootstrap_replay_hard_bounds_a_stuck_prepare_in_a_killable_subprocess(
     probe_result = tmp_path / "replay-probe-result.json"
     probe_log = tmp_path / "replay-probe.log"
     environment = dict(os.environ)
+    environment = environment_with_synthetic_independent_review_start_boundary(repo=Path(fixture["repo"]), environment=environment, session_id=str(record.payload["origin_session_id"]))
     environment["PATH"] = f"{shim_dir}{os.pathsep}{environment.get('PATH', '')}"
     environment[prep_file.ENV_PREP_ROOT] = str(tmp_path / "prep")
 

@@ -74,6 +74,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import json
 import sqlite3
 import subprocess
@@ -342,6 +343,7 @@ def _run_git(repo_path: Path, args: list[str]) -> str | None:
         result = subprocess.run(
             ["git", *args],
             cwd=str(repo_path),
+            env={key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
             capture_output=True,
             text=True,
             check=False,
@@ -358,6 +360,7 @@ def _run_git_bytes(repo_path: Path, args: list[str]) -> bytes | None:
         result = subprocess.run(
             ["git", *args],
             cwd=str(repo_path),
+            env={key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
             capture_output=True,
             check=False,
         )

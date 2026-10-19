@@ -33,8 +33,6 @@ __all__ = [
     "test_structural_decline_supersedes_earlier_deferred_until_condition_decline",
     "test_explicit_user_request_overrides_deferred_until_condition_decline_and_records_provenance",
     "test_circuit_breaker_refused_mint_requests_do_not_keep_the_breaker_tripped",
-    "test_reopen_own_declined_decision_refuses_unless_newest_token_of_this_session_is_declined",
-    "test_reopen_own_declined_decision_mints_with_agent_provenance_and_overrides_cooldown_and_snooze",
     "test_extra_token_payload_fields_cannot_override_system_written_explicit_user_request_fields",
     "test_kanban_task_committed_round_baseline_bootstraps_from_branch_point_when_never_reviewed",
     "test_retrospective_deferred_declines_are_reasked_while_structural_declines_stay_snoozed",
@@ -381,117 +379,6 @@ def test_circuit_breaker_refused_mint_requests_do_not_keep_the_breaker_tripped(t
     assert ask(3605, 99).outcome == dts.MINT_OUTCOME_MINTED
 
 
-# ---------------------------------------------------------------------------
-# D2：agent 按开发者口头要求撤回自己的谢绝
-# ---------------------------------------------------------------------------
-
-def _stub_start_runner(calls: list[dict]):
-    def _runner(**kwargs):
-        calls.append(kwargs)
-        cli = load_rvf_agent_decision_cli_module()  # noqa: F821
-        return cli.CommandResult(
-            command="start", status="ok", exit_code=cli.EXIT_OK, token=kwargs["token"],
-            token_state="acknowledged", message="stub start ok", detail={"run_id": "run-stub"},
-        )
-    return _runner
-
-
-def test_reopen_own_declined_decision_refuses_unless_newest_token_of_this_session_is_declined(tmp: Path) -> None:
-    cli = load_rvf_agent_decision_cli_module()  # noqa: F821
-    dts = load_rvf_decision_token_store_module()  # noqa: F821
-    roots = _agent_cli_roots(cli, tmp)  # noqa: F821
-    wt = _agent_cli_worktree(tmp)  # noqa: F821
-    t0 = _fixed_utc(0)  # noqa: F821
-    calls: list[dict] = []
-
-    def builder(_event, _worktree):
-        return {"repo": wt, "candidate_path_count": 1, "candidate_fingerprint": "fpNew"}
-
-    def reopen(session_id: str | None, **extra):
-        return cli.run_start_reopening_own_declined_decision_on_developer_verbal_request(
-            developer_verbal_request="审一下吧", repo=wt, session_id=session_id, roots=roots, now=t0,
-            candidate_summary_builder=extra.get("builder", builder), start_runner=_stub_start_runner(calls),
-        )
-
-    # 会话身份解析不出 ⇒ 拒绝（无法确认「最近一次谢绝是本会话做的」）。
-    with _environment(**{name: None for name in cli_session_id_environment_variable_names()}):
-        refused = reopen(None)
-    assert refused.exit_code == cli.EXIT_TOKEN_STATE and "会话身份" in refused.message, refused
-
-    # 本会话从未铸过 token；别的会话的谢绝不算。
-    other = _mint_agent_decision_token(dts, roots, worktree=wt, fingerprint="fpO", session_id="other", now=t0)  # noqa: F821
-    cli.run_decline(token=other, decline_kind=_STRUCTURAL, reason="琐碎", roots=roots, now=t0)
-    refused = reopen("mine")
-    assert refused.exit_code == cli.EXIT_TOKEN_STATE and "没有任何决策 token" in refused.message, refused
-
-    # 本会话最近一枚不是 declined（较早的那枚是 declined 也不行）。
-    older = _mint_agent_decision_token(dts, roots, worktree=wt, fingerprint="fpA", session_id="mine", now=t0)  # noqa: F821
-    cli.run_decline(token=older, decline_kind=_STRUCTURAL, reason="琐碎", roots=roots, now=t0)
-    _mint_agent_decision_token(dts, roots, worktree=wt, fingerprint="fpB", session_id="mine", now=_fixed_utc(30))  # noqa: F821
-    refused = reopen("mine")
-    assert refused.exit_code == cli.EXIT_TOKEN_STATE and "不是 declined" in refused.message, refused
-    assert refused.detail["newest_decision_token_state"] == "minted", refused.detail
-    assert calls == []
-
-
-def test_reopen_own_declined_decision_mints_with_agent_provenance_and_overrides_cooldown_and_snooze(
-    tmp: Path,
-) -> None:
-    cli = load_rvf_agent_decision_cli_module()  # noqa: F821
-    dts = load_rvf_decision_token_store_module()  # noqa: F821
-    roots = _agent_cli_roots(cli, tmp)  # noqa: F821
-    wt = _agent_cli_worktree(tmp)  # noqa: F821
-    t0 = _fixed_utc(0)  # noqa: F821
-    summary = _summary(["a.py", "b.py"], head="h1", unreviewed_lines=300)
-    summary["repo"] = wt
-    summary["candidate_fingerprint"] = "fpSame"
-    declined_token = _mint_agent_decision_token(  # noqa: F821
-        dts, roots, worktree=wt, fingerprint="fpSame", session_id="mine", candidate_summary=summary, now=t0
-    )
-    cli.run_decline(token=declined_token, decline_kind=_STRUCTURAL,
-                    reason="开发者说这轮先不审", roots=roots, now=t0)
-    assert dts.is_fingerprint_in_declined_cooldown(
-        worktree=wt, candidate_fingerprint="fpSame", cooldown_root=roots.cooldown_root
-    )
-    calls: list[dict] = []
-    result = cli.run_start_reopening_own_declined_decision_on_developer_verbal_request(
-        developer_verbal_request="我刚才说错了，现在审一下", repo=wt, session_id="mine",
-        roots=roots, now=_fixed_utc(60),
-        candidate_summary_builder=lambda _event, _worktree: dict(summary),
-        start_runner=_stub_start_runner(calls),
-    )
-    assert result.exit_code == cli.EXIT_OK, result
-    assert len(calls) == 1 and calls[0]["token"] != declined_token, calls
-    new_token = calls[0]["token"]
-    payload = json.loads(dts.decision_token_path(new_token, roots.token_root).read_text(encoding="utf-8"))
-    assert payload["explicit_user_request_provenance"] == (
-        "agent_reopened_own_declined_decision_on_developer_verbal_request"
-    ), payload
-    assert payload["reopened_declined_decision_token"] == declined_token
-    assert payload["developer_verbal_request_that_reopened_declined_decision"] == "我刚才说错了，现在审一下"
-    # 豁免语义与手动触发一致：冷却与 snooze 都被清掉（熔断整段跳过）。
-    assert result.detail["explicit_user_request_overrode_agent_declined_cooldown"] is True
-    assert result.detail["explicit_user_request_overrode_agent_declined_session_scope_snooze"] is True
-    assert not dts.is_fingerprint_in_declined_cooldown(
-        worktree=wt, candidate_fingerprint="fpSame", cooldown_root=roots.cooldown_root
-    )
-    assert dts.read_declined_session_scope_snooze(
-        worktree=wt, session_id="mine", cooldown_root=roots.cooldown_root
-    ) is None
-    assert result.detail["run_id"] == "run-stub" and "撤回本会话的谢绝" in result.message, result
-    telemetry_text = "".join(
-        path.read_text(encoding="utf-8") for path in Path(roots.telemetry_root).rglob("*.jsonl")
-    )
-    assert "agent_reopened_own_declined_decision_on_developer_verbal_request" in telemetry_text
-    # 立刻再撤回一次：最近一枚已不是 declined ⇒ 拒绝（只能撤回最近一次谢绝）。
-    again = cli.run_start_reopening_own_declined_decision_on_developer_verbal_request(
-        developer_verbal_request="再来一次", repo=wt, session_id="mine", roots=roots, now=_fixed_utc(90),
-        candidate_summary_builder=lambda _event, _worktree: dict(summary),
-        start_runner=_stub_start_runner(calls),
-    )
-    assert again.exit_code == cli.EXIT_TOKEN_STATE, again
-
-
 def test_extra_token_payload_fields_cannot_override_system_written_explicit_user_request_fields(
     tmp: Path,
 ) -> None:
@@ -541,10 +428,10 @@ def test_extra_token_payload_fields_cannot_override_system_written_explicit_user
     legitimate = _mint(
         dts, roots, session_id="s", fingerprint="fp1", summary=dict(summary), now=t0,
         initiated_by_explicit_user_request=True, explicit_user_request_provenance=developer_manual,
-        extra_token_payload_fields={"reopened_declined_decision_token": declined.token},
+        extra_token_payload_fields={"boundary_request_source_token": declined.token},
     )
     assert legitimate.outcome == dts.MINT_OUTCOME_MINTED, legitimate
-    assert legitimate.record.payload["reopened_declined_decision_token"] == declined.token
+    assert legitimate.record.payload["boundary_request_source_token"] == declined.token
     assert legitimate.record.payload["initiated_by_explicit_user_request"] is True
     assert legitimate.record.payload["explicit_user_request_provenance"] == developer_manual
 

@@ -1953,17 +1953,12 @@ def consult_declined_session_scope_snooze(
 # 「用户显式推翻 agent 谢绝」这一类铸造的来源（落进 token payload 的
 # ``explicit_user_request_provenance``，回执与遥测据此区分两条入口）：
 #   * 开发者在 prompt 里手动触发 RVF 主 skill（UPS manual 分支）；
-#   * 开发者口头要求开审，agent 用 ``rvf start --reopen-own-declined-decision`` 撤回自己的谢绝。
 EXPLICIT_USER_REQUEST_PROVENANCE_DEVELOPER_MANUAL_TRIGGER_VIA_USER_PROMPT_SUBMIT = (
     "developer_manual_trigger_via_user_prompt_submit"
-)
-EXPLICIT_USER_REQUEST_PROVENANCE_AGENT_REOPENED_OWN_DECLINED_DECISION_ON_DEVELOPER_VERBAL_REQUEST = (
-    "agent_reopened_own_declined_decision_on_developer_verbal_request"
 )
 EXPLICIT_USER_REQUEST_PROVENANCES = frozenset(
     {
         EXPLICIT_USER_REQUEST_PROVENANCE_DEVELOPER_MANUAL_TRIGGER_VIA_USER_PROMPT_SUBMIT,
-        EXPLICIT_USER_REQUEST_PROVENANCE_AGENT_REOPENED_OWN_DECLINED_DECISION_ON_DEVELOPER_VERBAL_REQUEST,
     }
 )
 # :func:`mint_decision_token` 自己写进 token payload 的显式请求两键。调用方的
@@ -2335,6 +2330,7 @@ def mint_decision_token(
     initiated_by_explicit_user_request: bool = False,
     explicit_user_request_provenance: str | None = None,
     extra_token_payload_fields: Mapping[str, Any] | None = None,
+    agent_requested_deferred_reconsideration_token: str | None = None,
 ) -> MintResult:
     """铸造一枚决策 token（Stop hook 侧唯一入口），依次经三道闸：
 
@@ -2391,8 +2387,8 @@ def mint_decision_token(
     默认 ``False`` ⇒ 自动路径（Stop hook）行为完全不变。
 
     ``initiated_by_explicit_user_request=True`` 时必须同时给出 ``explicit_user_request_provenance``
-    （:data:`EXPLICIT_USER_REQUEST_PROVENANCES` 之一），落进 token payload：豁免语义两条入口一致，但
-    「开发者自己触发」与「agent 按开发者口头要求撤回自己的谢绝」是两件事，回执与遥测都要能分开。
+    （仅 manual UPS 来源），落进 token payload；真正的用户消息由开审 gate 另行核验，
+    Agent 自填 reason 不得升级为显式用户请求。
     ``extra_token_payload_fields`` 原样并入新铸 token 的 payload（不得覆盖既有字段）。
     """
     if initiated_by_explicit_user_request and (
@@ -2532,6 +2528,15 @@ def mint_decision_token(
             candidate_summary=candidate_summary,
             cooldown_root=cooldown_root,
         )
+        # 自主条件判断只释放延后重问门，不伪装用户请求、不跳过结构性谢绝或铸造熔断。
+        if agent_requested_deferred_reconsideration_token:
+            deferred_record = deferred_consultation.deferred_record
+            if deferred_record and deferred_record.get("token") == agent_requested_deferred_reconsideration_token:
+                deferred_consultation = DeferredUntilConditionDeclineConsultation(
+                    still_awaiting_turn_boundary=False,
+                    release_reason="agent_requested_deferred_condition_reconsideration",
+                    deferred_record=deferred_record,
+                )
         if deferred_consultation.still_awaiting_turn_boundary:
             deferred_record = deferred_consultation.deferred_record or {}
             return MintResult(

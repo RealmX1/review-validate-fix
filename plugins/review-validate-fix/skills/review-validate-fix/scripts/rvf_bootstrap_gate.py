@@ -948,6 +948,7 @@ def _emit(payload):
 try:
     import rvf_prep_file
     import prepare_review_run
+    from core.review_start_boundary.review_start_boundary_verification import ReviewStartBoundaryNotVerified
 
     lookup = rvf_prep_file.read_prep_file(prep_token)
     if lookup.payload is None:
@@ -960,6 +961,8 @@ try:
             record, timeout_seconds=float(timeout_text)
         )
     )
+except ReviewStartBoundaryNotVerified as exc:
+    _emit({"status": exc.status, "error": exc.reason})
 except BaseException as exc:  # 子进程绝不把异常留给父进程去猜
     _emit({"status": "failed", "error": "%s: %s" % (type(exc).__name__, exc)})
 """

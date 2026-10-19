@@ -593,8 +593,6 @@ def run_decision_subcommand(subcommand: str, rest: list[str]) -> int:
         subcommand in ("start", "dispatch", "decline")
         and not _argv_names_token(rest)
         and not _argv_asks_for_help(rest)
-        # 撤回本会话的谢绝时没有待表态的 token 可推断——它自己铸新的。
-        and not (subcommand == "start" and "--reopen-own-declined-decision" in rest)
     ):
         token, how = infer_decision_token_for_subcommand(subcommand)
         if token is None:
@@ -1741,7 +1739,7 @@ def run_land(rest: list[str]) -> int:
 # argparse
 # ---------------------------------------------------------------------------
 
-DECISION_PASSTHROUGH_SUBCOMMANDS = ("start", "scope", "dispatch", "decline", "decline-dispatched-review")
+DECISION_PASSTHROUGH_SUBCOMMANDS = ("request-review-start-boundary", "start", "scope", "dispatch", "decline", "decline-dispatched-review")
 RAW_PASSTHROUGH_SUBCOMMANDS = ("validate", "land")
 
 

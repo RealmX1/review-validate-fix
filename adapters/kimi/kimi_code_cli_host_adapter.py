@@ -91,6 +91,9 @@ def _session_title_from_state_beside(wire_transcript_path: Path) -> str | None:
 class KimiCodeCliHostAdapter:
     """Kimi Code CLI 的 ``HostAdapter`` 具体实现（满足 ``core.host_adapter.HostAdapter``）。"""
 
+    def read_independent_user_turn_boundary_evidence(self, *, receipt):
+        return {"independent_user_turn_verified": False, "capability_unverified": True, "reason": "此宿主的开审 receipt 与原生回退绑定尚未取证"}
+
     def host_display_name(self) -> str:
         return HOST_DISPLAY_NAME
 

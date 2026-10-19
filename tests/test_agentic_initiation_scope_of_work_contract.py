@@ -47,6 +47,10 @@ def _isolate_rvf_runtime_environment(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
     所以本文件必须清掉整个 RVF env 命名空间并把落盘根钉进 tmp。
     """
+    monkeypatch.setattr(prepare_review_run, "bind_review_start_boundary_to_one_run", lambda receipt, run_id, run_dir: (run_id, run_dir))
+    # 这里只验证 SOW 渲染/门禁；独立消息/Git gate 在专用集成套件运行，不在此重复构造。
+    monkeypatch.setattr(prepare_review_run, "require_review_start_boundary_for_prepare", lambda **kw: {"test_scope": "scope-of-work"})
+    monkeypatch.setattr(rvf_agent_decision_cli, "require_prepared_run_review_start_boundary", lambda **kw: {"test_scope": "scope-of-work"})
     for name in tuple(os.environ):
         if name.startswith(("RVF_", "CODEX_RVF_", "KANBAN_", "CLINE_KANBAN_")):
             monkeypatch.delenv(name, raising=False)

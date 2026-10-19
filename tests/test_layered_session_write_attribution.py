@@ -173,7 +173,7 @@ ENVIRONMENT_VARIABLE_PREFIXES_INHERITED_FROM_RVF_OR_KANBAN_INVOKING_SHELL = ("RV
 
 @pytest.fixture(autouse=True)
 def rvf_state_roots_isolated_from_invoking_shell_environment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request
 ) -> dict[str, Path]:
     """清掉从调用方 shell 继承来的全部 RVF / Kanban 环境变量，再把 RVF 的各个状态根钉进 tmp。
 
@@ -198,6 +198,17 @@ def rvf_state_roots_isolated_from_invoking_shell_environment(
     monkeypatch.setenv("RVF_USER_LOCAL_DATA_ROOT", str(pinned_roots["rvf_user_local_data_root"]))
     monkeypatch.setenv("CODEX_RVF_PREP_ROOT", str(pinned_roots["prepare_root"]))
     monkeypatch.setenv("RVF_KANBAN_FOLLOWUP_LOCK_ROOT", str(pinned_roots["kanban_followup_lock_root"]))
+    if request.node.name.startswith("test_end_to_end_"):
+        # 此簇使用 Claude 合成归属历史，只验证归属/lease/覆盖链；不冒充已验证的宿主分界。
+        # 独立消息、Git 快照和直接入口 gate 由专用集成套件验证，Claude 原生 rewind 仍未取证。
+        from _rvf_test_support.loader import load_script_module
+        cli = load_script_module("rvf_agent_decision_cli")
+        prepare = load_script_module("prepare_review_run")
+        monkeypatch.setattr(cli, "require_review_start_boundary", lambda **kw: {"test_scope":"layered-attribution"})
+        monkeypatch.setattr(cli, "require_prepared_run_review_start_boundary", lambda **kw: {"test_scope":"layered-attribution"})
+        monkeypatch.setattr(prepare, "require_review_start_boundary_for_prepare", lambda **kw: {"test_scope":"layered-attribution"})
+        for module in (cli, prepare):
+            monkeypatch.setattr(module, "bind_review_start_boundary_to_one_run", lambda receipt, run_id, run_dir: (run_id, run_dir))
     return pinned_roots
 
 
