@@ -1,6 +1,6 @@
 ---
 name: rvf-land
-description: Use only when the user explicitly invokes $rvf-land or /rvf-land. 在同一个 worktree 中收尾一段由 future-self 跑完的 RVF 工作：吃下用户粘贴的 RVF handoff / finalization 正文，sanity-check 已经应用在当前 worktree 的修复，必要时做最小修正，验证后提交。不启动新的 RVF review；仅当用户已明确请求后续 base-branch-sync 时，封窗后继续执行该 follow-up。
+description: 用户明确调用 $rvf-land、/rvf-land，或 Kanban 通过已登记开审分界的 rvf_automatic_closeout 投递时使用。 在同一个 worktree 中收尾一段由 future-self 跑完的 RVF 工作：吃下用户粘贴的 RVF handoff / finalization 正文，sanity-check 已经应用在当前 worktree 的修复，必要时做最小修正，验证后提交。不启动新的 RVF review；仅当用户已明确请求后续 base-branch-sync 时，封窗后继续执行该 follow-up。
 ---
 
 # RVF Land
@@ -14,6 +14,12 @@ description: Use only when the user explicitly invokes $rvf-land or /rvf-land. �
 - 用户把 RVF run 结束时复制出来的 handoff & finalization 正文作为输入交给本命令（在 rvf 分析之前）。
 
 因此默认假设：handoff 描述的工作和当前 worktree 的 dirty 改动应该是**同一个 worktree**，而不是 fork / 另一个 task worktree。
+
+## Kanban 默认自动收尾
+
+Codex 收到包含 `RVF_AUTOMATIC_CLOSEOUT_TOKEN=` 的运行时收尾指令时，先用 `kanban task rvf-automatic-closeout-status` 核对当前 task 的持久记录：token、run、恢复后的原生会话与 handoff SHA256 必须一致，状态为 `submitting_closeout_prompt` 或 `closeout_prompt_submitted`。这是用户已配置的自动工作流来源，不冒充用户亲手输入；核对通过后即授权本次 land 及指令明确指定的 base-branch-sync follow-up，无需用户再确认。
+
+原任务明确要求不提交、不回 base 或停止时，以原要求为准。自动化也不豁免 prepare、验证、提交与 base 同步的实际门禁。永不选择 latest handoff，不自动部署或移入 Done。
 
 ## 输入
 

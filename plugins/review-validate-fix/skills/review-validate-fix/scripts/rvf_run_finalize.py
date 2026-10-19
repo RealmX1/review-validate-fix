@@ -23,6 +23,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from rvf_automatic_closeout_bridge import freeze_completion_notification, publish_completion  # noqa: E402
 from trajectory_capture import capture_run  # noqa: E402
 from workspace_diff import capture_after, compute as compute_workspace_diff  # noqa: E402
 
@@ -393,11 +394,14 @@ def finalize_run(
     if lock_path.exists():
         try:
             cached = json.loads(lock_path.read_text(encoding="utf-8"))
-            if isinstance(cached, dict):
-                cached.setdefault("already_finalized", True)
-                return cached
         except (OSError, json.JSONDecodeError):
             pass
+        else:
+            if isinstance(cached, dict):
+                # 通知失败只能重试发布，不能把有效缓存当作读取失败而重做 finalize。
+                publish_completion(run_dir, cached)
+                cached.setdefault("already_finalized", True)
+                return cached
 
     summary = _read_summary(run_dir / "summary.json")
     repo = _resolve_repo(run_dir, summary, event)
@@ -535,6 +539,13 @@ def finalize_run(
             }
         )
 
+    try:
+        freeze_completion_notification(run_dir, finalize_record)
+    except Exception as exc:
+        finalize_record["errors"].append(
+            {"stage": "automatic_closeout_completion_freeze", "error": f"{type(exc).__name__}: {exc}"}
+        )
+
     if summary_path.exists():
         merged = _read_summary(summary_path)
         merged["finalize"] = finalize_record
@@ -556,6 +567,7 @@ def finalize_run(
             {"stage": "lock_write", "error": f"{type(exc).__name__}: {exc}"}
         )
 
+    publish_completion(run_dir, finalize_record)
     return finalize_record
 
 

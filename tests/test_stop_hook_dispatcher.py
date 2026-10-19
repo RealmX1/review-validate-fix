@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -902,6 +903,20 @@ def _write_same_session_transcript_with_marker(path: Path, repo: Path) -> Path:
     return path
 
 
+def _seed_automatic_closeout_review_start_receipt(run_dir: Path, repo: Path) -> dict[str, str]:
+    receipt = {
+        "decision_token": "0123456789abcdef",
+        "session_id": "child-session",
+        "worktree": str(repo.resolve()),
+    }
+    inputs = run_dir / "inputs"
+    inputs.mkdir()
+    (inputs / "automatic-closeout-review-start-receipt.json").write_text(
+        json.dumps(receipt), encoding="utf-8"
+    )
+    return receipt
+
+
 def test_handoff_marker_finalizes_run_artifacts_same_session(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "rvf")
     marker = tmp_path / "marker"
@@ -911,6 +926,8 @@ def test_handoff_marker_finalizes_run_artifacts_same_session(tmp_path: Path) -> 
     write_fake_installed_hook(hook, marker)
     state = tmp_path / "state"
     run_dir, handoff = _seed_finalize_run_dir(state=state, repo=repo)
+    receipt = _seed_automatic_closeout_review_start_receipt(run_dir, repo)
+    rvf_home = tmp_path / "rvf-home"
     transcript = _write_same_session_transcript_with_marker(
         tmp_path / "rollout.jsonl",
         repo,
@@ -934,6 +951,7 @@ def test_handoff_marker_finalizes_run_artifacts_same_session(tmp_path: Path) -> 
         hook=hook,
         state=state,
         extra_env={
+            "RVF_HOME": str(rvf_home),
             "RVF_TMUX_BIN": str(fake_tmux),
             "FAKE_TMUX_CALLS": str(tmux_calls),
         },
@@ -956,7 +974,21 @@ def test_handoff_marker_finalizes_run_artifacts_same_session(tmp_path: Path) -> 
     paths = {item["path"]: item["op"] for item in payload["changed_paths"]}
     assert paths.get(".rvf-seed") == "modified"
     summary_payload = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
-    assert summary_payload.get("finalize", {}).get("decision_kind") == "dispatcher-handoff"
+    finalized = json.loads(lock.read_text(encoding="utf-8"))
+    assert finalized == summary_payload["finalize"]
+    assert finalized["decision_kind"] == "handoff"
+    assert finalized["errors"] == []
+    assert finalized["completed_at"]
+    notification_path = rvf_home / "automatic-closeout-completion-notifications" / f"{receipt['decision_token']}.json"
+    completion = json.loads(notification_path.read_text(encoding="utf-8"))
+    assert completion == {
+        "schema": "rvf-automatic-closeout-completion/v1",
+        **receipt,
+        "run_id": run_dir.name,
+        "run_dir": str(run_dir.resolve()),
+        "handoff_path": str(handoff.resolve()),
+        "handoff_sha256": hashlib.sha256(handoff.read_bytes()).hexdigest(),
+    }
     payload = json.loads(stdout)
     assert "rvf_analyze=thread_launched" in payload["systemMessage"]
     hook_summary = latest_summary(state)
@@ -977,6 +1009,8 @@ def test_handoff_marker_surfaces_finalize_record_errors(tmp_path: Path) -> None:
     write_fake_installed_hook(hook, marker)
     state = tmp_path / "state"
     run_dir, handoff = _seed_finalize_run_dir(state=state, repo=repo)
+    _seed_automatic_closeout_review_start_receipt(run_dir, repo)
+    rvf_home = tmp_path / "rvf-home"
     transcript = _write_same_session_transcript_with_marker(
         tmp_path / "rollout.jsonl",
         repo,
@@ -997,6 +1031,7 @@ def test_handoff_marker_surfaces_finalize_record_errors(tmp_path: Path) -> None:
         dev_repo=repo,
         hook=hook,
         state=state,
+        extra_env={"RVF_HOME": str(rvf_home)},
     )
 
     payload = json.loads(stdout)
@@ -1008,6 +1043,7 @@ def test_handoff_marker_surfaces_finalize_record_errors(tmp_path: Path) -> None:
     assert hook_summary["finalize_errors"][0]["stage"] == "analysis_scaffold"
     run_summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
     assert run_summary["finalize"]["errors"][0]["stage"] == "analysis_scaffold"
+    assert not (rvf_home / "automatic-closeout-completion-notifications").exists()
     events = [
         json.loads(line)
         for line in Path(str(hook_summary["events_path"])).read_text(encoding="utf-8").splitlines()

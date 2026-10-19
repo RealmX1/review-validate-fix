@@ -58,6 +58,7 @@ import _rvf_pyroot  # noqa: E402,F401 — 把 pyroot 上 sys.path，供 core.* /
 
 import agentic_initiation_review_scope_coverage_and_agent_explicit_path_claim as review_scope_coverage_and_claim  # noqa: E402
 import rvf_bootstrap_gate  # noqa: E402
+import rvf_automatic_closeout_bridge  # noqa: E402
 import rvf_decision_token_store as token_store  # noqa: E402
 import rvf_prep_file  # noqa: E402
 import rvf_dispatch_prompts  # noqa: E402 — scope-of-work stub 模板与 stub 标记（与 prepare 同源）
@@ -1626,6 +1627,18 @@ def run_start(
     )
     provider_health_runner = provider_health_runner or _default_provider_health_runner
 
+    # 宿主先持久化原生分界，失败不得 acknowledge 或创建正式 run；此时尚不激活自动收尾等待。
+    automatic_closeout_receipt = None
+    lookup_before_start = token_store.read_decision_token(token, root=roots.token_root, now=now_dt)
+    before_payload = getattr(lookup_before_start, "payload", None)
+    if isinstance(before_payload, Mapping):
+        candidate = before_payload.get("candidate_summary")
+        resolved_transcript, _ = resolve_start_transcript_path(explicit_transcript_path=transcript_path, candidate_summary=candidate)
+        try:
+            automatic_closeout_receipt = rvf_automatic_closeout_bridge.capture_before_start(before_payload, transcript_path=resolved_transcript, task_id=_current_kanban_task_id_from_env())
+        except Exception as exc:
+            return CommandResult(command="start", status="start_failed", exit_code=EXIT_START_FAILED, token=token, token_state=getattr(lookup_before_start, "state", None), message=f"无法登记自动 RVF 开审分界：{exc}", detail={"phase":"capture_independent_review_start_boundary"})
+
     # ① token → acknowledged（非终态；retry 再走一轮 acknowledge，递增 start_attempt_count）。
     # 先探一次 TTL 状态：acknowledge 内部会把「过期但 run 在途」的 token 就地复活，复活后就再也
     # 看不出它曾经过期了。而这正是 bootstrap 等待期的常态（900s TTL ≪ 一次大 base 吸收），
@@ -2030,6 +2043,16 @@ def run_start(
     # ⑤c 本轮 prepare 已收尾且 gate 已退场 → 释放恢复占位（放在摘 gate **之后**：这样并发的另一次
     # start 在 gate 还挂着的窗口里也无法起第二次重放）。
     _release_replay_claim()
+
+    if automatic_closeout_receipt is not None:
+        try:
+            rvf_automatic_closeout_bridge.bind_run(automatic_closeout_receipt, Path(run_dir))
+        except Exception as exc:
+            return _fail(f"无法绑定自动收尾 run：{exc}", phase="bind_automatic_closeout_run")
+        try:
+            rvf_automatic_closeout_bridge.activate_bound_run(automatic_closeout_receipt)
+        except Exception as exc:
+            return _fail(f"无法激活已绑定 run 的自动收尾：{exc}", phase="activate_automatic_closeout_after_run_binding")
 
     # ⑥ 自动 scope 产出（落盘，供 scope 子命令编辑）。
     auto_scope_paths = _initial_auto_scope_paths(candidate_summary, artifacts)
