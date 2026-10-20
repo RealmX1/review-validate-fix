@@ -226,6 +226,7 @@ def test_notification_failure_retries_publication_without_repeating_finalize(
     bridge.bind_run(
         {"decision_token": decision_token, "session_id": "S", "worktree": str(repo)},
         run_dir,
+        run_id=summary["run_id"],
     )
     (run_dir / "artifacts" / "handoff.md").write_text("RVF 已完成\n", encoding="utf-8")
     event = {"transcript_path": str(transcript), "session_id": "S", "cwd": str(repo)}

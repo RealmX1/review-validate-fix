@@ -19,6 +19,8 @@ from typing import Any, Iterator
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401 — 把 pyroot 加入 sys.path，供 adapters.* import
+from review_start_boundary_gate import require_review_start_boundary_for_prepare, bind_review_start_boundary_to_one_run
+from core.review_start_boundary.review_start_boundary_verification import INVALIDATED, PENDING, ReviewStartBoundaryNotVerified
 from codex_gui_without_kanban_task_stop_hook_policy import (  # noqa: E402
     CODEX_GUI_WITHOUT_KANBAN_TASK_STOP_HOOK_DISABLED_REASON,
     disabled_codex_gui_stop_hook_payload,
@@ -217,6 +219,7 @@ from cline_kanban_client import (
     unpark_task as cline_kanban_unpark_task,
 )
 from core.cline_kanban_terminal_delivery.cline_kanban_terminal_delivery_receipt import (  # noqa: E402 — 终端投递回执契约的唯一判读点（cline-kanban task cdea3 契约；RVF 只读）
+    TERMINAL_DELIVERY_STATUS_CONVERGENCE_CONTRACT_BUDGET_SECONDS,
     REDISPATCH_DISPOSITION_ALLOWED_WITH_FRESH_IDEMPOTENCY_KEY,
     REDISPATCH_DISPOSITION_NOT_NEEDED,
     REDISPATCH_DISPOSITION_REQUIRES_HUMAN_CONFIRMATION,
@@ -1408,6 +1411,10 @@ def write_dispatch_prep_file(
     origin_metadata_path: str | None = None,
     parent_thread_path: Path | None = None,
 ) -> rvf_prep_file.PrepFileRecord:
+    boundary = require_review_start_boundary_for_prepare(repo=str(origin_repo or target_worktree or origin_cwd or ""))
+    if boundary.get("session_id") and origin_session_id != boundary["session_id"]:
+        raise ReviewStartBoundaryNotVerified(INVALIDATED, "准备来源会话与分界不一致")
+    bind_review_start_boundary_to_one_run(receipt=boundary, run_id=ledger.run_id, run_dir=ledger.run_dir)
     tracker_scope_meta = getattr(ledger, "tracker_scope_meta", None)
     tracker_scope_path = None
     tracker_lease_id = None
@@ -1431,6 +1438,7 @@ def write_dispatch_prep_file(
         "target_session_id": target_session_id,
         "rvf_run": {
             "run_id": ledger.run_id,
+            "review_start_boundary_receipt": boundary,
             "run_dir": str(ledger.run_dir),
             "artifacts_dir": str(artifacts_dir),
             "scope_contract_path": str(artifacts_dir / "inputs" / "scope.contract.json"),
@@ -3648,6 +3656,13 @@ def _kanban_followup_bootstrap_gate_decision(
             )
             replay = replayed if isinstance(replayed, dict) else None
             replay_status = replay.get("status") if replay is not None else None
+        if replay_status in {PENDING, INVALIDATED}:
+            if claimed:
+                release_kanban_followup_bootstrap_replay_in_flight(marker)
+            return True, skip_decision(
+                _bootstrap_replay_error_text(replay) or "开审分界尚未验证，不能恢复正式审查。",
+                ledger, replay_status, cwd=cwd,
+            )
         if replay_status == rvf_bootstrap_gate.REPLAY_STATUS_COMPLETED:
             assert replay is not None  # narrow for readers
             # bootstrap 收尾 → 进入 REVIEWING：摘掉 gate、锁回 in_progress（**不清锁**，
@@ -4850,6 +4865,7 @@ def freeze_cline_kanban_dispatch_artifacts(
     dispatch_prep: rvf_prep_file.PrepFileRecord,
     target_flow: str,
 ) -> dict[str, Any]:
+    require_review_start_boundary_for_prepare(repo=cwd, receipt=(dispatch_prep.payload.get("rvf_run") or {}).get("review_start_boundary_receipt"))
     scope_text = dispatch_scope_of_work_text(
         target_flow=target_flow,
         cwd=cwd,
@@ -5668,6 +5684,8 @@ def start_cline_kanban_followup_message(
     idempotency_key: str | None = None,
     timeout: float | None = None,
     artifact_label: str = "kanban-followup",
+    deliver_when_agent_idle: bool = False,
+    decision_token_expires_at: str | None = None,
 ) -> dict[str, Any]:
     """经 cline-kanban 终端投递把 ``prompt`` 投成目标 task 的一条真实 user message。
 
@@ -5725,6 +5743,14 @@ def start_cline_kanban_followup_message(
     ]
     if attempt_id:
         command.extend(["--attempt-id", attempt_id])
+    if deliver_when_agent_idle:
+        if not decision_token_expires_at:
+            raise KanbanFollowupDeliveryNotAttemptedError("独立决策点投递缺少 token 截止时间")
+        remaining_seconds = (decision_token_store.parse_timestamp(decision_token_expires_at) - decision_token_store.utc_now()).total_seconds()
+        idle_wait_ms = int((remaining_seconds - TERMINAL_DELIVERY_STATUS_CONVERGENCE_CONTRACT_BUDGET_SECONDS) * 1000)
+        if idle_wait_ms <= 0:
+            raise KanbanFollowupDeliveryNotAttemptedError("token 剩余时效不足以投递独立决策点")
+        command.extend(["--deliver-when-agent-idle", "--max-wait-for-agent-idle-ms", str(idle_wait_ms)])
     # 契约第 4 条：短等而已（默认 0 = 完全不等，保持 Stop 链路的既有时延）。开大它并不能等满
     # 契约的 196.5s 收敛预算——CLI 硬超时会把等待 clamp 掉；真正的终态靠 message-status 轮询。
     wait_ms = _kanban_followup_env_int(
@@ -6076,6 +6102,13 @@ def run_review_validate_fix_child_fork(
             cwd=cwd,
         )
 
+    if mode != "dry-run":
+        try:
+            boundary = require_review_start_boundary_for_prepare(repo=str(origin_repo or cwd or ""))
+            if boundary.get("session_id") and boundary["session_id"] != parent_session_id:
+                raise ReviewStartBoundaryNotVerified(INVALIDATED, "fork 父会话与开审分界不一致")
+        except ReviewStartBoundaryNotVerified as exc:
+            return skip_payload(exc.reason, ledger, exc.status, cwd=cwd, **(extra_summary or {}))
     effective_prompt = prompt
     if suppress_child_stop_hook and SUPPRESS_STOP_HOOK_MARKER not in effective_prompt:
         effective_prompt = (
@@ -6113,17 +6146,19 @@ def run_review_validate_fix_child_fork(
         mode,
         cline_kanban_worktree_mode=cline_kanban_worktree_mode,
     )
-    dispatch_prep = write_dispatch_prep_file(
-        ledger=ledger,
-        origin_session_id=parent_session_id,
-        origin_repo=origin_repo or cwd,
-        origin_cwd=cwd,
-        target_flow=target_flow,
-        target_worktree=None if target_flow == "flow-2-branch" else cwd,
-        origin_metadata_path=origin_path,
-        parent_thread_path=parent_thread_path,
-    )
-    effective_prompt = add_dispatch_prep_to_prompt(effective_prompt, dispatch_prep)
+    dispatch_prep = None
+    if mode != "dry-run":
+        dispatch_prep = write_dispatch_prep_file(
+            ledger=ledger,
+            origin_session_id=parent_session_id,
+            origin_repo=origin_repo or cwd,
+            origin_cwd=cwd,
+            target_flow=target_flow,
+            target_worktree=None if target_flow == "flow-2-branch" else cwd,
+            origin_metadata_path=origin_path,
+            parent_thread_path=parent_thread_path,
+        )
+        effective_prompt = add_dispatch_prep_to_prompt(effective_prompt, dispatch_prep)
     prompt_path = ledger.artifact("fork.prompt.txt", effective_prompt)
     ledger.event(
         phase="fork",
@@ -6135,7 +6170,7 @@ def run_review_validate_fix_child_fork(
             key: value
             for key, value in {
                 "prompt": prompt_path,
-                "dispatch_prep_file": str(dispatch_prep.path),
+                "dispatch_prep_file": str(dispatch_prep.path) if dispatch_prep is not None else None,
             }.items()
             if value
         },
@@ -6143,7 +6178,7 @@ def run_review_validate_fix_child_fork(
         log_prefix=log_prefix,
     )
 
-    dispatch_prep_fields = dispatch_prep_summary_fields(dispatch_prep, target_flow=target_flow)
+    dispatch_prep_fields = dispatch_prep_summary_fields(dispatch_prep, target_flow=target_flow) if dispatch_prep is not None else {}
     result: dict[str, Any] = {
         "mode": mode,
         "log_prefix": log_prefix,
@@ -6690,6 +6725,10 @@ def launch_backend(
             backend=decision.backend,
         )
     cwd = decision.cwd or fork_cwd_for_event(event, decision.repo)
+    try:
+        require_review_start_boundary_for_prepare(repo=decision.repo)
+    except ReviewStartBoundaryNotVerified as exc:
+        return skip_payload(exc.reason, ledger, exc.status, repo=decision.repo, cwd=cwd)
     if decision.backend == "kanban-followup":
         task_id = current_kanban_task_id(event)
         if not task_id:
@@ -7594,6 +7633,11 @@ def allocate_auto_review_scope(
                          metadata without any tracker writes.
     """
     repo = context.get("repo")
+    if not dry_run:
+        try:
+            require_review_start_boundary_for_prepare(repo=str(repo or ""))
+        except ReviewStartBoundaryNotVerified as exc:
+            return skip_payload(exc.reason, ledger, exc.status, repo=repo)
     if _tracker_disabled():
         if dry_run:
             # The dispatcher dry-run path also predates the tracker — feed it
@@ -8527,6 +8571,16 @@ def route_reviewable_scope(
     后者自解析 round-baseline marker 把 committed 单元喂进 manifest，因此 committed
     改动与 dirty 改动的归属 / 分配 / 去重完全一致。
     """
+    backend = normalize_backend_from_env(event)
+    if backend == "off":
+        return skip_decision("CODEX_RVF_MODE=off", ledger, "mode_off", repo=repo, cwd=cwd, backend=backend)
+    if backend == "report-only":
+        return report_only_decision(repo, ledger)
+    # 旧路由也不得在证明分界前消费 reopen 意图或分配审查 lease。
+    try:
+        require_review_start_boundary_for_prepare(repo=repo)
+    except ReviewStartBoundaryNotVerified as exc:
+        return skip_decision(exc.reason, ledger, exc.status, repo=repo, cwd=cwd)
     all_changed_paths = candidate_paths
     session_precheck = precheck_session_scope_for_dirty_route(
         event,
@@ -11752,6 +11806,8 @@ def _decision_point_out_of_band_delivery_decision(
                 ledger=ledger,
                 idempotency_key=idempotency_key,
                 artifact_label="decision-point-banner",
+                deliver_when_agent_idle=True,
+                decision_token_expires_at=mint.record.payload["expires_at"],
             )
         except KanbanFollowupDeliveryVerdictNotYetAvailableError as exc:
             # 「还没结论」**不是**失败：这条消息可能已被受理并随后落地。按未确认投递继续。
@@ -11900,6 +11956,7 @@ def _decision_point_out_of_band_delivery_decision(
                 status=receipt.terminal_delivery_status,
                 detail={
                     "kanban_task_id": task_id,
+                    "kanban_project_path": project_path,
                     "idempotency_key": idempotency_key,
                     "terminal_delivery_verdict_not_yet_available": verdict_not_yet_available,
                     "receipt_field_source": receipt.receipt_field_source,
@@ -12053,6 +12110,8 @@ def _decision_point_out_of_band_delivery_outcome_unknown_decision(
             status=None,
             detail={
                 "kanban_task_id": task_id,
+                "kanban_project_path": project_path,
+                "idempotency_key": decision_point_out_of_band_idempotency_key(token),
                 "out_of_band_delivery_outcome_unknown": True,
                 "out_of_band_delivery_outcome_unknown_error": delivery_error,
                 "fell_back_to_stop_hook_self_injection": False,

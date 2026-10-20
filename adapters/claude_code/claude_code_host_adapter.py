@@ -83,6 +83,9 @@ CLAUDE_CODE_WHOLE_PROMPT_IS_ONE_PASTED_CONTENT_ENVELOPE_RE = re.compile(
 class ClaudeCodeHostAdapter:
     """Claude Code 的 ``HostAdapter`` 具体实现（满足 ``core.host_adapter.HostAdapter`` Protocol）。"""
 
+    def read_independent_user_turn_boundary_evidence(self, *, receipt):
+        return {"independent_user_turn_verified": False, "capability_unverified": True, "reason": "此宿主的开审 receipt 与原生回退绑定尚未取证"}
+
     def host_display_name(self) -> str:
         return "Claude Code"
 

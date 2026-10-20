@@ -49,6 +49,8 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 core.* import
+from review_start_boundary_gate import require_prepared_run_review_start_boundary
+from core.review_start_boundary.review_start_boundary_verification import ReviewStartBoundaryNotVerified
 import harness_limit_cooldown
 from core.run_ledger.run_ledger import safe_token, start_run
 from rvf_detached_thread import (
@@ -910,6 +912,7 @@ def execute_plan(
     仍优先（``status: failed``），但 reason 追加 ``_with_review_request_pending`` 后缀自报混合，
     否则主会话只会去等配额/修 auth，那条 request 从头到尾没进过 Contract Gate。
     """
+    require_prepared_run_review_start_boundary(repo=repo, scope_contract=scope_contract, run_id=run_id, run_dir=run_dir)
     reviewers = plan.get("reviewers", [])
     cooled: set[str] = set()
     # 本轮内失败过的 harness（含额度与非额度）——只用于排除替换候选，不落 cooldown。
@@ -1368,6 +1371,7 @@ def launch_detached_dispatch(
     （failed→1、``blocked_on_reviewer_request``→``DISPATCH_BLOCKED_ON_REVIEWER_REQUEST_EXIT_CODE``），
     线程已死时锁会被判陈旧并重夺，主会话处置完 reviewer request 后能经同一入口重派。
     """
+    require_prepared_run_review_start_boundary(repo=repo, scope_contract=scope_contract, run_id=ledger.run_id if ledger else None, run_dir=ledger.run_dir if ledger else None)
     reviewers_dir.mkdir(parents=True, exist_ok=True)
     status_path = reviewers_dir / DISPATCH_STATUS_FILENAME
     log_path = reviewers_dir / DISPATCH_LOG_FILENAME
@@ -1577,6 +1581,15 @@ def main() -> int:
         or os.environ.get("RVF_SESSION_CONTEXT")
     )
     scope_contract = args.scope_contract or os.environ.get("RVF_SCOPE_CONTRACT")
+
+    if args.execute:
+        try:
+            boundary_contract = json.loads(Path(scope_contract).read_text()) if scope_contract else {}
+            args.rvf_run_id = args.rvf_run_id or os.environ.get("RVF_RUN_ID") or boundary_contract.get("run_id")
+            require_prepared_run_review_start_boundary(repo=repo, scope_contract=scope_contract, run_id=args.rvf_run_id, run_dir=args.rvf_run_dir)
+        except (ReviewStartBoundaryNotVerified, OSError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 4
 
     try:
         registry = load_registry(Path(args.registry))

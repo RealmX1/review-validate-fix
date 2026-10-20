@@ -272,6 +272,19 @@ def invoke(
     # 默认把 terminal-notifier 指向无副作用的假 notifier，确保没有测试会在真机弹出
     # 真实 OS 通知；需要断言通知行为的测试自行传入 RVF_TERMINAL_NOTIFIER_BIN。
     env.setdefault("RVF_TERMINAL_NOTIFIER_BIN", str(_DEFAULT_FAKE_NOTIFIER))
+    # 旧续跑 transport 的正向测试已有接受阶段；为新门禁构造独立消息/Git 前置证明。
+    # 新发起与缺证据反例在专用分界套件直接运行生产入口，不走此夹具。
+    if env.get("CODEX_RVF_FORK_MODE") == "kanban-followup" and event.get("cwd"):
+        from independent_review_start_boundary_fixture import environment_with_synthetic_independent_review_start_boundary
+        candidate_repo = Path(str(event["cwd"]))
+        if candidate_repo.is_dir():
+            root_probe = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=candidate_repo, capture_output=True, text=True)
+            if root_probe.returncode == 0:
+                candidate_repo = Path(root_probe.stdout.strip())
+        has_head = subprocess.run(["git", "rev-parse", "--verify", "HEAD"], cwd=candidate_repo, capture_output=True).returncode == 0 if candidate_repo.is_dir() else False
+        if has_head:
+            env = environment_with_synthetic_independent_review_start_boundary(repo=candidate_repo, environment=env,
+                session_id=str(event.get("session_id") or "synthetic-native-session"), preserve_runtime_state_root=True)
     completed = subprocess.run(
         [sys.executable, str(SCRIPT)],
         input=json.dumps(event),
@@ -439,6 +452,14 @@ def load_hook_module():
     assert spec.loader is not None
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    # 保留旧后端/状态测试的职责；真实 gate 与子进程绕过面由专用集成套件验证。
+    import types
+    from independent_review_start_boundary_fixture import run_subprocess_with_independent_review_start_boundary
+    module.require_review_start_boundary_for_prepare = lambda **kw: {"test_scope": "stop-routing-unit"}
+    module.bind_review_start_boundary_to_one_run = lambda **kw: (kw["run_id"], Path(kw["run_dir"]) if kw["run_dir"] is not None else None)
+    module.subprocess = types.SimpleNamespace(**vars(subprocess))
+    module.subprocess.run = run_subprocess_with_independent_review_start_boundary
+    appserver.subprocess = module.subprocess
     return module
 
 
@@ -2850,7 +2871,7 @@ def test_kanban_task_workspace_mismatch_uses_task_lookup_without_workspace_env(t
     assert [call["argv"][0] for call in calls] == ["list"]
 
 
-def test_fork_experiment_missing_desktop_control_prepares_manual_not_continuation(
+def test_fork_experiment_without_boundary_never_prepares_manual_or_continuation(
     tmp_path: Path,
 ) -> None:
     state = tmp_path / "state"
@@ -2875,12 +2896,11 @@ def test_fork_experiment_missing_desktop_control_prepares_manual_not_continuatio
 
     assert "decision" not in payload
     assert payload["continue"] is True
-    assert "reason=manual_prepared" in payload["systemMessage"]
+    assert "reason=review_start_boundary_pending" in payload["systemMessage"]
     latest = latest_summary(state)
-    assert latest["status"] == "manual-prepared"
-    assert latest["desktop_control_unavailable_fallback"] == "manual"
-    assert latest["socket_selection"]["desktop_control"]["reason"] == "missing"
-    assert latest["socket_selection"]["bridge_policy"] == "report"
+    assert latest["status"] == "skipped"
+    assert "desktop_control_unavailable_fallback" not in latest
+    assert "socket_selection" not in latest
     assert latest["marker"] == "RVF_FORK_EXPERIMENT"
 
 
@@ -5595,6 +5615,19 @@ def test_agentic_initiation_e2e_dogfood_signal_to_guardian(tmp_path: Path) -> No
         cli = _ilu.module_from_spec(cli_spec)
         sys.modules[cli_spec.name] = cli
         cli_spec.loader.exec_module(cli)
+        # 与 invoke 的独立临时会话保持一致，不能继承运行本测试的真实 Kanban task 身份。
+        for inherited_identity_name in tuple(os.environ):
+            if inherited_identity_name.startswith(("KANBAN_", "CLINE_KANBAN_")):
+                saved_env.setdefault(inherited_identity_name, os.environ[inherited_identity_name])
+                os.environ.pop(inherited_identity_name)
+        # 本仓回归使用合成原生独立消息；原生可选 rewind 另由隔离 Codex PTY 实验验证。
+        from independent_review_start_boundary_fixture import environment_with_synthetic_independent_review_start_boundary
+        boundary_environment = environment_with_synthetic_independent_review_start_boundary(
+            repo=dirty, environment=os.environ.copy(), session_id="e2e-dogfood-session", preserve_runtime_state_root=True,
+            existing_token=token, native_transcript_path=transcript, accept_decision_before_prepare=False)
+        for boundary_key in ("RVF_REVIEW_START_BOUNDARY_RECEIPT", "RVF_SCOPE_CONTRACT", "CODEX_THREAD_ID", "CODEX_RVF_CLINE_KANBAN_TASK_CMD"):
+            saved_env.setdefault(boundary_key, os.environ.get(boundary_key))
+            os.environ[boundary_key] = boundary_environment[boundary_key]
         import rvf_decision_token_store as dts  # noqa: PLC0415
         import agentic_initiation_guardian_dispatch as guardian  # noqa: PLC0415
         import agentic_initiation_injection_attempt_ledger as injection_ledger  # noqa: PLC0415
@@ -5623,7 +5656,7 @@ def test_agentic_initiation_e2e_dogfood_signal_to_guardian(tmp_path: Path) -> No
         assert "降级" in start_result.message, start_result.message
         run_dir = Path(start_result.detail["run_dir"])
         assert run_dir.is_dir(), run_dir
-        assert str(run_dir).startswith(str(state)), run_dir  # run 落盘同样被隔离
+        assert run_dir.resolve().is_relative_to(state.resolve()), run_dir  # run 落盘同样被隔离
         prepare_artifacts = start_result.detail["prepare_artifacts"]
         assert Path(prepare_artifacts["review_packet"]).is_file(), prepare_artifacts
         assert Path(prepare_artifacts["scope_contract"]).is_file(), prepare_artifacts
@@ -5776,6 +5809,19 @@ def test_agentic_initiation_start_produces_session_owned_scope_with_tracker_leas
         cli = _ilu.module_from_spec(cli_spec)
         sys.modules[cli_spec.name] = cli
         cli_spec.loader.exec_module(cli)
+        # 与 invoke 的独立临时会话保持一致，不能继承运行本测试的真实 Kanban task 身份。
+        for inherited_identity_name in tuple(os.environ):
+            if inherited_identity_name.startswith(("KANBAN_", "CLINE_KANBAN_")):
+                saved_env.setdefault(inherited_identity_name, os.environ[inherited_identity_name])
+                os.environ.pop(inherited_identity_name)
+        # 本仓回归使用合成原生独立消息；原生可选 rewind 另由隔离 Codex PTY 实验验证。
+        from independent_review_start_boundary_fixture import environment_with_synthetic_independent_review_start_boundary
+        boundary_environment = environment_with_synthetic_independent_review_start_boundary(
+            repo=repo, environment=os.environ.copy(), session_id=session_id, preserve_runtime_state_root=True,
+            existing_token=token, native_transcript_path=transcript, accept_decision_before_prepare=False)
+        for boundary_key in ("RVF_REVIEW_START_BOUNDARY_RECEIPT", "RVF_SCOPE_CONTRACT", "CODEX_THREAD_ID", "CODEX_RVF_CLINE_KANBAN_TASK_CMD"):
+            saved_env.setdefault(boundary_key, os.environ.get(boundary_key))
+            os.environ[boundary_key] = boundary_environment[boundary_key]
 
         # 刻意**不传** --transcript-path：默认路径上 agent 通常不会带它，回退必须由候选摘要里
         # Stop hook 盖的那份兜住（这正是横幅之外的第二条保险）。
@@ -5807,7 +5853,7 @@ def test_agentic_initiation_start_produces_session_owned_scope_with_tracker_leas
         assert contract["session_manifest_path"], contract
         assert contract["primary_files"] == ["changed.txt"], contract["primary_files"]
         # 在途凭证与 run 工件都必须落在隔离 state 下（绝不写真实 ~/.rvf）。
-        assert str(start_result.detail["run_dir"]).startswith(str(state)), start_result.detail
+        assert Path(start_result.detail["run_dir"]).resolve().is_relative_to(state.resolve()), start_result.detail
         marker_path = start_result.detail["in_flight_receipt"].get("marker_path")
         assert marker_path and str(marker_path).startswith(str(state)), start_result.detail
     finally:
@@ -5865,6 +5911,19 @@ def test_agentic_initiation_start_releases_tracker_lease_when_prepare_does_not_c
         cli = _ilu.module_from_spec(cli_spec)
         sys.modules[cli_spec.name] = cli
         cli_spec.loader.exec_module(cli)
+        # 与 invoke 的独立临时会话保持一致，不能继承运行本测试的真实 Kanban task 身份。
+        for inherited_identity_name in tuple(os.environ):
+            if inherited_identity_name.startswith(("KANBAN_", "CLINE_KANBAN_")):
+                saved_env.setdefault(inherited_identity_name, os.environ[inherited_identity_name])
+                os.environ.pop(inherited_identity_name)
+        # 本仓回归使用合成原生独立消息；原生可选 rewind 另由隔离 Codex PTY 实验验证。
+        from independent_review_start_boundary_fixture import environment_with_synthetic_independent_review_start_boundary
+        boundary_environment = environment_with_synthetic_independent_review_start_boundary(
+            repo=repo, environment=os.environ.copy(), session_id=session_id, preserve_runtime_state_root=True,
+            existing_token=token, native_transcript_path=transcript, accept_decision_before_prepare=False)
+        for boundary_key in ("RVF_REVIEW_START_BOUNDARY_RECEIPT", "RVF_SCOPE_CONTRACT", "CODEX_THREAD_ID", "CODEX_RVF_CLINE_KANBAN_TASK_CMD"):
+            saved_env.setdefault(boundary_key, os.environ.get(boundary_key))
+            os.environ[boundary_key] = boundary_environment[boundary_key]
         import prepare_review_run  # noqa: PLC0415
         from datetime import datetime, timezone  # noqa: PLC0415
         from core.session_scope_allocation import reviewable_unit_diff_tracker as tracker  # noqa: PLC0415
@@ -6275,7 +6334,7 @@ def main() -> int:
         test_kanban_task_workspace_mismatch_skips_unrelated_dirty_repo,
         test_kanban_task_workspace_mismatch_uses_task_lookup_without_workspace_env,
         test_cline_kanban_mode_marks_unavailable_when_task_start_fails,
-        test_fork_experiment_missing_desktop_control_prepares_manual_not_continuation,
+        test_fork_experiment_without_boundary_never_prepares_manual_or_continuation,
         test_missing_desktop_control_fail_policy_reports,
         test_fork_session_visibility_waits_only_for_active_session,
         test_app_server_fork_waits_for_session_file_before_deeplink,

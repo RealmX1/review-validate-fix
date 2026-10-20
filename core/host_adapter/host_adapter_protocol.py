@@ -83,6 +83,10 @@ class HostAdapter(Protocol):
     不校验签名）。
     """
 
+    def read_independent_user_turn_boundary_evidence(self, *, receipt: Mapping[str, Any]) -> Mapping[str, Any]:
+        """读取原生可回退独立消息；未经宿主取证的能力必须明确拒绝。"""
+        ...
+
     def host_display_name(self) -> str:
         """本 host 的人类可读名，用于 prompt-block 文案标题（如 ``Claude Code`` / ``Codex``）。"""
         ...
@@ -186,6 +190,9 @@ def _self_check() -> None:
     """
 
     class _Conforming:
+        def read_independent_user_turn_boundary_evidence(self, *, receipt: Mapping[str, Any]) -> Mapping[str, Any]:
+            return {"independent_user_turn_verified": False, "capability_unverified": True}
+
         def host_display_name(self) -> str:
             return "Codex"
 
@@ -233,8 +240,9 @@ def _self_check() -> None:
     partial = _MissingSkipMode()
     assert isinstance(conforming, HostAdapter), "齐方法 stub 应满足 HostAdapter Protocol"
     assert not isinstance(partial, HostAdapter), "缺 detect_host_skip_mode 的 stub 不应满足"
-    # 顺带验证注入面的方法名集合就是这 9 个，防止悄悄增删。
+    # 顺带验证注入面的方法名集合就是这 10 个，防止悄悄增删。
     expected = {
+        "read_independent_user_turn_boundary_evidence",
         "host_display_name",
         "session_deep_link",
         "cline_kanban_agent_id",

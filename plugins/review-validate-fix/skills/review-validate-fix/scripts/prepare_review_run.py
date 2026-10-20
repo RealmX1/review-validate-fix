@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+
 import argparse
 import hashlib
 import json
@@ -17,6 +18,7 @@ from typing import Any, Mapping
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 core.* import
+from review_start_boundary_gate import require_review_start_boundary_for_prepare, bind_review_start_boundary_to_one_run
 import concurrent.futures
 import rvf_bootstrap_gate
 import rvf_prep_file
@@ -32,6 +34,7 @@ from core.run_ledger.run_ledger import normalize_rvf_backend, rvf_state_fields, 
 from core.session_scope_allocation import reviewable_unit_diff_tracker
 from core.host_adapter.host_transcript_format_detection import HOST_CODEX, detect_transcript_format
 from core.rvf_user_local_data_paths import resolved_rvf_reviewer_registry_path
+from core.review_start_boundary.review_start_boundary_verification import INVALIDATED, ReviewStartBoundaryNotVerified
 
 
 def _resolve_valid_main_harnesses() -> frozenset[str]:
@@ -1265,6 +1268,11 @@ def prepare_run(
     scope_contract_extensions: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     root = git_root(repo)
+
+    verified_boundary_receipt = require_review_start_boundary_for_prepare(
+        repo=str(root), receipt=(scope_contract_extensions or {}).get("review_start_boundary_receipt"),
+    )
+    scope_contract_extensions = {**dict(scope_contract_extensions or scope_contract_v3_extensions()), "review_start_boundary_receipt": verified_boundary_receipt}
     resolved_local_base_ref = resolve_local_base_ref(
         root,
         explicit_local_base_ref=local_base_ref,
@@ -1384,6 +1392,9 @@ def prepare_run(
     if base_ref and not committed_baseline:
         committed_baseline = base_ref
     canonical_backend = normalize_rvf_backend(rvf_backend) or "manual"
+    rvf_run_id, rvf_run_dir = bind_review_start_boundary_to_one_run(
+        receipt=verified_boundary_receipt, run_id=rvf_run_id, run_dir=rvf_run_dir,
+    )
     ledger = start_run(
         "prepare-run",
         repo=str(root),
@@ -2062,8 +2073,21 @@ def prepare_run_from_prep_file(
     """
     payload = dict(prep.payload)
     rvf_run = payload.get("rvf_run") if isinstance(payload.get("rvf_run"), dict) else {}
+
+    verified_boundary_receipt = require_review_start_boundary_for_prepare(
+        repo=str(_resolve_prep_target_repo(payload)), receipt=rvf_run.get("review_start_boundary_receipt"),
+        expected_session_id=str(payload.get("origin_session_id") or ""),
+    )
+    if verified_boundary_receipt.get("session_id") and payload.get("origin_session_id") != verified_boundary_receipt["session_id"]:
+        raise ReviewStartBoundaryNotVerified(INVALIDATED, "prep 来源会话与独立消息不一致")
+    # 唯一归属先于 completed 缓存与 startup scope；拒绝重放不得留下正式工件。
+    rvf_run_id, rvf_run_dir = bind_review_start_boundary_to_one_run(
+        receipt=verified_boundary_receipt, run_id=rvf_run.get("run_id"), run_dir=rvf_run.get("run_dir"),
+    )
     existing_state = rvf_run.get("shared_workflow_state") if isinstance(rvf_run, dict) else None
     if isinstance(existing_state, dict) and existing_state.get("status") == "completed":
+        if existing_state.get("run_id") != rvf_run_id or existing_state.get("run_dir") != str(rvf_run_dir):
+            raise ReviewStartBoundaryNotVerified(INVALIDATED, "prep 完成缓存与已冻结 run 身份不一致")
         # ⚠️ 这条幂等短路是「agent 写了真 scope-of-work 却进不了 packet」的结构性成因：packet 在
         # 首次 prepare 时就把 stub 内联冻结了，重跑 prepare 到这里直接返回、什么都不会重渲。
         # 要把新正文渲进 packet，走 ``rerender_scope_of_work_into_review_packet``（显式、带归档），
@@ -2073,9 +2097,6 @@ def prepare_run_from_prep_file(
 
     target_flow = str(payload.get("target_flow") or "")
     rvf_backend = TARGET_FLOW_BACKEND.get(target_flow, "manual")
-    rvf_run_id = rvf_run.get("run_id") if isinstance(rvf_run, dict) else None
-    rvf_run_dir_raw = rvf_run.get("run_dir") if isinstance(rvf_run, dict) else None
-    rvf_run_dir = Path(rvf_run_dir_raw).expanduser() if isinstance(rvf_run_dir_raw, str) and rvf_run_dir_raw else None
     tracker_scope_raw = rvf_run.get("tracker_scope_path") if isinstance(rvf_run, dict) else None
     tracker_scope = Path(tracker_scope_raw).expanduser() if isinstance(tracker_scope_raw, str) and tracker_scope_raw else None
 
@@ -2091,6 +2112,7 @@ def prepare_run_from_prep_file(
     local_base_ref_raw = payload.get("local_base_ref")
     local_base_ref = local_base_ref_raw.strip() if isinstance(local_base_ref_raw, str) and local_base_ref_raw.strip() else None
     contract_extensions = scope_contract_v3_extensions_from_prep_payload(payload, rvf_run)
+    contract_extensions["review_start_boundary_receipt"] = rvf_run.get("review_start_boundary_receipt")
 
     transcript_path: Path | None = None
     transcript_candidate = transcript_override
@@ -2192,6 +2214,9 @@ def prepare_run_from_prep_file(
             "completed_at": _shared_workflow_now(),
             "error": f"prepare_run exceeded {timeout_seconds:.0f}s timeout",
         }
+    except ReviewStartBoundaryNotVerified as exc:
+        executor.shutdown(wait=False, cancel_futures=True)
+        completed_state = {**state, "status": exc.status, "completed_at": _shared_workflow_now(), "error": exc.reason}
     except BootstrapRequiredBeforeRvf as exc:
         # 「等 local base bootstrap」不是失败，而是一个**可恢复的等待态**：给它独立的 status
         # （不与真失败混同）并附一枚白名单 gate 子记录，让两条入口（rvf-agent decision-token /

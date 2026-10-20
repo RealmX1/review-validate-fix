@@ -23,14 +23,11 @@ from core.rvf_shared_runtime_constants.rvf_shared_runtime_constants import (  # 
 )
 from session_label import text_from_message_payload
 
-try:
-    # 纯文本 handoff 识别复用：`RVF_RUN_RE`（run id 谓词）+ `parse_sections`
-    # （markdown 章节切分，无 IO）。仅用这两个无副作用函数判定「粘贴的是 handoff
-    # 正文」，**绝不**调 `build_payload`（它可能跑 git subprocess）。顶层 import
-    # 只引 stdlib，无 IO，可安全用于 UPS 检测热路径。缺省时降级为不做 handoff 识别。
-    import rvf_handoff_intake
-except Exception:  # pragma: no cover - handoff 识别可缺省降级
-    rvf_handoff_intake = None
+from core.review_start_boundary.explicit_manual_review_command_recognition import (
+    RVF_MANUAL_TRIGGER_RE,
+    RVF_SIBLING_TRIGGER_RE,
+    looks_like_rvf_handoff_body,
+)
 
 try:
     # Vendored single-file copy (see its header). Gives a structured "which skill
@@ -56,43 +53,6 @@ DISPATCH_ORIGIN_MARKERS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("kanban-followup", re.compile(rf"\b{re.escape(KANBAN_FOLLOWUP_MARKER)}\b")),
 )
 RVF_MANUAL_TRIGGERS = ("$review-validate-fix", "/review-validate-fix", ":review-validate-fix")
-# Match a manual trigger only at line start or after whitespace, and only
-# when the trailing token boundary is clean (\b). This avoids accidentally
-# triggering on quoted/embedded literals that appear inside review packets,
-# transcript excerpts, error stacks, or normal prose like
-# "please document the /review-validate-fix tool".
-# 负向先行断言 `(?!:rvf-)`：在检测层就区分主 skill 与 `rvf-*` 姊妹子 skill。所有
-# 姊妹 skill 的命名空间形态都是 `…:rvf-<name>`（如 `/review-validate-fix:rvf-land`、
-# `/review-validate-fix:rvf-local-deploy`），调用它们不应启动新 review；而主 skill
-# 的裸形态 `/review-validate-fix` 与命名空间形态
-# `/review-validate-fix:review-validate-fix`（后缀是 `:review-` 而非 `:rvf-`）仍命中。
-# 本断言位置无关，根因级修复「子 skill 出现在 prompt 句中时误触发 manual review」。
-RVF_MANUAL_TRIGGER_RE = re.compile(
-    r"(?:^|\s)[\$/:]review-validate-fix(?!:rvf-)\b",
-    re.MULTILINE,
-)
-# 前导姊妹命令抑制（位置锚定 prompt 开头，容忍前导空白）。`rvf-land` /
-# `rvf-handoff-intake` / `rvf-reopen` / `rvf-analyze` 等姊妹 skill 明确「不启动新
-# review」，却常把含 `review-validate-fix` 字面量的 handoff 正文作为参数粘贴进来。
-# 主 skill 名是 `review-validate-fix`（不以 `rvf-` 开头），故本正则永不误吞真触发。
-# 容忍命名空间前缀 `rvf:` / `review-validate-fix:`。
-RVF_SIBLING_TRIGGER_RE = re.compile(
-    r"\s*[\$/:](?:rvf:|review-validate-fix:)?rvf-[a-z0-9][a-z0-9-]*\b",
-)
-# handoff/finalization 正文里高度独有的 markdown 章节标题（归一化为小写后做子串
-# 匹配）。与 RVF run id 共现时判定为「粘贴的 handoff 正文」。这些短语在「普通要求
-# 跑一次 review」的 prompt 里几乎不会作为章节标题出现，叠加 run id 共现可避免误伤
-# 只顺嘴提了个 run id 的合法 review 请求。
-RVF_HANDOFF_SECTION_MARKERS = (
-    "handoff intake hints",
-    "deterministic intake hints",
-    "validate/fix",
-    "处理结果",
-    "repo delta",
-    "继续指引",
-    "升级事项",
-    "本次 review",
-)
 # manual 触发可内联指定 review scope：`/review-validate-fix scope: a.py b.py`。
 # 取首个 `scope:`（行首或空白前缀，避免命中 `telescope:` 之类）之后直到行尾的
 # 内容作为 primary 文件清单。大小写不敏感；建议把 `scope:` 放在该行末尾。
@@ -241,27 +201,8 @@ def _leading_sibling_command(text: str | None) -> bool:
 
 
 def _looks_like_handoff_body(text: str | None) -> bool:
-    """prompt 是否「看起来是粘贴的 RVF handoff/finalization 正文」（位置无关，纯文本）。
-
-    判据：含 RVF run id（``rvf_handoff_intake.RVF_RUN_RE``）**且** 含至少一个 handoff
-    独有的 markdown 章节标题（经 ``parse_sections`` 切出的 heading 命中
-    :data:`RVF_HANDOFF_SECTION_MARKERS`）。两条件叠加，避免误伤只顺嘴提了个 run id 的
-    合法 review 请求。只用 stdlib-only、无 IO 的两个函数；``rvf_handoff_intake`` 缺省时
-    直接返回 False（降级为不做识别）。
-    """
-    if rvf_handoff_intake is None or not text:
-        return False
-    try:
-        if not rvf_handoff_intake.RVF_RUN_RE.search(text):
-            return False
-        sections = rvf_handoff_intake.parse_sections(text)
-    except Exception:  # pragma: no cover - 识别失败永不阻断，按「非 handoff」处理
-        return False
-    for heading in sections:
-        normalized = heading.strip().lower()
-        if any(marker in normalized for marker in RVF_HANDOFF_SECTION_MARKERS):
-            return True
-    return False
+    """与开审分界复用纯文本 handoff 抑制规则，不把交接引用当作新命令。"""
+    return looks_like_rvf_handoff_body(text)
 
 
 def _codex_sibling_skill_invoked(event: dict[str, Any]) -> bool:

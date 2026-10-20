@@ -10,6 +10,7 @@ import sys
 import tempfile
 import importlib.util
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -903,17 +904,20 @@ def _write_same_session_transcript_with_marker(path: Path, repo: Path) -> Path:
     return path
 
 
-def _seed_automatic_closeout_review_start_receipt(run_dir: Path, repo: Path) -> dict[str, str]:
+def _seed_automatic_closeout_review_start_receipt(run_dir: Path, repo: Path, rvf_home: Path) -> dict[str, str]:
+    from _rvf_test_support.loader import load_script_module
+
     receipt = {
         "decision_token": "0123456789abcdef",
         "session_id": "child-session",
         "worktree": str(repo.resolve()),
     }
-    inputs = run_dir / "inputs"
-    inputs.mkdir()
-    (inputs / "automatic-closeout-review-start-receipt.json").write_text(
-        json.dumps(receipt), encoding="utf-8"
-    )
+    # 完成通知消费正式开审时的不可变绑定；夹具也经真实 bridge 建立该生命周期前提。
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    with patch.dict(os.environ, {"RVF_HOME": str(rvf_home)}):
+        load_script_module("rvf_automatic_closeout_bridge").bind_run(
+            receipt, run_dir, run_id=summary["run_id"],
+        )
     return receipt
 
 
@@ -926,8 +930,8 @@ def test_handoff_marker_finalizes_run_artifacts_same_session(tmp_path: Path) -> 
     write_fake_installed_hook(hook, marker)
     state = tmp_path / "state"
     run_dir, handoff = _seed_finalize_run_dir(state=state, repo=repo)
-    receipt = _seed_automatic_closeout_review_start_receipt(run_dir, repo)
     rvf_home = tmp_path / "rvf-home"
+    receipt = _seed_automatic_closeout_review_start_receipt(run_dir, repo, rvf_home)
     transcript = _write_same_session_transcript_with_marker(
         tmp_path / "rollout.jsonl",
         repo,
@@ -1009,8 +1013,8 @@ def test_handoff_marker_surfaces_finalize_record_errors(tmp_path: Path) -> None:
     write_fake_installed_hook(hook, marker)
     state = tmp_path / "state"
     run_dir, handoff = _seed_finalize_run_dir(state=state, repo=repo)
-    _seed_automatic_closeout_review_start_receipt(run_dir, repo)
     rvf_home = tmp_path / "rvf-home"
+    _seed_automatic_closeout_review_start_receipt(run_dir, repo, rvf_home)
     transcript = _write_same_session_transcript_with_marker(
         tmp_path / "rollout.jsonl",
         repo,

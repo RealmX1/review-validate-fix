@@ -18,17 +18,6 @@ def rvf_home() -> Path:
     return Path(os.environ.get('RVF_HOME') or Path.home() / '.rvf').expanduser()
 
 
-def _write_json(path: Path, value: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + f'.{os.getpid()}.writing')
-    with temporary.open('w', encoding='utf-8') as handle:
-        json.dump(value, handle, ensure_ascii=False, sort_keys=True, indent=2)
-        handle.write('\n')
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, path)
-
-
 def _write_complete_json_without_overwriting(path: Path, value: Mapping[str, Any]) -> None:
     """先落完整文件，再原子挂名；并发与重试均不能覆盖已存在的完成事实。"""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -75,13 +64,19 @@ def capture_before_start(payload: Mapping[str, Any], *, transcript_path: str | N
     return receipt
 
 
-def bind_run(receipt: Mapping[str, Any] | None, run_dir: Path) -> None:
+def bind_run(receipt: Mapping[str, Any] | None, run_dir: Path, *, run_id: str) -> None:
     if receipt is None:
         return
-    run_dir = run_dir.resolve()
-    _write_json(run_dir / 'inputs' / 'automatic-closeout-review-start-receipt.json', receipt)
-    digest = hashlib.sha256(json.dumps(dict(receipt), ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-    _write_json(rvf_home() / 'review-start-independent-user-turn-boundary-receipts' / f"{receipt['decision_token']}.run-binding.json", {'run_id': run_dir.name, 'run_dir': str(run_dir), 'receipt_sha256': digest})
+    if not isinstance(run_id, str) or not run_id.strip():
+        raise ValueError('自动收尾绑定必须提供真实 run_id')
+    from review_start_boundary_gate import bind_review_start_boundary_to_one_run
+
+    # 与 prepare/dispatch 共用不可变事实，真实 run_id 由调用方传递，不能由目录名猜测。
+    _, run_dir = bind_review_start_boundary_to_one_run(receipt=receipt, run_id=run_id, run_dir=run_dir)
+    receipt_path = run_dir / 'inputs' / 'automatic-closeout-review-start-receipt.json'
+    _write_complete_json_without_overwriting(receipt_path, receipt)
+    if json.loads(receipt_path.read_text(encoding='utf-8')) != dict(receipt):
+        raise ValueError('自动收尾的开审分界与已冻结 receipt 不一致')
 
 
 def activate_bound_run(receipt: Mapping[str, Any]) -> None:
@@ -112,12 +107,16 @@ def _completion_notification_identity(run_dir: Path, finalized: Mapping[str, Any
     receipt = json.loads(path.read_text(encoding='utf-8'))
     if not finalized.get('completed_at'):
         return
-    if finalized.get('run_id') != run_dir.name or Path(str(finalized.get('run_dir'))).resolve() != run_dir or Path(str(finalized.get('repo'))).resolve() != Path(receipt['worktree']).resolve():
+    from review_start_boundary_gate import review_start_boundary_receipt_path, bind_review_start_boundary_to_one_run
+    binding_path = review_start_boundary_receipt_path(str(receipt['decision_token'])).with_suffix('.run-binding.json')
+    binding = json.loads(binding_path.read_text(encoding='utf-8'))
+    if finalized.get('run_id') != binding.get('run_id') or binding.get('run_dir') != str(run_dir) or Path(str(finalized.get('run_dir'))).resolve() != run_dir or Path(str(finalized.get('repo'))).resolve() != Path(receipt['worktree']).resolve():
         raise ValueError('RVF 完成身份与开审分界不一致')
+    bind_review_start_boundary_to_one_run(receipt=receipt, run_id=binding['run_id'], run_dir=run_dir)
     return {
         'schema': 'rvf-automatic-closeout-completion/v1', 'decision_token': receipt['decision_token'],
         'session_id': receipt['session_id'], 'worktree': receipt['worktree'],
-        'run_id': run_dir.name, 'run_dir': str(run_dir),
+        'run_id': binding['run_id'], 'run_dir': str(run_dir),
         'handoff_path': str(run_dir / 'artifacts' / 'handoff.md'),
     }
 

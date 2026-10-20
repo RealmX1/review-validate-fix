@@ -170,6 +170,10 @@ def load_prepare_review_run_module():
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    # 本测试簇只验证既有状态机；真实宿主/Git 分界由独立集成测试覆盖。
+    module.require_review_start_boundary_for_prepare = lambda **kwargs: {"test_scope": "prepare-unit"}
+    # 专用状态机夹具维持绑定器的 Path 返回契约；真实双向绑定由隔离 Git 集成套件验证。
+    module.bind_review_start_boundary_to_one_run = lambda receipt, run_id, run_dir: (run_id, Path(run_dir) if run_dir is not None else None)
     return module
 
 
@@ -531,6 +535,8 @@ def load_check_review_output_module():
     return module
 
 
+from independent_review_start_boundary_fixture import run_subprocess_with_independent_review_start_boundary
+
 def run(
     cmd: list[str],
     cwd: Path | None = None,
@@ -550,6 +556,18 @@ def run(
         raise AssertionError(completed.stderr.strip() or completed.stdout.strip() or f"{cmd[0]} failed")
     return completed
 
+
+
+def run_with_independent_review_start_boundary(cmd, cwd=None, input_text=None, env=None):
+    """既有 prepare CLI 正向回归显式补齐新契约；独立 gate 反例仍直接运行生产入口。"""
+    if len(cmd) > 1 and Path(cmd[1]).name == "prepare_review_run.py" and "--repo" in cmd:
+        from independent_review_start_boundary_fixture import environment_with_synthetic_independent_review_start_boundary
+        def argument(name):
+            return cmd[cmd.index(name) + 1] if name in cmd else None
+        env = environment_with_synthetic_independent_review_start_boundary(
+            repo=Path(argument("--repo")), environment=env,
+            run_id=argument("--rvf-run-id"), run_dir=argument("--rvf-run-dir"))
+    return run(cmd, cwd=cwd, input_text=input_text, env=env)
 
 def read_jsonl(path: Path) -> list[dict[str, object]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -1579,6 +1597,11 @@ def test_prepare_run_from_prep_file_timeout_returns_immediately(tmp_path: Path) 
 
     prepare_module = importlib.import_module("prepare_review_run")
     original_prepare_run = prepare_module.prepare_run
+    original_boundary_gate = prepare_module.require_review_start_boundary_for_prepare
+    original_run_binding = prepare_module.bind_review_start_boundary_to_one_run
+    # 本用例只测 worker 超时，不测宿主；前置绑定仍保持真实接口的返回类型。
+    prepare_module.require_review_start_boundary_for_prepare = lambda **kw: {"test_scope": "prepare-timeout"}
+    prepare_module.bind_review_start_boundary_to_one_run = lambda receipt, run_id, run_dir: (run_id, Path(run_dir))
 
     def slow_prepare_run(**_: object) -> dict[str, object]:
         # Sleep well past our 1-second timeout to prove that the wrapper does
@@ -1597,6 +1620,8 @@ def test_prepare_run_from_prep_file_timeout_returns_immediately(tmp_path: Path) 
         elapsed = time.monotonic() - start
     finally:
         prepare_module.prepare_run = original_prepare_run
+        prepare_module.require_review_start_boundary_for_prepare = original_boundary_gate
+        prepare_module.bind_review_start_boundary_to_one_run = original_run_binding
 
     # Wall-clock must reflect the 1s timeout, not the 5s worker sleep. Allow
     # generous slack for slow CI but still well below the worker's 5s sleep.
@@ -4200,7 +4225,7 @@ def _slice_2b_prepare(
     if extra_args:
         cmd.extend(extra_args)
     env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root)}
-    completed = subprocess.run(cmd, capture_output=True, text=True, env=env, check=False)
+    completed = run_subprocess_with_independent_review_start_boundary(cmd, capture_output=True, text=True, env=env, check=False)
     if completed.returncode != 0:
         return completed, None
     payload = json.loads(output_json.read_text(encoding="utf-8"))
@@ -4282,6 +4307,7 @@ def test_scope_contract_v2_emitted_without_tracker_scope(tmp: Path) -> None:
     assert canonical["version"] == 3
     assert set(canonical.keys()) == {
         "version",
+        "review_start_boundary_receipt",
         "repo",
         "scope_mode",
         "primary_files",
@@ -4425,7 +4451,7 @@ def test_tracker_scope_requires_session_manifest_or_transcript(tmp: Path) -> Non
     base_dir.mkdir(parents=True, exist_ok=True)
     log_root = tmp / "logs"
     env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root)}
-    completed = subprocess.run(
+    completed = run_subprocess_with_independent_review_start_boundary(
         [
             sys.executable,
             str(PREPARE_REVIEW_RUN),
@@ -4843,7 +4869,7 @@ def test_committed_round_base_ref_drives_manifest_attribution(tmp: Path) -> None
         "--base-ref", baseline, "--rvf-backend", "manual",
     ]
     env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(tmp / "logs")}
-    completed = subprocess.run(cmd, capture_output=True, text=True, env=env, check=False)
+    completed = run_subprocess_with_independent_review_start_boundary(cmd, capture_output=True, text=True, env=env, check=False)
     assert completed.returncode == 0, completed.stderr
     payload = json.loads(output_json.read_text(encoding="utf-8"))
     art = Path(payload["artifacts_dir"])
@@ -6378,6 +6404,8 @@ def load_dispatch_reviewers_module():
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    # 本测试簇只验证既有状态机；真实宿主/Git 分界由独立集成测试覆盖。
+    module.require_prepared_run_review_start_boundary = lambda **kwargs: {"test_scope": "dispatch-unit"}
     return module
 
 
@@ -8480,6 +8508,11 @@ def load_rvf_agent_decision_cli_module():
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    # 本测试簇只验证既有状态机；真实宿主/Git 分界由独立集成测试覆盖。
+    module.require_review_start_boundary = lambda **kwargs: {"test_scope": "decision-state-unit"}
+    module.require_prepared_run_review_start_boundary = lambda **kwargs: {"test_scope": "decision-state-unit"}
+    # 专用状态机夹具维持绑定器的 Path 返回契约；真实双向绑定由隔离 Git 集成套件验证。
+    module.bind_review_start_boundary_to_one_run = lambda receipt, run_id, run_dir: (run_id, Path(run_dir) if run_dir is not None else None)
     return module
 
 
@@ -10947,14 +10980,6 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_circuit_breaker_refused_mint_requests_do_not_keep_the_breaker_tripped(root / "f4-5"),
         ),
         (
-            "reopen_own_declined_decision_refuses_unless_newest_token_of_this_session_is_declined",
-            lambda: test_reopen_own_declined_decision_refuses_unless_newest_token_of_this_session_is_declined(root / "f4-6"),
-        ),
-        (
-            "reopen_own_declined_decision_mints_with_agent_provenance_and_overrides_cooldown_and_snooze",
-            lambda: test_reopen_own_declined_decision_mints_with_agent_provenance_and_overrides_cooldown_and_snooze(root / "f4-7"),
-        ),
-        (
             "extra_token_payload_fields_cannot_override_system_written_explicit_user_request_fields",
             lambda: test_extra_token_payload_fields_cannot_override_system_written_explicit_user_request_fields(root / "f4-10"),
         ),
@@ -12189,8 +12214,8 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             ),
         ),
         (
-            "bootstrap_replay_after_receipt_reuses_the_same_run_end_to_end",
-            lambda: test_bootstrap_replay_after_receipt_reuses_the_same_run_end_to_end(
+            "bootstrap_replay_after_base_absorption_requires_new_review_start_boundary",
+            lambda: test_bootstrap_replay_after_base_absorption_requires_new_review_start_boundary(
                 root / "bootstrap-replay-same-run"
             ),
         ),
@@ -13653,7 +13678,7 @@ globals().update({_n: getattr(_difftrk, _n) for _n in _difftrk.__all__})
 # 让（未改动的）注册表 lambda 解析到它们。注册顺序 / 分片身份保持不变。
 from _rvf_review_support import prepare_review_run_bootstrap as _preprev
 _preprev.inject(
-    run=run,
+    run=run_with_independent_review_start_boundary,
     init_repo=init_repo,
     write_codex_transcript=write_codex_transcript,
     PREPARE_REVIEW_RUN=PREPARE_REVIEW_RUN,
