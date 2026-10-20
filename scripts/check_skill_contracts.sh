@@ -935,6 +935,7 @@ run_step "tests: rvf_handoff_marker_detection_across_host_transcripts" \
 run_step "tests: rvf_run_finalize" \
   python3 -m pytest -q \
     "$tests_dir/test_rvf_run_finalize.py" \
+    "$tests_dir/test_automatic_closeout_bridge.py" \
     "$tests_dir/test_cancel_rvf_run_finalize.py"
 # 测试卫生守卫本身的判据：认得出本次套件的泄漏、放得过活会话的并发写入（F5·H5b）。
 run_step "tests: check_contract_suite_left_no_test_artifacts_in_real_rvf_state_roots" \

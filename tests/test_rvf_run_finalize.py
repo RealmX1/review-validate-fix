@@ -5,6 +5,9 @@ import json
 import sqlite3
 import subprocess
 from pathlib import Path
+from unittest.mock import Mock
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -196,6 +199,99 @@ def test_finalize_for_handoff_resolves_run_dir_from_handoff_path(tmp_path: Path)
     assert record is not None
     assert record["run_dir"] == str(run_dir)
     assert record["decision_kind"] == "handoff-advisory"
+
+
+@pytest.mark.parametrize("failed_notification_operation", ["mkdir", "write"])
+@pytest.mark.parametrize("first_publication_fails", [False, True])
+def test_notification_failure_retries_publication_without_repeating_finalize(
+    tmp_path: Path,
+    monkeypatch,
+    failed_notification_operation: str,
+    first_publication_fails: bool,
+) -> None:
+    finalize = _load("rvf_run_finalize")
+    bridge = _load("rvf_automatic_closeout_bridge")
+    capture = _load("trajectory_capture")
+    repo = _init_repo(tmp_path / "repo")
+    transcript = tmp_path / "rollout.jsonl"
+    _write_transcript(transcript, capture.RVF_SKILL_TRIGGER)
+    run_dir = _make_run(tmp_path, repo, transcript)
+    summary_path = run_dir / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["run_id"] = run_dir.name
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+    monkeypatch.setenv("RVF_HOME", str(tmp_path / "rvf-home"))
+    monkeypatch.setenv("CODEX_RVF_LOG_ROOT", str(tmp_path / "state"))
+    decision_token = "0123456789abcdef"
+    bridge.bind_run(
+        {"decision_token": decision_token, "session_id": "S", "worktree": str(repo)},
+        run_dir,
+    )
+    (run_dir / "artifacts" / "handoff.md").write_text("RVF 已完成\n", encoding="utf-8")
+    event = {"transcript_path": str(transcript), "session_id": "S", "cwd": str(repo)}
+    side_effects = {}
+    for name in (
+        "capture_run", "_write_usage_summary", "capture_after", "compute_workspace_diff",
+        "_release_tracker_lease", "_advance_review_highwater", "_scaffold_analysis",
+    ):
+        side_effects[name] = Mock(wraps=getattr(finalize, name))
+        monkeypatch.setattr(finalize, name, side_effects[name])
+
+    if not first_publication_fails:
+        finalize.finalize_run(run_dir=run_dir, event=event)
+
+    notification_directory = tmp_path / "rvf-home" / "automatic-closeout-completion-notifications"
+    with monkeypatch.context() as notification_failure:
+        original_mkdir = Path.mkdir
+        original_open = Path.open
+
+        def fail_notification_directory_creation(path, *args, **kwargs):
+            if path == notification_directory:
+                raise OSError("通知目录不可写")
+            return original_mkdir(path, *args, **kwargs)
+
+        def fail_notification_file_write(path, mode="r", *args, **kwargs):
+            if path.parent == notification_directory and mode == "w":
+                raise OSError("通知文件不可写")
+            return original_open(path, mode, *args, **kwargs)
+
+        if failed_notification_operation == "mkdir":
+            notification_failure.setattr(Path, "mkdir", fail_notification_directory_creation)
+        else:
+            notification_failure.setattr(Path, "open", fail_notification_file_write)
+
+        if first_publication_fails:
+            with pytest.raises(OSError, match="通知"):
+                finalize.finalize_run(run_dir=run_dir, event=event)
+
+        completed_files = {
+            path.relative_to(run_dir): (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in run_dir.rglob("*") if path.is_file()
+        }
+        lock_path = run_dir / "artifacts" / ".finalize.lock"
+        completed_at = json.loads(lock_path.read_text(encoding="utf-8"))["completed_at"]
+        for _ in range(2):
+            with pytest.raises(OSError, match="通知"):
+                finalize.finalize_run(run_dir=run_dir, event=event)
+            assert {name: effect.call_count for name, effect in side_effects.items()} == {
+                name: 1 for name in side_effects
+            }
+            assert completed_files == {
+                path.relative_to(run_dir): (path.read_bytes(), path.stat().st_mtime_ns)
+                for path in run_dir.rglob("*") if path.is_file()
+            }
+
+    retried = finalize.finalize_run(run_dir=run_dir, event=event)
+    assert retried["already_finalized"] is True
+    assert retried["completed_at"] == completed_at
+    assert {name: effect.call_count for name, effect in side_effects.items()} == {
+        name: 1 for name in side_effects
+    }
+    assert completed_files == {
+        path.relative_to(run_dir): (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in run_dir.rglob("*") if path.is_file()
+    }
+    assert (notification_directory / f"{decision_token}.json").is_file()
 
 
 def test_finalize_run_releases_tracker_lease_from_scope_contract(tmp_path: Path, monkeypatch) -> None:

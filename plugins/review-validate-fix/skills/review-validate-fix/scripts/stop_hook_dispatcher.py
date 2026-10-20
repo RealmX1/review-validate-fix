@@ -1255,7 +1255,7 @@ def main() -> int:
                 finalize_record = finalize_for_handoff(
                     handoff_path=handoff_path_value,
                     event=event,
-                    decision_kind="dispatcher-handoff",
+                    decision_kind="handoff",
                 )
                 surface_finalize_record_errors(ledger, finalize_record, payload=payload)
                 surface_rvf_analyze_advisory(
