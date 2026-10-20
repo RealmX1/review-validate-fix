@@ -2080,8 +2080,14 @@ def prepare_run_from_prep_file(
     )
     if verified_boundary_receipt.get("session_id") and payload.get("origin_session_id") != verified_boundary_receipt["session_id"]:
         raise ReviewStartBoundaryNotVerified(INVALIDATED, "prep 来源会话与独立消息不一致")
+    # 唯一归属先于 completed 缓存与 startup scope；拒绝重放不得留下正式工件。
+    rvf_run_id, rvf_run_dir = bind_review_start_boundary_to_one_run(
+        receipt=verified_boundary_receipt, run_id=rvf_run.get("run_id"), run_dir=rvf_run.get("run_dir"),
+    )
     existing_state = rvf_run.get("shared_workflow_state") if isinstance(rvf_run, dict) else None
     if isinstance(existing_state, dict) and existing_state.get("status") == "completed":
+        if existing_state.get("run_id") != rvf_run_id or existing_state.get("run_dir") != str(rvf_run_dir):
+            raise ReviewStartBoundaryNotVerified(INVALIDATED, "prep 完成缓存与已冻结 run 身份不一致")
         # ⚠️ 这条幂等短路是「agent 写了真 scope-of-work 却进不了 packet」的结构性成因：packet 在
         # 首次 prepare 时就把 stub 内联冻结了，重跑 prepare 到这里直接返回、什么都不会重渲。
         # 要把新正文渲进 packet，走 ``rerender_scope_of_work_into_review_packet``（显式、带归档），
@@ -2091,9 +2097,6 @@ def prepare_run_from_prep_file(
 
     target_flow = str(payload.get("target_flow") or "")
     rvf_backend = TARGET_FLOW_BACKEND.get(target_flow, "manual")
-    rvf_run_id = rvf_run.get("run_id") if isinstance(rvf_run, dict) else None
-    rvf_run_dir_raw = rvf_run.get("run_dir") if isinstance(rvf_run, dict) else None
-    rvf_run_dir = Path(rvf_run_dir_raw).expanduser() if isinstance(rvf_run_dir_raw, str) and rvf_run_dir_raw else None
     tracker_scope_raw = rvf_run.get("tracker_scope_path") if isinstance(rvf_run, dict) else None
     tracker_scope = Path(tracker_scope_raw).expanduser() if isinstance(tracker_scope_raw, str) and tracker_scope_raw else None
 

@@ -49,6 +49,8 @@ def write_canonical_artifact(path: Path, payload: dict[str, object]) -> str:
 def test_prepare_run_from_prep_file_forwards_scope_contract_v3_extensions(tmp_path: Path, monkeypatch) -> None:
     # 此处只验证 v3 字段透传；分界真实性由专用宿主/Git 集成套件验证。
     monkeypatch.setattr(prepare_review_run, "require_review_start_boundary_for_prepare", lambda **kw: {"test_scope": "v3-field-forwarding"})
+    # 本单元测试隔离 v3 字段透传；绑定的完整交互由真实 start→prepare→dispatch 回归验证。
+    monkeypatch.setattr(prepare_review_run, "bind_review_start_boundary_to_one_run", lambda receipt, run_id, run_dir: (run_id, Path(run_dir)))
     repo = tmp_path / "repo"
     repo.mkdir()
     git(repo, "init", "-q", "-b", "main")

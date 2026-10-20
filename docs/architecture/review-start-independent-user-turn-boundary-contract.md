@@ -52,13 +52,13 @@ flowchart TD
 
 当前只放行已做原生实验的 Codex CLI 0.163.0 TUI（originator=codex-tui，已观察 source=cli/vscode）；Codex GUI、exec 与其它宿主形态不借用这份原生回退证明。原生 session_meta 的版本不在已验证集合时保持 pending，升级后须先重跑原生实验。本次直接启动 TUI 的隔离 app-server 实验原生记录 source=vscode，当前 Kanban TUI 记录 source=cli；source 字段单独不能证明 VS Code 扩展或 GUI 的回退能力。每次首次开审或重入，先验证静态 receipt、原始 JSONL 和 Git 候选，再在状态迁移前重新查询宿主实时活动分支；首次没有静态 receipt 时另先向宿主取一次，最后的实时查询仍不可省略。JSONL 要求 `session_meta.id` 相同、`task_started.turn_attribution.turn_trigger=user`、对应 turn 的 `item_completed.item.type=UserMessage` 和原生 message ID 相符。只存在 `response_item.role=user` 不算证据；后续出现另一用户发起的工作 turn、消息被截断移除或发生已持久化 rollback 都拒绝旧分界。真实 PTY 实验进一步确认：TUI 已显示回退后，原始 rollout 仍保留旧 UserMessage，静态 reader 仍判存在；所以它只证明消息曾存在，活动分支资格必须由本次 nonce 查询的宿主快照证明。重启后也不复用旧分支观测。
 
-自动正文必须精确包含本 token 的独立单行边界标记，不能混入其它输入。自动来源的 token 必须为 explicit=false；手动来源必须对应原生明确 `/review-validate-fix`、`$review-validate-fix` 或 `:review-validate-fix` 命令，以及 manual UPS provenance。Agent 自填 reason 不参与来源裁决。
+自动正文必须精确包含本 token 的独立单行边界标记，不能混入其它输入。自动来源的 token 必须为 explicit=false；手动来源必须对应原生明确 `/review-validate-fix`、`$review-validate-fix` 或 `:review-validate-fix` 主 skill 调用，也接受合法的前置文字及命名空间形态，例如 `now $review-validate-fix:review-validate-fix your own work.` 和 `$rvf:review-validate-fix`。UPS 与 verifier 共用纯文本识别与抑制规则；`$rvf:review-validate-fix` 等其它命名空间在 UPS 仍须由 Codex `text_elements` 确认，verifier 先核实 manual UPS provenance，再识别该原文，不扩大 UPS 的文本 fallback。兄弟 `rvf-*` skill、交接正文和被引号包裹的普通提及不能代替主 skill 调用。原文仍须是通过宿主证明的独立 user turn，并同时满足 `initiated_by_explicit_user_request=true`、`developer_manual_trigger_via_user_prompt_submit` provenance、原始消息 SHA256、完整 checkpoint 绑定及实时活动分支证明；合法命令形态本身不构成开审授权。Agent 自填 reason 不参与来源裁决。
 
 自动消息的原生接收时间必须在 token 创建与到期之间。手动命令允许原始消息先于 UPS 铸 token，间隔最多 120 秒；这不放宽消息、会话与快照绑定。过期、迟到、无有效在途锚点的 token 不得直接 prepare。
 
 快照必须使用 40 位不可变 commit，tree、HEAD、当前候选指纹、文件身份/mtime/ctime 签名、候选文件内容 SHA256、比较基线及其本地 ref tip 都重新核验。commit 正文必须有且只有一行 `RVF_REVIEW_START_BOUNDARY_BINDING=<JSON>`，内容等于下述绑定字段，不能复用任意 latest commit。Git 子进程清理继承的 `GIT_*` 仓库定位变量。还核对文件类型、执行权限、仓库内符号链接及 gitlink commit；仓库外链接和带未冻结修改的 submodule 拒绝使用本快照证明。
 
-通过验证后，先用排他锁将原生 session/message 绑定到唯一 token 和静态 receipt 摘要，再绑定唯一 `run_id/run_dir`；同一消息不能借给另一 run。相同 run 重入仍须通过 gate。当前实现有意保守：若已准备但未派发的 run 在后续 turn 或候选变化后失效，先终止旧准备并释放范围；不得直接把旧 run 或分界转给新候选。已开始 run 的跨 turn 冻结输入重试优化未在本次放宽。
+通过验证后，先用排他锁将原生 session/message 绑定到唯一 token 和静态 receipt 摘要，再绑定唯一 `run_id/run_dir`；同一消息不能借给另一 run。相同 token、静态 receipt 摘要、真实 `run_id` 与规范化 `run_dir` 才允许重入。所有 token 的绑定写入共用排他锁，并从同一组不可变 `*.run-binding.json` 记录核对反向归属；既有 run_id 或目录均不能被另一 token 占用。bridge 复用该绑定器，不能重写事实或从目录名推断 run_id；完成通知也使用冻结的真实 run_id。prep 必须在 completed 缓存返回及 startup scope/run 工件落盘前完成验证与占用。相同 run 重入仍须通过 gate。当前实现有意保守：若已准备但未派发的 run 在后续 turn 或候选变化后失效，先终止旧准备并释放范围；不得直接把旧 run 或分界转给新候选。已开始 run 的跨 turn 冻结输入重试优化未在本次放宽。
 
 ## cline-kanban 的生产接口与责任
 
@@ -135,7 +135,7 @@ checkpoint 的 JSON 绑定字段见代码 `CHECKPOINT_BINDING_FIELDS`，不含 c
 | --- | --- | --- |
 | 初次自动发起 | 独立原生 UserMessage、候选快照先于 acknowledge/prepare | 专用 pytest：真实隔离 Git、合成宿主事件/实时观测接口替身，正向到真实 prepare；原生 PTY 实验单独验证可回退能力与静态历史的盲区 |
 | 延后自动恢复 | 新 token、新消息请求，explicit=false，当前 turn 不开审 | 专用 pytest：重复请求、未接受状态、来源字段 |
-| 用户明确手动命令 | 原始独立命令 + manual provenance + 新绑定 commit | 专用 pytest 正向；换成果交接原文则拒绝 |
+| 用户明确手动命令 | 原始独立主 skill 命令（含前置文字与命名空间）+ manual provenance + 新绑定 commit | 专用 pytest 正向；兄弟 skill、交接正文、普通提及、hook 与伪来源反例拒绝 |
 | 条件满足但无新 turn | 不 acknowledge、不 prepare、不分配/派发 | 专用 pytest 反例，不读取 accepted 作为成功 |
 | 重复/失败/迟到/TTL | 相同请求 token/key；失败保持 pending；到期后消息拒绝 | 专用 pytest；Kanban 队列真实提交/消费仍须跨仓验收 |
 | 候选/HEAD/base/bootstrap 改变 | 旧分界失效，不用内容指纹掩盖纯 commit/base 变化 | 专用 pytest 与既有 bootstrap 回归新断言 |

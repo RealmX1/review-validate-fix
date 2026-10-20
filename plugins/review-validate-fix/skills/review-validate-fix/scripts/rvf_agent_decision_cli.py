@@ -2071,7 +2071,7 @@ def run_start(
 
     if automatic_closeout_receipt is not None:
         try:
-            rvf_automatic_closeout_bridge.bind_run(automatic_closeout_receipt, Path(run_dir))
+            rvf_automatic_closeout_bridge.bind_run(automatic_closeout_receipt, Path(run_dir), run_id=run_id)
         except Exception as exc:
             return _fail(f"无法绑定自动收尾 run：{exc}", phase="bind_automatic_closeout_run")
         try:

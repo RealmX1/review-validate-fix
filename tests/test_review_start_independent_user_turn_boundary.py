@@ -68,7 +68,8 @@ def valid_boundary(tmp_path, monkeypatch):
     summaries = importlib.import_module("stop_decision_candidate_summary")
     repo = tmp_path / "synthetic-repository"
     repo.mkdir()
-    git(repo, "init", "-q")
+    # 基线变动反例需要 main；不能依赖机器或调用方的 init.defaultBranch。
+    git(repo, "init", "-q", "-b", "main")
     git(repo, "config", "user.name", "隔离分界测试")
     git(repo, "config", "user.email", "boundary@example.invalid")
     (repo / "a.py").write_text("value = 1\n")
@@ -298,17 +299,15 @@ def test_verified_boundary_reaches_real_prepare_and_gates_dispatch_again(valid_b
             run_id="synthetic-real-prepare", run_dir=tmp_path / "isolated-real-run")
 
 
-def test_explicit_manual_command_needs_its_real_native_message_and_bound_checkpoint(valid_boundary, monkeypatch):
-    fixture = valid_boundary
+def explicit_manual_command_boundary(fixture, monkeypatch, command_text):
     tokens = fixture["tokens"]
     tokens.mark_withdrawn(fixture["token"], reason="改用明确手动命令")
     manual = tokens.mint_decision_token(worktree=str(fixture["repo"]), session_id="synthetic-session",
         candidate_summary=fixture["payload"]["candidate_summary"], candidate_fingerprint=fixture["payload"]["candidate_fingerprint"],
         initiated_by_explicit_user_request=True, explicit_user_request_provenance="developer_manual_trigger_via_user_prompt_submit")
     receipt = dict(fixture["receipt"], decision_token=manual.token, source="explicit_user_command")
-    text = "/review-validate-fix"
-    receipt["boundary_message_sha256"] = hashlib.sha256(text.encode()).hexdigest()
-    fixture["records"][-1]["payload"]["item"]["content"][0]["text"] = text
+    receipt["boundary_message_sha256"] = hashlib.sha256(command_text.encode()).hexdigest()
+    fixture["records"][-1]["payload"]["item"]["content"][0]["text"] = command_text
     fixture["transcript"].write_text("\n".join(json.dumps(record) for record in fixture["records"]))
     from core.review_start_boundary.review_start_boundary_verification import CHECKPOINT_BINDING_PREFIX, CHECKPOINT_BINDING_FIELDS
     receipt["checkpoint_commit"] = git(fixture["repo"], "commit-tree", receipt["checkpoint_tree"], "-p", "HEAD", "-m",
@@ -318,8 +317,25 @@ def test_explicit_manual_command_needs_its_real_native_message_and_bound_checkpo
     from independent_review_start_boundary_fixture import configure_synthetic_live_boundary_host_observation
     host_environment = configure_synthetic_live_boundary_host_observation(receipt_path=manual_receipt_path, repo=fixture["repo"], environment=os.environ.copy())
     monkeypatch.setenv("CODEX_RVF_CLINE_KANBAN_TASK_CMD", host_environment["CODEX_RVF_CLINE_KANBAN_TASK_CMD"])
+    return manual, receipt, host_environment
+
+
+@pytest.mark.parametrize("command_text", [
+    "/review-validate-fix",
+    "$review-validate-fix",
+    ":review-validate-fix",
+    "now $review-validate-fix:review-validate-fix your own work.",
+    "请现在 /review-validate-fix 审查这轮改动",
+    "待办已完成\n/review-validate-fix:review-validate-fix 审查改动",
+    "请运行 $rvf:review-validate-fix 审查改动",
+])
+def test_explicit_manual_command_needs_its_real_native_message_and_bound_checkpoint(valid_boundary, monkeypatch, command_text):
+    fixture = valid_boundary
+    tokens = fixture["tokens"]
+    manual, receipt, host_environment = explicit_manual_command_boundary(fixture, monkeypatch, command_text)
     manual_payload = tokens.read_decision_token(manual.token).payload
     assert fixture["gate"].require_review_start_boundary(token_payload=manual_payload, repo=str(fixture["repo"]), receipt=receipt) == receipt
+    from core.review_start_boundary.review_start_boundary_verification import CHECKPOINT_BINDING_PREFIX, CHECKPOINT_BINDING_FIELDS
     # 即使宿主误把同一条手动消息配给第二枚 token，也不能把旧分界充当新一轮起点。
     first_host_command = host_environment["CODEX_RVF_CLINE_KANBAN_TASK_CMD"]
     tokens.mark_withdrawn(manual.token, reason="合成测试：旧 token 作废")
@@ -331,6 +347,7 @@ def test_explicit_manual_command_needs_its_real_native_message_and_bound_checkpo
         CHECKPOINT_BINDING_PREFIX + json.dumps({key:second_receipt.get(key) for key in CHECKPOINT_BINDING_FIELDS}))
     second_path = fixture["gate"].review_start_boundary_receipt_path(second_manual.token)
     second_path.write_text(json.dumps(second_receipt))
+    from independent_review_start_boundary_fixture import configure_synthetic_live_boundary_host_observation
     second_environment = configure_synthetic_live_boundary_host_observation(receipt_path=second_path, repo=fixture["repo"], environment=os.environ.copy())
     monkeypatch.setenv("CODEX_RVF_CLINE_KANBAN_TASK_CMD", second_environment["CODEX_RVF_CLINE_KANBAN_TASK_CMD"])
     from core.review_start_boundary.review_start_boundary_verification import ReviewStartBoundaryNotVerified
@@ -343,6 +360,72 @@ def test_explicit_manual_command_needs_its_real_native_message_and_bound_checkpo
     from core.review_start_boundary.review_start_boundary_verification import ReviewStartBoundaryNotVerified
     with pytest.raises(ReviewStartBoundaryNotVerified):
         fixture["gate"].require_review_start_boundary(token_payload=manual_payload, repo=str(fixture["repo"]), receipt=receipt)
+
+
+@pytest.mark.parametrize("command_text,expected_classification", [
+    ("/review-validate-fix", "manual"),
+    ("now $review-validate-fix:review-validate-fix your own work.", "manual"),
+    ("请运行 $rvf:review-validate-fix 审查改动", "none"),
+    ("/review-validate-fix:rvf-land", "none"),
+    ("请运行 $review-validate-fix:rvf-reopen", "none"),
+    ("请运行 /review-validate-fix:rvf-local-deploy", "none"),
+    ("/rvf-land\n/review-validate-fix", "suppressed"),
+    ("/review-validate-fix\n## 处理结果\nrvf-20261020T080229Z-test", "suppressed"),
+    ("请参考 `$review-validate-fix` 的说明", "none"),
+    ("运行时成果交接，已验收", "none"),
+])
+def test_explicit_manual_source_text_uses_user_prompt_submit_classification(command_text, expected_classification):
+    submit = importlib.import_module("rvf_user_prompt_submit")
+    assert submit._classify_manual_trigger({}, command_text) == expected_classification
+
+
+@pytest.mark.parametrize("invalid_proof", ["checkpoint_binding", "merged_user_turn", "active_branch"])
+def test_namespaced_manual_command_still_requires_native_turn_checkpoint_and_active_branch(valid_boundary, monkeypatch, invalid_proof):
+    fixture = valid_boundary
+    manual, receipt, _ = explicit_manual_command_boundary(fixture, monkeypatch,
+        "now $review-validate-fix:review-validate-fix your own work.")
+    if invalid_proof == "checkpoint_binding":
+        receipt["checkpoint_commit"] = fixture["receipt"]["checkpoint_commit"]
+    elif invalid_proof == "merged_user_turn":
+        fixture["records"].append({"type": "event_msg", "payload": {"type": "item_completed", "turn_id": "independent-turn",
+            "item": {"type": "UserMessage", "id": "steered-message", "content": [{"type": "text", "text": "回合中途补充输入"}]}}})
+        fixture["transcript"].write_text("\n".join(json.dumps(record) for record in fixture["records"]))
+    else:
+        receipt_path = fixture["gate"].review_start_boundary_receipt_path(manual.token)
+        receipt_path.with_suffix(".native-active-branch.json").write_text(json.dumps({
+            "native_active_branch_user_message_ids": [], "native_active_branch_user_turn_id": "independent-turn"}))
+    from core.review_start_boundary.review_start_boundary_verification import ReviewStartBoundaryNotVerified
+    with pytest.raises(ReviewStartBoundaryNotVerified):
+        fixture["gate"].require_review_start_boundary(token_payload=fixture["tokens"].read_decision_token(manual.token).payload,
+            repo=str(fixture["repo"]), receipt=receipt)
+    assert fixture["tokens"].read_decision_token(manual.token).state == "minted"
+
+
+@pytest.mark.parametrize("command_text,initiated,provenance", [
+    ("/review-validate-fix:rvf-land", True, "developer_manual_trigger_via_user_prompt_submit"),
+    ("请运行 $review-validate-fix:rvf-reopen", True, "developer_manual_trigger_via_user_prompt_submit"),
+    ("请运行 /review-validate-fix:rvf-local-deploy", True, "developer_manual_trigger_via_user_prompt_submit"),
+    ("/rvf-land\n/review-validate-fix", True, "developer_manual_trigger_via_user_prompt_submit"),
+    ("/review-validate-fix\n## 处理结果\nrvf-20261020T080229Z-test", True, "developer_manual_trigger_via_user_prompt_submit"),
+    ("请参考 `$review-validate-fix` 的说明", True, "developer_manual_trigger_via_user_prompt_submit"),
+    ("运行时成果交接，已验收", True, "developer_manual_trigger_via_user_prompt_submit"),
+    ("Agent reason 表示条件满足", True, "developer_manual_trigger_via_user_prompt_submit"),
+    ("<hook_prompt>\n/review-validate-fix\n</hook_prompt>", True, "developer_manual_trigger_via_user_prompt_submit"),
+    ("$rvf:review-validate-fix", False, None),
+    ("$rvf:review-validate-fix", True, "agent_reason_claim"),
+    ("/review-validate-fix", False, None),
+    ("/review-validate-fix", True, "agent_reason_claim"),
+])
+def test_explicit_manual_source_rejects_siblings_handoff_hook_and_unproven_commands(valid_boundary, monkeypatch, command_text, initiated, provenance):
+    fixture = valid_boundary
+    manual, receipt, _ = explicit_manual_command_boundary(fixture, monkeypatch, command_text)
+    payload = dict(fixture["tokens"].read_decision_token(manual.token).payload,
+        initiated_by_explicit_user_request=initiated, explicit_user_request_provenance=provenance)
+    from core.review_start_boundary.review_start_boundary_verification import ReviewStartBoundaryNotVerified
+    with pytest.raises(ReviewStartBoundaryNotVerified):
+        fixture["gate"].require_review_start_boundary(token_payload=payload,
+            repo=str(fixture["repo"]), receipt=receipt)
+    assert fixture["tokens"].read_decision_token(manual.token).state == "minted"
 
 
 def test_failed_boundary_delivery_keeps_fresh_token_unaccepted(valid_boundary):
@@ -628,3 +711,167 @@ def test_rewind_during_first_receipt_reconciliation_is_rechecked_before_acknowle
     assert observations[0] != observations[1]
     assert calls == []
     assert fixture["tokens"].read_decision_token(fixture["token"]).state == "minted"
+
+
+@pytest.mark.parametrize("reused_identity", ["run_id", "run_dir"])
+def test_run_identity_cannot_be_reassigned_to_a_second_token(valid_boundary, tmp_path, reused_identity):
+    fixture = valid_boundary
+    gate = fixture["gate"]
+    original_run_directory = tmp_path / "original-directory"
+    gate.bind_review_start_boundary_to_one_run(receipt=fixture["receipt"], run_id="logical-run", run_dir=original_run_directory)
+    competing_receipt = dict(fixture["receipt"], decision_token="f" * 16)
+    competing_id = "logical-run" if reused_identity == "run_id" else "another-logical-run"
+    competing_directory = original_run_directory if reused_identity == "run_dir" else tmp_path / "another-directory"
+    from core.review_start_boundary.review_start_boundary_verification import ReviewStartBoundaryNotVerified
+    with pytest.raises(ReviewStartBoundaryNotVerified):
+        gate.bind_review_start_boundary_to_one_run(receipt=competing_receipt, run_id=competing_id, run_dir=competing_directory)
+    assert not gate.review_start_boundary_receipt_path(competing_receipt["decision_token"]).with_suffix(".run-binding.json").exists()
+    assert not original_run_directory.exists()
+    assert not competing_directory.exists()
+
+
+@pytest.mark.parametrize("cached_completed", [False, True])
+@pytest.mark.parametrize("changed_identity", ["run_id", "run_dir"])
+def test_prep_replay_checks_binding_before_cache_or_startup_artifact(valid_boundary, tmp_path, cached_completed, changed_identity):
+    fixture = valid_boundary
+    prepare = importlib.import_module("prepare_review_run")
+    prep_files = importlib.import_module("rvf_prep_file")
+    original_run = tmp_path / "original-directory"
+    fixture["gate"].bind_review_start_boundary_to_one_run(receipt=fixture["receipt"], run_id="logical-run", run_dir=original_run)
+    run_directory = tmp_path / "forbidden-replayed-directory" if changed_identity == "run_dir" else original_run
+    run_id = "another-logical-run" if changed_identity == "run_id" else "logical-run"
+    payload = {
+        "origin_session_id": fixture["receipt"]["session_id"], "origin_repo": str(fixture["repo"]),
+        "origin_cwd": str(fixture["repo"]), "target_worktree": str(fixture["repo"]),
+        "target_flow": "flow-agentic-initiation",
+        "rvf_run": {"run_id": run_id, "run_dir": str(run_directory), "review_start_boundary_receipt": fixture["receipt"]},
+    }
+    if cached_completed:
+        payload["rvf_run"]["shared_workflow_state"] = {"status": "completed", "run_id": run_id, "run_dir": str(run_directory), "artifacts": {}}
+    prep = prep_files.write_prep_file(payload, root=tmp_path / "dispatch-prep-files")
+    original_prep_bytes = prep.path.read_bytes()
+    from core.review_start_boundary.review_start_boundary_verification import ReviewStartBoundaryNotVerified
+    with pytest.raises(ReviewStartBoundaryNotVerified):
+        prepare.prepare_run_from_prep_file(prep, base_dir=tmp_path / "forbidden-prepared-runs")
+    assert prep.path.read_bytes() == original_prep_bytes
+    assert not run_directory.exists()
+    assert not (tmp_path / "forbidden-prepared-runs").exists()
+
+
+def test_default_start_prepare_dispatch_preserves_real_run_identity(valid_boundary, tmp_path, monkeypatch):
+    fixture = valid_boundary
+    cli = fixture["cli"]
+    bridge = importlib.import_module("rvf_automatic_closeout_bridge")
+    logical_run_id = "logical-review-run"
+    run_directory = tmp_path / "different-physical-directory-name"
+    monkeypatch.setenv("RVF_RUN_ID", logical_run_id)
+    monkeypatch.setenv("RVF_RUN_DIR", str(run_directory))
+    monkeypatch.setenv("CODEX_RVF_PREP_ROOT", str(tmp_path / "dispatch-prep-files"))
+    monkeypatch.setenv("RVF_KANBAN_FOLLOWUP_LOCK_ROOT", str(tmp_path / "isolated-followup-locks"))
+    # 只替代宿主捕获/激活接口和外部 provider 探测；默认 prepare 与所有真实分界绑定均执行。
+    monkeypatch.setattr(bridge, "capture_before_start", lambda *args, **kwargs: fixture["receipt"])
+    activations = []
+    monkeypatch.setattr(bridge, "activate_bound_run", lambda receipt: activations.append(receipt))
+    started = cli.run_start(token=fixture["token"], reason="验证默认完整绑定链", transcript_path=str(fixture["transcript"]),
+        launch_preflight=lambda **kwargs: (True, None), provider_health_requirements_resolver=lambda backend: [])
+    assert started.status == "ok", started
+    assert activations == [fixture["receipt"]]
+    overlay = cli.read_scope_adjustment(fixture["token"])
+    assert overlay["run_id"] == logical_run_id
+    assert overlay["run_dir"] == str(run_directory)
+    contract_path = Path(overlay["prepare_artifacts"]["scope_contract"])
+    assert json.loads(contract_path.read_text())["run_id"] == logical_run_id
+    binding_path = fixture["gate"].review_start_boundary_receipt_path(fixture["token"]).with_suffix(".run-binding.json")
+    frozen_binding = binding_path.read_bytes()
+    prep_files = importlib.import_module("rvf_prep_file")
+    prepare = importlib.import_module("prepare_review_run")
+    prep_path = next((tmp_path / "dispatch-prep-files").glob("*.json"))
+    prep_payload = json.loads(prep_path.read_text())
+    prepared_contract_snapshot = (contract_path.read_bytes(), contract_path.stat().st_mtime_ns)
+    completed_cache = prepare.prepare_run_from_prep_file(prep_files.PrepFileRecord(token=prep_payload["token"], path=prep_path, payload=prep_payload))
+    assert completed_cache["status"] == "completed"
+    assert completed_cache["run_id"] == logical_run_id
+    assert (contract_path.read_bytes(), contract_path.stat().st_mtime_ns) == prepared_contract_snapshot
+    scope = Path(overlay["prepare_artifacts"]["scope_of_work"])
+    scope.write_text("## 本轮范围\n审查 a.py 中 value 从 1 更新为 2 的实现与行为。\n")
+    rerendered = cli.run_scope_rerender_scope_of_work(token=fixture["token"])
+    assert rerendered.status == "ok", rerendered
+    dispatches = []
+    dispatched = cli.run_dispatch(token=fixture["token"], strictness="light",
+        reviewer_dispatcher=lambda **kwargs: dispatches.append(kwargs) or {"status": "ok"})
+    assert dispatched.status == "ok", dispatched
+    assert dispatches[0]["run_id"] == logical_run_id
+    assert dispatches[0]["run_dir"] == str(run_directory)
+    assert binding_path.read_bytes() == frozen_binding
+
+
+def test_real_prepare_rejects_second_token_before_overwriting_scope_contract(valid_boundary, tmp_path, monkeypatch):
+    fixture = valid_boundary
+    prepare = importlib.import_module("prepare_review_run")
+    context = tmp_path / "written-scope-of-work.md"
+    context.write_text("## 本轮范围\n审查 a.py 的 value 更新。\n")
+    run_directory = tmp_path / "physical-run-directory"
+    arguments = dict(repo=fixture["repo"], session_context=context, session_manifest=None, transcript=None,
+        base_dir=tmp_path / "prepared-runs", max_file_bytes=10000, max_packet_bytes=0,
+        primary_files=["a.py"], background_files=[], exclude_path_prefixes=[],
+        rvf_run_id="logical-run", rvf_run_dir=run_directory)
+    first = prepare.prepare_run(**arguments, scope_contract_extensions={"review_start_boundary_receipt": fixture["receipt"]})
+    contract = Path(first["scope_contract"])
+    original_contract = (contract.read_bytes(), contract.stat().st_mtime_ns)
+    from independent_review_start_boundary_fixture import environment_with_synthetic_independent_review_start_boundary
+    competing_environment = environment_with_synthetic_independent_review_start_boundary(
+        repo=fixture["repo"], environment=os.environ.copy(), run_id="logical-run", run_dir=run_directory,
+        session_id="second-independent-session", preserve_runtime_state_root=True)
+    for key, value in competing_environment.items():
+        monkeypatch.setenv(key, value)
+    competing_receipt = json.loads(Path(competing_environment["RVF_REVIEW_START_BOUNDARY_RECEIPT"]).read_text())
+    assert competing_receipt["decision_token"] != fixture["token"]
+    from core.review_start_boundary.review_start_boundary_verification import ReviewStartBoundaryNotVerified
+    with pytest.raises(ReviewStartBoundaryNotVerified):
+        prepare.prepare_run(**arguments, scope_contract_extensions={"review_start_boundary_receipt": competing_receipt})
+    assert (contract.read_bytes(), contract.stat().st_mtime_ns) == original_contract
+    assert not fixture["gate"].review_start_boundary_receipt_path(competing_receipt["decision_token"]).with_suffix(".run-binding.json").exists()
+
+
+@pytest.mark.parametrize("conflicting_direction", ["same_run", "same_run_id", "same_run_directory"])
+def test_concurrent_processes_and_restart_preserve_exclusive_run_binding(valid_boundary, tmp_path, conflicting_direction):
+    fixture = valid_boundary
+    run_directory = tmp_path / "claimed-physical-directory"
+    code = '''import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import review_start_boundary_gate as gate
+from core.review_start_boundary.review_start_boundary_verification import ReviewStartBoundaryNotVerified
+receipt, run_id, directory = json.loads(sys.argv[2]), sys.argv[3], sys.argv[4]
+try:
+    gate.bind_review_start_boundary_to_one_run(receipt=receipt, run_id=run_id, run_dir=directory)
+    print(json.dumps({"status":"bound", "token":receipt["decision_token"]}))
+except ReviewStartBoundaryNotVerified as error:
+    print(json.dumps({"status":error.status, "token":receipt["decision_token"]}))
+'''
+    contenders = []
+    for number in range(6):
+        receipt = dict(fixture["receipt"], decision_token=f"{number + 1:016x}")
+        run_id = f"logical-run-{number}" if conflicting_direction == "same_run_directory" else "logical-run"
+        directory = tmp_path / f"physical-directory-{number}" if conflicting_direction == "same_run_id" else run_directory
+        contenders.append((receipt, run_id, directory))
+    def command(contender):
+        receipt, run_id, directory = contender
+        return [sys.executable, "-c", code, str(SCRIPT_DIRECTORY), json.dumps(receipt), run_id, str(directory)]
+    processes = [subprocess.Popen(command(contender), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=os.environ.copy()) for contender in contenders]
+    results = []
+    for process in processes:
+        stdout, stderr = process.communicate(timeout=30)
+        assert process.returncode == 0, stderr
+        results.append(json.loads(stdout))
+    assert [result["status"] for result in results].count("bound") == 1
+    winner = next(contender for contender, result in zip(contenders, results) if result["status"] == "bound")
+    binding_path = fixture["gate"].review_start_boundary_receipt_path(winner[0]["decision_token"]).with_suffix(".run-binding.json")
+    frozen_binding = (binding_path.read_bytes(), binding_path.stat().st_mtime_ns)
+    # 重启后的每个进程仍只接受原获胜者，且同一静态 receipt 重入不改冻结记录。
+    for contender in contenders:
+        restarted = subprocess.run(command(contender), check=True, capture_output=True, text=True, env=os.environ.copy())
+        result = json.loads(restarted.stdout)
+        assert result["status"] == ("bound" if contender == winner else "review_start_boundary_invalidated")
+    assert (binding_path.read_bytes(), binding_path.stat().st_mtime_ns) == frozen_binding
+    assert all(not contender[2].exists() for contender in contenders)

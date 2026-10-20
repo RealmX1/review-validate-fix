@@ -208,7 +208,7 @@ def rvf_state_roots_isolated_from_invoking_shell_environment(
         monkeypatch.setattr(cli, "require_prepared_run_review_start_boundary", lambda **kw: {"test_scope":"layered-attribution"})
         monkeypatch.setattr(prepare, "require_review_start_boundary_for_prepare", lambda **kw: {"test_scope":"layered-attribution"})
         for module in (cli, prepare):
-            monkeypatch.setattr(module, "bind_review_start_boundary_to_one_run", lambda receipt, run_id, run_dir: (run_id, run_dir))
+            monkeypatch.setattr(module, "bind_review_start_boundary_to_one_run", lambda receipt, run_id, run_dir: (run_id, Path(run_dir) if run_dir is not None else None))
     return pinned_roots
 
 

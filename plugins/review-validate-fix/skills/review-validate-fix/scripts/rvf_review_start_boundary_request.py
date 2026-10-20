@@ -82,20 +82,29 @@ def run_request_review_start_boundary(
     current_session = resolve_current_agent_session_id_from_environment()
     if not current_session or payload.get("session_id") != current_session:
         return result("review_start_boundary_invalidated", "只能为当前会话请求开审分界")
+    ordinary_source_was_superseded_by_boundary_request = (
+        not deferred_decision_token and lookup.state == "withdrawn"
+        and payload.get("withdrawal_cause") == "superseded_review_start_boundary"
+    )
     if deferred_decision_token:
         if lookup.state != "declined" or payload.get("decline_kind") != "deferred_until_condition":
             return result("error", "自主恢复仅适用于 deferred_until_condition，不得推翻结构性谢绝")
-    elif lookup.state not in ("minted", "injected", "acknowledged"):
+    elif lookup.status != "valid":
+        return result("review_start_boundary_invalidated", "来源 token 已失效，不能重新请求开审")
+    elif lookup.state not in ("minted", "injected", "acknowledged") and not ordinary_source_was_superseded_by_boundary_request:
         return result("error", "已终态的 token 不能重新请求开审")
     newest = max(tokens.iter_decision_tokens_for_session(worktree=payload["worktree"], session_id=payload["session_id"], root=roots.token_root, now=now),
                  key=lambda record: str((record.payload or {}).get("minted_at") or ""), default=None)
     reusing_requested_boundary = False
     if newest is not None and newest.token != source:
-        if (newest.payload or {}).get("boundary_request_source_token") == source and newest.state in ("minted", "injected"):
+        if (newest.payload or {}).get("boundary_request_source_token") == source and newest.status == "valid" and newest.state in ("minted", "injected"):
             payload = newest.payload
             reusing_requested_boundary = True
         else:
             return result("error", "已有更新的决策，不得用旧 token 再开一轮")
+    # 已撤回的普通来源只能恢复磁盘上仍有效的同一请求，不能凭旧来源另铸一轮。
+    if ordinary_source_was_superseded_by_boundary_request and not reusing_requested_boundary:
+        return result("error", "已撤回来源没有可继续投递的派生请求")
     event = {"cwd": payload["worktree"], "session_id": payload["session_id"]}
     previous_summary = payload.get("candidate_summary") or {}
     if previous_summary.get("origin_transcript_path"):
@@ -107,6 +116,8 @@ def run_request_review_start_boundary(
     if event.get("transcript_path"):
         summary["origin_transcript_path"] = event["transcript_path"]
     changed = summary.get("candidate_fingerprint") != payload.get("candidate_fingerprint")
+    if ordinary_source_was_superseded_by_boundary_request and changed:
+        return result("review_start_boundary_invalidated", "候选已变化，不能用已撤回来源恢复旧请求")
     bootstrap_preparation_is_quiescent = bool(payload.get("bootstrap_gate")) and not tokens.bootstrap_replay_claim_path(payload["token"], roots.token_root).exists()
     if payload.get("state") == "acknowledged" and payload.get("run_anchor_dir") and not (payload.get("last_start_failure") or bootstrap_preparation_is_quiescent):
         return result("review_start_boundary_invalidated", "此 token 已有准备中的 run；须先结束该准备尝试并释放范围，不能把旧准备转给新候选")

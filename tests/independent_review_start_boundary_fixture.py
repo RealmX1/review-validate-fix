@@ -82,7 +82,8 @@ def environment_with_synthetic_independent_review_start_boundary(*, repo: Path, 
         receipt["candidate_filesystem_state_sha256"] = candidate_filesystem_state_sha256(str(repo), summary["candidates"])
         receipt["checkpoint_commit"] = git("commit-tree", tree, "-p", "HEAD", "-m", CHECKPOINT_BINDING_PREFIX + json.dumps({key:receipt.get(key) for key in CHECKPOINT_BINDING_FIELDS}, ensure_ascii=False))
         path = gate.review_start_boundary_receipt_path(token)
-        path.parent.mkdir(parents=True)
+        # 复用隔离运行根时可创建第二份真实测试分界，用于验证不同 token 的排他归属。
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(receipt))
         if accept_decision_before_prepare:
             tokens.acknowledge_decision_token(token)

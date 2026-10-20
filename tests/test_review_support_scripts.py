@@ -172,7 +172,8 @@ def load_prepare_review_run_module():
     spec.loader.exec_module(module)
     # 本测试簇只验证既有状态机；真实宿主/Git 分界由独立集成测试覆盖。
     module.require_review_start_boundary_for_prepare = lambda **kwargs: {"test_scope": "prepare-unit"}
-    module.bind_review_start_boundary_to_one_run = lambda receipt, run_id, run_dir: (run_id, run_dir)
+    # 专用状态机夹具维持绑定器的 Path 返回契约；真实双向绑定由隔离 Git 集成套件验证。
+    module.bind_review_start_boundary_to_one_run = lambda receipt, run_id, run_dir: (run_id, Path(run_dir) if run_dir is not None else None)
     return module
 
 
@@ -1597,7 +1598,10 @@ def test_prepare_run_from_prep_file_timeout_returns_immediately(tmp_path: Path) 
     prepare_module = importlib.import_module("prepare_review_run")
     original_prepare_run = prepare_module.prepare_run
     original_boundary_gate = prepare_module.require_review_start_boundary_for_prepare
+    original_run_binding = prepare_module.bind_review_start_boundary_to_one_run
+    # 本用例只测 worker 超时，不测宿主；前置绑定仍保持真实接口的返回类型。
     prepare_module.require_review_start_boundary_for_prepare = lambda **kw: {"test_scope": "prepare-timeout"}
+    prepare_module.bind_review_start_boundary_to_one_run = lambda receipt, run_id, run_dir: (run_id, Path(run_dir))
 
     def slow_prepare_run(**_: object) -> dict[str, object]:
         # Sleep well past our 1-second timeout to prove that the wrapper does
@@ -1617,6 +1621,7 @@ def test_prepare_run_from_prep_file_timeout_returns_immediately(tmp_path: Path) 
     finally:
         prepare_module.prepare_run = original_prepare_run
         prepare_module.require_review_start_boundary_for_prepare = original_boundary_gate
+        prepare_module.bind_review_start_boundary_to_one_run = original_run_binding
 
     # Wall-clock must reflect the 1s timeout, not the 5s worker sleep. Allow
     # generous slack for slow CI but still well below the worker's 5s sleep.
@@ -8506,7 +8511,8 @@ def load_rvf_agent_decision_cli_module():
     # 本测试簇只验证既有状态机；真实宿主/Git 分界由独立集成测试覆盖。
     module.require_review_start_boundary = lambda **kwargs: {"test_scope": "decision-state-unit"}
     module.require_prepared_run_review_start_boundary = lambda **kwargs: {"test_scope": "decision-state-unit"}
-    module.bind_review_start_boundary_to_one_run = lambda receipt, run_id, run_dir: (run_id, run_dir)
+    # 专用状态机夹具维持绑定器的 Path 返回契约；真实双向绑定由隔离 Git 集成套件验证。
+    module.bind_review_start_boundary_to_one_run = lambda receipt, run_id, run_dir: (run_id, Path(run_dir) if run_dir is not None else None)
     return module
 
 

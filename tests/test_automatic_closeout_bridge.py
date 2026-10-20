@@ -12,6 +12,7 @@ sys.path.insert(0, str(SCRIPTS))
 import rvf_automatic_closeout_bridge as bridge
 
 
+# 既有完成通知夹具显式提供其逻辑 run_id；目录名仅由夹具选择与它相同。
 def test_completion_is_exact_bound_run_and_durable(tmp_path, monkeypatch):
     monkeypatch.setenv('RVF_HOME', str(tmp_path))
     receipt = {'decision_token': '0123456789abcdef', 'session_id': 'source', 'worktree': str(tmp_path / 'repo')}
@@ -23,7 +24,7 @@ def test_completion_is_exact_bound_run_and_durable(tmp_path, monkeypatch):
     (run / 'artifacts').mkdir(parents=True)
     handoff = run / 'artifacts' / 'handoff.md'
     handoff.write_text('RVF 已完成')
-    bridge.bind_run(receipt, run)
+    bridge.bind_run(receipt, run, run_id=run.name)
     finalized = {'run_id': 'run-id', 'run_dir': str(run), 'repo': receipt['worktree'], 'decision_kind': 'handoff', 'completed_at': 'now', 'errors': []}
     bridge.freeze_completion_notification(run, finalized)
     bridge.publish_completion(run, finalized)
@@ -39,7 +40,7 @@ def test_errors_and_non_handoff_do_not_trigger_closeout(tmp_path, monkeypatch):
     (run / 'artifacts').mkdir(parents=True)
     (run / 'artifacts' / 'handoff.md').write_text('RVF 已完成')
     receipt = {'decision_token': '0123456789abcdef', 'session_id': 'source', 'worktree': str(tmp_path / 'repo')}
-    bridge.bind_run(receipt, run)
+    bridge.bind_run(receipt, run, run_id=run.name)
     finalized = {'run_id': run.name, 'run_dir': str(run), 'repo': receipt['worktree'], 'completed_at': 'now'}
     bridge.publish_completion(run, {**finalized, 'errors': ['failed'], 'decision_kind': 'handoff'})
     bridge.publish_completion(run, {**finalized, 'errors': [], 'decision_kind': 'cancelled'})
@@ -96,6 +97,8 @@ def _start_fixture(tmp_path, monkeypatch):
     )
     receipt = {'decision_token': minted.token, 'session_id': 'source', 'worktree': str(tmp_path), 'kanban_task_id': 'task'}
     monkeypatch.setattr(bridge, 'capture_before_start', lambda *args, **kwargs: receipt)
+    # 本组只验证自动收尾的激活时序；真实分界和候选证明由专项隔离 Git 测试覆盖。
+    monkeypatch.setattr(cli, 'require_review_start_boundary', lambda **kwargs: receipt)
     monkeypatch.setattr(cli, 'resolve_agent_initiation_backend', lambda: 'manual')
     arguments = {
         'token': minted.token, 'reason': '测试', 'roots': roots,
@@ -213,7 +216,7 @@ def test_cached_finalize_and_restarted_publish_keep_original_handoff_digest(tmp_
     run = tmp_path / 'runs' / 'run-id'
     (run / 'artifacts').mkdir(parents=True)
     (run / 'summary.json').write_text(json.dumps({'run_id': run.name, 'repo': receipt['worktree']}))
-    bridge.bind_run(receipt, run)
+    bridge.bind_run(receipt, run, run_id=run.name)
     handoff = run / 'artifacts' / 'handoff.md'
     handoff.write_text('首次完成时的 handoff')
     original_digest = hashlib.sha256(handoff.read_bytes()).hexdigest()
@@ -260,7 +263,7 @@ def test_cached_finalize_without_frozen_evidence_cannot_endorse_current_handoff(
     run = tmp_path / 'run-id'
     (run / 'artifacts').mkdir(parents=True)
     receipt = {'decision_token': '0123456789abcdef', 'session_id': 'source', 'worktree': str(tmp_path / 'repo')}
-    bridge.bind_run(receipt, run)
+    bridge.bind_run(receipt, run, run_id=run.name)
     (run / 'artifacts' / 'handoff.md').write_text('没有冻结证据的当前 handoff')
     finalized = {'run_id': run.name, 'run_dir': str(run), 'repo': receipt['worktree'], 'decision_kind': 'handoff', 'completed_at': 'now', 'errors': []}
     (run / 'artifacts' / '.finalize.lock').write_text(json.dumps(finalized))
@@ -276,7 +279,7 @@ def test_freeze_failure_cannot_be_retried_using_changed_handoff(tmp_path, monkey
     run = tmp_path / 'run-id'
     (run / 'artifacts').mkdir(parents=True)
     (run / 'summary.json').write_text(json.dumps({'run_id': run.name, 'repo': receipt['worktree']}))
-    bridge.bind_run(receipt, run)
+    bridge.bind_run(receipt, run, run_id=run.name)
     handoff = run / 'artifacts' / 'handoff.md'
     handoff.write_text('首次完成时的 handoff')
     for name in ('capture_run', '_write_usage_summary', '_release_tracker_lease', '_advance_review_highwater', '_scaffold_analysis'):
@@ -304,7 +307,7 @@ def test_concurrent_freezes_and_publications_keep_one_complete_snapshot(tmp_path
     run = tmp_path / 'run-id'
     (run / 'artifacts').mkdir(parents=True)
     receipt = {'decision_token': '0123456789abcdef', 'session_id': 'source', 'worktree': str(tmp_path / 'repo')}
-    bridge.bind_run(receipt, run)
+    bridge.bind_run(receipt, run, run_id=run.name)
     finalized = {'run_id': run.name, 'run_dir': str(run), 'repo': receipt['worktree'], 'decision_kind': 'handoff', 'completed_at': 'now', 'errors': []}
     handoff = run / 'artifacts' / 'handoff.md'
     handoff.write_text('并发完成的 handoff')
@@ -333,3 +336,46 @@ def test_concurrent_freezes_and_publications_keep_one_complete_snapshot(tmp_path
     bridge.publish_completion(run, finalized)
     assert frozen_path.read_bytes() == frozen_bytes
     assert notification_path.read_bytes() == frozen_bytes
+
+
+def test_bridge_reuses_gate_binding_without_replacing_its_receipt_or_run_id(tmp_path, monkeypatch):
+    import review_start_boundary_gate as gate
+    monkeypatch.setenv('RVF_HOME', str(tmp_path / 'rvf-home'))
+    receipt = {'decision_token': '0123456789abcdef', 'session_id': 'source', 'worktree': str(tmp_path / 'repo')}
+    run = tmp_path / 'physical-directory'
+    gate.bind_review_start_boundary_to_one_run(receipt=receipt, run_id='logical-review-run', run_dir=run)
+    binding_path = gate.review_start_boundary_receipt_path(receipt['decision_token']).with_suffix('.run-binding.json')
+    frozen = (binding_path.read_bytes(), binding_path.stat().st_mtime_ns)
+    bridge.bind_run(receipt, run, run_id='logical-review-run')
+    bridge.bind_run(receipt, run, run_id='logical-review-run')
+    assert (binding_path.read_bytes(), binding_path.stat().st_mtime_ns) == frozen
+    (run / 'artifacts').mkdir()
+    (run / 'artifacts' / 'handoff.md').write_text('本轮 RVF 已完成')
+    finalized = {'run_id': 'logical-review-run', 'run_dir': str(run), 'repo': receipt['worktree'], 'decision_kind': 'handoff', 'completed_at': 'now', 'errors': []}
+    bridge.freeze_completion_notification(run, finalized)
+    bridge.publish_completion(run, finalized)
+    notification = json.loads((tmp_path / 'rvf-home' / 'automatic-closeout-completion-notifications' / f"{receipt['decision_token']}.json").read_text())
+    assert notification['run_id'] == 'logical-review-run'
+    assert notification['run_dir'] == str(run)
+
+
+@pytest.mark.parametrize('changed_identity', ['receipt', 'run_id', 'run_dir', 'token'])
+def test_bridge_rejects_binding_conflict_before_writing_run_inputs(tmp_path, monkeypatch, changed_identity):
+    import review_start_boundary_gate as gate
+    from core.review_start_boundary.review_start_boundary_verification import ReviewStartBoundaryNotVerified
+    monkeypatch.setenv('RVF_HOME', str(tmp_path / 'rvf-home'))
+    receipt = {'decision_token': '0123456789abcdef', 'session_id': 'source', 'worktree': str(tmp_path / 'repo')}
+    run = tmp_path / 'physical-directory'
+    gate.bind_review_start_boundary_to_one_run(receipt=receipt, run_id='logical-review-run', run_dir=run)
+    binding_path = gate.review_start_boundary_receipt_path(receipt['decision_token']).with_suffix('.run-binding.json')
+    frozen = (binding_path.read_bytes(), binding_path.stat().st_mtime_ns)
+    supplied_receipt = dict(receipt, session_id='changed-session') if changed_identity == 'receipt' else dict(receipt)
+    if changed_identity == 'token':
+        supplied_receipt['decision_token'] = 'fedcba9876543210'
+    supplied_run = tmp_path / 'another-physical-directory' if changed_identity == 'run_dir' else run
+    supplied_id = 'another-logical-run' if changed_identity == 'run_id' else 'logical-review-run'
+    with pytest.raises(ReviewStartBoundaryNotVerified):
+        bridge.bind_run(supplied_receipt, supplied_run, run_id=supplied_id)
+    assert (binding_path.read_bytes(), binding_path.stat().st_mtime_ns) == frozen
+    assert not supplied_run.exists()
+    assert not run.exists()

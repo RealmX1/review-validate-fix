@@ -456,7 +456,7 @@ def load_hook_module():
     import types
     from independent_review_start_boundary_fixture import run_subprocess_with_independent_review_start_boundary
     module.require_review_start_boundary_for_prepare = lambda **kw: {"test_scope": "stop-routing-unit"}
-    module.bind_review_start_boundary_to_one_run = lambda **kw: (kw["run_id"], kw["run_dir"])
+    module.bind_review_start_boundary_to_one_run = lambda **kw: (kw["run_id"], Path(kw["run_dir"]) if kw["run_dir"] is not None else None)
     module.subprocess = types.SimpleNamespace(**vars(subprocess))
     module.subprocess.run = run_subprocess_with_independent_review_start_boundary
     appserver.subprocess = module.subprocess

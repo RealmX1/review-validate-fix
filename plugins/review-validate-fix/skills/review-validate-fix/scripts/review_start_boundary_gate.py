@@ -88,8 +88,16 @@ def _assert_or_create_immutable_boundary_binding_record(path: Path, expected: Ma
         else:
             temporary = path.with_suffix(f".{uuid.uuid4().hex}.pending-write")
             try:
-                temporary.write_text(json.dumps(dict(expected), sort_keys=True), encoding="utf-8")
+                with temporary.open("w", encoding="utf-8") as handle:
+                    json.dump(dict(expected), handle, sort_keys=True)
+                    handle.flush()
+                    os.fsync(handle.fileno())
                 os.replace(temporary, path)
+                directory_descriptor = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_descriptor)
+                finally:
+                    os.close(directory_descriptor)
             finally:
                 temporary.unlink(missing_ok=True)
 
@@ -186,5 +194,18 @@ def bind_review_start_boundary_to_one_run(*, receipt: Mapping[str, Any], run_id:
     receipt_path = review_start_boundary_receipt_path(token)
     binding_path = receipt_path.with_suffix(".run-binding.json")
     expected = {"run_id": resolved_id, "run_dir": str(resolved_directory), "receipt_sha256": receipt_digest(receipt)}
-    _assert_or_create_immutable_boundary_binding_record(binding_path, expected, "此消息/checkpoint 已绑定另一 run 或另一份分界证明")
+    # 全部 token 共用同一把锁；每个不可变记录同时证明 token→run 与 run→token。
+    # 单文件原子落盘避免多个正反向索引在进程退出时只写完一半。
+    binding_path.parent.mkdir(parents=True, exist_ok=True)
+    with (binding_path.parent / ".exclusive-run-identity-bindings.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if binding_path.exists() and read_receipt(binding_path) != expected:
+            raise ReviewStartBoundaryNotVerified(INVALIDATED, "此消息/checkpoint 已绑定另一 run 或另一份分界证明")
+        for existing_path in binding_path.parent.glob("*.run-binding.json"):
+            if existing_path == binding_path:
+                continue
+            existing = read_receipt(existing_path)
+            if existing.get("run_id") == resolved_id or existing.get("run_dir") == str(resolved_directory):
+                raise ReviewStartBoundaryNotVerified(INVALIDATED, "此 run 身份或目录已绑定另一 token/checkpoint")
+        _assert_or_create_immutable_boundary_binding_record(binding_path, expected, "此消息/checkpoint 已绑定另一 run 或另一份分界证明")
     return resolved_id, resolved_directory

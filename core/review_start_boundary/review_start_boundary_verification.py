@@ -5,11 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping
+
+from core.review_start_boundary.explicit_manual_review_command_recognition import manual_review_command_text_is_eligible
 
 RECEIPT_SCHEMA = "rvf-independent-user-turn-boundary/v1"
 PENDING = "review_start_boundary_pending"
@@ -119,10 +120,10 @@ def verify_independent_user_turn_boundary(
     if not isinstance(text, str) or hashlib.sha256(text.encode()).hexdigest() != receipt["boundary_message_sha256"]:
         invalid("原生用户消息正文与投递记录不一致")
     if receipt.get("source") == "explicit_user_command":
-        if not re.match(r"^\s*[/\$:]+review-validate-fix(?:\s|$)", text):
-            invalid("原始消息不是明确的 RVF 手动命令")
         if token_payload.get("initiated_by_explicit_user_request") is not True or token_payload.get("explicit_user_request_provenance") != "developer_manual_trigger_via_user_prompt_submit":
             invalid("手动命令的原始来源与 token 不一致")
+        if not manual_review_command_text_is_eligible(text, has_verified_manual_ups_provenance=True):
+            invalid("原始消息不是明确的 RVF 手动命令")
     elif receipt.get("source") == "rvf_automatic_decision_message":
         if token_payload.get("initiated_by_explicit_user_request") is not False or token_payload.get("explicit_user_request_provenance"):
             invalid("自动消息不能被记成开发者显式授权")
