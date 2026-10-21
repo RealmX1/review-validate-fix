@@ -69,12 +69,12 @@ def test_codex_capture_uses_main_checkout_and_explicit_runtime_operation(tmp_pat
     import subprocess
     monkeypatch.setenv('RVF_HOME', str(tmp_path))
     transcript = tmp_path / 'rollout.jsonl'
-    transcript.write_text(json.dumps({'type': 'session_meta', 'payload': {'originator': 'codex-tui', 'source': 'cli'}}) + '\n')
+    transcript.write_text(json.dumps({'type': 'session_meta', 'payload': {'originator': 'codex-tui', 'source': 'cli', 'cli_version': '0.163.0'}}) + '\n')
     payload = {'token': '0123456789abcdef', 'session_id': 'source', 'worktree': str(tmp_path / 'worktree')}
     calls = []
     def run(command, **kwargs):
         calls.append(command)
-        output = str(tmp_path / 'main' / '.git') if command[0] == 'git' else json.dumps({'receipt': {'decision_token': payload['token'], 'session_id': 'source', 'worktree': payload['worktree']}})
+        output = str(tmp_path / 'main' / '.git') if command[0] == 'git' else json.dumps({'status': 'captured', 'receipt': {'decision_token': payload['token'], 'session_id': 'source', 'worktree': payload['worktree']}})
         return subprocess.CompletedProcess(command, 0, stdout=output, stderr='')
     monkeypatch.setattr(bridge.kanban, 'run_command', run)
     monkeypatch.setattr(bridge.kanban, 'task_runtime_port', lambda **kwargs: 12345)

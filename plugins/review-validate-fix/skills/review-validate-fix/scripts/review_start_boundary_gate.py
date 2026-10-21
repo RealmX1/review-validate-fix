@@ -62,7 +62,11 @@ def _read_or_reconcile_host_boundary_receipt(token_payload: Mapping[str, Any], s
     receipt = status.get("independent_user_turn_boundary_receipt")
     observation = status.get("review_start_boundary_active_branch_observation")
     if not isinstance(receipt, dict) or not isinstance(observation, dict):
-        raise ReviewStartBoundaryNotVerified(PENDING, "投递回执尚未包含独立分界与活动分支证明")
+        raise ReviewStartBoundaryNotVerified(
+            PENDING, str(status.get("review_start_boundary_pending_reason") or "投递回执尚未包含独立分界与活动分支证明"),
+            reason_code=str(status.get("reason_code") or "native_active_branch_observation_unavailable"),
+            recovery_action=str(status.get("recovery_action") or "repair_host_capability"),
+        )
     if observation.get("request_nonce") != nonce or observation.get("kanban_task_id") != task_id or observation.get("idempotency_key") != key:
         raise ReviewStartBoundaryNotVerified(PENDING, "宿主返回的活动分支观测不是本次查询，拒绝缓存或迟到回执")
     if receipt.get("decision_token") != token_payload["token"] or receipt.get("session_id") != observation.get("session_id"):
@@ -71,7 +75,10 @@ def _read_or_reconcile_host_boundary_receipt(token_payload: Mapping[str, Any], s
     if not isinstance(active_messages, list) or not observation.get("native_active_branch_user_turn_id"):
         raise ReviewStartBoundaryNotVerified(PENDING, "宿主尚未提供完整活动分支消息快照")
     if active_messages.count(receipt.get("native_user_message_id")) != 1 or observation.get("native_active_branch_user_turn_id") != receipt.get("native_turn_id"):
-        raise ReviewStartBoundaryNotVerified(INVALIDATED, "开审消息已不在宿主当前活动分支或已进入另一 turn")
+        raise ReviewStartBoundaryNotVerified(
+            INVALIDATED, "开审消息已不在宿主当前活动分支或已进入另一 turn",
+            reason_code="native_boundary_no_longer_active", recovery_action="request_new_boundary_after_turn_completion",
+        )
     if cached_receipt and receipt_digest(cached_receipt) != receipt_digest(receipt):
         raise ReviewStartBoundaryNotVerified(INVALIDATED, "本次宿主分界与已冻结 receipt 不一致")
     return receipt

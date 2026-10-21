@@ -12,6 +12,9 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import cline_kanban_client as kanban
+import _rvf_pyroot  # noqa: F401
+from adapters.codex.review_start_independent_user_turn_evidence import codex_native_rewind_boundary_capability_is_verified
+from core.review_start_boundary.review_start_boundary_verification import PENDING, INVALIDATED, ReviewStartBoundaryNotVerified
 
 
 def rvf_home() -> Path:
@@ -45,22 +48,50 @@ def _write_complete_json_without_overwriting(path: Path, value: Mapping[str, Any
 def capture_before_start(payload: Mapping[str, Any], *, transcript_path: str | None, task_id: str | None) -> dict[str, Any] | None:
     if not task_id or not transcript_path:
         return None
-    # 只适配已核验的 Codex CLI；其它 harness 保留其开审行为。
-    with Path(transcript_path).expanduser().open(encoding='utf-8') as transcript:
-        first = json.loads(transcript.readline())
-    metadata = first.get('payload', {}) if first.get('type') == 'session_meta' else {}
-    if metadata.get('originator') not in {'codex-tui', 'codex_cli_rs'} or metadata.get('source') != 'cli':
-        return None
+    try:
+        with Path(transcript_path).expanduser().open(encoding='utf-8') as transcript:
+            first = json.loads(transcript.readline())
+        metadata = first.get('payload', {}) if isinstance(first, dict) and first.get('type') == 'session_meta' else {}
+    except (OSError, ValueError):
+        metadata = {}
+    if not isinstance(metadata, Mapping) or not codex_native_rewind_boundary_capability_is_verified(metadata):
+        raise ReviewStartBoundaryNotVerified(
+            PENDING, '此 Codex 版本或宿主形态的独立消息与原生回退能力尚未取证',
+            reason_code='native_rewind_capability_unverified', recovery_action='repair_host_capability',
+        )
     repo = Path(str(payload['worktree'])).resolve()
     task_cmd = os.environ.get('CODEX_RVF_CLINE_KANBAN_TASK_CMD') or kanban.DEFAULT_TASK_CMD
     # project-path 必须是 main checkout；不能把 task worktree 交给 Kanban 注册查找。
     result = kanban.run_command(['git', '-c', 'core.hooksPath=/dev/null', 'rev-parse', '--path-format=absolute', '--git-common-dir'], cwd=repo)
     project = Path(result.stdout.strip()).parent
     command = kanban.task_command(task_cmd, 'capture-rvf-review-start-boundary', '--project-path', str(project), '--task-id', task_id, '--decision-token', str(payload['token']))
-    result = kanban.run_command(command, cwd=repo, env=kanban.runtime_env(kanban.task_runtime_port(task_cmd=task_cmd)), timeout=60)
-    receipt = json.loads(result.stdout)['receipt']
-    if receipt.get('decision_token') != payload['token'] or receipt.get('session_id') != payload['session_id'] or Path(receipt.get('worktree', '')).resolve() != repo:
-        raise ValueError('宿主返回的 RVF 分界身份不一致')
+    result = kanban.run_command(command, cwd=repo, env=kanban.runtime_env(kanban.task_runtime_port(task_cmd=task_cmd)), timeout=60, check=False)
+    try:
+        response = json.loads(result.stdout)
+    except (ValueError, TypeError) as exc:
+        raise ReviewStartBoundaryNotVerified(
+            PENDING, f'宿主捕获命令没有返回有效 JSON（exit {result.returncode}）：{result.stderr.strip()}',
+            reason_code='host_cli_response_invalid', recovery_action='repair_host_capability',
+        ) from exc
+    if isinstance(response, dict) and response.get('status') in {'pending', 'invalidated'}:
+        raise ReviewStartBoundaryNotVerified(
+            INVALIDATED if response['status'] == 'invalidated' else PENDING,
+            str(response.get('reason') or '宿主尚未证明独立开审分界'),
+            reason_code=str(response.get('reason_code') or 'boundary_evidence_unverified'),
+            recovery_action=str(response.get('recovery_action') or 'inspect_boundary_diagnostic'),
+        )
+    if result.returncode or not isinstance(response, dict) or response.get('status') != 'captured' or not isinstance(response.get('receipt'), dict):
+        raise ReviewStartBoundaryNotVerified(
+            PENDING, f'宿主捕获命令未成功提供完整 receipt（exit {result.returncode}）：{result.stderr.strip()}',
+            reason_code='host_cli_response_invalid', recovery_action='repair_host_capability',
+        )
+    receipt = response['receipt']
+    receipt_worktree = receipt.get('worktree')
+    if receipt.get('decision_token') != payload['token'] or receipt.get('session_id') != payload['session_id'] or not isinstance(receipt_worktree, str) or not receipt_worktree or Path(receipt_worktree).resolve() != repo:
+        raise ReviewStartBoundaryNotVerified(
+            INVALIDATED, '宿主返回的 RVF 分界身份不一致',
+            reason_code='captured_boundary_identity_mismatch', recovery_action='inspect_boundary_diagnostic',
+        )
     return receipt
 
 

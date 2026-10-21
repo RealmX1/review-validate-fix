@@ -5686,6 +5686,7 @@ def start_cline_kanban_followup_message(
     artifact_label: str = "kanban-followup",
     deliver_when_agent_idle: bool = False,
     decision_token_expires_at: str | None = None,
+    required_native_independent_user_turn_session_id: str | None = None,
 ) -> dict[str, Any]:
     """经 cline-kanban 终端投递把 ``prompt`` 投成目标 task 的一条真实 user message。
 
@@ -5744,6 +5745,8 @@ def start_cline_kanban_followup_message(
     if attempt_id:
         command.extend(["--attempt-id", attempt_id])
     if deliver_when_agent_idle:
+        if not required_native_independent_user_turn_session_id:
+            raise KanbanFollowupDeliveryNotAttemptedError("独立决策点投递缺少目标原生会话")
         if not decision_token_expires_at:
             raise KanbanFollowupDeliveryNotAttemptedError("独立决策点投递缺少 token 截止时间")
         remaining_seconds = (decision_token_store.parse_timestamp(decision_token_expires_at) - decision_token_store.utc_now()).total_seconds()
@@ -5751,6 +5754,7 @@ def start_cline_kanban_followup_message(
         if idle_wait_ms <= 0:
             raise KanbanFollowupDeliveryNotAttemptedError("token 剩余时效不足以投递独立决策点")
         command.extend(["--deliver-when-agent-idle", "--max-wait-for-agent-idle-ms", str(idle_wait_ms)])
+        command.extend(["--require-native-independent-user-turn-for-session", required_native_independent_user_turn_session_id])
     # 契约第 4 条：短等而已（默认 0 = 完全不等，保持 Stop 链路的既有时延）。开大它并不能等满
     # 契约的 196.5s 收敛预算——CLI 硬超时会把等待 clamp 掉；真正的终态靠 message-status 轮询。
     wait_ms = _kanban_followup_env_int(
@@ -11808,6 +11812,7 @@ def _decision_point_out_of_band_delivery_decision(
                 artifact_label="decision-point-banner",
                 deliver_when_agent_idle=True,
                 decision_token_expires_at=mint.record.payload["expires_at"],
+                required_native_independent_user_turn_session_id=session_id,
             )
         except KanbanFollowupDeliveryVerdictNotYetAvailableError as exc:
             # 「还没结论」**不是**失败：这条消息可能已被受理并随后落地。按未确认投递继续。

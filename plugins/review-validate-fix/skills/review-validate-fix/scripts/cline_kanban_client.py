@@ -852,9 +852,14 @@ def send_task_message(
     wait_for_terminal_status_timeout_ms: int | None = None,
     deliver_when_agent_idle: bool = False,
     max_wait_for_agent_idle_ms: int | None = None,
+    required_native_independent_user_turn_session_id: str | None = None,
 ) -> dict[str, Any]:
     if prompt is None and prompt_file is None:
         raise KanbanError("message requires --prompt or --prompt-file")
+    if required_native_independent_user_turn_session_id is not None and (
+        not required_native_independent_user_turn_session_id.strip() or not deliver_when_agent_idle
+    ):
+        raise KanbanError("原生独立回合投递必须绑定非空会话并启用空闲投递")
     port = task_runtime_port(task_cmd=task_cmd, start_cmd=start_cmd)
     command = task_command(
         task_cmd,
@@ -875,6 +880,8 @@ def send_task_message(
         if not max_wait_for_agent_idle_ms or max_wait_for_agent_idle_ms <= 0:
             raise KanbanError("空闲投递必须提供正数等待截止")
         command.extend(["--deliver-when-agent-idle", "--max-wait-for-agent-idle-ms", str(max_wait_for_agent_idle_ms)])
+    if required_native_independent_user_turn_session_id is not None:
+        command.extend(["--require-native-independent-user-turn-for-session", required_native_independent_user_turn_session_id])
     # 契约第 4 条：`--wait-for-terminal-status` 只能做**短等**，不能拿来等满契约的 196.5s
     # 收敛预算——CLI 自己的硬超时会把等待预算 clamp 掉。真正的终态由 `message-status` 轮询
     # （见 read_task_message_terminal_delivery_status）拿。传 None/0 即完全不等（默认）。
@@ -1082,6 +1089,7 @@ def main() -> int:
     parser.add_argument("--wait-for-terminal-status-timeout-ms", type=int, default=0)
     parser.add_argument("--deliver-when-agent-idle", action="store_true")
     parser.add_argument("--max-wait-for-agent-idle-ms", type=int)
+    parser.add_argument("--require-native-independent-user-turn-for-session")
     parser.add_argument("--start-in-plan-mode", action="store_true")
     parser.add_argument("--auto-review-enabled", action="store_true")
     parser.add_argument("--auto-review-mode", default=os.environ.get("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE", "commit"))
@@ -1194,6 +1202,7 @@ def main() -> int:
                 wait_for_terminal_status_timeout_ms=args.wait_for_terminal_status_timeout_ms,
                 deliver_when_agent_idle=args.deliver_when_agent_idle,
                 max_wait_for_agent_idle_ms=args.max_wait_for_agent_idle_ms,
+                required_native_independent_user_turn_session_id=args.require_native_independent_user_turn_for_session,
             )
     # 三个降级运行态各有专属退出码：它们**都不是**「投递失败」，shell 调用方必须能分辨。
     except KanbanTerminalDeliveryInterfaceUnavailableError as exc:

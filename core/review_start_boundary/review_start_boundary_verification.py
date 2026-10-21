@@ -21,9 +21,11 @@ CHECKPOINT_BINDING_FIELDS = ("schema", "decision_token", "session_id", "native_u
 
 
 class ReviewStartBoundaryNotVerified(ValueError):
-    def __init__(self, status: str, reason: str):
+    def __init__(self, status: str, reason: str, *, reason_code: str = "boundary_evidence_unverified", recovery_action: str = "inspect_boundary_diagnostic"):
         self.status = status
         self.reason = reason
+        self.reason_code = reason_code
+        self.recovery_action = recovery_action
         super().__init__(f"{status}: {reason}")
 
 
@@ -104,9 +106,15 @@ def verify_independent_user_turn_boundary(
             invalid(f"分界 receipt 缺少 {name}")
     native = native_boundary_reader(receipt=receipt)
     if native.get("capability_unverified"):
-        raise ReviewStartBoundaryNotVerified(PENDING, str(native.get("reason")))
+        raise ReviewStartBoundaryNotVerified(
+            PENDING, str(native.get("reason")), reason_code="native_rewind_capability_unverified", recovery_action="repair_host_capability",
+        )
     if not native.get("independent_user_turn_verified"):
-        invalid(str(native.get("reason") or "宿主没有证明独立可回退用户消息"))
+        raise ReviewStartBoundaryNotVerified(
+            INVALIDATED, str(native.get("reason") or "宿主没有证明独立可回退用户消息"),
+            reason_code=str(native.get("reason_code") or "native_independent_user_turn_evidence_missing"),
+            recovery_action=str(native.get("recovery_action") or "inspect_boundary_diagnostic"),
+        )
     try:
         timestamps = [datetime.fromisoformat(str(value).replace("Z", "+00:00")) for value in (token_payload.get("minted_at"), native.get("native_message_received_at"), token_payload.get("expires_at"))]
         # EXPERIMENT_NODE: 用真实 UPS 样本验证手动消息先于铸币的 120 秒容忍窗。

@@ -1,6 +1,6 @@
 # RVF 开审前独立消息与 checkpoint 契约
 
-本契约把自主发起资格与可回退消息分界分开。Agent 可以自己判断条件满足并请求下一次征询；这不等于用户刚刚明确命令开审。任何新一轮正式 RVF 都必须先验证独立消息、会话、当前候选和不可变 Git 快照。当前 RVF 实现已提供消费门禁；cline-kanban 的完整 receipt 生产接口尚未完成，因此缺少证据时返回 `review_start_boundary_pending`。未验证其它宿主的原生 rewind 能力，不从 Codex 样本外推。
+本契约把自主发起资格与可回退消息分界分开。Agent 可以自己判断条件满足并请求下一次征询；这不等于用户刚刚明确命令开审。任何新一轮正式 RVF 都必须先验证独立消息、会话、当前候选和不可变 Git 快照。RVF 提供消费门禁，cline-kanban 当前源码提供 receipt 捕获与活动分支观测；实际调用缺少完整证据时仍返回 `review_start_boundary_pending`，不能由源码存在推导已安装实例或完整原生链路已经通过验收。未验证其它宿主的原生 rewind 能力，不从 Codex 样本外推。
 
 ## 事故与偏差
 
@@ -66,9 +66,9 @@ RVF 发送独立边界标记，使用 `--deliver-when-agent-idle`，空闲等待
 
 cline-kanban 负责证明以下因果次序：目标会话确定 → 原生独立消息提交 → 原生消息/turn 已可选作 rewind 分界 → 针对此消息捕获准确 Git 内容快照 → 提供 receipt。不能把任务卡 latest checkpoint 无条件贴到消息回执上。应捕获准确消息/turn 的 immutable checkpoint，保全 ref 以免被 GC，并在 rewind/重建会话时按活动分支更新或撤销证明。
 
-`kanban task message-status` 应在原有回执中增加 `independent_user_turn_boundary_receipt`。RVF 当前消费者已支持该字段；每次 gate 还会通过 `--review-start-boundary-observation-nonce <本次随机 nonce>` 请求活动分支快照。旧 CLI 不支持此参数，或没有完整观测时保持 pending。canonical receipt、prep/contract 内的 receipt 和 `RVF_REVIEW_START_BOUNDARY_RECEIPT` 都只定位并冻结静态证明，不能跳过实时查询。现有手动消息也需宿主为其生成可查询的原生消息记录；用户的明确命令本身可以充当消息分界，仍需 checkpoint 和当前分支证明。
+`kanban task message-status` 应在原有回执中增加 `independent_user_turn_boundary_receipt`。RVF 当前消费者已支持该字段；每次 gate 还会通过 `--review-start-boundary-observation-nonce <本次随机 nonce>` 请求活动分支快照。CLI 若不支持此参数，或没有完整观测时保持 pending。canonical receipt、prep/contract 内的 receipt 和 `RVF_REVIEW_START_BOUNDARY_RECEIPT` 都只定位并冻结静态证明，不能跳过实时查询。现有手动消息也需宿主为其生成可查询的原生消息记录；用户的明确命令本身可以充当消息分界，仍需 checkpoint 和当前分支证明。
 
-宿主必须返回 `review_start_boundary_active_branch_observation`，含本次 `request_nonce`、查询的 task/key/session、`native_active_branch_user_message_ids` 和 `native_active_branch_user_turn_id`。边界消息必须恰好出现一次，当前 user turn 必须与 receipt 相同。nonce 必须来自本次请求；不得回显旧查询、用 accepted/submitted 代替，或仅把历史 rollout 末尾当作活动分支。宿主需通过真实原生控制面观察 UI rewind 后的当前分支；无法证明时不返回正向观测。该 producer 尚未实现，因此本任务未宣称跨仓端到端完成。
+宿主必须返回 `review_start_boundary_active_branch_observation`，含本次 `request_nonce`、查询的 task/key/session、`native_active_branch_user_message_ids` 和 `native_active_branch_user_turn_id`。边界消息必须恰好出现一次，当前 user turn 必须与 receipt 相同。nonce 必须来自本次请求；不得回显旧查询、用 accepted/submitted 代替，或仅把历史 rollout 末尾当作活动分支。宿主需通过真实原生控制面观察 UI rewind 后的当前分支；无法证明时不返回正向观测。该 producer 的当前源码已提供控制端点查询；每次仍须证明端点属于当前 TUI 及 incarnation，并在查询后复核身份。源码、部署和跨仓原生端到端验收分别记录，不能相互替代。
 
 ```json
 {
@@ -113,7 +113,7 @@ cline-kanban 负责证明以下因果次序：目标会话确定 → 原生独�
 
 checkpoint 的 JSON 绑定字段见代码 `CHECKPOINT_BINDING_FIELDS`，不含 commit 自身以避免循环哈希。宿主需保留 message→checkpoint 映射；仅有 Git commit 正文不能证明宿主已经提供了原生可选回退。
 
-本任务不编辑 cline-kanban。当前源码与已安装 CLI bundle 均未发现本契约的 receipt 字段；已安装 `task message --help` 确认支持两项 idle 参数。自动投递的可用性恢复与生产端 receipt 的真实端到端验收由关联 cline-kanban 任务负责。Claude Code/Kimi 适配器明确报告能力未取证并保持 pending；不能静默沿用 Codex reader。
+历史 e9e12 的“producer 尚未实现”是当时状态。当前修复由 RVF 40659 与 cline-kanban 87345 分别在独立 worktree 实施；CLI 异步吞错复用既有 caaa3。源码和隔离联验结果不等于生产安装已更新。Claude Code/Kimi 适配器明确报告能力未取证并保持 pending；不能静默沿用 Codex reader。
 
 ## 自主恢复与旧路径移除
 
@@ -154,3 +154,13 @@ checkpoint 的 JSON 绑定字段见代码 `CHECKPOINT_BINDING_FIELDS`，不含 c
 - cline-kanban `297ef` 正在实现完成后自动 rewind 与 land/base 同步，已记录其消费本任务产出的关联；它依赖准确开审分界，不等同于当前 producer 已实现。本契约可作为其对接输入，不在本任务代改该 checkout。
 
 后续跨仓步骤：实现上述 producer → 在隔离 Kanban/Codex 实例验证真实独立投递、消费、可选 rewind 和快照绑定 → 验证自动恢复/失败/重启/rewind 矩阵 → 按独立授权执行本地安装。RVF 本任务只提交当前 worktree，不自动安装、不更新本地 main 或远端。
+
+## 原生回合投递与捕获诊断（40659 / 87345）
+
+自动首投和重请求均在 `--deliver-when-agent-idle` 基础上增加 `--require-native-independent-user-turn-for-session <session-id>`。持久字段 `requiredNativeIndependentUserTurnSessionId` 约束目标原生会话；summary 空闲只作初筛，宿主还须从当前 TUI 控制面证明前一原生 turn 已完成。等待不更新原始 TTL、不增加投递次数、不占用 PTY。身份变化或能力不可用不得退化为普通投递；同 key 的幂等比较包含严格约束。确认首次提交已经形成目标消息的新 turn 后，不得因该新 turn 正在运行而误报失败或补发重复消息。
+
+bridge 与 reader 共用已取证能力判据：`0.163.0` / `codex-tui` / `source in {cli,vscode}`。`codex_cli_rs`、GUI、exec 与未知版本均不借用取证结果。完整 receipt 捕获成功仍不免除 gate 的当前候选验证及本次 nonce 活动分支查询。
+
+`capture-rvf-review-start-boundary` 的响应为判别结果：`status=captured` 必须携带 `receipt`；`status=pending/invalidated` 携带 `reason`、`reason_code`、`recovery_action`，命令以非零退出。未知异常保持错误正文与非零码；exit 0 的空输出、坏 JSON 或不完整对象也不能算捕获成功。receipt v1 的字段和 checkpoint 绑定不变。
+
+恢复动作区分 `wait_for_native_turn_completion`、`request_new_boundary_after_turn_completion`、`repair_host_capability`、`retry_capture`、`inspect_boundary_diagnostic`。同 turn 混入须等待真实回合完成再请求新分界；缺控制面或能力不符不靠重复 mint 解决。原生回退、候选或绑定失效继续拒绝旧分界，不改写旧 receipt/token。

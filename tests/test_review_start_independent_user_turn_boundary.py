@@ -585,6 +585,7 @@ def test_default_boundary_sender_uses_idle_delivery_and_persists_intent_before_s
     assert result.status == "review_start_boundary_pending"
     assert len(sent) == 1, result
     assert sent[0]["deliver_when_agent_idle"] is True
+    assert sent[0]["required_native_independent_user_turn_session_id"] == fixture["payload"]["session_id"]
     assert 0 < sent[0]["max_wait_for_agent_idle_ms"] < 1200000
     assert sent[0]["prompt"] == fixture["tokens"].render_decision_point_out_of_band_boundary_marker(token=result.token)
     assert fixture["tokens"].read_decision_token(result.token).state == "minted"

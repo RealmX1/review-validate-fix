@@ -51,6 +51,7 @@ def _send_boundary_message(*, payload, summary, reason, now, token_root=None):
         repo=project, task_id=task_id, prompt=tokens.render_decision_point_out_of_band_boundary_marker(token=payload["token"]),
         prompt_file=None, source="review-validate-fix", idempotency_key=key, attempt_id=None,
         deliver_when_agent_idle=True, max_wait_for_agent_idle_ms=wait_ms,
+        required_native_independent_user_turn_session_id=payload["session_id"],
     )
     tokens.record_out_of_band_delivery_status(payload["token"], status=result.get("terminal_delivery_status"),
                                              detail={"kanban_task_id": task_id, "kanban_project_path": str(project), "idempotency_key": key}, root=token_root)

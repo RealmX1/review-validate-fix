@@ -1646,6 +1646,12 @@ def run_start(
         resolved_transcript, _ = resolve_start_transcript_path(explicit_transcript_path=transcript_path, candidate_summary=candidate)
         try:
             automatic_closeout_receipt = rvf_automatic_closeout_bridge.capture_before_start(before_payload, transcript_path=resolved_transcript, task_id=_current_kanban_task_id_from_env())
+        except ReviewStartBoundaryNotVerified as exc:
+            return CommandResult(
+                command="start", status=exc.status, exit_code=EXIT_REVIEW_START_BOUNDARY_NOT_VERIFIED,
+                token=token, token_state=getattr(lookup_before_start, "state", None), message=exc.reason,
+                detail={"phase": "capture_independent_review_start_boundary", "reason_code": exc.reason_code, "recovery_action": exc.recovery_action},
+            )
         except Exception as exc:
             return CommandResult(command="start", status="start_failed", exit_code=EXIT_START_FAILED, token=token, token_state=getattr(lookup_before_start, "state", None), message=f"无法登记自动 RVF 开审分界：{exc}", detail={"phase":"capture_independent_review_start_boundary"})
 
@@ -1661,7 +1667,11 @@ def run_start(
             return CommandResult(
                 command="start", status=exc.status, exit_code=EXIT_REVIEW_START_BOUNDARY_NOT_VERIFIED,
                 token=token, token_state=lookup_before_start.state, message=exc.reason,
-                next_steps=[f'{_rvf()} request-review-start-boundary --decision-token {token} --reason "<自主判断理由>"'],
+                detail={"reason_code": exc.reason_code, "recovery_action": exc.recovery_action},
+                next_steps=(
+                    [f'{_rvf()} request-review-start-boundary --decision-token {token} --reason "<自主判断理由>"']
+                    if exc.recovery_action == "request_new_boundary_after_turn_completion" else []
+                ),
             )
 
     # ① token → acknowledged（非终态；retry 再走一轮 acknowledge，递增 start_attempt_count）。
