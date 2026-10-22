@@ -18,7 +18,7 @@ agent 在**发起决策点横幅**上显式接受的就地 run 走 ``RVF_DECISIO
 ``trigger_needle_for_lock_marker``）。两者都唯一、且必然随注入正文一起进 transcript，不依赖
 任何在 arm 时刻拿不到的 message uuid。
 
-四种结论（见 ``TRIGGER_PRESENCE_*``）刻意区分「不在主链」与「整份 transcript 里都没有」：
+五种结论（见 ``TRIGGER_PRESENCE_*``）刻意区分「不在主链」与「整份 transcript 里都没有」：
 前者是确凿的 rewind 证据，后者可能只是我们读错了文件（会话不匹配 / 路径不可读），必须保守
 处理，绝不据此清一把可能真在跑的锁。
 """
@@ -40,6 +40,10 @@ TRIGGER_PRESENCE_OFF_ANCESTOR_CHAIN_REWOUND = "off_ancestor_chain_rewound"
 TRIGGER_PRESENCE_ABSENT_FROM_TRANSCRIPT = "absent_from_transcript"
 # transcript 不可读 / 无路径 → 无结论，调用方必须保守（维持既有行为，不得据此清锁）。
 TRIGGER_PRESENCE_UNKNOWN_TRANSCRIPT_UNREADABLE = "unknown_transcript_unreadable"
+# Codex rollout 等格式没有 uuid 祖先链，不能把无法判定说成 trigger 未落地。
+TRIGGER_PRESENCE_UNKNOWN_TRANSCRIPT_HAS_NO_PARSEABLE_ANCESTOR_CHAIN = (
+    "unknown_transcript_has_no_parseable_ancestor_chain"
+)
 
 # 单份 transcript 的扫描上限（行）。长会话 jsonl 可达数万行；这是 Stop hook 的热路径，必须
 # 有界。超限时只保留最后 N 行——祖先链回溯只需要 leaf 附近的连续片段，而 rewind 判定本身也
@@ -449,6 +453,15 @@ def classify_dispatch_trigger_presence(
             leaf_uuid = uuid
         if literal in _entry_text(entry) and isinstance(uuid, str) and uuid:
             trigger_uuids.append(uuid)
+
+    if not by_uuid:
+        return TriggerPresence(
+            presence=TRIGGER_PRESENCE_UNKNOWN_TRANSCRIPT_HAS_NO_PARSEABLE_ANCESTOR_CHAIN,
+            dispatch_token=token,
+            transcript_path=str(path),
+            scanned_entry_count=len(entries),
+            truncated=truncated,
+        )
 
     if not trigger_uuids:
         return TriggerPresence(

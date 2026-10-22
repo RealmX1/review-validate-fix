@@ -589,6 +589,7 @@ repo_required_files=(
   "scripts/merge_rvf_state_roots.py"
   "tests/test_stop_hook_dispatcher.py"
   "tests/test_codex_gui_without_kanban_task_stop_hook_policy.py"
+  "tests/test_finalized_run_in_progress_marker_reconciliation.py"
   "tests/test_stop_review_validate_fix.py"
   "tests/test_install_to_codex.py"
   "tests/test_rvf_local_deploy_trampoline.py"
@@ -770,7 +771,8 @@ run_step "python compile" python3 -m py_compile \
 run_parallel_test_steps
 run_step "tests: codex_gui_without_kanban_task_stop_hook_policy" \
   python3 -m pytest -q \
-    "$tests_dir/test_codex_gui_without_kanban_task_stop_hook_policy.py"
+    "$tests_dir/test_codex_gui_without_kanban_task_stop_hook_policy.py" \
+    "$tests_dir/test_finalized_run_in_progress_marker_reconciliation.py"
 run_step "tests: rvf_local_deploy" \
   python3 -m pytest -q \
     "$tests_dir/test_developer_local_main_installation.py" \

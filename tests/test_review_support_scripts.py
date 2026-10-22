@@ -12872,6 +12872,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             ),
         ),
         (
+            "kanban_followup_trigger_presence_on_codex_rollout_without_uuid_chain_is_unknown_not_absent",
+            lambda: test_kanban_followup_trigger_presence_on_codex_rollout_without_uuid_chain_is_unknown_not_absent(
+                root / "trigger-presence-codex-rollout-T1"
+            ),
+        ),
+        (
             "kanban_followup_trigger_transcript_scan_reads_only_bounded_tail",
             lambda: test_kanban_followup_trigger_transcript_scan_reads_only_bounded_tail(
                 root / "trigger-presence-scan-T1"

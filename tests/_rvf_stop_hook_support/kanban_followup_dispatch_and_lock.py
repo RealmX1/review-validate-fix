@@ -80,6 +80,10 @@ __all__ = [
     'test_run_activity_probe_does_not_descend_into_fix_attempt_worktree_tree',
     'test_run_activity_probe_anchor_enumeration_stays_within_stat_budget',
     'test_stale_in_progress_lock_with_recent_activity_only_below_artifacts_root_is_revived',
+    'test_kanban_followup_in_progress_marker_of_already_finalized_run_is_reconciled_without_reengage',
+    'test_kanban_followup_in_progress_marker_of_unfinalized_run_with_existing_run_dir_still_reengages',
+    'test_kanban_followup_reconcile_for_finalized_run_keeps_other_run_marker',
+    'test_kanban_followup_stale_marker_of_finalized_run_is_not_revived_by_run_activity',
 ]
 
 
@@ -4655,4 +4659,315 @@ def test_stale_in_progress_lock_with_recent_activity_only_below_artifacts_root_i
         e
         for e in events
         if e.get("event") == "kanban_followup_in_progress_marker_revived_on_run_activity"
+    ], events
+
+
+# ---------------------------------------------------------------------------
+# f03b5：在途凭证指向**已 finalize** 的 run ⇒ 对账清除，绝不再催「仍在进行且未 handoff」
+#
+# 事故形态（Codex，W1/W2 实测 3/3）：dispatcher 的 handoff 出口 finalize 了 run 却不清 marker，
+# 之后每次 Stop 读到残留凭证就发 decision:block 续跑。本组钉住「续跑之前先核对同一 run 的持久
+# 完成证据（``artifacts/.finalize.lock``）」——不论残留从哪条出口漏出来。
+# ---------------------------------------------------------------------------
+
+
+def _write_codex_rollout_records(
+    path: Path,
+    *,
+    thread_id: str,
+    user_messages: list[str],
+    history_base: dict | None = None,
+) -> Path:
+    """写一份 Codex rollout 形态的 transcript：没有 ``uuid`` / ``parentUuid``，用户正文在
+    ``response_item.payload.content[].text``。``history_base`` 非空时模拟 rewind 之后另起的分段文件。"""
+    session_meta: dict = {"id": thread_id, "cwd": str(path.parent)}
+    if history_base is not None:
+        session_meta["history_mode"] = "paginated"
+        session_meta["history_base"] = history_base
+    records: list[dict] = [{"type": "session_meta", "payload": session_meta}]
+    for message in user_messages:
+        records.append(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": message}],
+                },
+            }
+        )
+        records.append({"type": "event_msg", "payload": {"type": "user_message", "message": message}})
+    return _write_transcript_entries(path, records)
+
+
+def _write_run_finalize_completion_lock(run_dir: Path, *, run_id: str) -> Path:
+    """按 ``rvf_run_finalize.finalize_run`` 的落盘形态写 ``artifacts/.finalize.lock``（finalize 最后一步才写）。"""
+    lock_path = run_dir / "artifacts" / ".finalize.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "decision_kind": "dispatcher-handoff",
+                "run_id": run_id,
+                "run_dir": str(run_dir),
+                "completed_at": "2026-10-04T16:53:57.081608Z",
+                "errors": [],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return lock_path
+
+
+def _arm_codex_accepted_review_run_in_flight_receipt(
+    tmp_path: Path,
+    *,
+    repo: Path,
+    state: Path,
+    session_id: str,
+    run_id: str,
+    run_dir: Path,
+    decision_token: str,
+) -> tuple[Path, Path]:
+    """按 Codex ``rvf start`` 的形态 arm 一枚 session-keyed 在途凭证，凭证记的投递 transcript
+    是铸 token 那一刻的 Codex rollout（含决策点横幅）。返回 (marker_path, 原 rollout 路径)。"""
+    original_rollout = _write_codex_rollout_records(
+        tmp_path / f"rollout-2026-10-04T21-03-33-{session_id}.jsonl",
+        thread_id=session_id,
+        user_messages=[
+            "实现完成",
+            f"RVF 发起决策点 · RVF_DECISION_TOKEN={decision_token}",
+        ],
+    )
+    lock_module = load_kanban_followup_lock_module()  # noqa: F821 — inject() 注入
+    marker_path = lock_module.write_marker(
+        task_id=None,
+        session_id=session_id,
+        run_id=run_id,
+        run_dir=str(run_dir),
+        repo=str(repo),
+        cwd=str(repo),
+        decision_token=decision_token,
+        delivered_session_id=session_id,
+        delivered_transcript_path=str(original_rollout),
+        state=lock_module.STATE_IN_PROGRESS,
+        root=state,
+    )
+    assert marker_path is not None and marker_path.exists()
+    return marker_path, original_rollout
+
+
+def _invoke_codex_commit_and_base_sync_stop_after_rewind(
+    tmp_path: Path,
+    *,
+    repo: Path,
+    state: Path,
+    session_id: str,
+    original_rollout: Path,
+) -> dict:
+    """rewind 之后同一 thread 另起分段文件，用户要求 commit + base-branch-sync，随后 Stop。"""
+    rewound_segment = _write_codex_rollout_records(
+        tmp_path / f"rollout-2026-10-05T01-09-18-{session_id}_01a107e3-0000-7000-8000-000000000000.jsonl",
+        thread_id=session_id,
+        user_messages=["RVF found no issue. Commit and $base-branch-sync"],
+        history_base={
+            "thread_id": session_id,
+            "end_ordinal_exclusive": 1,
+            "end_byte_offset": 1,
+        },
+    )
+    stdout, _ = invoke(  # noqa: F821 — inject() 注入
+        {
+            "cwd": str(repo),
+            "session_id": session_id,
+            "transcript_path": str(rewound_segment),
+            "stop_hook_active": False,
+            "last_user_message": "RVF found no issue. Commit and $base-branch-sync",
+        },
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "off",
+            "CODEX_RVF_KANBAN_FOLLOWUP_IN_PROGRESS_NUDGE_BUDGET": "2",
+        },
+        state_dir=state,
+    )
+    return parse_json(stdout)  # noqa: F821 — inject() 注入
+
+
+def test_kanban_followup_in_progress_marker_of_already_finalized_run_is_reconciled_without_reengage(
+    tmp_path: Path,
+) -> None:
+    """残留凭证指向已 finalize 的 run：对账清除并记账（developer_only），绝不 decision:block 续跑。
+
+    复现 W1 task 863b8 的时间线：handoff → finalize ``errors=[]`` → 用户 rewind → commit +
+    base-branch-sync → Stop。修复前这一次 Stop 会发「run … 仍在进行且未 handoff」。
+    """
+    repo = init_repo(tmp_path / "repo", dirty=True)  # noqa: F821
+    state = tmp_path / "state"
+    run_dir = tmp_path / "runs" / "rvf-finalized"
+    finalize_lock_path = _write_run_finalize_completion_lock(run_dir, run_id="rvf-finalized")
+    marker_path, original_rollout = _arm_codex_accepted_review_run_in_flight_receipt(
+        tmp_path,
+        repo=repo,
+        state=state,
+        session_id="01a10703-34b8-72d0-9bd8-976ad362b12a",
+        run_id="rvf-finalized",
+        run_dir=run_dir,
+        decision_token="bca5ac470e8d9f18",
+    )
+
+    payload = _invoke_codex_commit_and_base_sync_stop_after_rewind(
+        tmp_path,
+        repo=repo,
+        state=state,
+        session_id="01a10703-34b8-72d0-9bd8-976ad362b12a",
+        original_rollout=original_rollout,
+    )
+
+    assert payload.get("decision") != "block", payload
+    assert "仍在进行且未 handoff" not in json.dumps(payload, ensure_ascii=False), payload
+    assert not marker_path.exists(), "指向已 finalize run 的残留凭证必须被对账清除"
+    events = latest_events(state)  # noqa: F821
+    assert not [e for e in events if e.get("event") == "kanban_followup_in_progress_nudged"], events
+    reconciled = [
+        e
+        for e in events
+        if e.get("event") == "kanban_followup_lock_reconciled_for_already_finalized_run"
+    ]
+    assert len(reconciled) == 1, [e.get("event") for e in events]
+    assert reconciled[0]["reason_code"] == "kanban_followup_in_progress_marker_run_already_finalized"
+    assert reconciled[0]["reconciled_blocking_run_id"] == "rvf-finalized"
+    assert Path(reconciled[0]["finalize_completion_evidence"]["finalize_lock_path"]).resolve() == finalize_lock_path.resolve()
+    assert reconciled[0]["removed_kanban_followup_in_progress_marker_paths"] == [str(marker_path)]
+
+
+def test_kanban_followup_in_progress_marker_of_unfinalized_run_with_existing_run_dir_still_reengages(
+    tmp_path: Path,
+) -> None:
+    """判据不能放宽：run 目录在、handoff.md 也写了，但**没有** ``.finalize.lock`` ⇒ 仍按在途续跑。"""
+    repo = init_repo(tmp_path / "repo", dirty=True)  # noqa: F821
+    state = tmp_path / "state"
+    run_dir = tmp_path / "runs" / "rvf-unfinalized"
+    (run_dir / "artifacts").mkdir(parents=True)
+    (run_dir / "artifacts" / "handoff.md").write_text("# handoff\n", encoding="utf-8")
+    (run_dir / "summary.json").write_text(json.dumps({"run_id": "rvf-unfinalized"}), encoding="utf-8")
+    marker_path, original_rollout = _arm_codex_accepted_review_run_in_flight_receipt(
+        tmp_path,
+        repo=repo,
+        state=state,
+        session_id="01a10799-e6a2-79e0-b526-04d5c662f819",
+        run_id="rvf-unfinalized",
+        run_dir=run_dir,
+        decision_token="0123456789abcdef",
+    )
+
+    payload = _invoke_codex_commit_and_base_sync_stop_after_rewind(
+        tmp_path,
+        repo=repo,
+        state=state,
+        session_id="01a10799-e6a2-79e0-b526-04d5c662f819",
+        original_rollout=original_rollout,
+    )
+
+    assert payload.get("decision") == "block", payload
+    assert "rvf-unfinalized" in payload["reason"], payload
+    assert marker_path.exists()
+    events = latest_events(state)  # noqa: F821
+    assert len([e for e in events if e.get("event") == "kanban_followup_in_progress_nudged"]) == 1, events
+    assert not [
+        e
+        for e in events
+        if e.get("event") == "kanban_followup_lock_reconciled_for_already_finalized_run"
+    ], events
+
+
+def test_kanban_followup_reconcile_for_finalized_run_keeps_other_run_marker(
+    tmp_path: Path,
+) -> None:
+    """task 键的凭证属于已 finalize 的 run X、sess 键的凭证属于在途 run Y：只清 X，并接着按 Y 续跑。"""
+    repo = init_repo(tmp_path / "repo", dirty=True)  # noqa: F821
+    state = tmp_path / "state"
+    finalized_run_dir = tmp_path / "runs" / "rvf-finalized-x"
+    _write_run_finalize_completion_lock(finalized_run_dir, run_id="rvf-finalized-x")
+    finalized_marker_path = _write_kanban_followup_lock_marker(
+        state / "kanban-followup-in-progress",
+        task_id="task-active",
+        state="in_progress",
+        expires_at="2999-01-01T00:00:00Z",
+        repository_identity_anchor=repo,
+        session_id="session-active",
+        run_id="rvf-finalized-x",
+        run_dir=str(finalized_run_dir),
+    )
+    lock_module = load_kanban_followup_lock_module()  # noqa: F821
+    in_flight_run_dir = tmp_path / "runs" / "rvf-in-flight-y"
+    in_flight_run_dir.mkdir(parents=True)
+    in_flight_marker_path = lock_module.write_marker(
+        task_id=None,
+        session_id="session-active",
+        run_id="rvf-in-flight-y",
+        run_dir=str(in_flight_run_dir),
+        repo=str(repo),
+        cwd=str(repo),
+        state=lock_module.STATE_IN_PROGRESS,
+        root=state,
+    )
+    assert in_flight_marker_path is not None and in_flight_marker_path != finalized_marker_path
+
+    stdout, _ = invoke(  # noqa: F821
+        {
+            "cwd": str(repo),
+            "session_id": "session-active",
+            "stop_hook_active": False,
+            "last_user_message": "继续推进。",
+        },
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "off",
+            "KANBAN_TASK_ID": "task-active",
+            "CODEX_RVF_KANBAN_FOLLOWUP_IN_PROGRESS_NUDGE_BUDGET": "2",
+        },
+        state_dir=state,
+    )
+
+    assert not finalized_marker_path.exists()
+    assert in_flight_marker_path.exists(), "别的 run 的在途凭证不得被误清"
+    payload = parse_json(stdout)  # noqa: F821
+    assert payload.get("decision") == "block", payload
+    assert "rvf-in-flight-y" in payload["reason"], payload
+    assert "rvf-finalized-x" not in payload["reason"], payload
+
+
+def test_kanban_followup_stale_marker_of_finalized_run_is_not_revived_by_run_activity(
+    tmp_path: Path,
+) -> None:
+    """已过 TTL 的残留凭证：finalize / analyze 刚写过 run 目录，心跳会误判「仍在跑」而续期——
+    完成证据必须先于心跳续期被核对。"""
+    repo = init_repo(tmp_path / "repo", dirty=True)  # noqa: F821
+    state = tmp_path / "state"
+    run_dir = tmp_path / "finalized-run-with-fresh-analysis-writes"
+    marker_path = _stale_in_progress_marker_with_run_dir(
+        state=state,
+        repo=repo,
+        run_dir=run_dir,
+        armed_at=_iso_minutes_ago(90),
+        run_id="rvf-heartbeat",
+    )
+    _write_run_finalize_completion_lock(run_dir, run_id="rvf-heartbeat")
+
+    _invoke_stop_against_stale_lock(repo, state)
+
+    assert not marker_path.exists(), "已 finalize 的 run 不得被心跳续期"
+    events = latest_events(state)  # noqa: F821
+    assert not [
+        e
+        for e in events
+        if e.get("event") == "kanban_followup_in_progress_marker_revived_on_run_activity"
+    ], events
+    assert [
+        e
+        for e in events
+        if e.get("event") == "kanban_followup_lock_reconciled_for_already_finalized_run"
     ], events

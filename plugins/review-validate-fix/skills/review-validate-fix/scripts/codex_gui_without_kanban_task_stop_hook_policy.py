@@ -14,7 +14,7 @@ import _rvf_pyroot  # noqa: F401
 from adapters.codex.transcript import read_codex_originator
 from core.rvf_shared_runtime_constants.rvf_shared_runtime_constants import SESSION_PATH_KEYS
 from host_adapter_resolver import resolve_current_session_host_adapter
-from kanban_followup_lock import clear_marker
+from kanban_followup_lock import clear_markers_belonging_to_handed_off_run
 from rvf_analyze_advisory import current_kanban_task_id
 from rvf_handoff import handoff_path_from_event, validate_handoff_path
 from rvf_run_finalize import finalize_for_handoff, surface_finalize_record_errors
@@ -79,8 +79,9 @@ def disabled_codex_gui_stop_hook_payload(
                     # 无法定位 run 时不清锁。只清本 session + repository 的 marker，
                     # 不从 handoff 的父 task 元数据反推 task，不碰其它会话。
                     if record is not None:
-                        removed = clear_marker(
+                        removed, kept = clear_markers_belonging_to_handed_off_run(
                             task_id=None, session_id=kanban_followup_lock_session_id(event),
+                            run_id=record.get("run_id"), run_dir=record.get("run_dir"),
                             repo=kanban_followup_lock_repository_anchor(
                                 event, cwd=event.get("cwd"), marker=record,
                             ),
@@ -89,6 +90,7 @@ def disabled_codex_gui_stop_hook_payload(
                             phase="complete", event="codex_gui_silent_handoff_finalized",
                             status="completed", reason_code="handoff_file_ready",
                             handoff_path=str(handoff_path), removed_marker_paths=removed,
+                            kept_in_progress_markers=kept,
                         )
             except Exception as exc:
                 ledger.event(
