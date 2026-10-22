@@ -53,6 +53,9 @@ from review_start_boundary_gate import require_prepared_run_review_start_boundar
 from core.review_start_boundary.review_start_boundary_verification import ReviewStartBoundaryNotVerified
 import harness_limit_cooldown
 from core.run_ledger.run_ledger import safe_token, start_run
+from core.host_adapter.current_agent_session_identity_from_environment import (
+    CURRENT_AGENT_SESSION_ID_ENVIRONMENT_VARIABLE_NAMES,
+)
 from rvf_detached_thread import (
     LAUNCH_FAILED,
     LAUNCH_LAUNCHED,
@@ -1405,6 +1408,18 @@ def launch_detached_dispatch(
         "error": None,
     }
 
+    # 已有 tmux server 不会继承 client 的当前环境。所有受支持身份字段都须在内层覆盖；
+    # 父进程缺失的字段写空，防止 server 残留的任务／会话／harness 信号改变 marker 分键。
+    detached_dispatch_environment_exports = {
+        name: os.environ.get(name, "")
+        for name in (
+            "KANBAN_TASK_ID", "CLINE_KANBAN_TASK_ID", "KANBAN_HOOK_TASK_ID",
+            *CURRENT_AGENT_SESSION_ID_ENVIRONMENT_VARIABLE_NAMES,
+            "CLAUDECODE", "CURSOR_AGENT", "CODEX_RVF_CLINE_KANBAN_AGENT_ID", "AI_AGENT",
+        )
+    }
+    detached_dispatch_environment_exports.update(ledger.env())
+
     result = launch_detached(
         session_name=session_name,
         argv=child_argv,
@@ -1412,13 +1427,9 @@ def launch_detached_dispatch(
         status_path=status_path,
         lock_path=lock_path,
         status_payload=status_payload,
-        # 把 RVF env 显式写进 tmux 内层 shell 的 `export X=Y;` 行，让 detached
-        # reviewer 子进程稳定读到 CODEX_RVF_LOG_ROOT 等——不再依赖 tmux server 是否
-        # 预存在的 env 继承（既有 tmux server 会让 new-session 继承 server 的 env，
-        # 丢掉这里 launch_env 传入的值）。否则 reviewer 的 diff-tracker DB 落到默认
-        # state 目录、与 prepare 写 lease 的库分叉 → lease_not_found。
-        exports=ledger.env(),
-        launch_env={**os.environ, **ledger.env()},
+        # run 日志根与当前身份一并写进内层 shell，保持 prepare 的 tracker 库与任务基线。
+        exports=detached_dispatch_environment_exports,
+        launch_env={**os.environ, **detached_dispatch_environment_exports},
         idempotency_key=f"rvf-dispatch:{run_name}",
         total_timeout_seconds=args.total_timeout,
     )

@@ -22,6 +22,9 @@ from independent_review_start_boundary_fixture import environment_with_synthetic
 __all__ = [
     'test_dispatch_reviewers_detached_launch_wiring',
     'test_dispatch_reviewers_detached_exports_codex_rvf_log_root',
+    'test_dispatch_reviewers_detached_exports_current_task_and_native_session_identity',
+    'test_dispatch_reviewers_detached_candidate_summary_ignores_stale_server_identity',
+    'test_dispatch_reviewers_detached_preserves_parent_harness_marker_and_candidate_summary',
     'test_dispatch_reviewers_wait_status_branches',
     'test_dispatch_reviewers_routing_matrix',
     'test_dispatch_reviewers_pseudo_random_selection_seed_reproducible',
@@ -213,6 +216,305 @@ def test_dispatch_reviewers_detached_exports_codex_rvf_log_root(root: Path) -> N
         f"export CODEX_RVF_LOG_ROOT={shlex.quote(str(log_root))};" in shell_command
     ), shell_command
     assert f"export RVF_RUN_DIR={shlex.quote(str(run_dir))};" in shell_command
+
+
+def test_dispatch_reviewers_detached_exports_current_task_and_native_session_identity(root: Path) -> None:
+    """当前身份与缺失项都须显式覆盖 server 环境；RVF run 环境仍以 ledger 为准。"""
+    import contextlib
+    import io
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    d = load_dispatch_reviewers_module()
+    from core.host_adapter.current_agent_session_identity_from_environment import (
+        CURRENT_AGENT_SESSION_ID_ENVIRONMENT_VARIABLE_NAMES,
+    )
+    from core.run_ledger.run_ledger import RunLedger
+
+    identity_names = (
+        "KANBAN_TASK_ID", "CLINE_KANBAN_TASK_ID", "KANBAN_HOOK_TASK_ID",
+        *CURRENT_AGENT_SESSION_ID_ENVIRONMENT_VARIABLE_NAMES,
+        "CLAUDECODE", "CURSOR_AGENT", "CODEX_RVF_CLINE_KANBAN_AGENT_ID", "AI_AGENT",
+    )
+    ledger = SimpleNamespace(
+        run_id="synthetic-current-run", correlation_id="synthetic-current-correlation",
+        root=root / "日志 'with quotes'", run_dir=root / "synthetic-run",
+        event=lambda **kwargs: None,
+    )
+    ledger.env = lambda: RunLedger.env(ledger)
+    identity_cases = [{name: "当前身份 'quoted'"} for name in identity_names]
+    identity_cases += [{name: f"current-{name}" for name in identity_names}, {}]
+    for index, current_identity in enumerate(identity_cases):
+        environment = {name: value for name, value in os.environ.items() if name not in identity_names}
+        environment.update(current_identity, RVF_RUN_ID="stale-parent-run", UNRELATED_ENVIRONMENT_VALUE="not-an-export")
+        with patch.dict(os.environ, environment, clear=True), contextlib.redirect_stdout(io.StringIO()):
+            with patch.object(d, "_build_detached_child_argv", return_value=[sys.executable, "-c", "pass"]), patch.object(
+                d, "launch_detached", return_value={"launch_status": "launched"},
+            ) as launched:
+                assert d.launch_detached_dispatch(
+                    argparse.Namespace(total_timeout=30), ledger, root / str(index),
+                    repo="/synthetic-repository", review_packet=None, session_context=None,
+                    scope_contract="/synthetic-scope-contract",
+                ) == 0
+        arguments = launched.call_args.kwargs
+        expected_exports = {**{name: current_identity.get(name, "") for name in identity_names}, **ledger.env()}
+        assert arguments["exports"] == expected_exports
+        assert all(arguments["launch_env"][name] == value for name, value in expected_exports.items())
+        assert arguments["launch_env"]["UNRELATED_ENVIRONMENT_VALUE"] == "not-an-export"
+
+
+def test_dispatch_reviewers_detached_candidate_summary_ignores_stale_server_identity(root: Path) -> None:
+    """执行真实 wrapper，模拟 server 固定旧环境；候选必须与当前父环境的结果一致。"""
+    import contextlib
+    import io
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    d = load_dispatch_reviewers_module()
+    from core.host_adapter.current_agent_session_identity_from_environment import (
+        CURRENT_AGENT_SESSION_ID_ENVIRONMENT_VARIABLE_NAMES,
+    )
+    from core.run_ledger.run_ledger import RunLedger
+
+    identity_names = (
+        "KANBAN_TASK_ID", "CLINE_KANBAN_TASK_ID", "KANBAN_HOOK_TASK_ID",
+        *CURRENT_AGENT_SESSION_ID_ENVIRONMENT_VARIABLE_NAMES,
+    )
+    clean_environment = {
+        name: value for name, value in os.environ.items()
+        if name not in identity_names
+        and not name.startswith(("RVF_", "CODEX_RVF_", "KANBAN_", "CLINE_KANBAN_", "GIT_"))
+    }
+    clean_environment.update(
+        RVF_HOME=str(root / "isolated-rvf-home"),
+        RVF_USER_LOCAL_DATA_ROOT=str(root / "isolated-user-local-data"),
+        PYTHONDONTWRITEBYTECODE="1",
+    )
+    repository = root / "isolated-committed-task-repository"
+    repository.mkdir(parents=True)
+
+    def git(*arguments):
+        return subprocess.run(
+            ["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", *arguments],
+            cwd=repository, env=clean_environment, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.name", "隔离身份回归")
+    git("config", "user.email", "detached-identity@example.invalid")
+    (repository / "task-content.txt").write_text("base\n", encoding="utf-8")
+    git("add", "task-content.txt")
+    git("commit", "-qm", "test: 建立隔离基线")
+    git("checkout", "-qb", "synthetic-task-branch")
+    (repository / "task-content.txt").write_text("base\ntask change\n", encoding="utf-8")
+    git("commit", "-qam", "test: 建立隔离任务提交")
+    original_head = git("rev-parse", "HEAD")
+
+    probe_source = (
+        "import json,sys\n"
+        "sys.path.insert(0,sys.argv[1])\n"
+        "import _rvf_pyroot\n"
+        "from stop_decision_candidate_summary import build_candidate_summary\n"
+        "from core.host_adapter.current_agent_session_identity_from_environment import resolve_current_agent_session_id_from_environment\n"
+        "session=resolve_current_agent_session_id_from_environment()\n"
+        "summary=build_candidate_summary(event={'session_id':session,'cwd':sys.argv[2]},cwd=sys.argv[2],repo=sys.argv[2],ledger=None)\n"
+        "keys=('kanban_task_id','session_id','candidate_path_count','candidate_fingerprint','committed_round_baseline')\n"
+        "print(json.dumps({'native_session':session,'summary':{key:summary.get(key) for key in keys}}))\n"
+    )
+    probe_argv = [sys.executable, "-B", "-c", probe_source, str(SCRIPT_DIR), str(repository)]
+    server_environment_path = root / "fixed-tmux-server-environment.json"
+    fake_tmux = root / "tmux-with-fixed-server-environment.py"
+    fake_tmux.write_text(
+        f"#!{sys.executable}\n"
+        "import json,os,subprocess,sys\n"
+        "from pathlib import Path\n"
+        "environment=json.loads(Path(os.environ['FIXED_TMUX_SERVER_ENVIRONMENT_PATH']).read_text())\n"
+        "raise SystemExit(subprocess.run(['/bin/sh','-c',sys.argv[-1]],env=environment).returncode)\n",
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o700)
+    current_identity_cases = [
+        {"KANBAN_TASK_ID": "synthetic-task-a", "CODEX_THREAD_ID": "synthetic-session-a"},
+        {"CLINE_KANBAN_TASK_ID": "synthetic-task-b", "CLAUDE_CODE_SESSION_ID": "synthetic-session-b"},
+        {"KANBAN_HOOK_TASK_ID": "synthetic-task-c", "CODEX_SESSION_ID": "synthetic-session-c"},
+        {"KANBAN_TASK_ID": "synthetic-priority-task", "CLINE_KANBAN_TASK_ID": "synthetic-lower-priority-task",
+         "RVF_SESSION_ID": "synthetic-override-session", "CLAUDE_CODE_SESSION_ID": "synthetic-lower-priority-session",
+         "CODEX_THREAD_ID": "synthetic-lower-priority-thread"},
+        {},
+    ]
+    for server_has_stale_identity in (False, True):
+        server_environment = dict(clean_environment)
+        if server_has_stale_identity:
+            server_environment.update({name: "synthetic-stale-server-identity" for name in identity_names})
+        server_environment_path.write_text(json.dumps(server_environment), encoding="utf-8")
+        for index, current_identity in enumerate(current_identity_cases):
+            parent_environment = {**clean_environment, **current_identity}
+            expected = json.loads(subprocess.run(
+                probe_argv, env=parent_environment, check=True, capture_output=True, text=True,
+            ).stdout)
+            assert expected["summary"]["candidate_path_count"] == (1 if current_identity else 0)
+            case_directory = root / f"server-stale-{server_has_stale_identity}-parent-{index}"
+            ledger = SimpleNamespace(
+                run_id=case_directory.name, correlation_id="synthetic-detached-identity",
+                root=root / "isolated-log-root", run_dir=case_directory, event=lambda **kwargs: None,
+            )
+            ledger.env = lambda: RunLedger.env(ledger)
+            parent_environment.update(
+                RVF_TMUX_BIN=str(fake_tmux), FIXED_TMUX_SERVER_ENVIRONMENT_PATH=str(server_environment_path),
+            )
+            with patch.dict(os.environ, parent_environment, clear=True), patch.object(
+                d, "_build_detached_child_argv", return_value=probe_argv,
+            ), contextlib.redirect_stdout(io.StringIO()):
+                assert d.launch_detached_dispatch(
+                    argparse.Namespace(total_timeout=30), ledger, case_directory / "reviewers",
+                    repo=str(repository), review_packet=None, session_context=None,
+                    scope_contract="/synthetic-scope-contract",
+                ) == 0
+            reviewers_directory = case_directory / "reviewers"
+            status = json.loads((reviewers_directory / d.DISPATCH_STATUS_FILENAME).read_text())
+            log = (reviewers_directory / d.DISPATCH_LOG_FILENAME).read_text()
+            assert status["returncode"] == 0, (status, log)
+            assert json.loads(log.splitlines()[0]) == expected
+    assert git("rev-parse", "HEAD") == original_head
+    assert git("status", "--porcelain") == ""
+
+
+def test_dispatch_reviewers_detached_preserves_parent_harness_marker_and_candidate_summary(root: Path) -> None:
+    """真实 marker 按父 harness 选中；四个信号的传递与缺失清空都不能改变候选。"""
+    import contextlib
+    import io
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    d = load_dispatch_reviewers_module()
+    from core.host_adapter.current_agent_session_identity_from_environment import (
+        CURRENT_AGENT_SESSION_ID_ENVIRONMENT_VARIABLE_NAMES,
+    )
+    from core.host_adapter.parent_harness_identity import resolve_parent_harness_identity
+    from core.run_ledger.run_ledger import RunLedger
+    from core.session_scope_allocation.round_baseline_marker import write_round_baseline_marker
+
+    harness_signals = {
+        "CLAUDECODE": "1",
+        "CURSOR_AGENT": "1",
+        "CODEX_RVF_CLINE_KANBAN_AGENT_ID": "codex",
+        "AI_AGENT": "kimi_1-0_agent",
+    }
+    identity_names = (
+        "KANBAN_TASK_ID", "CLINE_KANBAN_TASK_ID", "KANBAN_HOOK_TASK_ID",
+        *CURRENT_AGENT_SESSION_ID_ENVIRONMENT_VARIABLE_NAMES, *harness_signals,
+    )
+    log_root = root / "isolated-log-root"
+    clean_environment = {
+        name: value for name, value in os.environ.items()
+        if name not in identity_names
+        and not name.startswith(("RVF_", "CODEX_RVF_", "KANBAN_", "CLINE_KANBAN_", "GIT_"))
+    }
+    clean_environment.update(
+        RVF_HOME=str(root / "isolated-rvf-home"),
+        RVF_USER_LOCAL_DATA_ROOT=str(root / "isolated-user-local-data"),
+        CODEX_RVF_LOG_ROOT=str(log_root), PYTHONDONTWRITEBYTECODE="1",
+    )
+    repository = root / "isolated-harness-marker-repository"
+    repository.mkdir(parents=True)
+
+    def git(*arguments):
+        return subprocess.run(
+            ["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", *arguments],
+            cwd=repository, env=clean_environment, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    # 没有 main/base ref 的受支持路径直接消费 marker，task 分支点兜底不会掩盖错键。
+    git("init", "-q", "-b", "synthetic-local-base")
+    git("config", "user.name", "隔离 harness 回归")
+    git("config", "user.email", "detached-harness@example.invalid")
+    (repository / "task-content.txt").write_text("base\n", encoding="utf-8")
+    git("add", "task-content.txt")
+    git("commit", "-qm", "test: 建立隔离 marker 基线")
+    baseline = git("rev-parse", "HEAD")
+    git("checkout", "-qb", "synthetic-task-branch")
+    (repository / "task-content.txt").write_text("base\ntask change\n", encoding="utf-8")
+    git("commit", "-qam", "test: 建立隔离 harness 任务提交")
+    original_head = git("rev-parse", "HEAD")
+
+    probe_source = (
+        "import json,os,sys\n"
+        "sys.path.insert(0,sys.argv[1])\n"
+        "import _rvf_pyroot\n"
+        "from stop_decision_candidate_summary import build_candidate_summary\n"
+        "from core.host_adapter.parent_harness_identity import resolve_parent_harness_identity\n"
+        "from core.session_scope_allocation.round_baseline_marker import read_round_baseline_marker\n"
+        "session=os.environ['RVF_SESSION_ID']\n"
+        "marker=read_round_baseline_marker(task_id=os.environ['KANBAN_TASK_ID'],session_id=session,repo=sys.argv[2])\n"
+        "summary=build_candidate_summary(event={'session_id':session,'cwd':sys.argv[2]},cwd=sys.argv[2],repo=sys.argv[2],ledger=None)\n"
+        "keys=('kanban_task_id','session_id','candidate_path_count','candidate_fingerprint','committed_round_baseline')\n"
+        "print(json.dumps({'harness':resolve_parent_harness_identity(),'marker_path':marker['_marker_path'],'marker_baseline':marker['baseline_head'],'summary':{key:summary.get(key) for key in keys}}))\n"
+    )
+    probe_argv = [sys.executable, "-B", "-c", probe_source, str(SCRIPT_DIR), str(repository)]
+    server_environment_path = root / "fixed-tmux-server-environment.json"
+    fake_tmux = root / "tmux-with-fixed-harness-environment.py"
+    fake_tmux.write_text(
+        f"#!{sys.executable}\n"
+        "import json,os,subprocess,sys\n"
+        "from pathlib import Path\n"
+        "environment=json.loads(Path(os.environ['FIXED_TMUX_SERVER_ENVIRONMENT_PATH']).read_text())\n"
+        "raise SystemExit(subprocess.run(['/bin/sh','-c',sys.argv[-1]],env=environment).returncode)\n",
+        encoding="utf-8",
+    )
+    fake_tmux.chmod(0o700)
+    for signal_name, signal_value in harness_signals.items():
+        for parent_has_signal in (True, False):
+            case_name = f"{signal_name}-parent-{'present' if parent_has_signal else 'absent'}"
+            shared_identity = {"KANBAN_TASK_ID": case_name, "RVF_SESSION_ID": "synthetic-shared-session"}
+            parent_environment = {**clean_environment, **shared_identity}
+            server_environment = {**clean_environment, **shared_identity}
+            (parent_environment if parent_has_signal else server_environment)[signal_name] = signal_value
+            parent_harness = resolve_parent_harness_identity(environ=parent_environment)
+            server_harness = resolve_parent_harness_identity(environ=server_environment)
+            assert parent_harness != server_harness
+            for harness, head in ((parent_harness, baseline), (server_harness, original_head)):
+                write_round_baseline_marker(
+                    task_id=case_name, session_id=shared_identity["RVF_SESSION_ID"],
+                    baseline_head=head, repo=str(repository), parent_harness_identity=harness,
+                    root=log_root,
+                )
+            expected = json.loads(subprocess.run(
+                probe_argv, env=parent_environment, check=True, capture_output=True, text=True,
+            ).stdout)
+            stale = json.loads(subprocess.run(
+                probe_argv, env=server_environment, check=True, capture_output=True, text=True,
+            ).stdout)
+            assert expected["marker_baseline"] == baseline
+            assert expected["summary"]["committed_round_baseline"] == baseline
+            assert expected["summary"]["candidate_path_count"] == 1
+            assert stale["marker_baseline"] == original_head
+            assert stale["summary"]["candidate_path_count"] == 0
+            assert stale["summary"]["candidate_fingerprint"] != expected["summary"]["candidate_fingerprint"]
+            server_environment_path.write_text(json.dumps(server_environment), encoding="utf-8")
+            case_directory = root / case_name
+            ledger = SimpleNamespace(
+                run_id=case_name, correlation_id="synthetic-detached-harness",
+                root=log_root, run_dir=case_directory, event=lambda **kwargs: None,
+            )
+            ledger.env = lambda: RunLedger.env(ledger)
+            parent_environment.update(
+                RVF_TMUX_BIN=str(fake_tmux), FIXED_TMUX_SERVER_ENVIRONMENT_PATH=str(server_environment_path),
+            )
+            with patch.dict(os.environ, parent_environment, clear=True), patch.object(
+                d, "_build_detached_child_argv", return_value=probe_argv,
+            ), contextlib.redirect_stdout(io.StringIO()):
+                assert d.launch_detached_dispatch(
+                    argparse.Namespace(total_timeout=30), ledger, case_directory / "reviewers",
+                    repo=str(repository), review_packet=None, session_context=None,
+                    scope_contract="/synthetic-scope-contract",
+                ) == 0
+            reviewers_directory = case_directory / "reviewers"
+            status = json.loads((reviewers_directory / d.DISPATCH_STATUS_FILENAME).read_text())
+            log = (reviewers_directory / d.DISPATCH_LOG_FILENAME).read_text()
+            assert status["returncode"] == 0, (status, log)
+            assert json.loads(log.splitlines()[0]) == expected, (case_name, expected, log)
+    assert git("rev-parse", "HEAD") == original_head
+    assert git("status", "--porcelain") == ""
 
 
 def test_dispatch_reviewers_wait_status_branches(root: Path) -> None:

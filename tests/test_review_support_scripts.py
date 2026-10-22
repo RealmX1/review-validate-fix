@@ -13072,6 +13072,24 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             ),
         ),
         (
+            "dispatch_reviewers_detached_exports_current_task_and_native_session_identity",
+            lambda: test_dispatch_reviewers_detached_exports_current_task_and_native_session_identity(
+                root / "dispatch-detached-current-identity"
+            ),
+        ),
+        (
+            "dispatch_reviewers_detached_candidate_summary_ignores_stale_server_identity",
+            lambda: test_dispatch_reviewers_detached_candidate_summary_ignores_stale_server_identity(
+                root / "dispatch-detached-candidate-identity"
+            ),
+        ),
+        (
+            "dispatch_reviewers_detached_preserves_parent_harness_marker_and_candidate_summary",
+            lambda: test_dispatch_reviewers_detached_preserves_parent_harness_marker_and_candidate_summary(
+                root / "dispatch-detached-parent-harness-marker"
+            ),
+        ),
+        (
             "dispatch_reviewers_wait_status_branches",
             lambda: test_dispatch_reviewers_wait_status_branches(root / "dispatch-wait"),
         ),
