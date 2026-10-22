@@ -2225,10 +2225,20 @@ def complete_rvf_handoff_and_clear_in_flight_marker_for_stop_event(
         )
     try:
         finalized_identity = finalize_record or {}
-        run_dir = finalized_identity.get("run_dir") or resolve_run_dir(handoff_path=handoff_path, event=event)
+        if not finalized_identity:
+            # 通知发布可能在完成锁落盘后抛错；恢复完整身份，不能退回仅按目录清理。
+            resolved_run_dir = resolve_run_dir(handoff_path=handoff_path, event=event)
+            completion_evidence = (
+                read_finalize_completion_evidence_for_in_progress_marker_run({"run_dir": str(resolved_run_dir)})
+                if resolved_run_dir is not None else None
+            )
+            recovered_run_id = completion_evidence.get("finalize_run_id") if completion_evidence else None
+            if isinstance(recovered_run_id, str) and recovered_run_id.strip():
+                finalized_identity = {"run_id": recovered_run_id, "run_dir": resolved_run_dir}
         clear_kanban_followup_lock_for_event(
             event, ledger, cwd=cwd, handoff_path=str(handoff_path),
-            handed_off_run_id=finalized_identity.get("run_id"), handed_off_run_dir=run_dir,
+            handed_off_run_id=finalized_identity.get("run_id"),
+            handed_off_run_dir=finalized_identity.get("run_dir"),
         )
     except Exception as exc:
         ledger.event(
@@ -4262,6 +4272,9 @@ def kanban_followup_in_progress_decision(
         cleanup_failures = [item for item in kept if item["cleanup_reason"] == "marker_unlink_failed"]
         completed_marker_paths.update(removed)
         completed_marker_paths.update(item["_marker_path"] for item in cleanup_failures)
+        # 已选快照也可能刚被对账为完成；即使删除失败，也不能进入 nudge 再写回。
+        if marker is not None and marker["_marker_path"] in completed_marker_paths:
+            marker = None
         ledger.event(
             phase="gate", event="kanban_followup_lock_reconciled_for_already_finalized_run",
             status="warning" if cleanup_failures else "completed",
