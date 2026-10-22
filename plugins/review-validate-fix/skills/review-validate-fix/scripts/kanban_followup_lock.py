@@ -1032,6 +1032,111 @@ def read_marker(
     return None
 
 
+def read_in_progress_markers_for_task_and_session(
+    *, task_id: str | None, session_id: str | None, repo: str | Path | None,
+    root: Path | None = None,
+) -> list[dict[str, Any]]:
+    """有界读取 task / session 两把候选锁，避免第一把完成锁遮住另一轮在途锁。"""
+    markers = []
+    for path in marker_paths(task_id=task_id, session_id=session_id, repo=repo, root=root):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(payload, dict):
+            payload["_marker_path"] = str(path)
+            markers.append(payload)
+    return markers
+
+
+def marker_belongs_to_handed_off_run(
+    marker: dict[str, Any], *, run_id: str | None, run_dir: str | Path | None,
+) -> bool:
+    """至少一种 run 身份可核实，且所有双方已知的身份均一致，才允许清理。"""
+    if run_id is not None and not isinstance(run_id, str):
+        return False
+    if run_dir is not None and not isinstance(run_dir, (str, Path)):
+        return False
+    identity_confirmed = False
+    marker_run_id = marker.get("run_id")
+    if isinstance(marker_run_id, str) and marker_run_id and run_id:
+        if marker_run_id != run_id:
+            return False
+        identity_confirmed = True
+    marker_run_dir = marker.get("run_dir")
+    if isinstance(marker_run_dir, str) and marker_run_dir and run_dir:
+        try:
+            if Path(marker_run_dir).expanduser().resolve() != Path(run_dir).expanduser().resolve():
+                return False
+        except (OSError, ValueError, RuntimeError):
+            return False
+        identity_confirmed = True
+    return identity_confirmed
+
+
+def read_finalize_completion_evidence_for_in_progress_marker_run(
+    marker: dict[str, Any],
+) -> dict[str, Any] | None:
+    """只认同一 run 的持久 finalize 终态；handoff 文件或目录活动本身不算完成。"""
+    run_dir = marker.get("run_dir")
+    if not isinstance(run_dir, str) or not run_dir:
+        return None
+    try:
+        # 写入方 rvf_run_finalize.finalize_run 在收尾步骤结束后才落这份缓存。
+        lock_path = Path(run_dir).expanduser().resolve() / "artifacts" / ".finalize.lock"
+        finalized = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RuntimeError):
+        return None
+    if not isinstance(finalized, dict) or _parse_iso_ts(finalized.get("completed_at")) is None:
+        return None
+    if not marker_belongs_to_handed_off_run(
+        marker, run_id=finalized.get("run_id"), run_dir=finalized.get("run_dir"),
+    ):
+        return None
+    return {
+        "finalize_lock_path": str(lock_path),
+        "finalize_completed_at": finalized["completed_at"],
+        "finalize_decision_kind": finalized.get("decision_kind"),
+        "finalize_run_id": finalized.get("run_id"),
+        "finalize_errors": finalized.get("errors", []),
+    }
+
+
+def _unlink_marker_and_bootstrap_replay_claim(path: Path) -> bool:
+    """锁删除成功后才摘掉重放占位；锁仍在时不允许绕过其重放互斥。"""
+    removed = True
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        removed = False
+    except OSError:
+        return False
+    try:
+        _bootstrap_replay_claim_path_for(path).unlink()
+    except OSError:
+        pass
+    return removed
+
+
+def clear_markers_belonging_to_handed_off_run(
+    *, task_id: str | None, session_id: str | None, repo: str | Path | None,
+    run_id: str | None, run_dir: str | Path | None, root: Path | None = None,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """仅删除身份匹配的 marker；返回删除路径与保留记录（含删除失败）。"""
+    removed_paths = []
+    kept_markers = []
+    for marker in read_in_progress_markers_for_task_and_session(
+        task_id=task_id, session_id=session_id, repo=repo, root=root,
+    ):
+        if not marker_belongs_to_handed_off_run(marker, run_id=run_id, run_dir=run_dir):
+            kept_markers.append({**marker, "cleanup_reason": "run_identity_unconfirmed_or_different"})
+        elif _unlink_marker_and_bootstrap_replay_claim(Path(marker["_marker_path"])):
+            removed_paths.append(marker["_marker_path"])
+        else:
+            kept_markers.append({**marker, "cleanup_reason": "marker_unlink_failed"})
+    return removed_paths, kept_markers
+
+
 def clear_marker(
     *,
     task_id: str | None,
@@ -1041,19 +1146,8 @@ def clear_marker(
 ) -> list[str]:
     removed: list[str] = []
     for path in marker_paths(task_id=task_id, session_id=session_id, repo=repo, root=root):
-        # 锁没了，这把锁的重放占位就失去意义：不一并摘掉，它会在窗口内（默认 15min）把**下一
-        # 轮**的第一次重放白白挡掉。sidecar 不是锁本身，故不计入 removed。
-        try:
-            _bootstrap_replay_claim_path_for(path).unlink()
-        except (FileNotFoundError, OSError):
-            pass
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            continue
-        except OSError:
-            continue
-        removed.append(str(path))
+        if _unlink_marker_and_bootstrap_replay_claim(path):
+            removed.append(str(path))
     return removed
 
 

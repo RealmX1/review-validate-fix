@@ -4244,8 +4244,7 @@ def test_handoff_file_clears_kanban_followup_in_progress_marker(tmp_path: Path) 
     state = tmp_path / "state"
     # cwd 必须是真实 git 仓：锁 key 含仓身份，清锁侧要按同一身份才定位得到这把锁。
     repo = init_repo_with_head(tmp_path / "repo")
-    handoff = tmp_path / "handoff.md"
-    handoff.write_text("# handoff\n", encoding="utf-8")
+    run_dir, handoff = seed_finalize_run_dir(state=state, repo=repo)
     marker_dir = state / "kanban-followup-in-progress"
     marker_dir.mkdir(parents=True)
     marker_path = marker_dir / in_progress_lock_marker_name(
@@ -4260,8 +4259,8 @@ def test_handoff_file_clears_kanban_followup_in_progress_marker(tmp_path: Path) 
                 "expires_at": "2999-01-01T00:00:00Z",
                 "kanban_task_id": "task-active",
                 "session_id": "session-active",
-                "run_id": "rvf-existing",
-                "run_dir": str(tmp_path / "existing-run"),
+                "run_id": run_dir.name,
+                "run_dir": str(run_dir),
             },
             ensure_ascii=False,
             indent=2,
@@ -6493,6 +6492,12 @@ def main() -> int:
         test_run_activity_probe_does_not_descend_into_fix_attempt_worktree_tree,
         test_run_activity_probe_anchor_enumeration_stays_within_stat_budget,
         test_stale_in_progress_lock_with_recent_activity_only_below_artifacts_root_is_revived,
+        # f03b5：在途凭证指向已 finalize 的 run ⇒ 对账清除、绝不续跑；判据不放宽；不误清别的 run；
+        # 完成证据先于心跳续期核对。
+        test_kanban_followup_in_progress_marker_of_already_finalized_run_is_reconciled_without_reengage,
+        test_kanban_followup_in_progress_marker_of_unfinalized_run_with_existing_run_dir_still_reengages,
+        test_kanban_followup_reconcile_for_finalized_run_keeps_other_run_marker,
+        test_kanban_followup_stale_marker_of_finalized_run_is_not_revived_by_run_activity,
         # 硬顶的**上界**本身也要有守卫：续期只判「续之前有没有越界」，不截断续期后的 expires_at，
         # 硬顶就能被整整绕过一个 TTL。
         test_revived_in_progress_lock_never_outlives_the_revival_absolute_cap,

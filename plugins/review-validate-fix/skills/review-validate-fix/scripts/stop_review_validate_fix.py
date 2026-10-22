@@ -95,7 +95,7 @@ from rvf_handoff import (
     notify_kanban_followup_stranded,
     resolve_kanban_task_url,
 )
-from rvf_run_finalize import finalize_for_handoff, surface_finalize_record_errors
+from rvf_run_finalize import finalize_for_handoff, resolve_run_dir, surface_finalize_record_errors
 from rvf_analyze_advisory import (
     RVF_ANALYZE_FOLLOWUP_MARKER,
     current_kanban_task_id,
@@ -129,6 +129,9 @@ from kanban_followup_lock import (
     marker_state as kanban_followup_lock_state,
     promote_marker_out_of_awaiting_agent_decision as promote_kanban_followup_lock_out_of_awaiting,
     clear_marker as clear_kanban_followup_lock,
+    clear_markers_belonging_to_handed_off_run,
+    read_finalize_completion_evidence_for_in_progress_marker_run,
+    read_in_progress_markers_for_task_and_session,
     revive_marker as revive_kanban_followup_lock,
     revive_count as kanban_followup_lock_revive_count,
     in_flight_run_shows_recent_activity as in_flight_rvf_run_shows_recent_activity,
@@ -2154,17 +2157,29 @@ def clear_kanban_followup_lock_for_event(
     *,
     cwd: str | None,
     handoff_path: str | None = None,
+    handed_off_run_id: str | None = None,
+    handed_off_run_dir: str | Path | None = None,
 ) -> list[str]:
     task_id = current_kanban_task_id(event)
     session_id = kanban_followup_lock_session_id(event)
-    removed = clear_kanban_followup_lock(
+    removed, kept = clear_markers_belonging_to_handed_off_run(
         task_id=task_id,
         session_id=session_id,
         repo=kanban_followup_lock_repository_anchor(event, cwd=cwd),
+        run_id=handed_off_run_id,
+        run_dir=handed_off_run_dir,
     )
+    if kept:
+        ledger.event(
+            phase="complete", event="kanban_followup_in_progress_marker_kept_for_other_run",
+            status="warning", reason_code="kanban_followup_handoff_marker_not_cleared",
+            handed_off_run_id=handed_off_run_id,
+            handed_off_run_dir=str(handed_off_run_dir) if handed_off_run_dir else None,
+            kept_kanban_followup_in_progress_markers=kept,
+        )
     # handoff 完成顺带清掉残留 pending（对称卫生）：正常路径投递落地时 UPS arm 已清，
     # 这里兜底处理「同 token pending 因故未被清」的尾巴。
-    removed_pending = clear_kanban_followup_pending(task_id=task_id)
+    removed_pending = [] if kept else clear_kanban_followup_pending(task_id=task_id)
     if removed or removed_pending:
         ledger.event(
             phase="complete",
@@ -2186,6 +2201,41 @@ def clear_kanban_followup_lock_for_event(
             ),
         )
     return removed
+
+
+def complete_rvf_handoff_and_clear_in_flight_marker_for_stop_event(
+    event: dict[str, Any], ledger: RunLedger, *, handoff_path: Path,
+    payload: dict[str, Any], cwd: str | None, decision_kind: str,
+) -> None:
+    """两个常规 Stop 出口共用收尾；附属通知失败也不能遗留本 run 的在途凭证。"""
+    finalize_record = None
+    try:
+        finalize_record = finalize_for_handoff(
+            handoff_path=handoff_path, event=event, decision_kind=decision_kind,
+        )
+        surface_finalize_record_errors(ledger, finalize_record, payload=payload)
+        surface_rvf_analyze_advisory(
+            event=event, ledger=ledger, payload=payload, finalize_record=finalize_record,
+        )
+    except Exception as exc:
+        ledger.event(
+            phase="handoff", event="finalize_failed", status="warning",
+            reason_code="finalize_error", level="warn",
+            error={"kind": type(exc).__name__, "message": str(exc)},
+        )
+    try:
+        finalized_identity = finalize_record or {}
+        run_dir = finalized_identity.get("run_dir") or resolve_run_dir(handoff_path=handoff_path, event=event)
+        clear_kanban_followup_lock_for_event(
+            event, ledger, cwd=cwd, handoff_path=str(handoff_path),
+            handed_off_run_id=finalized_identity.get("run_id"), handed_off_run_dir=run_dir,
+        )
+    except Exception as exc:
+        ledger.event(
+            phase="handoff", event="handoff_marker_cleanup_failed", status="warning",
+            reason_code="handoff_marker_cleanup_error", level="warn",
+            error={"kind": type(exc).__name__, "message": str(exc)},
+        )
 
 
 def _query_kanban_terminal_delivery_receipt(
@@ -4192,9 +4242,38 @@ def kanban_followup_in_progress_decision(
     task_id = current_kanban_task_id(event)
     session_id = kanban_followup_lock_session_id(event)
     repository_anchor = kanban_followup_lock_repository_anchor(event, cwd=cwd)
-    marker = read_kanban_followup_lock(
-        task_id=task_id, session_id=session_id, repo=repository_anchor
-    )
+    marker = None
+    completed_marker_paths: set[str] = set()
+    # 同一次 Stop 先对账 task / session 两把锁；完成的 X 不能遮住仍在途的 Y。
+    for candidate in read_in_progress_markers_for_task_and_session(
+        task_id=task_id, session_id=session_id, repo=repository_anchor,
+    ):
+        if candidate["_marker_path"] in completed_marker_paths:
+            continue
+        completion = read_finalize_completion_evidence_for_in_progress_marker_run(candidate)
+        if completion is None:
+            if marker is None:
+                marker = candidate
+            continue
+        removed, kept = clear_markers_belonging_to_handed_off_run(
+            task_id=task_id, session_id=session_id, repo=repository_anchor,
+            run_id=candidate.get("run_id"), run_dir=candidate.get("run_dir"),
+        )
+        cleanup_failures = [item for item in kept if item["cleanup_reason"] == "marker_unlink_failed"]
+        completed_marker_paths.update(removed)
+        completed_marker_paths.update(item["_marker_path"] for item in cleanup_failures)
+        ledger.event(
+            phase="gate", event="kanban_followup_lock_reconciled_for_already_finalized_run",
+            status="warning" if cleanup_failures else "completed",
+            reason_code="kanban_followup_in_progress_marker_run_already_finalized",
+            cwd=cwd, cline_kanban_task_id=task_id, session_id=session_id,
+            kanban_followup_in_progress_marker=candidate,
+            reconciled_blocking_run_id=candidate.get("run_id"),
+            reconciled_blocking_run_dir=candidate.get("run_dir"),
+            finalize_completion_evidence=completion,
+            removed_kanban_followup_in_progress_marker_paths=removed,
+            kept_kanban_followup_in_progress_markers=kept,
+        )
     if marker is None:
         # 无 in-progress 锁（从未落地或已 handoff 清掉）→ 转交 pending 对账：判断上一条
         # dispatch 是否在途（去重）或已静默丢投（重投）。
@@ -12346,33 +12425,9 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
     if handoff_path_value is not None:
         payload = handoff_completion_payload(event, ledger, cwd=cwd)
         if payload is not None:
-            try:
-                finalize_record = finalize_for_handoff(
-                    handoff_path=handoff_path_value,
-                    event=event,
-                    decision_kind="handoff-advisory",
-                )
-                surface_finalize_record_errors(ledger, finalize_record, payload=payload)
-                surface_rvf_analyze_advisory(
-                    event=event,
-                    ledger=ledger,
-                    payload=payload,
-                    finalize_record=finalize_record,
-                )
-            except Exception as exc:
-                ledger.event(
-                    phase="handoff",
-                    event="finalize_failed",
-                    status="warning",
-                    reason_code="finalize_error",
-                    level="warn",
-                    error={"kind": type(exc).__name__, "message": str(exc)},
-                )
-            clear_kanban_followup_lock_for_event(
-                event,
-                ledger,
-                cwd=cwd,
-                handoff_path=str(handoff_path_value),
+            complete_rvf_handoff_and_clear_in_flight_marker_for_stop_event(
+                event, ledger, handoff_path=handoff_path_value, payload=payload,
+                cwd=cwd, decision_kind="handoff-advisory",
             )
             return payload_decision(payload, reason_code="handoff_file_ready", cwd=cwd)
 

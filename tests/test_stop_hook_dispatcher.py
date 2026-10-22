@@ -11,6 +11,7 @@ import tempfile
 import importlib.util
 from pathlib import Path
 from unittest.mock import patch
+from _rvf_test_support.registry_completeness_guard import assert_every_defined_test_is_registered
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -2243,6 +2244,301 @@ def test_installed_hook_receives_hooks_json_mode_over_stale_cached_env(tmp_path:
     }
 
 
+
+# ---------------------------------------------------------------------------
+# f03b5：Codex 的 handoff 出口（本 dispatcher 的 handoff 分支）必须与 Claude 出口一样清掉
+# 「已被 agent 接受、仍在途」的 RVF run 凭证（kanban-followup-in-progress marker），否则之后
+# 每一次 Stop 都会读到残留凭证、对一轮早已 handoff + finalize 的 run 发「仍在进行且未 handoff」。
+# ---------------------------------------------------------------------------
+
+
+def load_kanban_followup_lock_module_for_dispatcher_tests():
+    # 按生产里的模块名 import（模块内 dataclass 需要在 sys.modules 里找到自己）。
+    if str(SCRIPT.parent) not in sys.path:
+        sys.path.insert(0, str(SCRIPT.parent))
+    import kanban_followup_lock
+
+    return kanban_followup_lock
+
+
+def _isolated_rvf_runtime_state_env_for_dispatcher_tests(state: Path) -> dict[str, str]:
+    """把 RVF 全部可变状态根指到 ``state`` 之下：本组测试会走到真实 installed hook，任何一根
+    漏设都会写进真实 ``~/.rvf``（live infra，假绿）。"""
+    return {
+        "RVF_HOME": str(state / "rvf-home"),
+        "RVF_USER_LOCAL_DATA_ROOT": str(state / "rvf-user-local-data"),
+        "RVF_KANBAN_FOLLOWUP_LOCK_ROOT": str(state / "kanban-followup-in-progress"),
+        "RVF_PROVIDER_HEALTH_CHECK": "0",
+        "CODEX_RVF_FORK_MODE": "off",
+        "CODEX_RVF_KANBAN_FOLLOWUP_IN_PROGRESS_NUDGE_BUDGET": "2",
+    }
+
+
+def _arm_codex_rvf_start_in_flight_receipt_for_dispatcher_tests(
+    *,
+    state: Path,
+    repo: Path,
+    session_id: str,
+    run_id: str,
+    run_dir: Path,
+    delivered_transcript_path: Path,
+) -> Path:
+    """按 Codex ``rvf start`` 的形态写 session-keyed 在途凭证（task_id=None）。"""
+    lock_module = load_kanban_followup_lock_module_for_dispatcher_tests()
+    marker_path = lock_module.write_marker(
+        task_id=None,
+        session_id=session_id,
+        run_id=run_id,
+        run_dir=str(run_dir),
+        repo=str(repo),
+        cwd=str(repo),
+        decision_token="bca5ac470e8d9f18",
+        delivered_session_id=session_id,
+        delivered_transcript_path=str(delivered_transcript_path),
+        state=lock_module.STATE_IN_PROGRESS,
+        root=state,
+    )
+    assert marker_path is not None and marker_path.exists()
+    return marker_path
+
+
+def _write_codex_rollout_for_dispatcher_tests(
+    path: Path,
+    *,
+    thread_id: str,
+    repo: Path,
+    user_messages: list[str],
+    assistant_message: str | None = None,
+    history_base: dict[str, object] | None = None,
+) -> Path:
+    session_meta: dict[str, object] = {"id": thread_id, "cwd": str(repo)}
+    if history_base is not None:
+        session_meta["history_mode"] = "paginated"
+        session_meta["history_base"] = history_base
+    records: list[dict[str, object]] = [{"type": "session_meta", "payload": session_meta}]
+    for message in user_messages:
+        records.append(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": message}],
+                },
+            }
+        )
+        records.append({"type": "event_msg", "payload": {"type": "user_message", "message": message}})
+    if assistant_message is not None:
+        records.append({"type": "event_msg", "payload": {"type": "agent_message", "message": assistant_message}})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records), encoding="utf-8")
+    return path
+
+
+def _ledger_events_of_latest_stop(state: Path) -> list[dict[str, object]]:
+    pointer = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    return [
+        json.loads(line)
+        for line in Path(str(pointer["events_path"])).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def _invoke_codex_handoff_stop_through_dispatcher(
+    tmp_path: Path,
+    *,
+    repo: Path,
+    state: Path,
+    session_id: str,
+    handoff: Path,
+    hook: Path,
+) -> str:
+    transcript = _write_codex_rollout_for_dispatcher_tests(
+        tmp_path / f"rollout-2026-10-04T21-03-33-{session_id}.jsonl",
+        thread_id=session_id,
+        repo=repo,
+        user_messages=["实现完成", "RVF 发起决策点 · RVF_DECISION_TOKEN=bca5ac470e8d9f18"],
+        assistant_message=f"RVF_HANDOFF_FILE: {handoff}",
+    )
+    return invoke(
+        {
+            "cwd": str(repo),
+            "session_id": session_id,
+            "turn_id": "turn-handoff",
+            "hook_event_name": "Stop",
+            "transcript_path": str(transcript),
+            "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
+        },
+        dev_repo=None,
+        hook=hook,
+        state=state,
+        extra_env=_isolated_rvf_runtime_state_env_for_dispatcher_tests(state),
+    )
+
+
+def test_dispatcher_handoff_clears_in_progress_marker_of_handed_off_run(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    state = tmp_path / "state"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, tmp_path)
+    run_dir, handoff = _seed_finalize_run_dir(state=state, repo=repo, run_id="rvf-handed-off")
+    session_id = "01a10703-34b8-72d0-9bd8-976ad362b12a"
+    marker_path = _arm_codex_rvf_start_in_flight_receipt_for_dispatcher_tests(
+        state=state,
+        repo=repo,
+        session_id=session_id,
+        run_id="rvf-handed-off",
+        run_dir=run_dir,
+        delivered_transcript_path=tmp_path / "delivered.jsonl",
+    )
+
+    stdout = _invoke_codex_handoff_stop_through_dispatcher(
+        tmp_path, repo=repo, state=state, session_id=session_id, handoff=handoff, hook=hook
+    )
+
+    payload = json.loads(stdout)
+    assert payload.get("decision") != "block", payload
+    assert (run_dir / "artifacts" / ".finalize.lock").exists()
+    assert not marker_path.exists(), "Codex handoff 出口必须清掉本 run 的在途凭证"
+    cleared = [
+        e for e in _ledger_events_of_latest_stop(state) if e.get("event") == "kanban_followup_in_progress_cleared"
+    ]
+    assert len(cleared) == 1, cleared
+    assert cleared[0]["removed_kanban_followup_in_progress_marker_paths"] == [str(marker_path)]
+    assert not (tmp_path / "hook-input.json").exists(), "handoff 分支不应再转交 installed hook"
+
+
+def test_dispatcher_repeated_handoff_is_idempotent(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    state = tmp_path / "state"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, tmp_path)
+    run_dir, handoff = _seed_finalize_run_dir(state=state, repo=repo, run_id="rvf-handed-off")
+    session_id = "01a10799-e6a2-79e0-b526-04d5c662f819"
+    marker_path = _arm_codex_rvf_start_in_flight_receipt_for_dispatcher_tests(
+        state=state,
+        repo=repo,
+        session_id=session_id,
+        run_id="rvf-handed-off",
+        run_dir=run_dir,
+        delivered_transcript_path=tmp_path / "delivered.jsonl",
+    )
+
+    first_payload = json.loads(
+        _invoke_codex_handoff_stop_through_dispatcher(
+            tmp_path, repo=repo, state=state, session_id=session_id, handoff=handoff, hook=hook
+        )
+    )
+    assert not marker_path.exists()
+    finalize_lock_after_first = (run_dir / "artifacts" / ".finalize.lock").read_text(encoding="utf-8")
+
+    second_payload = json.loads(
+        _invoke_codex_handoff_stop_through_dispatcher(
+            tmp_path, repo=repo, state=state, session_id=session_id, handoff=handoff, hook=hook
+        )
+    )
+
+    assert second_payload.get("decision") != "block", second_payload
+    assert set(second_payload) == set(first_payload)
+    assert not marker_path.exists()
+    assert (run_dir / "artifacts" / ".finalize.lock").read_text(encoding="utf-8") == finalize_lock_after_first
+    second_events = _ledger_events_of_latest_stop(state)
+    assert not [e for e in second_events if e.get("event") == "kanban_followup_in_progress_cleared"], second_events
+    assert not [e for e in second_events if e.get("event") == "finalize_failed"], second_events
+
+
+def test_dispatcher_handoff_keeps_in_progress_marker_of_different_run(tmp_path: Path) -> None:
+    """同一会话里凭证属于**另一轮** run（例如本次 handoff 的是旧 run 的残留标记）：不得误清。"""
+    repo = init_repo(tmp_path / "repo")
+    state = tmp_path / "state"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, tmp_path)
+    _run_dir, handoff = _seed_finalize_run_dir(state=state, repo=repo, run_id="rvf-handed-off")
+    other_run_dir = state / "runs" / "rvf-other-in-flight"
+    other_run_dir.mkdir(parents=True)
+    session_id = "01a10aaa-0000-7000-8000-000000000001"
+    marker_path = _arm_codex_rvf_start_in_flight_receipt_for_dispatcher_tests(
+        state=state,
+        repo=repo,
+        session_id=session_id,
+        run_id="rvf-other-in-flight",
+        run_dir=other_run_dir,
+        delivered_transcript_path=tmp_path / "delivered.jsonl",
+    )
+
+    _invoke_codex_handoff_stop_through_dispatcher(
+        tmp_path, repo=repo, state=state, session_id=session_id, handoff=handoff, hook=hook
+    )
+
+    assert marker_path.exists(), "别的 run 的在途凭证不得被本次 handoff 误清"
+    events = _ledger_events_of_latest_stop(state)
+    assert not [e for e in events if e.get("event") == "kanban_followup_in_progress_cleared"], events
+    kept = [e for e in events if e.get("event") == "kanban_followup_in_progress_marker_kept_for_other_run"]
+    assert len(kept) == 1, [e.get("event") for e in events]
+    assert kept[0]["handed_off_run_id"] == "rvf-handed-off"
+    assert kept[0]["kept_kanban_followup_in_progress_markers"][0]["run_id"] == "rvf-other-in-flight"
+
+
+def test_dispatcher_handoff_then_rewind_then_commit_stop_does_not_reengage(tmp_path: Path) -> None:
+    """端到端（W1 task 863b8 时间线）：Codex handoff → 用户 rewind（同 thread 另起分段文件）→
+    要求 commit + base-branch-sync → Stop。这次 Stop 经 dispatcher 转交**真实** installed hook，
+    绝不能再发「仍在进行且未 handoff」。"""
+    repo = init_repo(tmp_path / "repo")
+    state = tmp_path / "state"
+    real_installed_hook = SCRIPT.with_name("stop_review_validate_fix.py")
+    run_dir, handoff = _seed_finalize_run_dir(state=state, repo=repo, run_id="rvf-handed-off")
+    session_id = "01a10703-34b8-72d0-9bd8-976ad362b12a"
+    marker_path = _arm_codex_rvf_start_in_flight_receipt_for_dispatcher_tests(
+        state=state,
+        repo=repo,
+        session_id=session_id,
+        run_id="rvf-handed-off",
+        run_dir=run_dir,
+        delivered_transcript_path=tmp_path / f"rollout-2026-10-04T21-03-33-{session_id}.jsonl",
+    )
+    _invoke_codex_handoff_stop_through_dispatcher(
+        tmp_path, repo=repo, state=state, session_id=session_id, handoff=handoff, hook=real_installed_hook
+    )
+    assert (run_dir / "artifacts" / ".finalize.lock").exists()
+
+    # rewind 之后同一 thread 另起分段文件；工作树仍脏（commit 之前的 Stop / base-sync 期间的 Stop）。
+    (repo / "feature.txt").write_text("rvf reviewed change\n", encoding="utf-8")
+    rewound_segment = _write_codex_rollout_for_dispatcher_tests(
+        tmp_path / f"rollout-2026-10-05T01-09-18-{session_id}_01a107e3-0000-7000-8000-000000000000.jsonl",
+        thread_id=session_id,
+        repo=repo,
+        user_messages=["RVF found no issue. Commit and $base-branch-sync"],
+        assistant_message="已提交并完成 base-branch-sync。",
+        history_base={"thread_id": session_id, "end_ordinal_exclusive": 1, "end_byte_offset": 1},
+    )
+    completed = invoke_result(
+        {
+            "cwd": str(repo),
+            "session_id": session_id,
+            "turn_id": "turn-after-rewind",
+            "hook_event_name": "Stop",
+            "transcript_path": str(rewound_segment),
+            "stop_hook_active": False,
+            "last_assistant_message": "已提交并完成 base-branch-sync。",
+        },
+        dev_repo=None,
+        hook=real_installed_hook,
+        state=state,
+        extra_env=_isolated_rvf_runtime_state_env_for_dispatcher_tests(state),
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout) if completed.stdout.strip() else {}
+    assert payload.get("decision") != "block" or "仍在进行且未 handoff" not in str(payload.get("reason")), payload
+    assert "仍在进行且未 handoff" not in completed.stdout, completed.stdout
+    assert not marker_path.exists()
+    nudged = [
+        path
+        for path in (state / "runs").rglob("events.jsonl")
+        if "kanban_followup_in_progress_nudged" in path.read_text(encoding="utf-8")
+    ]
+    assert not nudged, nudged
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--shard-count", type=int, default=1)
@@ -2254,6 +2550,12 @@ def main() -> int:
         raise SystemExit("--shard-index must be in [0, shard-count)")
 
     tests = [
+        # f03b5：Codex handoff 出口清本 run 的在途凭证；重复 handoff 幂等；不误清别的 run；
+        # handoff → rewind → commit/base-sync → Stop 不再被续跑提示驱动。
+        test_dispatcher_handoff_clears_in_progress_marker_of_handed_off_run,
+        test_dispatcher_repeated_handoff_is_idempotent,
+        test_dispatcher_handoff_keeps_in_progress_marker_of_different_run,
+        test_dispatcher_handoff_then_rewind_then_commit_stop_does_not_reengage,
         test_router_defaults_to_dev_when_dev_terms_apply,
         test_router_defaults_to_stable_when_dev_terms_do_not_apply,
         test_router_channel_dev_marker_routes_current_and_later_stops,
@@ -2301,6 +2603,9 @@ def main() -> int:
         test_hook_config_extracts_router_env_when_current_dispatcher_is_second_target,
         test_installed_hook_receives_hooks_json_mode_over_stale_cached_env,
     ]
+    assert_every_defined_test_is_registered(
+        globals(), {test.__name__ for test in tests}, source_path=__file__,
+    )
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)
         selected = [
