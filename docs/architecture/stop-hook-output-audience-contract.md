@@ -214,8 +214,7 @@ return StopDecision(
 ```
 
 - `audience` 由**构造决策的调用点显式声明**，不靠 `reason_code` 白名单反查。
-  （`reengage_decision` 的 `reason_code` 既有默认值、也有 `f"kanban_followup_bootstrap_{…}"`
-  这样**动态生成**的取值，任何静态清单都必漏。）
+  `reason_code` 用于诊断归因，受众由当前出口承担的职责决定。
 - `developer_visible_notice` **不是可选装饰**：历史上 90/92 条阻塞注入不带 `systemMessage`，
   开发者在终端里没法把它与「hook 真崩了」区分开。gate 会红。
 - `developer_only` 的正文放 `payload`（`{"continue": True, "systemMessage": …}` 形状，或

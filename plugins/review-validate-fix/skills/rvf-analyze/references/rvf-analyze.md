@@ -8,9 +8,9 @@ agent 的本职是**叙事补全 + 因果归属**——所有可机械抽取的�
 ``rvf_run_finalize.finalize_run()`` 会在 RVF finish/finalize 后自动生成同一套
 确定性 scaffold。用户显式跑 ``$rvf-analyze`` 时，脚本仍会重新 scaffold 一次，
 然后由 agent 补全叙事与 ``candidate_patch_call_ids``。
-如果 finalize 发生在 Cline Kanban native task session，Stop hook 可能已经把
-``$rvf-analyze <run_dir>`` 作为真实 follow-up 用户消息注入同一 task；如果发生在
-Codex GUI / 非 Kanban native session，Stop hook 只会在系统提示中给出手动触发命令。
+自动后台线程直接消费 finalize 已生成的 scaffold，不重新运行上述脚本。后台完成
+由正式产物校验决定，进程退出码为 0 本身不能证明归档完成；后台派发与手动入口的
+边界以 `SKILL.md` 为准。
 
 > ⚠️ 与主 RVF 流程严格分离：``$rvf-analyze`` 与 ``$review-validate-fix`` 是
 > 两套独立 mode。即便上下文里同时出现 review/validate/fix 叙事，本 agent 的
@@ -74,6 +74,7 @@ classification 与用户决策。后续重入时该文件会被 classify 读出�
   不要复制大段原文。
 - 如果某节因为数据缺失（``half_broken`` 或 ``declined_finalize``）无法叙事，
   原句保留 placeholder + 加一行明确说明 "**数据不全**：…"，不要瞎编。
+  此时正式完成状态仍为 incomplete，不能宣称完整复盘已交付。
 
 各节的叙事侧重：
 - ``## 概览``——一句话回答"这个 run 干了什么、是否成功"。
@@ -111,6 +112,11 @@ issue 判断"哪些 patch 的 call_id 看起来是为了响应这条 issue"，�
 write back。其余字段（``schema_version`` / ``run_id`` / ``patches`` 等）
 保持原样。原子写：``<path>.tmp`` + ``mv`` 或者使用 Python 标准套路；不要
 让其他进程读到半文件。
+
+两份正式文件是唯一交付目标。原子写入的中间文件也留在同一 `analysis/` 目录；
+无法写回时明确报告失败，不得在业务 worktree、`.rvf-analysis-writeback-pending`、
+`/tmp` 或其他临时目录保存替代稿。后台包装器会独立校验并记录失败，不需要唤醒
+原任务会话处理。
 
 ### 3. 最终输出
 

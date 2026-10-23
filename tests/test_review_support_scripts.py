@@ -20,6 +20,7 @@ import tempfile
 import time
 import traceback
 from pathlib import Path
+from independent_review_start_boundary_fixture import fixed_git_coordinates_for_review_start_boundary_unit_test
 
 from _rvf_test_support.kanban_followup_lock_marker_name import in_progress_lock_marker_name
 from _rvf_test_support.registry_completeness_guard import (
@@ -157,7 +158,7 @@ def load_prepare_review_run_module():
     """加载 prepare_review_run 模块（进程内直调 prepare_run_from_prep_file 等）。
 
     与 load_rvf_agent_decision_cli_module 同构：它 top-level import 兄弟脚本
-    （rvf_prep_file / rvf_bootstrap_gate）与 core.*（经 _rvf_pyroot），故先保证 ROOT +
+    （rvf_prep_file）与 core.*（经 _rvf_pyroot），故先保证 ROOT +
     SCRIPT_DIR 在 sys.path 上。
     """
     if str(ROOT) not in sys.path:
@@ -171,27 +172,12 @@ def load_prepare_review_run_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     # 本测试簇只验证既有状态机；真实宿主/Git 分界由独立集成测试覆盖。
-    module.require_review_start_boundary_for_prepare = lambda **kwargs: {"test_scope": "prepare-unit"}
+    module.require_review_start_boundary_for_prepare = lambda **kwargs: fixed_git_coordinates_for_review_start_boundary_unit_test(kwargs["repo"], test_scope="prepare-unit")
     # 专用状态机夹具维持绑定器的 Path 返回契约；真实双向绑定由隔离 Git 集成套件验证。
     module.bind_review_start_boundary_to_one_run = lambda receipt, run_id, run_dir: (run_id, Path(run_dir) if run_dir is not None else None)
     return module
 
 
-def load_rvf_bootstrap_gate_module():
-    """加载 rvf_bootstrap_gate 模块（pre-review local-base bootstrap 的等待状态机）。"""
-    if str(ROOT) not in sys.path:
-        sys.path.insert(0, str(ROOT))
-    if str(SCRIPT_DIR) not in sys.path:
-        sys.path.insert(0, str(SCRIPT_DIR))
-    spec = importlib.util.spec_from_file_location(
-        "rvf_bootstrap_gate", SCRIPT_DIR / "rvf_bootstrap_gate.py"
-    )
-    if spec is None or spec.loader is None:
-        raise AssertionError("failed to load rvf_bootstrap_gate module")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
 
 
 def load_rvf_decision_token_store_module():
@@ -370,7 +356,7 @@ def _seed_analysis_payload(run_dir: Path) -> dict[str, str]:
 
 def test_rvf_analyze_thread_builds_claude_command(_root: Path | None = None) -> None:
     module = load_rvf_analyze_thread_module()
-    argv, uses_stdin = module.build_analyze_command(module.HOST_CLAUDE)
+    argv, uses_stdin = module.build_analyze_command(module.HOST_CLAUDE, analysis_directory=Path("/formal-analysis"))
     assert uses_stdin is True
     assert Path(argv[0]).name == "claude"
     assert "-p" in argv
@@ -382,14 +368,14 @@ def test_rvf_analyze_thread_builds_claude_command(_root: Path | None = None) -> 
 
 def test_rvf_analyze_thread_builds_codex_command(_root: Path | None = None) -> None:
     module = load_rvf_analyze_thread_module()
-    argv, uses_stdin = module.build_analyze_command(module.HOST_CODEX)
+    argv, uses_stdin = module.build_analyze_command(module.HOST_CODEX, analysis_directory=Path("/formal-analysis"))
     assert uses_stdin is True
     assert Path(argv[0]).name == "codex"
     assert "exec" in argv
     assert argv[-1] == "-"
     assert "--sandbox" in argv and "workspace-write" in argv
     # 未知 host 兜底到 codex 向量。
-    fallback_argv, _ = module.build_analyze_command("totally-unknown-host")
+    fallback_argv, _ = module.build_analyze_command("totally-unknown-host", analysis_directory=Path("/formal-analysis"))
     assert fallback_argv == argv
 
 
@@ -1600,7 +1586,7 @@ def test_prepare_run_from_prep_file_timeout_returns_immediately(tmp_path: Path) 
     original_boundary_gate = prepare_module.require_review_start_boundary_for_prepare
     original_run_binding = prepare_module.bind_review_start_boundary_to_one_run
     # 本用例只测 worker 超时，不测宿主；前置绑定仍保持真实接口的返回类型。
-    prepare_module.require_review_start_boundary_for_prepare = lambda **kw: {"test_scope": "prepare-timeout"}
+    prepare_module.require_review_start_boundary_for_prepare = lambda **kw: fixed_git_coordinates_for_review_start_boundary_unit_test(kw["repo"], test_scope="prepare-timeout")
     prepare_module.bind_review_start_boundary_to_one_run = lambda receipt, run_id, run_dir: (run_id, Path(run_dir))
 
     def slow_prepare_run(**_: object) -> dict[str, object]:
@@ -4327,8 +4313,6 @@ def test_scope_contract_v2_emitted_without_tracker_scope(tmp: Path) -> None:
         "task_change_paths",
         "interaction_primary_paths",
         "base_delta_protected_paths",
-        "bootstrap_receipt_path",
-        "bootstrap_receipt_digest",
         "candidate_evidence_path",
         "candidate_evidence_digest",
         "integration_candidate_receipt_path",
@@ -4848,6 +4832,8 @@ def test_committed_round_base_ref_drives_manifest_attribution(tmp: Path) -> None
     manifest's committed-round attribution (not only the packet diff-base), so prepare builds a
     session-owned packet instead of aborting with 'session manifest has no owned paths'."""
     repo, _ = _committed_round_repo(tmp)
+    # 在独立任务分支提交，使开审候选登记的分支点与显式比较 OID 相同。
+    run(["git", "switch", "-q", "-c", "committed-review-task"], cwd=repo)
     (repo / "f.txt").write_text("base\nCOMMITTED\n", encoding="utf-8")
     run(["git", "commit", "-qam", "slice"], cwd=repo)
     baseline = run(["git", "rev-parse", "HEAD~1"], cwd=repo).stdout.strip()
@@ -6784,8 +6770,8 @@ def test_detached_wrapper_executes_real_guardian_cli_post_exit(tmp_path: Path) -
     assert counter["last_run_dir"] == str(run_dir)
 
 
-def test_rvf_analyze_thread_wires_guardian_post_exit_cli_signature(tmp_path: Path) -> None:
-    """analyze launcher 生成的 tmux wrapper 含真实 guardian CLI 子命令与 run-dir 参数。"""
+def test_rvf_analyze_thread_wires_verified_archive_execution(tmp_path: Path) -> None:
+    """analyze launcher 把完成计数交给正式归档校验包装器。"""
     module = load_rvf_analyze_thread_module()
     run_dir = tmp_path / "runs" / "rvf-post-exit-wire"
     analysis = _seed_analysis_payload(run_dir)
@@ -6811,8 +6797,8 @@ def test_rvf_analyze_thread_wires_guardian_post_exit_cli_signature(tmp_path: Pat
     assert result["launch_status"] == "launched"
     tmux_argv = json.loads(tmux_calls.read_text(encoding="utf-8").splitlines()[0])["argv"]
     wrapper = tmux_argv[-1]
-    assert str(SCRIPT_DIR / "agentic_initiation_guardian_dispatch.py") in wrapper
-    assert "record-analyze-completion" in wrapper
+    assert str(SCRIPT_DIR / "rvf_analyze_formal_archive_verified_execution.py") in wrapper
+    assert "record-analyze-completion" not in wrapper
     assert "--run-dir" in wrapper and str(run_dir) in wrapper
 
 
@@ -8586,13 +8572,8 @@ def _agent_cli_stub_prepare(tmp: Path, *, run_name: str = "run-1", primary_files
 
     def _stub(
         *, token_record, repo, session_id, transcript_path, now, timeout_seconds=60.0,
-        resume_run_id=None, resume_run_dir=None,
-        parent_attempt_run_id=None, parent_attempt_run_dir=None,
     ):
         state["calls"] += 1
-        state["last_resume_run_id"] = resume_run_id
-        state["last_resume_run_dir"] = resume_run_dir
-        state["last_parent_attempt_run_id"] = parent_attempt_run_id
         if state["calls"] <= fail_first_n:
             return {"status": "failed", "error": "stub prepare 故意失败", "run_id": None, "run_dir": None, "artifacts": {}}
         run_dir = tmp / "runs" / run_name
@@ -10930,8 +10911,7 @@ def test_run_start_no_unreviewed_scope_holds_token_acknowledged_and_offers_force
         return {
             "status": cli.PREPARE_STATUS_NO_UNREVIEWED_SCOPE,
             "run_id": "run-nus", "run_dir": str(tmp / "runs" / "run-nus"),
-            "artifacts": {}, "error": None, "prep_token": None, "bootstrap_gate": None,
-            "initiation_run_id": "run-nus", "initiation_run_dir": str(tmp / "runs" / "run-nus"),
+            "artifacts": {}, "error": None, "prep_token": None,
             "tracker_scope_allocation": {
                 "status": cli.AGENTIC_INITIATION_TRACKER_SCOPE_NO_UNREVIEWED_SCOPE,
                 "tracker_scope_path": None, "tracker_lease_id": None, "tracker_scope_hash": None,
@@ -11211,8 +11191,8 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             ),
         ),
         (
-            "rvf_analyze_thread_wires_guardian_post_exit_cli_signature",
-            lambda: test_rvf_analyze_thread_wires_guardian_post_exit_cli_signature(
+            "rvf_analyze_thread_wires_verified_archive_execution",
+            lambda: test_rvf_analyze_thread_wires_verified_archive_execution(
                 root / "analyze-guardian-post-exit-wire"
             ),
         ),
@@ -12170,93 +12150,9 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             ),
         ),
         (
-            "prepare_review_run_blocks_opted_in_repo_until_local_base_is_absorbed",
-            lambda: test_prepare_review_run_blocks_opted_in_repo_until_local_base_is_absorbed(
-                root / "prepare-local-base-bootstrap-gate"
-            ),
-        ),
-        (
             "prepare_review_run_rejects_invalid_local_base_ref",
             lambda: test_prepare_review_run_rejects_invalid_local_base_ref(
                 root / "prepare-invalid-local-base-ref"
-            ),
-        ),
-        (
-            "prepare_from_prep_file_waits_for_local_base_bootstrap_with_recoverable_gate",
-            lambda: test_prepare_from_prep_file_waits_for_local_base_bootstrap_with_recoverable_gate(
-                root / "bootstrap-gate-waiting"
-            ),
-        ),
-        (
-            "bootstrap_gate_reconciles_receipt_conflict_and_tamper_fail_closed",
-            lambda: test_bootstrap_gate_reconciles_receipt_conflict_and_tamper_fail_closed(
-                root / "bootstrap-gate-conflict-tamper"
-            ),
-        ),
-        (
-            "bootstrap_gate_reports_artifact_loss_and_opt_in_withdrawal_without_raising",
-            lambda: test_bootstrap_gate_reports_artifact_loss_and_opt_in_withdrawal_without_raising(
-                root / "bootstrap-gate-artifact-loss"
-            ),
-        ),
-        (
-            "bootstrap_gate_never_carries_environment_or_credential_values",
-            lambda: test_bootstrap_gate_never_carries_environment_or_credential_values(
-                root / "bootstrap-gate-no-env-leak"
-            ),
-        ),
-        (
-            "agent_cli_start_parks_on_bootstrap_then_resumes_same_run",
-            lambda: test_agent_cli_start_parks_on_bootstrap_then_resumes_same_run(
-                root / "bootstrap-agent-cli-resume"
-            ),
-        ),
-        (
-            "ups_stamps_waiting_bootstrap_onto_armed_kanban_followup_lock",
-            lambda: test_ups_stamps_waiting_bootstrap_onto_armed_kanban_followup_lock(
-                root / "bootstrap-ups-lock-stamp"
-            ),
-        ),
-        (
-            "bootstrap_replay_after_base_absorption_requires_new_review_start_boundary",
-            lambda: test_bootstrap_replay_after_base_absorption_requires_new_review_start_boundary(
-                root / "bootstrap-replay-same-run"
-            ),
-        ),
-        (
-            "held_bootstrap_gate_persists_verified_receipt_digest_so_swapped_receipt_is_tampered",
-            lambda: test_held_bootstrap_gate_persists_verified_receipt_digest_so_swapped_receipt_is_tampered(
-                root / "bootstrap-gate-digest-writeback"
-            ),
-        ),
-        (
-            "bootstrap_gate_g0_rejects_forged_origin_run_lineage_and_lost_run_artifacts",
-            lambda: test_bootstrap_gate_g0_rejects_forged_origin_run_lineage_and_lost_run_artifacts(
-                root / "bootstrap-gate-g0-forgery"
-            ),
-        ),
-        (
-            "bootstrap_gate_recovers_when_local_base_advances_during_the_wait",
-            lambda: test_bootstrap_gate_recovers_when_local_base_advances_during_the_wait(
-                root / "bootstrap-gate-base-advanced"
-            ),
-        ),
-        (
-            "agent_cli_start_retry_resumes_after_local_base_advances_during_the_wait",
-            lambda: test_agent_cli_start_retry_resumes_after_local_base_advances_during_the_wait(
-                root / "bootstrap-agent-cli-base-advanced"
-            ),
-        ),
-        (
-            "agent_cli_concurrent_bootstrap_resume_claims_prepare_exactly_once",
-            lambda: test_agent_cli_concurrent_bootstrap_resume_claims_prepare_exactly_once(
-                root / "bootstrap-agent-cli-replay-claim"
-            ),
-        ),
-        (
-            "bootstrap_replay_hard_bounds_a_stuck_prepare_in_a_killable_subprocess",
-            lambda: test_bootstrap_replay_hard_bounds_a_stuck_prepare_in_a_killable_subprocess(
-                root / "bootstrap-replay-hard-deadline"
             ),
         ),
         (
@@ -13343,7 +13239,7 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         ),
         (
             "agent_cli_start_receipt_renders_intent_status_and_ordered_next_steps",
-            lambda: test_agent_cli_start_receipt_renders_intent_status_and_ordered_next_steps(root / "agent-cli-start-receipt"),
+            lambda: test_agent_cli_start_receipt_renders_ordered_next_steps(root / "agent-cli-start-receipt"),
         ),
         # --- T1/T2/T3 集成审计修复包 F2：执行段 ---
         (
@@ -13714,7 +13610,6 @@ _preprev.inject(
     APPLY_WORKTREE_BOOTSTRAP=APPLY_WORKTREE_BOOTSTRAP,
     # pre-review local-base bootstrap 等待生命周期簇所需（进程内直调 prepare / gate / 入口 A CLI）。
     load_prepare_review_run_module=load_prepare_review_run_module,
-    load_rvf_bootstrap_gate_module=load_rvf_bootstrap_gate_module,
     load_rvf_prep_file_module=load_rvf_prep_file_module,
     load_rvf_decision_token_store_module=load_rvf_decision_token_store_module,
     load_rvf_agent_decision_cli_module=load_rvf_agent_decision_cli_module,

@@ -18,17 +18,13 @@ from typing import Any, Mapping
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 core.* import
+from core.session_scope_allocation.committed_round_detection import (  # noqa: E402
+    frozen_committed_round_base_exclusion_ref,
+    resolve_local_review_base_branch_ref,
+)
 from review_start_boundary_gate import require_review_start_boundary_for_prepare, bind_review_start_boundary_to_one_run
 import concurrent.futures
-import rvf_bootstrap_gate
 import rvf_prep_file
-from base_task_intent_reconciliation_artifact import (
-    consumed_base_task_intent_reconciliation,
-    intent_context_markdown,
-    record_intent_artifact_consumption_outcome,
-    status_artifact_payload as intent_artifact_status_artifact_payload,
-    STATUS_ARTIFACT_FILENAME as INTENT_ARTIFACT_STATUS_FILENAME,
-)
 from rvf_dispatch_prompts import dispatch_scope_of_work_text
 from core.run_ledger.run_ledger import normalize_rvf_backend, rvf_state_fields, start_run
 from core.session_scope_allocation import reviewable_unit_diff_tracker
@@ -95,12 +91,7 @@ COMMAND_LOCK = SKILL_DIR / "scripts" / "command_lock.py"
 WRITE_REVIEW_RESULT = SKILL_DIR / "scripts" / "write_review_result.py"
 CHECK_REVIEW_RESULT = SKILL_DIR / "scripts" / "check_review_result.py"
 SCOPE_CONTRACT_VERSION = 3
-PRE_REVIEW_BASE_SYNC_MARKER = "RVF-PRE-REVIEW-BASE-SYNC-SKILL:"
 REVIEW_KINDS = {"implementation", "base_drift_integration"}
-class BootstrapRequiredBeforeRvf(RuntimeError):
-    def __init__(self, payload: Mapping[str, Any]) -> None:
-        super().__init__("bootstrap_required_before_rvf")
-        self.payload = dict(payload)
 
 
 def fail(message: str, code: int = 1) -> int:
@@ -161,258 +152,6 @@ def _local_base_ref_full_name(local_base_ref: str) -> str:
         raise ValueError(f"invalid local base ref: {local_base_ref!r}")
     return full_ref
 
-
-def _local_branch_exists(repo: Path, candidate: str) -> bool:
-    try:
-        full_ref = _local_base_ref_full_name(candidate)
-    except ValueError:
-        return False
-    completed = subprocess.run(
-        ["git", "show-ref", "--verify", "--quiet", full_ref],
-        cwd=repo,
-        check=False,
-        capture_output=True,
-        text=True,
-        env=git_repository_location_clean_environment(),
-    )
-    return completed.returncode == 0
-
-
-def resolve_local_base_ref(
-    repo: Path,
-    *,
-    explicit_local_base_ref: str | None,
-    committed_base_ref: str | None,
-) -> str | None:
-    if explicit_local_base_ref:
-        return explicit_local_base_ref.strip()
-    if committed_base_ref:
-        candidate = committed_base_ref.strip().lstrip("^")
-        if _local_branch_exists(repo, candidate):
-            return candidate
-    origin_head = subprocess.run(
-        ["git", "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
-        cwd=repo,
-        check=False,
-        capture_output=True,
-        text=True,
-        env=git_repository_location_clean_environment(),
-    )
-    if origin_head.returncode == 0:
-        remote_ref = origin_head.stdout.strip()
-        prefix = "refs/remotes/origin/"
-        candidate = remote_ref[len(prefix):] if remote_ref.startswith(prefix) else ""
-        if candidate and _local_branch_exists(repo, candidate):
-            return candidate
-    if _local_branch_exists(repo, "main"):
-        return "main"
-    return None
-
-
-def pre_review_base_sync_state(repo: Path, local_base_ref: str | None) -> dict[str, str] | None:
-    """Read the opt-in marker from the local base commit, never from a stale task checkout."""
-    if not local_base_ref:
-        return None
-    full_ref = _local_base_ref_full_name(local_base_ref)
-    local_base_tip = run(["git", "rev-parse", "--verify", f"{full_ref}^{{commit}}"], cwd=repo).strip()
-    agents = subprocess.run(
-        ["git", "show", f"{local_base_tip}:AGENTS.md"],
-        cwd=repo,
-        check=False,
-        capture_output=True,
-        text=True,
-        env=git_repository_location_clean_environment(),
-    )
-    if agents.returncode != 0:
-        return None
-    required_skill: str | None = None
-    for line in agents.stdout.splitlines():
-        if line.strip().startswith(PRE_REVIEW_BASE_SYNC_MARKER):
-            value = line.split(PRE_REVIEW_BASE_SYNC_MARKER, 1)[1].strip()
-            if value:
-                required_skill = value.split()[0]
-            break
-    if required_skill is None:
-        return None
-    task_head = run(["git", "rev-parse", "HEAD"], cwd=repo).strip()
-    ancestor = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", local_base_tip, task_head],
-        cwd=repo,
-        check=False,
-        capture_output=True,
-        text=True,
-        env=git_repository_location_clean_environment(),
-    )
-    if ancestor.returncode == 0:
-        return {
-            "status": "absorbed",
-            "required_skill": required_skill,
-            "local_base_ref": local_base_ref,
-            "local_base_tip": local_base_tip,
-            "task_head": task_head,
-        }
-    if ancestor.returncode != 1:
-        raise RuntimeError(ancestor.stderr.strip() or "git merge-base --is-ancestor failed")
-    return {
-        "status": "bootstrap_required_before_rvf",
-        "required_skill": required_skill,
-        "local_base_ref": local_base_ref,
-        "local_base_tip": local_base_tip,
-        "task_head": task_head,
-    }
-
-
-def refuse_explicit_local_base_ref_that_bypasses_opt_in(
-    repo: Path,
-    *,
-    explicit_local_base_ref: str | None,
-    committed_base_ref: str | None,
-    resolved_local_base_ref: str | None,
-) -> None:
-    """堵 O1：不许用一个**存在但没有 marker 的旁支**当 base ref，从而绕开本仓的 opt-in 门禁。
-
-    ``resolve_local_base_ref`` 把 ``explicit_local_base_ref`` 当最高优先级短路，而门禁读哪个 commit
-    的 ``AGENTS.md`` 完全由它决定。畸形 ref 与不存在的 ref 早已 fail-closed（``_local_base_ref_full_name``
-    与 ``git rev-parse --verify`` 各挡一层），**唯一**剩下的旁路形态是：仓库自己解析出来的 base 是
-    opt-in 的，而显式传入的那个分支恰好没有 marker ⇒ ``pre_review_base_sync_state`` 返回 ``None``、
-    整道门禁静默变成 ``not_applicable``。这与 docstring 承诺的「always read from the current local
-    base commit」直接矛盾。
-
-    因此这里独立解析一次（不带显式覆盖），只在「独立解析出的 base 是 opt-in、而显式那个不是」时拒绝。
-    显式 ref 与独立解析**不同但同样 opt-in**（或两者都非 opt-in）不受影响——那是合法用法，
-    比如默认分支不叫 main、又没有 ``origin/HEAD`` 的仓库。
-    """
-    if not explicit_local_base_ref:
-        return
-    independently_resolved = resolve_local_base_ref(
-        repo, explicit_local_base_ref=None, committed_base_ref=committed_base_ref
-    )
-    if not independently_resolved or independently_resolved == resolved_local_base_ref:
-        return
-    if pre_review_base_sync_state(repo, independently_resolved) is None:
-        return
-    if pre_review_base_sync_state(repo, resolved_local_base_ref) is not None:
-        return
-    raise ValueError(
-        "explicit local base ref bypasses the repository's opt-in pre-review base sync marker: "
-        f"{resolved_local_base_ref!r} carries no marker while {independently_resolved!r} does"
-    )
-
-
-def git_diff_path_set(repo: Path, older_tip: str, newer_tip: str) -> list[str]:
-    completed = subprocess.run(
-        ["git", "diff", "--name-only", "-z", older_tip, newer_tip, "--"],
-        cwd=repo,
-        check=False,
-        capture_output=True,
-        env=git_repository_location_clean_environment(),
-    )
-    if completed.returncode != 0:
-        raise ValueError(completed.stderr.decode(errors="replace").strip() or "git diff failed")
-    return sorted({os.fsdecode(path) for path in completed.stdout.split(b"\0") if path})
-
-
-def validated_bootstrap_receipt(
-    repo: Path, state: Mapping[str, str], receipt_path: Path
-) -> dict[str, Any]:
-    expected_path = (
-        Path(run(["git", "rev-parse", "--absolute-git-dir"], cwd=repo).strip())
-        / "base-branch-sync"
-        / "local-base-into-task-worktree-bootstrap-receipt.json"
-    )
-    if receipt_path.absolute() != expected_path.absolute():
-        raise ValueError("bootstrap receipt must use the task absolute git-dir path")
-    _receipt_value, _receipt_digest = canonical_json_artifact_identity(receipt_path)
-    payload = json.loads(receipt_path.read_text(encoding="utf-8"))
-    common_dir = Path(
-        run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=repo).strip()
-    ).resolve()
-    required_values = {
-        "schema_name": "local-base-into-task-worktree-bootstrap-receipt",
-        "schema_version": 1,
-        "absorbed_base_tip": state["local_base_tip"],
-        "base_ref": state["local_base_ref"],
-        "git_common_directory_realpath": str(common_dir),
-        "task_worktree_realpath": str(repo.resolve()),
-        "boundary_status": "VERIFIED",
-        "lock_status": "RELEASED",
-        "target_repository_hooks_status": "DISABLED",
-    }
-    if any(payload.get(name) != value for name, value in required_values.items()):
-        raise ValueError("bootstrap receipt identity does not match the opt-in repository")
-    if payload.get("wip_status") not in {
-        "NOT_REQUIRED_TASK_WORKTREE_CLEAN",
-        "RESTORED_AND_DROPPED",
-    }:
-        raise ValueError("bootstrap receipt WIP status is not reusable")
-    tips: dict[str, str] = {}
-    for name in (
-        "base_task_merge_base_tip",
-        "absorbed_base_tip",
-        "task_tip_before_base_absorption",
-        "task_tip_after_base_absorption",
-    ):
-        value = payload.get(name)
-        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40,64}", value):
-            raise ValueError(f"bootstrap receipt {name} is invalid")
-        run(["git", "cat-file", "-e", f"{value}^{{commit}}"], cwd=repo)
-        tips[name] = value
-    actual_merge_base = run(
-        [
-            "git",
-            "merge-base",
-            tips["task_tip_before_base_absorption"],
-            tips["absorbed_base_tip"],
-        ],
-        cwd=repo,
-    ).strip()
-    if actual_merge_base != tips["base_task_merge_base_tip"]:
-        raise ValueError("bootstrap receipt merge-base identity is invalid")
-    for ancestor_tip in (
-        tips["absorbed_base_tip"],
-        tips["task_tip_before_base_absorption"],
-        tips["task_tip_after_base_absorption"],
-    ):
-        descendant = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", ancestor_tip, state["task_head"]],
-            cwd=repo,
-            env=git_repository_location_clean_environment(),
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if descendant.returncode != 0:
-            raise ValueError("current task HEAD does not descend from the bootstrap receipt")
-    expected_base_delta_paths = git_diff_path_set(
-        repo, tips["base_task_merge_base_tip"], tips["absorbed_base_tip"]
-    )
-    expected_task_change_paths = git_diff_path_set(
-        repo, tips["base_task_merge_base_tip"], tips["task_tip_before_base_absorption"]
-    )
-    expected_interaction_paths = sorted(
-        set(expected_base_delta_paths).intersection(expected_task_change_paths)
-    )
-    for name, expected_paths in (
-        ("base_delta_paths", expected_base_delta_paths),
-        ("task_change_paths", expected_task_change_paths),
-        ("interaction_primary_paths", expected_interaction_paths),
-    ):
-        if payload.get(name) != expected_paths:
-            raise ValueError(f"bootstrap receipt {name} does not match the fixed Git tips")
-    return payload
-
-
-def default_bootstrap_receipt(repo: Path, state: Mapping[str, str]) -> Path | None:
-    absolute_git_dir = Path(run(["git", "rev-parse", "--absolute-git-dir"], cwd=repo).strip())
-    receipt_path = (
-        absolute_git_dir
-        / "base-branch-sync"
-        / "local-base-into-task-worktree-bootstrap-receipt.json"
-    )
-    if not receipt_path.exists() and not Path(f"{receipt_path}.sha256").exists():
-        return None
-    validated_bootstrap_receipt(repo, state, receipt_path)
-    return receipt_path
 
 
 def safe_repo_name(repo: Path) -> str:
@@ -896,13 +635,11 @@ def scope_contract_v3_extensions(
     task_change_paths: list[str] | None = None,
     interaction_primary_paths: list[str] | None = None,
     base_delta_protected_paths: list[str] | None = None,
-    bootstrap_receipt: Path | None = None,
     candidate_evidence: Path | None = None,
     integration_candidate_receipt: Path | None = None,
 ) -> dict[str, Any]:
     if review_kind not in REVIEW_KINDS:
         raise ValueError(f"unsupported review kind: {review_kind}")
-    bootstrap_path, bootstrap_digest = canonical_json_artifact_identity(bootstrap_receipt)
     candidate_path, candidate_digest = canonical_json_artifact_identity(candidate_evidence)
     integration_path, integration_digest = canonical_json_artifact_identity(
         integration_candidate_receipt
@@ -919,8 +656,6 @@ def scope_contract_v3_extensions(
         "task_change_paths": normalized_scope_list(task_change_paths or []),
         "interaction_primary_paths": normalized_scope_list(interaction_primary_paths or []),
         "base_delta_protected_paths": normalized_scope_list(base_delta_protected_paths or []),
-        "bootstrap_receipt_path": bootstrap_path,
-        "bootstrap_receipt_digest": bootstrap_digest,
         "candidate_evidence_path": candidate_path,
         "candidate_evidence_digest": candidate_digest,
         "integration_candidate_receipt_path": integration_path,
@@ -1273,73 +1008,43 @@ def prepare_run(
         repo=str(root), receipt=(scope_contract_extensions or {}).get("review_start_boundary_receipt"),
     )
     scope_contract_extensions = {**dict(scope_contract_extensions or scope_contract_v3_extensions()), "review_start_boundary_receipt": verified_boundary_receipt}
-    resolved_local_base_ref = resolve_local_base_ref(
+    resolved_local_base_ref = resolve_local_review_base_branch_ref(
         root,
-        explicit_local_base_ref=local_base_ref,
+        explicit_local_base_ref=local_base_ref or verified_boundary_receipt.get("comparison_base_ref"),
         committed_base_ref=committed_base_ref,
     )
-    refuse_explicit_local_base_ref_that_bypasses_opt_in(
-        root,
-        explicit_local_base_ref=local_base_ref,
-        committed_base_ref=committed_base_ref,
-        resolved_local_base_ref=resolved_local_base_ref,
-    )
-    pre_review_sync_state = pre_review_base_sync_state(root, resolved_local_base_ref)
-    if pre_review_sync_state is not None and pre_review_sync_state["status"] == "bootstrap_required_before_rvf":
-        raise BootstrapRequiredBeforeRvf(pre_review_sync_state)
-    # N5/K4：把本轮已校验的 bootstrap receipt 与它的 digest 捕获到函数作用域，供 intent artifact
-    # 的 subject binding 使用（digest 是 anti-replay 直接锚，receipt 自身按 schema 不得内嵌它）。
-    validated_bootstrap_receipt_payload: dict[str, Any] | None = None
-    validated_bootstrap_receipt_digest: str | None = None
-    effective_scope_contract_extensions = dict(
-        scope_contract_extensions or scope_contract_v3_extensions()
-    )
-    if pre_review_sync_state is not None:
-        configured_base_ref = effective_scope_contract_extensions.get("base_ref")
-        if configured_base_ref not in {None, resolved_local_base_ref}:
-            raise ValueError("configured base_ref conflicts with the resolved local base ref")
-        effective_scope_contract_extensions["base_ref"] = resolved_local_base_ref
-        if not effective_scope_contract_extensions.get("remote_name"):
-            effective_scope_contract_extensions["remote_name"] = "origin"
-        default_tip_values = {
-            "comparison_base_tip": pre_review_sync_state["local_base_tip"],
-            "reviewed_base_tip": pre_review_sync_state["local_base_tip"],
-            "reviewed_task_tip": pre_review_sync_state["task_head"],
-            "candidate_task_tip": pre_review_sync_state["task_head"],
-        }
-        for name, value in default_tip_values.items():
-            if not effective_scope_contract_extensions.get(name):
-                effective_scope_contract_extensions[name] = value
-        configured_receipt_path = effective_scope_contract_extensions.get("bootstrap_receipt_path")
-        receipt_path = (
-            Path(configured_receipt_path)
-            if isinstance(configured_receipt_path, str)
-            else default_bootstrap_receipt(root, pre_review_sync_state)
-        )
-        if receipt_path is not None:
-            receipt_payload = validated_bootstrap_receipt(root, pre_review_sync_state, receipt_path)
-            receipt_value, receipt_digest = canonical_json_artifact_identity(receipt_path)
-            validated_bootstrap_receipt_payload = receipt_payload
-            validated_bootstrap_receipt_digest = receipt_digest
-            configured_receipt_digest = effective_scope_contract_extensions.get(
-                "bootstrap_receipt_digest"
-            )
-            if configured_receipt_digest not in {None, receipt_digest}:
-                raise ValueError("configured bootstrap receipt digest does not match its artifact")
-            effective_scope_contract_extensions["bootstrap_receipt_path"] = receipt_value
-            effective_scope_contract_extensions["bootstrap_receipt_digest"] = receipt_digest
-            for name in (
-                "base_delta_paths",
-                "task_change_paths",
-                "interaction_primary_paths",
-            ):
-                receipt_paths = receipt_payload[name]
-                configured_paths = effective_scope_contract_extensions.get(name)
-                if configured_paths:
-                    if normalized_scope_list(configured_paths) != receipt_paths:
-                        raise ValueError(f"configured {name} conflicts with the bootstrap receipt")
-                else:
-                    effective_scope_contract_extensions[name] = receipt_paths
+    effective_scope_contract_extensions = dict(scope_contract_extensions or scope_contract_v3_extensions())
+    fixed_comparison_tip = verified_boundary_receipt.get("comparison_base_tip")
+    default_comparison_tip = verified_boundary_receipt["worktree_head_commit_sha"]
+    if resolved_local_base_ref:
+        full_ref = _local_base_ref_full_name(resolved_local_base_ref)
+        boundary_base_ref = verified_boundary_receipt.get("comparison_base_ref")
+        if not boundary_base_ref or _local_base_ref_full_name(boundary_base_ref) != full_ref:
+            raise ValueError("本地 base ref 与开审分界不一致")
+        fixed_base_tip = verified_boundary_receipt.get("comparison_base_ref_tip")
+        if not fixed_base_tip:
+            raise ValueError("开审分界没有固定的本地 base tip")
+        task_head = verified_boundary_receipt["worktree_head_commit_sha"]
+        common_ancestors = run(["git", "merge-base", "--all", task_head, fixed_base_tip], cwd=root).splitlines()
+        if len(common_ancestors) != 1:
+            raise ValueError("审查候选需要唯一且明确的共同 base 祖先")
+        if effective_scope_contract_extensions.get("review_kind", "implementation") == "implementation":
+            default_comparison_tip = common_ancestors[0]
+            defaults = {
+                "base_ref": resolved_local_base_ref, "remote_name": "origin",
+                "reviewed_base_tip": common_ancestors[0],
+                "reviewed_task_tip": task_head, "candidate_task_tip": task_head,
+            }
+            for name, value in defaults.items():
+                configured = effective_scope_contract_extensions.get(name)
+                if name == "base_ref" and configured:
+                    if _local_base_ref_full_name(configured) != full_ref:
+                        raise ValueError("scope 的本地 base ref 与开审分界不一致")
+                elif name != "remote_name" and configured and configured != value:
+                    raise ValueError(f"scope 的 {name} 与固定审查坐标不一致")
+                if not configured:
+                    effective_scope_contract_extensions[name] = value
+        committed_base_ref = frozen_committed_round_base_exclusion_ref(root, resolved_local_base_ref, fixed_base_tip)
     integration_receipt_value = effective_scope_contract_extensions.get(
         "integration_candidate_receipt_path"
     )
@@ -1385,11 +1090,26 @@ def prepare_run(
         raise ValueError(
             "base_drift_integration requires a canonical integration candidate receipt"
         )
-    # An explicit --base-ref (the documented manual lever for reviewing already-committed work)
-    # must also drive the manifest's committed-round attribution; otherwise a clean worktree
-    # produces empty owned paths and the packet build aborts with "no owned paths". Derive the
-    # committed baseline from it when the caller did not already supply one.
-    if base_ref and not committed_baseline:
+    if effective_scope_contract_extensions.get("review_kind", "implementation") == "implementation":
+        # 显式比较输入必须与分界坐标一致；后续子进程只接收固定 OID，不能重读活 ref。
+        for comparison_input in (base_ref, committed_baseline):
+            if not comparison_input:
+                continue
+            input_tip = run(["git", "rev-parse", "--verify", f"{comparison_input}^{{commit}}"], cwd=root).strip()
+            if fixed_comparison_tip and input_tip != fixed_comparison_tip:
+                raise ValueError("比较基线与开审分界不一致")
+            fixed_comparison_tip = input_tip
+        fixed_comparison_tip = fixed_comparison_tip or default_comparison_tip
+        comparison_ancestors = run(["git", "merge-base", "--all", fixed_comparison_tip,
+                                    verified_boundary_receipt["worktree_head_commit_sha"]], cwd=root).splitlines()
+        if comparison_ancestors != [fixed_comparison_tip]:
+            raise ValueError("比较基线与开审分界不一致：不是固定审查候选的祖先")
+        configured_comparison_tip = effective_scope_contract_extensions.get("comparison_base_tip")
+        if configured_comparison_tip and configured_comparison_tip != fixed_comparison_tip:
+            raise ValueError("scope 的比较基线与开审分界不一致")
+        effective_scope_contract_extensions["comparison_base_tip"] = fixed_comparison_tip
+        base_ref = committed_baseline = fixed_comparison_tip
+    elif base_ref and not committed_baseline:
         committed_baseline = base_ref
     canonical_backend = normalize_rvf_backend(rvf_backend) or "manual"
     rvf_run_id, rvf_run_dir = bind_review_start_boundary_to_one_run(
@@ -1438,67 +1158,6 @@ def prepare_run(
     if session_context is not None:
         shutil.copyfile(session_context, scope_of_work_path)
         packet_session_context = scope_of_work_path
-
-    # ------------------------------------------------------------------ N5 / K4
-    # 消费 base-branch-sync 的 intent artifact，注入 reviewer / fixer context。
-    #
-    # **只对 opt-in 仓库做**（``pre_review_sync_state is not None`` 即 opt-in）：非 opt-in 仓库
-    # 既没有 base 单向吸收、也不会有 artifact，给它们写日志只会污染退出条件第 4 条的分母。
-    #
-    # **三种 status 一律放行**：consumed / missing / invalid 走同一条路径，绝不 raise。
-    # 两侧部署节奏天然不同步（my-ai-setup 软链即时生效、RVF 要跑 /rvf-local-deploy），
-    # 因此「artifact 不在」是常规事件而非异常——把它当异常就是再造一条 fail-closed 死路。
-    intent_artifact_outcome: dict[str, Any] | None = None
-    intent_artifact_status_path: Path | None = None
-    if pre_review_sync_state is not None:
-        intent_artifact_outcome = consumed_base_task_intent_reconciliation(
-            root,
-            validated_bootstrap_receipt_payload,
-            validated_bootstrap_receipt_digest,
-        )
-        # 机器可校验的落点①：run 工件（事后可审计）。
-        intent_artifact_status_path = artifact_dir / INTENT_ARTIFACT_STATUS_FILENAME
-        intent_artifact_status_path.write_text(
-            json.dumps(
-                intent_artifact_status_artifact_payload(
-                    intent_artifact_outcome, run_id=ledger.run_id
-                ),
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-        # 机器可校验的落点②：跨 run 的 append-only 日志（过渡机制退出条件第 4 条要它做统计）。
-        # best-effort，永不阻断 prepare。
-        intent_log_git_common_directory = (validated_bootstrap_receipt_payload or {}).get(
-            "git_common_directory_realpath"
-        )
-        if not intent_log_git_common_directory:
-            # `run()` 见非零退出即 raise。这条路径**只是可观测性记录**，绝不允许把 prepare 拖红
-            # ——给它留一条能抛的缝，就等于在「一律放行」的契约里凿了个 fail-closed 出来。
-            try:
-                intent_log_git_common_directory = run(
-                    ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
-                    cwd=root,
-                ).strip()
-            except (OSError, RuntimeError):
-                intent_log_git_common_directory = str(root)
-        record_intent_artifact_consumption_outcome(
-            outcome=intent_artifact_outcome,
-            git_common_directory=intent_log_git_common_directory,
-            task_worktree=str(root),
-            rvf_run_id=ledger.run_id,
-        )
-        # 注入通道：追加到 scope-of-work 末尾。**只在已有 scope-of-work 时追加**——
-        # 若本轮压根没传 session context，凭空造一个只含 intent 段的文件会改变
-        # allow_missing_session_context 的既有语义。追加在末尾还保证 stub marker
-        # （scope_of_work_is_untouched_stub 只看前 20 行）不会被我们误判成「已填实」。
-        if packet_session_context is not None and scope_of_work_path.exists():
-            with scope_of_work_path.open("a", encoding="utf-8") as handle:
-                handle.write("\n" + intent_context_markdown(intent_artifact_outcome))
-    # ---------------------------------------------------------------- end N5 / K4
 
     packet_session_manifest: Path | None = None
     source_session_manifest: str | None = None
@@ -1800,22 +1459,6 @@ def prepare_run(
         "main_harness_file": str(main_harness_path),
         "scope_contract": str(scope_contract_path),
         "scope_contract_payload": scope_contract,
-        # N5/K4：intent artifact 的消费结局。三种取值一律放行，这里只是把它做成机器事实。
-        "intent_artifact_status": (
-            intent_artifact_outcome.get("status")
-            if intent_artifact_outcome is not None
-            else None
-        ),
-        "intent_artifact_status_reason": (
-            intent_artifact_outcome.get("reason")
-            if intent_artifact_outcome is not None
-            else None
-        ),
-        "intent_artifact_status_file": (
-            str(intent_artifact_status_path)
-            if intent_artifact_status_path is not None
-            else None
-        ),
         "review_packet": str(packet_path),
         "review_packet_metadata": str(metadata_path),
         "before_workspace_snapshot": str(snapshot_path),
@@ -1860,7 +1503,6 @@ def prepare_run(
         "primary_files": primary_files,
         "background_files": background_files,
         "excluded_path_prefixes": metadata.get("excluded_path_prefixes"),
-        "pre_review_base_sync_state": pre_review_sync_state,
         **rvf_state_fields(
             phase="prepare",
             backend=canonical_backend,
@@ -1942,7 +1584,6 @@ def _shared_workflow_artifacts(result: dict[str, Any]) -> dict[str, str | None]:
         "worktree_bootstrap": result.get("worktree_bootstrap"),
         "session_manifest": result.get("session_manifest_file"),
         "scope_of_work": result.get("scope_of_work_file"),
-        "intent_artifact_status_file": result.get("intent_artifact_status_file"),
     }
 
 
@@ -1993,7 +1634,6 @@ def scope_contract_v3_extensions_from_prep_payload(
     artifact_paths: dict[str, Path | None] = {}
     declared_digests: dict[str, str | None] = {}
     for prefix in (
-        "bootstrap_receipt",
         "candidate_evidence",
         "integration_candidate_receipt",
     ):
@@ -2016,43 +1656,18 @@ def scope_contract_v3_extensions_from_prep_payload(
         remote_name=remote_name,
         **tips,
         **path_lists,
-        bootstrap_receipt=artifact_paths["bootstrap_receipt"],
         candidate_evidence=artifact_paths["candidate_evidence"],
         integration_candidate_receipt=artifact_paths[
             "integration_candidate_receipt"
         ],
     )
     for prefix in (
-        "bootstrap_receipt",
         "candidate_evidence",
         "integration_candidate_receipt",
     ):
         if declared_digests[prefix] != extensions[f"{prefix}_digest"]:
             raise ValueError(f"prep {prefix} digest does not match its canonical artifact")
     return extensions
-
-
-def _bootstrap_gate_parent_attempt(
-    existing_state: Any, rvf_run_id: str | None
-) -> dict[str, str | None]:
-    """本轮等待的**上一次尝试** run 血缘（供 `build_bootstrap_gate` 的 parent_attempt_* 参数）。
-
-    同一个 run 上反复重放 prepare 不算「新一轮独立 RVF」，故 run_id 未变时把上一枚 gate 记的
-    parent 原样带下去；只有当本轮确实换了 run（旧工件丢失后重开）才把旧 run 记成 parent。
-    """
-    previous = rvf_bootstrap_gate.gate_of(existing_state)
-    if previous is None:
-        return {"parent_attempt_run_id": None, "parent_attempt_run_dir": None}
-    previous_run_id = previous.get("rvf_run_id")
-    if previous_run_id and previous_run_id != rvf_run_id:
-        return {
-            "parent_attempt_run_id": previous_run_id,
-            "parent_attempt_run_dir": previous.get("rvf_run_dir"),
-        }
-    return {
-        "parent_attempt_run_id": previous.get("parent_attempt_run_id"),
-        "parent_attempt_run_dir": previous.get("parent_attempt_run_dir"),
-    }
 
 
 def prepare_run_from_prep_file(
@@ -2217,33 +1832,6 @@ def prepare_run_from_prep_file(
     except ReviewStartBoundaryNotVerified as exc:
         executor.shutdown(wait=False, cancel_futures=True)
         completed_state = {**state, "status": exc.status, "completed_at": _shared_workflow_now(), "error": exc.reason}
-    except BootstrapRequiredBeforeRvf as exc:
-        # 「等 local base bootstrap」不是失败，而是一个**可恢复的等待态**：给它独立的 status
-        # （不与真失败混同）并附一枚白名单 gate 子记录，让两条入口（rvf-agent decision-token /
-        # kanban follow-up）都能持久化、重验证、按同一 run 恢复。此路径在 start_run 之前抛出，
-        # 故不建 run、不分配 lease、不派 reviewer——gate 只描述「等什么、等谁、在哪等」。
-        executor.shutdown(wait=False, cancel_futures=True)
-        completed_state = {
-            **state,
-            **exc.payload,
-            "status": rvf_bootstrap_gate.WAITING_STATUS,
-            "bootstrap_gate": rvf_bootstrap_gate.build_bootstrap_gate(
-                target_repo,
-                exc.payload,
-                origin_kind=(
-                    rvf_bootstrap_gate.BOOTSTRAP_ORIGIN_KANBAN_FOLLOWUP
-                    if rvf_backend == "kanban-followup"
-                    else rvf_bootstrap_gate.BOOTSTRAP_ORIGIN_DECISION_TOKEN
-                ),
-                origin_prep_token=prep.token,
-                origin_kanban_task_id=payload.get("target_kanban_task_id"),
-                origin_session_id=payload.get("origin_session_id"),
-                rvf_run_id=rvf_run_id,
-                rvf_run_dir=rvf_run_dir,
-                **_bootstrap_gate_parent_attempt(existing_state, rvf_run_id),
-            ),
-            "completed_at": _shared_workflow_now(),
-        }
     except Exception as exc:
         executor.shutdown(wait=False, cancel_futures=True)
         completed_state = {
@@ -2315,7 +1903,6 @@ def main() -> int:
     parser.add_argument("--task-change-path", action="append", default=[])
     parser.add_argument("--interaction-primary-path", action="append", default=[])
     parser.add_argument("--base-delta-protected-path", action="append", default=[])
-    parser.add_argument("--bootstrap-receipt", help="Canonical JSON bootstrap receipt to bind into scope v3.")
     parser.add_argument("--candidate-evidence", help="Canonical JSON candidate evidence to bind into scope v3.")
     parser.add_argument(
         "--integration-candidate-receipt",
@@ -2371,7 +1958,6 @@ def main() -> int:
             task_change_paths=args.task_change_path,
             interaction_primary_paths=args.interaction_primary_path,
             base_delta_protected_paths=args.base_delta_protected_path,
-            bootstrap_receipt=Path(args.bootstrap_receipt) if args.bootstrap_receipt else None,
             candidate_evidence=Path(args.candidate_evidence) if args.candidate_evidence else None,
             integration_candidate_receipt=(
                 Path(args.integration_candidate_receipt)
@@ -2399,13 +1985,6 @@ def main() -> int:
             local_base_ref=args.local_base_ref,
             scope_contract_extensions=contract_extensions,
         )
-    except BootstrapRequiredBeforeRvf as exc:
-        payload = json.dumps(exc.payload, ensure_ascii=False, indent=2) + "\n"
-        if args.output_json:
-            Path(args.output_json).expanduser().resolve().write_text(payload, encoding="utf-8")
-        else:
-            print(payload, end="")
-        return 3
     except Exception as exc:
         return fail(str(exc), 2)
 

@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from independent_review_start_boundary_fixture import fixed_git_coordinates_for_review_start_boundary_unit_test
 
 import pytest
 
@@ -48,7 +49,7 @@ def write_canonical_artifact(path: Path, payload: dict[str, object]) -> str:
 
 def test_prepare_run_from_prep_file_forwards_scope_contract_v3_extensions(tmp_path: Path, monkeypatch) -> None:
     # 此处只验证 v3 字段透传；分界真实性由专用宿主/Git 集成套件验证。
-    monkeypatch.setattr(prepare_review_run, "require_review_start_boundary_for_prepare", lambda **kw: {"test_scope": "v3-field-forwarding"})
+    monkeypatch.setattr(prepare_review_run, "require_review_start_boundary_for_prepare", lambda **kw: fixed_git_coordinates_for_review_start_boundary_unit_test(kw["repo"], test_scope="v3-field-forwarding"))
     # 本单元测试隔离 v3 字段透传；绑定的完整交互由真实 start→prepare→dispatch 回归验证。
     monkeypatch.setattr(prepare_review_run, "bind_review_start_boundary_to_one_run", lambda receipt, run_id, run_dir: (run_id, Path(run_dir)))
     repo = tmp_path / "repo"
@@ -61,13 +62,11 @@ def test_prepare_run_from_prep_file_forwards_scope_contract_v3_extensions(tmp_pa
     git(repo, "commit", "-q", "-m", "base")
     head = git(repo, "rev-parse", "HEAD")
     git_dir = Path(git(repo, "rev-parse", "--absolute-git-dir"))
-    bootstrap_path = git_dir / "base-branch-sync/local-base-into-task-worktree-bootstrap-receipt.json"
     candidate_path = git_dir / "rvf/evidence/reviewed-task-candidate-evidence.json"
     integration_path = (
         git_dir
         / "base-branch-sync/reviewed-task-handback-integration-candidate.json"
     )
-    bootstrap_digest = write_canonical_artifact(bootstrap_path, {"schema_version": 1})
     candidate_digest = write_canonical_artifact(candidate_path, {"schema_version": 1})
     integration_digest = write_canonical_artifact(
         integration_path, {"schema_version": 1}
@@ -91,8 +90,6 @@ def test_prepare_run_from_prep_file_forwards_scope_contract_v3_extensions(tmp_pa
             "task_change_paths": ["tracked.txt"],
             "interaction_primary_paths": ["shared.txt"],
             "base_delta_protected_paths": ["package.json"],
-            "bootstrap_receipt_path": str(bootstrap_path),
-            "bootstrap_receipt_digest": bootstrap_digest,
             "candidate_evidence_path": str(candidate_path),
             "candidate_evidence_digest": candidate_digest,
             "integration_candidate_receipt_path": str(integration_path),
@@ -127,7 +124,6 @@ def test_prepare_run_from_prep_file_forwards_scope_contract_v3_extensions(tmp_pa
     assert extensions["remote_name"] == "origin"
     assert extensions["comparison_base_tip"] == head
     assert extensions["interaction_primary_paths"] == ["shared.txt"]
-    assert extensions["bootstrap_receipt_digest"] == bootstrap_digest
     assert extensions["candidate_evidence_digest"] == candidate_digest
     assert extensions["integration_candidate_receipt_digest"] == integration_digest
 

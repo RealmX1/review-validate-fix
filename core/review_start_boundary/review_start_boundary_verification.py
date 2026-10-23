@@ -170,8 +170,11 @@ def verify_independent_user_turn_boundary(
     base_ref = summary.get("committed_round_base_ref")
     if receipt.get("comparison_base_ref") != base_ref or current.get("committed_round_base_ref") != base_ref:
         invalid("比较基线的本地 ref 与分界不一致")
-    if base_ref and git_output(repo, "rev-parse", "--verify", str(base_ref)) != receipt.get("comparison_base_ref_tip"):
-        invalid("本地 base 在分界之后改变，须重新请求分界")
+    if base_ref:
+        fixed_base_tip = receipt.get("comparison_base_ref_tip")
+        if not isinstance(fixed_base_tip, str) or len(fixed_base_tip) not in (40, 64) or any(character not in "0123456789abcdef" for character in fixed_base_tip):
+            invalid("分界必须记录不可变的本地 base commit")
+        git_output(repo, "rev-parse", "--verify", fixed_base_tip + "^{commit}")
     for candidate in current.get("candidates", []):
         if not candidate.get("included_in_candidate_set"):
             continue

@@ -39,6 +39,12 @@ LAUNCH_LAUNCHED = "launched"
 LAUNCH_ALREADY_RUNNING = "already_running"
 LAUNCH_FAILED = "launch_failed"
 
+DETACHED_LAUNCH_RESERVED_STATUS_FIELD_NAMES = frozenset({
+    "schema_version", "run_dir", "run_name", "host", "tmux_session", "command",
+    "pid", "started_at", "armed_at", "returncode", "finished_at", "launch_status",
+    "error", "lock_path", "status_path", "idempotency_key",
+})
+
 # run-with-timeout backstop 命中 wall-clock 上限时的退出码：沿用 ``timeout(1)`` /
 # ``run_alternative_reviewer.EXTERNAL_REVIEWER_TIMEOUT_EXIT_CODE`` 的 124 约定。
 RUN_TIMEOUT_EXIT_CODE = 124
@@ -217,6 +223,7 @@ def launch_detached(
     status_path: Path,
     lock_path: Path,
     status_payload: dict[str, Any],
+    launch_failure_status_fields: dict[str, Any] | None = None,
     exports: dict[str, str] | None = None,
     stdin_path: Path | None = None,
     launch_env: dict[str, str] | None = None,
@@ -238,10 +245,16 @@ def launch_detached(
     启动时把它（``launch_status`` 强制为 ``launched``）原子落盘，并在被包命令退出时经
     ``--finalize-status`` 回调 merge ``returncode``/``finished_at``。``total_timeout_seconds``
     非 None 时对被包命令施加 wall-clock backstop（见模块 docstring）。
+    专属失败字段经 ``launch_failure_status_fields`` 传入，由本 helper 持锁落盘；不得覆盖
+    启动身份、锁、退出码等保留字段。调用方收到失败结果后不再补写共享状态。
     """
     exports = exports or {}
     lock_acquired = False
     try:
+        failure_status_fields = dict(launch_failure_status_fields or {})
+        reserved_overrides = failure_status_fields.keys() & DETACHED_LAUNCH_RESERVED_STATUS_FIELD_NAMES
+        if reserved_overrides:
+            raise ValueError(f"失败扩展字段不能覆盖启动状态：{', '.join(sorted(reserved_overrides))}")
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.touch(exist_ok=True)
 
@@ -314,8 +327,10 @@ def launch_detached(
                 or completed.stdout.strip()
                 or "tmux new-session failed"
             )
+            payload.update(failure_status_fields)
             payload["launch_status"] = LAUNCH_FAILED
             payload["error"] = error
+            payload["returncode"] = completed.returncode
             _atomic_write_json(status_path, payload)
             # launch 失败时释放锁，便于后续重新 launch。
             _unlink_quiet(lock_path)
@@ -334,16 +349,16 @@ def launch_detached(
         }
     except Exception as exc:  # noqa: BLE001 - 启动失败绝不阻断调用方主路径。
         error = f"{type(exc).__name__}: {exc}"
-        try:
-            failure = dict(status_payload)
-            failure["launch_status"] = LAUNCH_FAILED
-            failure["error"] = error
-            failure.setdefault("returncode", None)
-            failure.setdefault("finished_at", None)
-            _atomic_write_json(status_path, failure)
-        except Exception:  # noqa: BLE001
-            pass
         if lock_acquired:
+            try:
+                failure = {**status_payload, **failure_status_fields}
+                failure["launch_status"] = LAUNCH_FAILED
+                failure["error"] = error
+                failure.setdefault("returncode", None)
+                failure.setdefault("finished_at", None)
+                _atomic_write_json(status_path, failure)
+            except Exception:  # noqa: BLE001
+                pass
             _unlink_quiet(lock_path)
         return {
             "launch_status": LAUNCH_FAILED,

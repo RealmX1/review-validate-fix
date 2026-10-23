@@ -31,6 +31,14 @@ Cline Kanban GUI 接管可视化与 workflow 集成）。无论后台线程成�
 缺失，用户始终可以手动触发 `$rvf-analyze <run_dir>` 收尾。
 只有用户显式调用本 skill 时，agent 才进入叙事补全与 issue ↔ patch 因果归属流程。
 
+后台线程直接补全 finalize 已生成的骨架，不重新执行 `rvf_analyze.py`。Codex
+保持 `workspace-write`，额外只授权当前 run 的正式 `analysis/` 目录。禁止向业务
+worktree 或临时目录保存替代稿；无法写回时报告失败。分析专用包装器在退出后检查
+正式报告无 TODO、因果 JSON 的版本/run 身份和 patch 引用合法，且除候选归因外的
+事实未被改写；通过后才计入完成数。`.analyze-thread.status.json` 的
+`agent_process_returncode` 是进程结果，`formal_analysis_completion_status` 是
+`pending/completed/incomplete/failed`；`returncode` 是综合结果，非零允许后续重试。
+
 ## 入口与脚本
 
 唯一入口脚本（确定性后端）：

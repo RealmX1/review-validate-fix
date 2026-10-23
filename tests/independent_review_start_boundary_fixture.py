@@ -11,6 +11,22 @@ from pathlib import Path
 from unittest.mock import patch
 
 
+def fixed_git_coordinates_for_review_start_boundary_unit_test(repo, *, test_scope):
+    """为仅替代宿主 gate 的单元测试保留真实 Git 坐标。"""
+    from core.session_scope_allocation.committed_round_detection import _resolve_committed_round_base_ref
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    def commit(revision):
+        if not revision:
+            return None
+        result = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "rev-parse", "--verify", f"{revision}^{{commit}}"],
+            cwd=repo, env=environment, capture_output=True, text=True)
+        return result.stdout.strip() if result.returncode == 0 else None
+    base_ref = _resolve_committed_round_base_ref(Path(repo))
+    return {"test_scope": test_scope, "worktree_head_commit_sha": commit("HEAD"),
+            "comparison_base_ref": base_ref, "comparison_base_ref_tip": commit(base_ref),
+            "comparison_base_tip": None}
+
+
 def environment_with_synthetic_independent_review_start_boundary(*, repo: Path, environment=None, run_id=None, run_dir=None, session_id="synthetic-native-session", preserve_runtime_state_root=False, existing_token=None, native_transcript_path=None, accept_decision_before_prepare=True):
     import rvf_decision_token_store as tokens
     import stop_decision_candidate_summary as summaries
