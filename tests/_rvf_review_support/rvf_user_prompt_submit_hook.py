@@ -891,12 +891,12 @@ def test_rvf_user_prompt_submit_manual_declined_cooldown_is_overridden_by_user(
         )
         fingerprint = summ["candidate_fingerprint"]
         dts.record_declined_fingerprint(
-            worktree=str(repo.resolve()),
+            worktree=str(repo.resolve()), session_id="cooldown-sess",
             candidate_fingerprint=fingerprint,
             reason="agent declined earlier",
         )
         assert dts.is_fingerprint_in_declined_cooldown(
-            worktree=str(repo.resolve()), candidate_fingerprint=fingerprint
+            worktree=str(repo.resolve()), session_id="cooldown-sess", candidate_fingerprint=fingerprint
         )
         payload = submit.inspect_user_prompt_submit(
             {
@@ -914,7 +914,7 @@ def test_rvf_user_prompt_submit_manual_declined_cooldown_is_overridden_by_user(
 
         # 冷却记录被清除：后续自动 Stop 路径也不再被这条陈旧 decline 挡住。
         assert not dts.is_fingerprint_in_declined_cooldown(
-            worktree=str(repo.resolve()), candidate_fingerprint=fingerprint
+            worktree=str(repo.resolve()), session_id="cooldown-sess", candidate_fingerprint=fingerprint
         )
 
         # additionalContext 必须告知 agent 用户推翻了它早前的谢绝。
@@ -949,13 +949,13 @@ def test_rvf_user_prompt_submit_manual_declined_cooldown_override_survives_clear
         )
         fingerprint = summ["candidate_fingerprint"]
         dts.record_declined_fingerprint(
-            worktree=str(repo.resolve()),
+            worktree=str(repo.resolve()), session_id="cooldown-clear-fail-sess",
             candidate_fingerprint=fingerprint,
             reason="agent declined earlier",
         )
 
         # 只让「冷却表目录下的文件」删除失败，其余 unlink 照常，避免误伤 hook 其它落盘。
-        blocked_dir = dts.declined_fingerprint_root().resolve()
+        blocked_dir = (dts.declined_fingerprint_root() / dts.SESSION_SCOPED_DECLINED_CANDIDATE_FINGERPRINT_SUBDIRNAME).resolve()
         original_unlink = Path.unlink
 
         def unlink_failing_only_inside_declined_cooldown_dir(self, *args, **kwargs):
@@ -981,7 +981,7 @@ def test_rvf_user_prompt_submit_manual_declined_cooldown_override_survives_clear
         assert payload["status"] == "manual_decision_injected", payload
         # 冷却记录确实没删掉（复现了 unlink 失败），自动路径仍被挡。
         assert dts.is_fingerprint_in_declined_cooldown(
-            worktree=str(repo.resolve()), candidate_fingerprint=fingerprint
+            worktree=str(repo.resolve()), session_id="cooldown-clear-fail-sess", candidate_fingerprint=fingerprint
         )
         # 关键回归：告知 agent 的那段不得因清除失败而消失。
         additional_context = payload["hookSpecificOutput"]["additionalContext"]
@@ -2756,7 +2756,7 @@ def test_rvf_user_prompt_submit_manual_trigger_tells_agent_it_overrode_declined_
             worktree=worktree, session_id=session_id, candidate_summary=summary, reason="wip",
         ) is not None
         assert not dts.is_fingerprint_in_declined_cooldown(
-            worktree=worktree, candidate_fingerprint=summary["candidate_fingerprint"]
+            worktree=worktree, session_id=session_id, candidate_fingerprint=summary["candidate_fingerprint"]
         ), "前提：只有 snooze 挡着，冷却没命中"
 
         payload = submit.inspect_user_prompt_submit(
@@ -3196,7 +3196,7 @@ def test_rvf_user_prompt_submit_claude_task_notification_quoting_the_manual_trig
             worktree=worktree, session_id=session_id, candidate_summary=summary, reason="wip",
         ) is not None
         dts.record_declined_fingerprint(
-            worktree=worktree, candidate_fingerprint=summary["candidate_fingerprint"], reason="wip"
+            worktree=worktree, session_id=session_id, candidate_fingerprint=summary["candidate_fingerprint"], reason="wip"
         )
         subagent_result = (
             "审查完成。要复核的话，在主会话里跑\n/review-validate-fix\n或者 $review-validate-fix 即可。"
@@ -3217,5 +3217,5 @@ def test_rvf_user_prompt_submit_claude_task_notification_quoting_the_manual_trig
             "不得执行「用户显式请求」才有的 snooze 清除"
         )
         assert dts.is_fingerprint_in_declined_cooldown(
-            worktree=worktree, candidate_fingerprint=summary["candidate_fingerprint"]
+            worktree=worktree, session_id=session_id, candidate_fingerprint=summary["candidate_fingerprint"]
         ), "不得执行「用户显式请求」才有的冷却清除"

@@ -23,13 +23,13 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
 3. 写一份 scope-of-work / session context 文件，说明用户意图、本轮实际完成的工作或 manual scope、需要审查的文件、逐文件编辑明细、已跑验证、关键取舍和不确定点。
 4. Scope-of-work 不要只列 created/modified/deleted 文件。
 5. 若当前 prompt 或环境已提供冻结的 RVF run artifacts，复用既有 `review-env.sh`、scope contract 和 review packet；不要新建 run。
-6. 否则先取得宿主提供的独立消息/checkpoint receipt（通过 `RVF_REVIEW_START_BOUNDARY_RECEIPT` 传入；缺证据保持等待，不手填成功），再运行 `scripts/prepare_review_run.py --repo <repo> --session-context <file>`；在 transcript 或 manifest 可用时传入对应参数；在已知主修改文件、manual scope 文件或背景 WIP 时，分别传入 `--primary-file` / `--background-file`，避免无 manifest 时降级到 `manual-all-uncommitted` 把背景 WIP 纳入 `primary_files` / `fix_allowlist`。
+6. 否则使用真实决策 token 运行 `scripts/prepare_review_run.py --repo <repo> --decision-token <token> --session-context <file>`，冻结独立候选快照。原生回退 receipt 是可选自动化证据，缺失或能力不可用时继续普通审查并在 handoff 后人工 land/base 同步；不得手填原生成功字段；在 transcript 或 manifest 可用时传入对应参数；在已知主修改文件、manual scope 文件或背景 WIP 时，分别传入 `--primary-file` / `--background-file`，避免无 manifest 时降级到 `manual-all-uncommitted` 把背景 WIP 纳入 `primary_files` / `fix_allowlist`。
    - 审**已提交**工作（无父会话自动检测时的显式杠杆）：传 `--base-ref <commit>`（committed-round baseline）+ `--transcript <session.jsonl>`，packet 即用 `git diff <base-ref>` 渲染已提交改动（base-ref 须是 HEAD 祖先，否则自动回退 HEAD）。仍然不需要 `git reset`。
 7. 后续使用脚本生成的 `review-agent-context.md` / `review-env.sh` / prompt artifacts；不要手写 `RVF_*` export block，也不要把脚本内部 env/config 当成 agent 需要记忆的状态机。
 
 ### 统一发起协议：唯一的发起消息是**发起决策点横幅**
 
-**持续关闭策略**：没有对应 Kanban task 的 Codex GUI 会话不自动发起或续跑 RVF，直到用户明确要求恢复。该策略随源码部署，重启、redeploy、会话级 `RVF_STOP_HOOK: on` 和 stable/dev channel 切换均不解除。直接手动调用本 skill、`/review-validate-fix` 或 `:review-validate-fix` 不受这项关闭策略限制，仍须通过开审分界 gate；Stop 只为有效 handoff 静默记账、释放锁，不自动启动 analyze。Kanban task 内、Codex CLI 和其它宿主维持既有行为。
+**持续关闭策略**：没有对应 Kanban task 的 Codex GUI 会话不自动发起或续跑 RVF，直到用户明确要求恢复。该策略随源码部署，重启、redeploy、会话级 `RVF_STOP_HOOK: on` 和 stable/dev channel 切换均不解除。直接手动调用本 skill、`/review-validate-fix` 或 `:review-validate-fix` 不受这项关闭策略限制，仍须通过真实授权与候选快照 gate；Stop 只为有效 handoff 静默记账、释放锁，不自动启动 analyze。Kanban task 内、Codex CLI 和其它宿主维持既有行为。
 
 自动 RVF 的发起**一律**先给你一份决策点正文，首行是 `=== REVIEW-VALIDATE-FIX 发起决策点：由你自主决定 start 或 decline ===`，正文含候选摘要 + `RVF_DECISION_TOKEN=<token>` + CLI 命令样例。是否发起由你决定，开发者已预先授权，不需要征询开发者：简析后用 `rvf start`（发起）或 `rvf decline`（谢绝）显式表态。**这条规则不分环境**——在不在 Cline Kanban task 内、Claude 还是 Codex，横幅的**正文与决策协议完全一致**。
 
@@ -44,9 +44,9 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
 
 **结构性谢绝会在本会话 snooze 这片工作范围。** 同一会话、同一 worktree 的自动横幅会保持静默，直到出现工作边界：提交（HEAD 变化）、范围明显扩大（出现新路径**且**未审行数比基线多出 50% 以上）、同一批文件上的未审行数涨到基线的 3 倍**且**多出至少 150 行，或 12 小时到期。开发者发来新 prompt 不解除 snooze，只把「范围扩大 / 行数翻倍」的对比基线挪到那一刻（后台任务完成通知之类 host 自己合成的回合不算发话）。开发者手动触发 `/review-validate-fix` 不受 snooze 与延后的限制，此时横幅会明说「用户推翻了你的谢绝 / 延后」，不要照上次的判断再谢绝一次。
 
-**自主延后恢复**：条件满足后执行 `rvf request-review-start-boundary --deferred-decision-token <旧 token> --reason "<自主判断理由>"`，只请求下一条独立消息，随后结束当前 turn。收到新消息并由 gate 验证其原生 user turn、当前候选与不可变 Git checkpoint 后才能 `start`。候选变化或旧分界失效时用 `--decision-token <当前 token>` 请求新分界。Agent 的 reason 永远不是开发者原话证据，也不豁免熔断或结构性谢绝。
+**自主延后恢复**：条件满足后执行 `rvf request-review-start-boundary --deferred-decision-token <旧 token> --reason "<自主判断理由>"`，只请求下一条独立消息，随后结束当前 turn。需要可自动回退的起点时，收到新消息并验证原生 user turn、当前候选与不可变 Git checkpoint 后再注册自动收尾。普通审查仍可使用有效决策 token 与独立候选快照继续，不因缺少回退起点而等待宿主升级。候选变化或旧分界失效时用 `--decision-token <当前 token>` 请求新分界。Agent 的 reason 永远不是开发者原话证据，也不豁免熔断或结构性谢绝。
 
-**开审前分界**：`start`、直接 prepare 和 dispatch 共用强制 gate；accepted/submitted、hook 合成 user 消息、latest checkpoint 不足以开审。宿主 receipt 缺失时保持 `review_start_boundary_pending`，不得手填成功字段。明确的 `/review-validate-fix` 用户命令可作分界，仍须绑定真实原生消息及快照。协议和宿主支持范围见 `docs/architecture/review-start-independent-user-turn-boundary-contract.md`。
+**审查输入与可选原生回退**：`start`、直接 prepare 和 dispatch 共用授权、范围及 `review_candidate_snapshot` 验证；Harness 版本仅用于诊断。原生 receipt、本次 nonce 和独立 UserMessage 只决定自动回退资格，缺少这些能力时普通 review/fix/handoff 继续，之后人工 land/base 同步。不能把 accepted/submitted、hook 合成消息或 latest checkpoint 冒充原生回退证据，也不能伪造 receipt。token 撤销、错误会话/目录及真实候选失效继续拒绝。只有可读且 token/run 匹配的 `registered` 记录允许发布自动恢复完成通知；注册记录缺失、损坏或为 `pending/disabled` 时均关闭自动动作；结果未知不以新幂等键重试。协议见 `docs/architecture/review-start-independent-user-turn-boundary-contract.md`。
 
 变的只是横幅**怎么送到你面前**（transport，与决策协议正交）：
 
@@ -152,7 +152,7 @@ RVF 审查开审分界固定的任务候选。candidate、比较基线与 base �
 
 ## 执行段速查：每一步一条 `rvf` 命令
 
-token 与 run 目录都可省——`rvf` 按「显式参数 > `RVF_RUN_DIR` > 当前 cwd 所在 fix attempt worktree > 本会话本仓的 in-flight marker > 本 worktree 最近一次已接受的决策 token」自动推断（Claude Code 的 Bash 不保留 shell 状态，所以不要指望 `source review-env.sh` 跨调用生效）。直接跑 `prepare_review_run.py` 也必须绑定原生消息、决策 token 与 checkpoint receipt；执行后给 `rvf` 显式 `--run-dir <run_dir>`。解析不出当前会话 id 的 host（Kimi 等）上推断一律 fail-closed：回执里给出的命令已经带好 `--run-dir`，照抄即可；自己拼的 `rvf` 命令也带上（`rvf validate` 用 `--rvf-run-dir`）。
+token 与 run 目录都可省——`rvf` 按「显式参数 > `RVF_RUN_DIR` > 当前 cwd 所在 fix attempt worktree > 本会话本仓的 in-flight marker > 本 worktree 最近一次已接受的决策 token」自动推断（Claude Code 的 Bash 不保留 shell 状态，所以不要指望 `source review-env.sh` 跨调用生效）。直接跑 `prepare_review_run.py` 也必须以真实决策 token 冻结候选快照，原生消息/checkpoint receipt 只用于可选自动回退；执行后给 `rvf` 显式 `--run-dir <run_dir>`。解析不出当前会话 id 的 host（Kimi 等）上推断一律 fail-closed：回执里给出的命令已经带好 `--run-dir`，照抄即可；自己拼的 `rvf` 命令也带上（`rvf validate` 用 `--rvf-run-dir`）。
 
 | 步骤 | 命令 | 需要你判断的点 |
 | --- | --- | --- |

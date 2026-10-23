@@ -47,15 +47,17 @@ def normalize_review_scope_excluded_path_prefix(prefix: str) -> str | None:
     return f"{normalized}/" if is_directory_prefix else normalized
 
 
-def load_review_scope_excluded_path_prefixes(repo: Path, extra_prefixes: Iterable[str]) -> list[str]:
+def load_review_scope_excluded_path_prefixes(repo: Path, extra_prefixes: Iterable[str], *, repo_local_ignore_file_text: str | None = None) -> list[str]:
     prefixes: list[str] = []
     for prefix in BUILTIN_DEVELOPER_TOOL_MANAGED_PATH_PREFIXES_EXCLUDED_FROM_REVIEW_SCOPE:
         normalized = normalize_review_scope_excluded_path_prefix(prefix)
         if normalized is not None:
             prefixes.append(normalized)
     ignore_file = repo / REVIEW_VALIDATE_FIX_REPO_LOCAL_IGNORE_FILE_NAME
-    if ignore_file.is_file():
-        for line in ignore_file.read_text(encoding="utf-8").splitlines():
+    if repo_local_ignore_file_text is None and ignore_file.is_file():
+        repo_local_ignore_file_text = ignore_file.read_text(encoding="utf-8")
+    if repo_local_ignore_file_text is not None:
+        for line in repo_local_ignore_file_text.splitlines():
             normalized = normalize_review_scope_excluded_path_prefix(line)
             if normalized is not None:
                 prefixes.append(normalized)

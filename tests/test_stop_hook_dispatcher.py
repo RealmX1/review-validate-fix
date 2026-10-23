@@ -905,7 +905,7 @@ def _write_same_session_transcript_with_marker(path: Path, repo: Path) -> Path:
     return path
 
 
-def _seed_automatic_closeout_review_start_receipt(run_dir: Path, repo: Path, rvf_home: Path) -> dict[str, str]:
+def _seed_bound_automatic_closeout_receipt_and_synthetic_registration(run_dir: Path, repo: Path, rvf_home: Path) -> dict[str, str]:
     from _rvf_test_support.loader import load_script_module
 
     receipt = {
@@ -919,6 +919,10 @@ def _seed_automatic_closeout_review_start_receipt(run_dir: Path, repo: Path, rvf
         load_script_module("rvf_automatic_closeout_bridge").bind_run(
             receipt, run_dir, run_id=summary["run_id"],
         )
+    # 此成功夹具显式声明合成注册事实；缺记录不得获得自动通知资格。
+    (run_dir / "artifacts" / "automatic-closeout-registration.json").write_text(json.dumps({
+        "run_id": summary["run_id"], "decision_token": receipt["decision_token"], "status": "registered",
+    }), encoding="utf-8")
     return receipt
 
 
@@ -932,7 +936,7 @@ def test_handoff_marker_finalizes_run_artifacts_same_session(tmp_path: Path) -> 
     state = tmp_path / "state"
     run_dir, handoff = _seed_finalize_run_dir(state=state, repo=repo)
     rvf_home = tmp_path / "rvf-home"
-    receipt = _seed_automatic_closeout_review_start_receipt(run_dir, repo, rvf_home)
+    receipt = _seed_bound_automatic_closeout_receipt_and_synthetic_registration(run_dir, repo, rvf_home)
     transcript = _write_same_session_transcript_with_marker(
         tmp_path / "rollout.jsonl",
         repo,
@@ -1015,7 +1019,7 @@ def test_handoff_marker_surfaces_finalize_record_errors(tmp_path: Path) -> None:
     state = tmp_path / "state"
     run_dir, handoff = _seed_finalize_run_dir(state=state, repo=repo)
     rvf_home = tmp_path / "rvf-home"
-    _seed_automatic_closeout_review_start_receipt(run_dir, repo, rvf_home)
+    _seed_bound_automatic_closeout_receipt_and_synthetic_registration(run_dir, repo, rvf_home)
     transcript = _write_same_session_transcript_with_marker(
         tmp_path / "rollout.jsonl",
         repo,
