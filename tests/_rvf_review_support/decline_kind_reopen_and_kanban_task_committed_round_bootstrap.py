@@ -101,7 +101,7 @@ def test_decline_kind_is_required_and_unknown_kind_is_rejected_without_touching_
     still = dts.read_decision_token(minted.token, root=roots["root"], now=t0)
     assert still.state == dts.STATE_MINTED, still
     assert not dts.is_fingerprint_in_declined_cooldown(
-        worktree="/wt", candidate_fingerprint="fp", cooldown_root=roots["cooldown_root"]
+        worktree="/wt", session_id="s", candidate_fingerprint="fp", cooldown_root=roots["cooldown_root"]
     )
     # CLI：不带 --decline-kind 直接是用法错误（项目未分发，不留无类型兼容）。
     try:
@@ -125,7 +125,7 @@ def test_deferred_until_condition_decline_writes_neither_fingerprint_cooldown_no
     )
     assert declined.payload["decline_kind"] == _DEFERRED
     assert not dts.is_fingerprint_in_declined_cooldown(
-        worktree="/wt", candidate_fingerprint="fp1", cooldown_root=roots["cooldown_root"]
+        worktree="/wt", session_id="s", candidate_fingerprint="fp1", cooldown_root=roots["cooldown_root"]
     )
     assert dts.read_declined_session_scope_snooze(
         worktree="/wt", session_id="s", cooldown_root=roots["cooldown_root"]
@@ -315,7 +315,7 @@ def test_structural_decline_supersedes_earlier_deferred_until_condition_decline(
         worktree="/wt", session_id="s", cooldown_root=roots["cooldown_root"]
     ) is None
     assert dts.is_fingerprint_in_declined_cooldown(
-        worktree="/wt", candidate_fingerprint="fp2", cooldown_root=roots["cooldown_root"]
+        worktree="/wt", session_id="s", candidate_fingerprint="fp2", cooldown_root=roots["cooldown_root"]
     )
     assert dts.read_declined_session_scope_snooze(
         worktree="/wt", session_id="s", cooldown_root=roots["cooldown_root"]
@@ -422,7 +422,7 @@ def test_extra_token_payload_fields_cannot_override_system_written_explicit_user
             pass
     assert sorted(Path(roots["root"]).rglob("*")) == token_files_before
     assert dts.is_fingerprint_in_declined_cooldown(
-        worktree="/wt", candidate_fingerprint="fp1", cooldown_root=roots["cooldown_root"]
+        worktree="/wt", session_id="s", candidate_fingerprint="fp1", cooldown_root=roots["cooldown_root"]
     )
     # 不冲突的额外字段照常并入，系统两键保持系统写入值。
     legitimate = _mint(
