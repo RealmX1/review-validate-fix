@@ -104,11 +104,26 @@ def test_no_installed_candidate_reports_runtime_unavailable(tmp_path, monkeypatc
 def test_rvf_virtual_environment_keeps_its_symlink_and_site_packages(tmp_path):
     repository = tmp_path / "rvf with spaces"
     virtual_environment = repository / ".venv"
-    subprocess.run([sys.executable, "-m", "venv", "--without-pip", "--system-site-packages", str(virtual_environment)], check=True)
-    selected = runtime.select_tool_runtime_python_environment(repository, {"HOME": str(tmp_path), "PATH": os.defpath})
+    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(virtual_environment)], check=True)
+    virtual_python = virtual_environment / "bin/python"
+    site_packages = Path(subprocess.check_output(
+        [str(virtual_python), "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"], text=True,
+    ).strip())
+    # 显式提供当前测试环境的依赖路径，兼容全局、用户 site-packages 和父 venv。
+    (site_packages / "rvf-test-dependency-paths.pth").write_text(
+        "\n".join(str(Path(path).resolve()) for path in sys.path if path and Path(path).is_dir()) + "\n",
+        encoding="utf-8",
+    )
+    environment = {"HOME": str(tmp_path), "PATH": os.defpath}
+    selected = runtime.select_tool_runtime_python_environment(repository, environment)
     assert selected.interpreter_selection_source == "rvf_repository_virtual_environment"
-    assert selected.python_executable_absolute_path == str(virtual_environment / "bin/python")
+    assert selected.python_executable_absolute_path == str(virtual_python)
     assert selected.required_module_preflight_results["pytest"] == "available"
+    observation = json.loads(subprocess.check_output(
+        [str(virtual_python), "-c", runtime.PYTHON_ENVIRONMENT_PROBE], env=environment, text=True,
+    ))
+    assert Path(observation["python_environment_prefix"]).resolve() == virtual_environment.resolve()
+    assert observation["python_environment_prefix"] != observation["python_base_environment_prefix"]
 
 
 def test_nested_shell_python_is_pinned_and_forwarder_is_cleaned(tmp_path):
