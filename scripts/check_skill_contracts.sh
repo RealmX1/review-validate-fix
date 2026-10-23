@@ -555,6 +555,8 @@ repo_required_files=(
   "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_rescope.py"
   "core/run_ledger/run_ledger.py"
   "core/rvf_user_local_data_paths.py"
+  "core/review_start_boundary/review_candidate_snapshot.py"
+  "tests/test_review_candidate_snapshot_without_native_rewind.py"
   "core/rvf_shared_runtime_constants/rvf_shared_runtime_constants.py"
   "core/provider_health/provider_health_guard.py"
   "adapters/codex/codex_provider_login.py"
@@ -915,6 +917,8 @@ require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scr
 # 开审前门禁需验证真实隔离 Git 与原生消息 schema，不能仅检查状态字段。
 run_step "tests: review_start_independent_user_turn_boundary" \
   python3 -m pytest -q "$tests_dir/test_review_start_independent_user_turn_boundary.py" \
+    "$tests_dir/test_review_candidate_snapshot_without_native_rewind.py" \
+    "$tests_dir/test_review_packet_from_frozen_candidate_snapshot.py" \
     "$tests_dir/test_review_start_boundary_request_retry.py" \
     "$tests_dir/test_review_without_pre_review_base_absorption.py"
 # Kimi 激活态核对：installed.json 磁盘上**没有** state 字段（persist 只落 9 个），所以判定必须

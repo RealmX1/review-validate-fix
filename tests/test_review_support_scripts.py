@@ -4294,6 +4294,8 @@ def test_scope_contract_v2_emitted_without_tracker_scope(tmp: Path) -> None:
     assert set(canonical.keys()) == {
         "version",
         "review_start_boundary_receipt",
+        "review_candidate_snapshot",
+        "automatic_closeout_eligibility",
         "repo",
         "scope_mode",
         "primary_files",
@@ -4529,6 +4531,18 @@ def test_existing_cross_session_conflicts_path_unchanged_with_tracker_scope(tmp:
         repo=repo,
         session_id="other-session",
         run_id="run-other",
+        worktree=None,
+        branch=None,
+        owned_paths=["tracked.txt"],
+        apply_patch_paths={"tracked.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    # 构造双方均有明确写入归属的冲突；只有他会话认领的路径不属于本次候选。
+    module.register_claims(
+        repo=repo,
+        session_id="synthetic-native-session",
+        run_id="run-current",
         worktree=None,
         branch=None,
         owned_paths=["tracked.txt"],
@@ -8499,7 +8513,7 @@ def load_rvf_agent_decision_cli_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     # 本测试簇只验证既有状态机；真实宿主/Git 分界由独立集成测试覆盖。
-    module.require_review_start_boundary = lambda **kwargs: {"test_scope": "decision-state-unit"}
+    module.require_review_start_boundary = lambda **kwargs: {"test_scope": "decision-state-unit", "automatic_closeout_eligibility": {"status": "unavailable", "reason_code": "isolated_unit_test_host"}}
     module.require_prepared_run_review_start_boundary = lambda **kwargs: {"test_scope": "decision-state-unit"}
     # 专用状态机夹具维持绑定器的 Path 返回契约；真实双向绑定由隔离 Git 集成套件验证。
     module.bind_review_start_boundary_to_one_run = lambda receipt, run_id, run_dir: (run_id, Path(run_dir) if run_dir is not None else None)

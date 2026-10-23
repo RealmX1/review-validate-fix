@@ -937,7 +937,8 @@ def test_allocate_review_scope_output_consumed_by_prepare_run(tmp: Path) -> None
     allocator = _alloc_invoke(
         repo=repo,
         log_root=log_root,
-        session_id="sess-T15",
+        # 分配与开审使用同一合成会话，否则冻结候选会正确排除他会话的已认领路径。
+        session_id="synthetic-native-session",
         run_id="run-T15",
         output_scope=output_scope,
     )
@@ -945,7 +946,7 @@ def test_allocate_review_scope_output_consumed_by_prepare_run(tmp: Path) -> None
     completed, artifacts_dir = _slice_2b_prepare(
         tmp=tmp, repo=repo, tracker_scope_path=output_scope, log_root=log_root
     )
-    assert completed.returncode == 0
+    assert completed.returncode == 0, completed.stderr
     contract = json.loads((artifacts_dir / "inputs" / "scope.contract.json").read_text(encoding="utf-8"))
     assert contract["version"] == 3
     assert contract["primary_units"] == sorted(allocator["scope"]["unit_ids"])

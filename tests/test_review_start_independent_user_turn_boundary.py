@@ -31,7 +31,7 @@ def isolate_runtime_state(tmp_path, monkeypatch):
     monkeypatch.setenv("RVF_USER_LOCAL_DATA_ROOT", str(tmp_path / "isolated-user-local-data"))
 
 
-def test_start_without_independent_boundary_does_not_acknowledge_or_prepare(tmp_path):
+def test_start_without_valid_candidate_does_not_acknowledge_or_prepare(tmp_path):
     cli = importlib.import_module("rvf_agent_decision_cli")
     tokens = importlib.import_module("rvf_decision_token_store")
     repo = tmp_path / "synthetic-repository"
@@ -50,7 +50,7 @@ def test_start_without_independent_boundary_does_not_acknowledge_or_prepare(tmp_
         return {"status": "failed", "error": "不应进入准备阶段"}
 
     result = cli.run_start(token=minted.token, reason="条件已满足", roots=roots, prepare_pipeline=prepare)
-    assert result.status == "review_start_boundary_pending"
+    assert result.status == "review_start_boundary_invalidated"
     assert tokens.read_decision_token(minted.token, root=roots.token_root).state == "minted"
     assert prepare_calls == []
 
@@ -256,8 +256,11 @@ def test_default_prepare_allocates_scope_using_boundary_base_tip(valid_boundary,
 
 
 @pytest.mark.parametrize("changed", ["candidate", "head", "session", "message_hash", "checkpoint", "hook", "later_turn", "rewind", "comparison_base", "merged_prompt", "file_mode"])
-def test_stale_or_synthetic_boundary_is_rejected_before_prepare(valid_boundary, changed):
+def test_stale_candidate_or_native_boundary_is_rejected_by_its_own_gate(valid_boundary, changed):
     fixture = valid_boundary
+    if changed in {"candidate", "head", "file_mode"}:
+        # 普通保护从其真实快照冻结时生效，不借原生 receipt 充当普通候选快照。
+        fixture["gate"].require_review_start_boundary(token_payload=fixture["payload"], repo=str(fixture["repo"]))
     receipt = copy.deepcopy(fixture["receipt"])
     records = copy.deepcopy(fixture["records"])
     if changed == "file_mode":
@@ -287,6 +290,18 @@ def test_stale_or_synthetic_boundary_is_rejected_before_prepare(valid_boundary, 
         receipt["boundary_message_sha256"] = hashlib.sha256(text.encode()).hexdigest()
     fixture["transcript"].write_text("\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n")
     fixture["gate"].review_start_boundary_receipt_path(fixture["token"]).write_text(json.dumps(receipt))
+    if changed not in {"candidate", "head", "file_mode"}:
+        from core.review_start_boundary.review_start_boundary_verification import ReviewStartBoundaryNotVerified
+        with pytest.raises(ReviewStartBoundaryNotVerified):
+            fixture["gate"].require_native_review_start_boundary(
+                token_payload=fixture["payload"], repo=str(fixture["repo"]),
+            )
+        snapshot = fixture["gate"].require_review_start_boundary(
+            token_payload=fixture["payload"], repo=str(fixture["repo"]),
+        )
+        assert snapshot["automatic_closeout_eligibility"]["status"] == "unavailable"
+        assert fixture["tokens"].read_decision_token(fixture["token"]).state == "minted"
+        return
     calls = []
     result = fixture["cli"].run_start(token=fixture["token"], reason="条件满足", prepare_pipeline=lambda **kwargs: calls.append(kwargs))
     assert result.status == "review_start_boundary_invalidated"
@@ -328,9 +343,10 @@ def test_deferred_recovery_requests_new_message_without_explicit_user_provenance
     assert second.token == first.token, second
     assert len(sent) == 2  # 同一 token/key；进程重启也只重试投递，不另铸。
     assert fixture["tokens"].read_decision_token(fixture["token"]).state == "declined"
-    blocked = fixture["cli"].run_start(token=first.token, reason="回执已 accepted")
-    assert blocked.status == "review_start_boundary_pending"
-    assert fixture["tokens"].read_decision_token(first.token).state == "minted"
+    started = fixture["cli"].run_start(token=first.token, reason="独立回退不可用时按普通审查继续")
+    assert started.status == "ok"
+    assert started.detail["automatic_closeout_registration"]["status"] == "disabled"
+    assert fixture["tokens"].read_decision_token(first.token).state == "acknowledged"
 
 
 def test_structural_decline_cannot_be_reopened_by_agent_reason(valid_boundary):
@@ -367,12 +383,13 @@ def test_direct_dispatch_has_no_reviewer_side_effect_without_boundary(tmp_path, 
     assert not artifacts.exists()
 
 
-def test_delayed_delivery_outside_token_ttl_cannot_start(valid_boundary):
+def test_delayed_native_message_outside_token_ttl_cannot_authorize_rewind(valid_boundary):
     fixture = valid_boundary
     fixture["records"][-1]["timestamp"] = (datetime.fromisoformat(fixture["payload"]["expires_at"].replace("Z", "+00:00")) + timedelta(seconds=1)).isoformat()
     fixture["transcript"].write_text("\n".join(json.dumps(record) for record in fixture["records"]))
-    result = fixture["cli"].run_start(token=fixture["token"], reason="迟到投递")
-    assert result.status == "review_start_boundary_invalidated"
+    from core.review_start_boundary.review_start_boundary_verification import ReviewStartBoundaryNotVerified
+    with pytest.raises(ReviewStartBoundaryNotVerified):
+        fixture["gate"].require_native_review_start_boundary(token_payload=fixture["payload"], repo=str(fixture["repo"]))
     assert fixture["tokens"].read_decision_token(fixture["token"]).state == "minted"
 
 
@@ -384,8 +401,8 @@ def test_delivery_status_without_native_receipt_cannot_start(valid_boundary, mon
         detail={"kanban_task_id": "synthetic-task", "kanban_project_path": str(fixture["repo"]), "idempotency_key": "synthetic-key"})
     monkeypatch.setattr(client, "read_task_message_terminal_delivery_status", lambda **kw: {"terminal_delivery_status": "delivered_and_submit_confirmed"})
     result = fixture["cli"].run_start(token=fixture["token"], reason="宿主声称 submitted")
-    assert result.status == "review_start_boundary_pending"
-    assert fixture["tokens"].read_decision_token(fixture["token"]).state == "minted"
+    assert result.status == "ok"
+    assert fixture["tokens"].read_decision_token(fixture["token"]).state == "acknowledged"
 
 
 def test_one_boundary_cannot_authorize_two_runs_even_after_restart(valid_boundary, tmp_path):
@@ -415,7 +432,7 @@ def test_verified_boundary_reaches_real_prepare_and_gates_dispatch_again(valid_b
     contract = json.loads(Path(result["scope_contract"]).read_text())
     assert contract["review_start_boundary_receipt"] == fixture["receipt"]
     assert fixture["gate"].require_prepared_run_review_start_boundary(repo=str(fixture["repo"]), scope_contract=result["scope_contract"],
-        run_id="synthetic-real-prepare", run_dir=tmp_path / "isolated-real-run") == fixture["receipt"]
+        run_id="synthetic-real-prepare", run_dir=tmp_path / "isolated-real-run")["native_review_start_boundary_receipt"] == fixture["receipt"]
     (fixture["repo"] / "a.py").write_text("value = 99\n")
     from core.review_start_boundary.review_start_boundary_verification import ReviewStartBoundaryNotVerified
     with pytest.raises(ReviewStartBoundaryNotVerified):
@@ -458,7 +475,7 @@ def test_explicit_manual_command_needs_its_real_native_message_and_bound_checkpo
     tokens = fixture["tokens"]
     manual, receipt, host_environment = explicit_manual_command_boundary(fixture, monkeypatch, command_text)
     manual_payload = tokens.read_decision_token(manual.token).payload
-    assert fixture["gate"].require_review_start_boundary(token_payload=manual_payload, repo=str(fixture["repo"]), receipt=receipt) == receipt
+    assert fixture["gate"].require_native_review_start_boundary(token_payload=manual_payload, repo=str(fixture["repo"]), receipt=receipt) == receipt
     from core.review_start_boundary.review_start_boundary_verification import CHECKPOINT_BINDING_PREFIX, CHECKPOINT_BINDING_FIELDS
     # 即使宿主误把同一条手动消息配给第二枚 token，也不能把旧分界充当新一轮起点。
     first_host_command = host_environment["CODEX_RVF_CLINE_KANBAN_TASK_CMD"]
@@ -476,14 +493,14 @@ def test_explicit_manual_command_needs_its_real_native_message_and_bound_checkpo
     monkeypatch.setenv("CODEX_RVF_CLINE_KANBAN_TASK_CMD", second_environment["CODEX_RVF_CLINE_KANBAN_TASK_CMD"])
     from core.review_start_boundary.review_start_boundary_verification import ReviewStartBoundaryNotVerified
     with pytest.raises(ReviewStartBoundaryNotVerified, match="此原生消息已绑定另一 token"):
-        fixture["gate"].require_review_start_boundary(token_payload=tokens.read_decision_token(second_manual.token).payload, repo=str(fixture["repo"]), receipt=second_receipt)
+        fixture["gate"].require_native_review_start_boundary(token_payload=tokens.read_decision_token(second_manual.token).payload, repo=str(fixture["repo"]), receipt=second_receipt)
     assert tokens.read_decision_token(second_manual.token).state == "minted"
     monkeypatch.setenv("CODEX_RVF_CLINE_KANBAN_TASK_CMD", first_host_command)
     fixture["records"][-1]["payload"]["item"]["content"][0]["text"] = "运行时成果交接，已验收"
     fixture["transcript"].write_text("\n".join(json.dumps(record) for record in fixture["records"]))
     from core.review_start_boundary.review_start_boundary_verification import ReviewStartBoundaryNotVerified
     with pytest.raises(ReviewStartBoundaryNotVerified):
-        fixture["gate"].require_review_start_boundary(token_payload=manual_payload, repo=str(fixture["repo"]), receipt=receipt)
+        fixture["gate"].require_native_review_start_boundary(token_payload=manual_payload, repo=str(fixture["repo"]), receipt=receipt)
 
 
 @pytest.mark.parametrize("command_text,expected_classification", [
@@ -520,7 +537,7 @@ def test_namespaced_manual_command_still_requires_native_turn_checkpoint_and_act
             "native_active_branch_user_message_ids": [], "native_active_branch_user_turn_id": "independent-turn"}))
     from core.review_start_boundary.review_start_boundary_verification import ReviewStartBoundaryNotVerified
     with pytest.raises(ReviewStartBoundaryNotVerified):
-        fixture["gate"].require_review_start_boundary(token_payload=fixture["tokens"].read_decision_token(manual.token).payload,
+        fixture["gate"].require_native_review_start_boundary(token_payload=fixture["tokens"].read_decision_token(manual.token).payload,
             repo=str(fixture["repo"]), receipt=receipt)
     assert fixture["tokens"].read_decision_token(manual.token).state == "minted"
 
@@ -547,7 +564,7 @@ def test_explicit_manual_source_rejects_siblings_handoff_hook_and_unproven_comma
         initiated_by_explicit_user_request=initiated, explicit_user_request_provenance=provenance)
     from core.review_start_boundary.review_start_boundary_verification import ReviewStartBoundaryNotVerified
     with pytest.raises(ReviewStartBoundaryNotVerified):
-        fixture["gate"].require_review_start_boundary(token_payload=payload,
+        fixture["gate"].require_native_review_start_boundary(token_payload=payload,
             repo=str(fixture["repo"]), receipt=receipt)
     assert fixture["tokens"].read_decision_token(manual.token).state == "minted"
 
@@ -614,21 +631,22 @@ def test_legacy_child_fork_cannot_write_formal_artifacts_without_boundary(tmp_pa
 
 
 @pytest.mark.parametrize("version", [None, "0.164.0"])
-def test_unverified_native_harness_version_stays_pending(valid_boundary, version):
+def test_recorded_native_harness_version_does_not_gate_review(valid_boundary, version):
     fixture = valid_boundary
     fixture["records"][0]["payload"]["cli_version"] = version
     fixture["transcript"].write_text("\n".join(json.dumps(record) for record in fixture["records"]))
     result = fixture["cli"].run_start(token=fixture["token"], reason="不能从旧宿主版本外推")
-    assert result.status == "review_start_boundary_pending"
-    assert fixture["tokens"].read_decision_token(fixture["token"]).state == "minted"
+    assert result.status == "ok"
+    assert fixture["tokens"].read_decision_token(fixture["token"]).state == "acknowledged"
 
 
 def test_duplicate_native_message_id_is_not_a_unique_boundary(valid_boundary):
     fixture = valid_boundary
     fixture["records"].append(copy.deepcopy(fixture["records"][-1]))
     fixture["transcript"].write_text("\n".join(json.dumps(record) for record in fixture["records"]))
-    result = fixture["cli"].run_start(token=fixture["token"], reason="重复原生 ID")
-    assert result.status == "review_start_boundary_invalidated"
+    from core.review_start_boundary.review_start_boundary_verification import ReviewStartBoundaryNotVerified
+    with pytest.raises(ReviewStartBoundaryNotVerified):
+        fixture["gate"].require_native_review_start_boundary(token_payload=fixture["payload"], repo=str(fixture["repo"]))
     assert fixture["tokens"].read_decision_token(fixture["token"]).state == "minted"
 
 
@@ -674,7 +692,7 @@ def test_process_restart_revalidates_native_branch_instead_of_cached_verified_st
     source = (
         "import sys; sys.path.insert(0, sys.argv[1]); "
         "import review_start_boundary_gate as gate, rvf_decision_token_store as tokens; "
-        "gate.require_review_start_boundary(token_payload=tokens.read_decision_token(sys.argv[2]).payload, repo=sys.argv[3]); print('verified')"
+        "gate.require_native_review_start_boundary(token_payload=tokens.read_decision_token(sys.argv[2]).payload, repo=sys.argv[3]); print('verified')"
     )
     command = [sys.executable, "-c", source, str(SCRIPT_DIRECTORY), fixture["token"], str(fixture["repo"])]
     first = subprocess.run(command, capture_output=True, text=True, env=os.environ.copy())
@@ -706,6 +724,11 @@ def test_cli_processes_cannot_bypass_missing_boundary(valid_boundary, entry, tmp
         command = [sys.executable, str(SCRIPT_DIRECTORY / "dispatch_reviewers.py"), "--repo", str(fixture["repo"]), "--execute"]
         expected_code = 4
     result = subprocess.run(command, capture_output=True, text=True, env=os.environ.copy())
+    if entry in ("start", "force-start"):
+        assert result.returncode == 0, result.stderr
+        assert fixture["tokens"].read_decision_token(fixture["token"]).state == "acknowledged"
+        assert "交接后人工" in result.stdout
+        return
     assert result.returncode == expected_code, result.stderr
     if entry != "removed-reopen":
         assert "review_start_boundary_pending" in result.stderr
@@ -745,8 +768,9 @@ def test_same_turn_implementation_then_content_restore_does_not_reuse_old_bounda
     original = path.read_text()
     path.write_text("value = 99\n")
     path.write_text(original)
-    result = fixture["cli"].run_start(token=fixture["token"], reason="内容已恢复也不能省略新的分界")
-    assert result.status == "review_start_boundary_invalidated"
+    from core.review_start_boundary.review_start_boundary_verification import ReviewStartBoundaryNotVerified
+    with pytest.raises(ReviewStartBoundaryNotVerified):
+        fixture["gate"].require_native_review_start_boundary(token_payload=fixture["payload"], repo=str(fixture["repo"]))
     assert fixture["tokens"].read_decision_token(fixture["token"]).state == "minted"
 
 
@@ -756,8 +780,8 @@ def test_other_codex_host_shapes_do_not_borrow_tui_rewind_proof(valid_boundary, 
     fixture["records"][0]["payload"].update(source=source, originator=originator)
     fixture["transcript"].write_text("\n".join(json.dumps(record) for record in fixture["records"]))
     result = fixture["cli"].run_start(token=fixture["token"], reason="其它宿主不能沿用 TUI 样本")
-    assert result.status == "review_start_boundary_pending"
-    assert fixture["tokens"].read_decision_token(fixture["token"]).state == "minted"
+    assert result.status == "ok"
+    assert fixture["tokens"].read_decision_token(fixture["token"]).state == "acknowledged"
 
 
 def test_native_ui_rewind_with_unchanged_rollout_is_rejected_by_fresh_host_branch(valid_boundary):
@@ -767,8 +791,9 @@ def test_native_ui_rewind_with_unchanged_rollout_is_rejected_by_fresh_host_branc
     # 复现真实 TUI：原始 rollout 尚保留旧消息，宿主当前分支已经移除了它。
     active = fixture["gate"].review_start_boundary_receipt_path(fixture["token"]).with_suffix(".native-active-branch.json")
     active.write_text(json.dumps({"native_active_branch_user_message_ids":[], "native_active_branch_user_turn_id":"rewound-active-turn"}))
-    result = fixture["cli"].run_start(token=fixture["token"], reason="旧文件仍在不等于分界仍有效")
-    assert result.status == "review_start_boundary_invalidated"
+    from core.review_start_boundary.review_start_boundary_verification import ReviewStartBoundaryNotVerified
+    with pytest.raises(ReviewStartBoundaryNotVerified):
+        fixture["gate"].require_native_review_start_boundary(token_payload=fixture["payload"], repo=str(fixture["repo"]))
     assert fixture["tokens"].read_decision_token(fixture["token"]).state == "minted"
 
 
@@ -788,8 +813,8 @@ def test_static_receipt_never_replaces_a_fresh_host_observation(valid_boundary, 
         return result
     monkeypatch.setattr(client, "read_task_message_terminal_delivery_status", reply)
     result = fixture["cli"].run_start(token=fixture["token"], reason="即使 canonical receipt 存在也须实时观测")
-    assert result.status == "review_start_boundary_pending"
-    assert fixture["tokens"].read_decision_token(fixture["token"]).state == "minted"
+    assert result.status == "ok"
+    assert fixture["tokens"].read_decision_token(fixture["token"]).state == "acknowledged"
 
 
 def test_each_gate_queries_a_new_host_observation_and_rejects_forged_supplied_receipt(valid_boundary, monkeypatch):
@@ -802,12 +827,12 @@ def test_each_gate_queries_a_new_host_observation_and_rejects_forged_supplied_re
         return original(**fields)
     monkeypatch.setattr(client, "read_task_message_terminal_delivery_status", observe)
     for _ in range(2):
-        fixture["gate"].require_review_start_boundary(token_payload=fixture["payload"], repo=str(fixture["repo"]))
+        fixture["gate"].require_native_review_start_boundary(token_payload=fixture["payload"], repo=str(fixture["repo"]))
     assert len(requests) == len(set(requests)) == 2
     forged = dict(fixture["receipt"], checkpoint_commit="0"*40)
     from core.review_start_boundary.review_start_boundary_verification import ReviewStartBoundaryNotVerified
     with pytest.raises(ReviewStartBoundaryNotVerified):
-        fixture["gate"].require_review_start_boundary(token_payload=fixture["payload"], repo=str(fixture["repo"]), receipt=forged)
+        fixture["gate"].require_native_review_start_boundary(token_payload=fixture["payload"], repo=str(fixture["repo"]), receipt=forged)
 
 
 def test_separate_message_steered_into_existing_user_turn_is_not_an_independent_boundary(valid_boundary):
@@ -815,8 +840,9 @@ def test_separate_message_steered_into_existing_user_turn_is_not_an_independent_
     fixture["records"].insert(-1, {"type":"event_msg", "payload":{"type":"item_completed", "turn_id":"independent-turn",
         "item":{"type":"UserMessage", "id":"another-user-message-in-the-same-turn", "content":[{"type":"text","text":"运行时成果交接"}]}}})
     fixture["transcript"].write_text("\n".join(json.dumps(record) for record in fixture["records"]))
-    result = fixture["cli"].run_start(token=fixture["token"], reason="单独一条消息仍须是新 turn")
-    assert result.status == "review_start_boundary_invalidated"
+    from core.review_start_boundary.review_start_boundary_verification import ReviewStartBoundaryNotVerified
+    with pytest.raises(ReviewStartBoundaryNotVerified):
+        fixture["gate"].require_native_review_start_boundary(token_payload=fixture["payload"], repo=str(fixture["repo"]))
     assert fixture["tokens"].read_decision_token(fixture["token"]).state == "minted"
 
 
@@ -834,7 +860,7 @@ def test_model_maintenance_without_new_user_message_keeps_the_same_review_bounda
     assert fixture["tokens"].read_decision_token(fixture["token"]).state == "acknowledged"
 
 
-def test_rewind_during_first_receipt_reconciliation_is_rechecked_before_acknowledge(valid_boundary, tmp_path, monkeypatch):
+def test_rewind_during_first_receipt_reconciliation_prevents_native_eligibility(valid_boundary, tmp_path, monkeypatch):
     fixture = valid_boundary
     client = importlib.import_module("cline_kanban_client")
     from independent_review_start_boundary_fixture import configure_synthetic_live_boundary_host_observation
@@ -852,13 +878,11 @@ def test_rewind_during_first_receipt_reconciliation_is_rechecked_before_acknowle
             response["review_start_boundary_active_branch_observation"]["native_active_branch_user_message_ids"] = []
         return response
     monkeypatch.setattr(client, "read_task_message_terminal_delivery_status", observe)
-    calls = []
-    result = fixture["cli"].run_start(token=fixture["token"], reason="首次取证期间发生真实分支撤回",
-        prepare_pipeline=lambda **kw: calls.append(kw))
-    assert result.status == "review_start_boundary_invalidated"
+    from core.review_start_boundary.review_start_boundary_verification import ReviewStartBoundaryNotVerified
+    with pytest.raises(ReviewStartBoundaryNotVerified):
+        fixture["gate"].require_native_review_start_boundary(token_payload=fixture["payload"], repo=str(fixture["repo"]))
     assert len(observations) == 2
     assert observations[0] != observations[1]
-    assert calls == []
     assert fixture["tokens"].read_decision_token(fixture["token"]).state == "minted"
 
 
@@ -1010,11 +1034,10 @@ def prepare_start_with_retryable_post_prepare_failure(fixture, tmp_path, monkeyp
                      transcript_path=str(fixture["transcript"]), prepare_pipeline=prepare,
                      launch_preflight=lambda **kwargs: (True, None),
                      provider_health_requirements_resolver=lambda backend: [])
-    failed = cli.run_start(**arguments)
-    assert failed.status == "start_failed", failed
-    assert failed.detail["phase"] == (
-        "bind_automatic_closeout_run" if failure_phase == "bind"
-        else "activate_automatic_closeout_after_run_binding")
+    started = cli.run_start(**arguments)
+    assert started.status == "ok", started
+    assert started.detail["automatic_closeout_registration"]["status"] == "disabled"
+    assert started.detail["automatic_closeout_registration"]["failed_phase"] == failure_phase
     assert len(preparations) == len(allocations) == 1
     assert preparations[0]["status"] == "completed"
     assert allocations[0]["status"] == "allocated"
@@ -1042,15 +1065,15 @@ def test_start_retry_reuses_completed_prepare_and_lease(valid_boundary, tmp_path
     assert repeated.detail["run_dir"] == prepared["run_dir"]
     assert repeated.detail["prepare_artifacts"] == prepared["artifacts"]
     assert repeated.detail["tracker_scope_allocation"]["tracker_lease_id"] == allocations[0]["lease_id"]
-    assert len(bindings) == (2 if failure_phase == "bind" else 1)
-    assert len(activations) == (2 if failure_phase == "activate" else 1)
+    assert len(bindings) == 1
+    assert len(activations) == (1 if failure_phase == "activate" else 0)
     assert cli.read_scope_adjustment(fixture["token"])["annotations"] == overlay["annotations"]
     assert {path: (Path(path).read_bytes(), Path(path).stat().st_mtime_ns)
             for path in artifact_snapshots} == artifact_snapshots
     successful_retry = cli.run_start(**arguments, retry=True)
     assert successful_retry.to_dict() == repeated.to_dict()
     assert len(preparations) == len(allocations) == 1
-    assert len(activations) == (2 if failure_phase == "activate" else 1)
+    assert len(activations) == (1 if failure_phase == "activate" else 0)
 
 
 @pytest.mark.parametrize("changed", ["candidate", "prepared_run"])
@@ -1099,7 +1122,8 @@ def test_real_prepare_rejects_second_token_before_overwriting_scope_contract(val
 
 
 @pytest.mark.parametrize("conflicting_direction", ["same_run", "same_run_id", "same_run_directory"])
-def test_concurrent_processes_and_restart_preserve_exclusive_run_binding(valid_boundary, tmp_path, conflicting_direction):
+@pytest.mark.parametrize("binding_namespace_sequence", ["native_only", "alternating_native_and_candidate"])
+def test_concurrent_processes_and_restart_preserve_exclusive_run_binding(valid_boundary, tmp_path, conflicting_direction, binding_namespace_sequence):
     fixture = valid_boundary
     run_directory = tmp_path / "claimed-physical-directory"
     code = '''import json, sys
@@ -1117,6 +1141,8 @@ except ReviewStartBoundaryNotVerified as error:
     contenders = []
     for number in range(6):
         receipt = dict(fixture["receipt"], decision_token=f"{number + 1:016x}")
+        if binding_namespace_sequence == "alternating_native_and_candidate" and number % 2:
+            receipt["schema"] = "rvf-review-candidate-snapshot/v1"
         run_id = f"logical-run-{number}" if conflicting_direction == "same_run_directory" else "logical-run"
         directory = tmp_path / f"physical-directory-{number}" if conflicting_direction == "same_run_id" else run_directory
         contenders.append((receipt, run_id, directory))
@@ -1131,7 +1157,9 @@ except ReviewStartBoundaryNotVerified as error:
         results.append(json.loads(stdout))
     assert [result["status"] for result in results].count("bound") == 1
     winner = next(contender for contender, result in zip(contenders, results) if result["status"] == "bound")
-    binding_path = fixture["gate"].review_start_boundary_receipt_path(winner[0]["decision_token"]).with_suffix(".run-binding.json")
+    from core.review_start_boundary.review_candidate_snapshot import SNAPSHOT_SCHEMA, candidate_snapshot_path
+    binding_record_path = candidate_snapshot_path if winner[0]["schema"] == SNAPSHOT_SCHEMA else fixture["gate"].review_start_boundary_receipt_path
+    binding_path = binding_record_path(winner[0]["decision_token"]).with_suffix(".run-binding.json")
     frozen_binding = (binding_path.read_bytes(), binding_path.stat().st_mtime_ns)
     # 重启后的每个进程仍只接受原获胜者，且同一静态 receipt 重入不改冻结记录。
     for contender in contenders:
@@ -1140,3 +1168,81 @@ except ReviewStartBoundaryNotVerified as error:
         assert result["status"] == ("bound" if contender == winner else "review_start_boundary_invalidated")
     assert (binding_path.read_bytes(), binding_path.stat().st_mtime_ns) == frozen_binding
     assert all(not contender[2].exists() for contender in contenders)
+
+
+@pytest.mark.parametrize("first_binding_namespace", ["native", "candidate"])
+@pytest.mark.parametrize("conflicting_identity", ["run_id", "run_directory"])
+def test_cross_namespace_partial_run_binding_blocks_another_token(valid_boundary, tmp_path, first_binding_namespace, conflicting_identity):
+    fixture = valid_boundary
+    first_receipt = dict(fixture["receipt"], decision_token="0000000000000001")
+    second_receipt = dict(fixture["receipt"], decision_token="0000000000000002")
+    candidate_receipt = first_receipt if first_binding_namespace == "candidate" else second_receipt
+    candidate_receipt["schema"] = "rvf-review-candidate-snapshot/v1"
+    first_directory = tmp_path / "partially-bound-run-directory"
+    # 只写其中一个命名空间，模拟在另一条绑定落盘前退出。
+    fixture["gate"].bind_review_start_boundary_to_one_run(
+        receipt=first_receipt, run_id="partially-bound-run", run_dir=first_directory,
+    )
+
+    with pytest.raises(ValueError, match="run"):
+        fixture["gate"].bind_review_start_boundary_to_one_run(
+            receipt=second_receipt,
+            run_id="partially-bound-run" if conflicting_identity == "run_id" else "competing-run",
+            run_dir=first_directory if conflicting_identity == "run_directory" else tmp_path / "competing-run-directory",
+        )
+    assert not first_directory.exists()
+
+
+@pytest.mark.parametrize("first_binding_namespace", ["native", "candidate"])
+def test_cross_namespace_partial_run_binding_allows_same_token_idempotent_reentry(valid_boundary, tmp_path, first_binding_namespace):
+    fixture = valid_boundary
+    native_receipt = fixture["receipt"]
+    candidate_receipt = dict(native_receipt, schema="rvf-review-candidate-snapshot/v1")
+    receipts = [native_receipt, candidate_receipt] if first_binding_namespace == "native" else [candidate_receipt, native_receipt]
+    directory = tmp_path / "idempotent-cross-namespace-run-directory"
+    identities = [fixture["gate"].bind_review_start_boundary_to_one_run(
+        receipt=receipt, run_id="idempotent-cross-namespace-run", run_dir=directory,
+    ) for receipt in receipts]
+    from core.review_start_boundary.review_candidate_snapshot import candidate_snapshot_path
+    paths = [
+        fixture["gate"].review_start_boundary_receipt_path(fixture["token"]).with_suffix(".run-binding.json"),
+        candidate_snapshot_path(fixture["token"]).with_suffix(".run-binding.json"),
+    ]
+    prior_records = [(path.read_bytes(), path.stat().st_mtime_ns) for path in paths]
+    for receipt in receipts:
+        assert fixture["gate"].bind_review_start_boundary_to_one_run(
+            receipt=receipt, run_id="idempotent-cross-namespace-run", run_dir=directory,
+        ) == identities[0]
+    assert identities[0] == identities[1]
+    assert [(path.read_bytes(), path.stat().st_mtime_ns) for path in paths] == prior_records
+
+
+@pytest.mark.parametrize("first_binding_namespace", ["native", "candidate"])
+def test_cross_namespace_partial_run_binding_prevents_same_token_from_selecting_another_run(valid_boundary, tmp_path, first_binding_namespace):
+    fixture = valid_boundary
+    native_receipt = fixture["receipt"]
+    candidate_receipt = dict(native_receipt, schema="rvf-review-candidate-snapshot/v1")
+    first_receipt, second_receipt = (native_receipt, candidate_receipt) if first_binding_namespace == "native" else (candidate_receipt, native_receipt)
+    fixture["gate"].bind_review_start_boundary_to_one_run(
+        receipt=first_receipt, run_id="first-run", run_dir=tmp_path / "first-run-directory",
+    )
+    with pytest.raises(ValueError, match="run"):
+        fixture["gate"].bind_review_start_boundary_to_one_run(
+            receipt=second_receipt, run_id="another-run", run_dir=tmp_path / "another-run-directory",
+        )
+
+
+def test_cross_namespace_snapshot_with_native_evidence_binds_both_records_and_reenters(valid_boundary, tmp_path):
+    fixture = valid_boundary
+    native_receipt = fixture["receipt"]
+    candidate_receipt = dict(native_receipt, schema="rvf-review-candidate-snapshot/v1", native_review_start_boundary_receipt=native_receipt)
+    directory = tmp_path / "candidate-with-native-evidence-run-directory"
+    first = fixture["gate"].bind_review_start_boundary_to_one_run(
+        receipt=candidate_receipt, run_id="candidate-with-native-evidence-run", run_dir=directory,
+    )
+    assert fixture["gate"].bind_review_start_boundary_to_one_run(
+        receipt=candidate_receipt, run_id=first[0], run_dir=first[1],
+    ) == first
+    from core.review_start_boundary.review_candidate_snapshot import candidate_snapshot_path
+    assert fixture["gate"].review_start_boundary_receipt_path(fixture["token"]).with_suffix(".run-binding.json").is_file()
+    assert candidate_snapshot_path(fixture["token"]).with_suffix(".run-binding.json").is_file()

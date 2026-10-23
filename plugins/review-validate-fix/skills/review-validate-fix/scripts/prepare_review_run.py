@@ -290,6 +290,7 @@ def review_agent_context_text(
     review_env_path: Path,
     scope_of_work_path: Path | None,
     session_manifest_path: Path | None,
+    automatic_closeout_eligibility: Mapping[str, Any] | None = None,
 ) -> str:
     lines = [
         "## RVF Generated Reviewer Context",
@@ -311,6 +312,12 @@ def review_agent_context_text(
         lines.append("- scope-of-work: `$RVF_SCOPE_OF_WORK`")
     if session_manifest_path is not None:
         lines.append("- session manifest: `$RVF_SESSION_MANIFEST`")
+    if automatic_closeout_eligibility is not None:
+        lines.extend([
+            "", "普通审查由 review_candidate_snapshot 冻结输入；原生 receipt 只服务自动回退。",
+            "自动回退资格：" + json.dumps(dict(automatic_closeout_eligibility), ensure_ascii=False),
+            "资格不可用或 automatic-closeout-registration.json 未确认 registered 时，继续 review/fix/handoff，交接后人工 land/base 同步；不手填原生成功凭据。",
+        ])
     lines.extend(
         [
             "- review packet: `$RVF_REVIEW_PACKET`",
@@ -1001,16 +1008,21 @@ def prepare_run(
     committed_base_ref: str | None = None,
     local_base_ref: str | None = None,
     scope_contract_extensions: Mapping[str, Any] | None = None,
+    decision_token: str | None = None,
 ) -> dict[str, Any]:
     root = git_root(repo)
 
     verified_boundary_receipt = require_review_start_boundary_for_prepare(
         repo=str(root), receipt=(scope_contract_extensions or {}).get("review_start_boundary_receipt"),
+        candidate_snapshot=(scope_contract_extensions or {}).get("review_candidate_snapshot"),
+        decision_token=decision_token,
     )
-    scope_contract_extensions = {**dict(scope_contract_extensions or scope_contract_v3_extensions()), "review_start_boundary_receipt": verified_boundary_receipt}
+    scope_contract_extensions = {**dict(scope_contract_extensions or scope_contract_v3_extensions()), "review_candidate_snapshot": verified_boundary_receipt,
+        "review_start_boundary_receipt": verified_boundary_receipt.get("native_review_start_boundary_receipt"),
+        "automatic_closeout_eligibility": verified_boundary_receipt["automatic_closeout_eligibility"]}
     resolved_local_base_ref = resolve_local_review_base_branch_ref(
         root,
-        explicit_local_base_ref=local_base_ref or verified_boundary_receipt.get("comparison_base_ref"),
+        explicit_local_base_ref=local_base_ref or verified_boundary_receipt.get("local_review_base_ref"),
         committed_base_ref=committed_base_ref,
     )
     effective_scope_contract_extensions = dict(scope_contract_extensions or scope_contract_v3_extensions())
@@ -1018,10 +1030,10 @@ def prepare_run(
     default_comparison_tip = verified_boundary_receipt["worktree_head_commit_sha"]
     if resolved_local_base_ref:
         full_ref = _local_base_ref_full_name(resolved_local_base_ref)
-        boundary_base_ref = verified_boundary_receipt.get("comparison_base_ref")
+        boundary_base_ref = verified_boundary_receipt.get("local_review_base_ref")
         if not boundary_base_ref or _local_base_ref_full_name(boundary_base_ref) != full_ref:
             raise ValueError("本地 base ref 与开审分界不一致")
-        fixed_base_tip = verified_boundary_receipt.get("comparison_base_ref_tip")
+        fixed_base_tip = verified_boundary_receipt.get("local_review_base_tip")
         if not fixed_base_tip:
             raise ValueError("开审分界没有固定的本地 base tip")
         task_head = verified_boundary_receipt["worktree_head_commit_sha"]
@@ -1227,7 +1239,11 @@ def prepare_run(
         str(metadata_path),
         "--max-file-bytes",
         str(max_file_bytes),
+        "--frozen-candidate-commit",
+        verified_boundary_receipt["checkpoint_commit"],
     ]
+    for context_only_path in verified_boundary_receipt.get("packet_context_only_paths", []):
+        packet_cmd.extend(["--frozen-packet-context-only-path", context_only_path])
     if max_packet_bytes:
         packet_cmd.extend(["--max-packet-bytes", str(max_packet_bytes)])
     if packet_session_context is not None:
@@ -1444,6 +1460,7 @@ def prepare_run(
         review_env_path=review_env_path,
         scope_of_work_path=scope_path,
         session_manifest_path=manifest_path,
+        automatic_closeout_eligibility=verified_boundary_receipt["automatic_closeout_eligibility"],
     )
     review_agent_context_path.write_text(review_agent_context, encoding="utf-8")
     result = {
@@ -1691,6 +1708,7 @@ def prepare_run_from_prep_file(
 
     verified_boundary_receipt = require_review_start_boundary_for_prepare(
         repo=str(_resolve_prep_target_repo(payload)), receipt=rvf_run.get("review_start_boundary_receipt"),
+        candidate_snapshot=rvf_run.get("review_candidate_snapshot"),
         expected_session_id=str(payload.get("origin_session_id") or ""),
     )
     if verified_boundary_receipt.get("session_id") and payload.get("origin_session_id") != verified_boundary_receipt["session_id"]:
@@ -1727,7 +1745,9 @@ def prepare_run_from_prep_file(
     local_base_ref_raw = payload.get("local_base_ref")
     local_base_ref = local_base_ref_raw.strip() if isinstance(local_base_ref_raw, str) and local_base_ref_raw.strip() else None
     contract_extensions = scope_contract_v3_extensions_from_prep_payload(payload, rvf_run)
-    contract_extensions["review_start_boundary_receipt"] = rvf_run.get("review_start_boundary_receipt")
+    contract_extensions["review_start_boundary_receipt"] = verified_boundary_receipt.get("native_review_start_boundary_receipt")
+    contract_extensions["review_candidate_snapshot"] = verified_boundary_receipt
+    contract_extensions["automatic_closeout_eligibility"] = verified_boundary_receipt["automatic_closeout_eligibility"]
 
     transcript_path: Path | None = None
     transcript_candidate = transcript_override
@@ -1850,6 +1870,7 @@ def prepare_run_from_prep_file(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Prepare an auditable review-validate-fix run directory.")
     parser.add_argument("--repo", required=True, help="Target git repository.")
+    parser.add_argument("--decision-token", help="普通审查的真实决策 token；不要求原生回退 receipt。")
     parser.add_argument("--session-context", help="Required file containing the main-agent work summary.")
     parser.add_argument("--session-manifest", help="Optional prebuilt session ownership manifest JSON.")
     parser.add_argument("--transcript", help="Optional Codex JSONL transcript used to build session-manifest.json.")
@@ -1984,6 +2005,7 @@ def main() -> int:
             base_ref=args.base_ref,
             local_base_ref=args.local_base_ref,
             scope_contract_extensions=contract_extensions,
+            decision_token=args.decision_token,
         )
     except Exception as exc:
         return fail(str(exc), 2)
