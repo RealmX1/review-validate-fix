@@ -112,7 +112,7 @@ def bind_run(receipt: Mapping[str, Any] | None, run_dir: Path, *, run_id: str) -
 
 def activate_bound_run(receipt: Mapping[str, Any]) -> None:
     # 捕获分界只保存不可变身份；宿主从已落盘的精确 run-binding 核验后才进入完成等待。
-    # 因此 bootstrap 等待、可重试失败与无可审范围都不会留下等待不存在 run 的活跃记录。
+    # 可重试失败与无可审范围都不会留下等待不存在 run 的活跃记录。
     repo = Path(str(receipt['worktree'])).resolve()
     task_cmd = os.environ.get('CODEX_RVF_CLINE_KANBAN_TASK_CMD') or kanban.DEFAULT_TASK_CMD
     result = kanban.run_command(['git', '-c', 'core.hooksPath=/dev/null', 'rev-parse', '--path-format=absolute', '--git-common-dir'], cwd=repo)

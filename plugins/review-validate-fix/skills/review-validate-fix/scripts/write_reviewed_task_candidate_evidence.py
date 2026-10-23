@@ -303,36 +303,6 @@ def optional_receipt(
     return str(path), actual_digest
 
 
-def bootstrap_receipt_live_identity(
-    path_value: Any, digest_value: Any, *, required_path: Path, label: str
-) -> tuple[str | None, str | None]:
-    """bootstrap receipt 的链接校验（K3 专用路径，**不要**并回 ``optional_receipt``）。
-
-    ``optional_receipt`` 仍原样服务 handback integration candidate receipt 与其它链接；那些 artifact
-    在其生命周期内不会被第三方原地覆写，冻结 digest 相等对它们是正确判据。bootstrap receipt 不同：
-    它落在 ``<git-dir>/base-branch-sync/`` 下、**每一次同步都会原地重写**，而 evidence/contract 记的
-    是某一刻的旧 digest。拿旧 digest 判罪活文件 ⇒ base 前移一次就永久 fail-closed。
-
-    因此这里只保留两件仍然成立的事：
-      1. 路径必须是 task git-dir 下那唯一的 canonical 落点（防指到别处的 receipt）；
-      2. 活文件必须 canonical JSON 且与它自己的 ``.sha256`` sidecar 自洽（防半写/被篡改的字节）。
-    记录下来的 digest 降级为**历史记录**：形状仍校验（防畸形 artifact），但不再与活文件比对。
-    语义判据（base 身份）交给 ``validate_bootstrap_receipt_subject`` 的单调祖先性。
-
-    返回的 digest 是**活文件现算值**，因此写进 evidence 的 ``receipts.bootstrap_sha256`` 永远等于
-    写 evidence 那一刻的真实文件——下游（含 my-ai-setup handback）据此重算才对得上。
-    """
-    if path_value is None and digest_value is None:
-        return None, None
-    if not isinstance(path_value, str) or not isinstance(digest_value, str):
-        raise ValueError(f"{label} path and digest must both be present")
-    if not SHA256_PATTERN.fullmatch(digest_value):
-        raise ValueError(f"{label} recorded digest is malformed")
-    path = Path(path_value)
-    if not path.is_absolute() or path.absolute() != required_path.absolute():
-        raise ValueError(f"{label} must use the task git-dir receipt path")
-    _payload, live_digest = validated_canonical_artifact(path, label)
-    return str(path), live_digest
 
 
 def expected_parent_evidence_receipt(
@@ -538,79 +508,6 @@ def restamp_scope_contract_for_landing(
     return reviewed_tip
 
 
-def validate_bootstrap_receipt_subject(
-    receipt_path: str | None,
-    *,
-    contract: Mapping[str, Any],
-    repo: Path,
-    common_dir: Path,
-    current_head: str,
-) -> None:
-    if receipt_path is None:
-        return
-    payload = read_json_object(Path(receipt_path), "bootstrap receipt")
-    expected = {
-        "schema_name": "local-base-into-task-worktree-bootstrap-receipt",
-        "schema_version": 1,
-        "base_ref": contract.get("base_ref"),
-        "remote_name": contract.get("remote_name"),
-        # ``absorbed_base_tip`` **不在这张严格相等表里**（K3）。见下方单独的祖先性判据。
-        "git_common_directory_realpath": str(common_dir),
-        "task_worktree_realpath": str(repo),
-        "boundary_status": "VERIFIED",
-        "lock_status": "RELEASED",
-        "target_repository_hooks_status": "DISABLED",
-    }
-    if any(payload.get(name) != value for name, value in expected.items()):
-        raise ValueError("bootstrap receipt subject does not match the reviewed candidate")
-    # K3：base 身份改判**单调祖先性**，不再要求 ``absorbed_base_tip == contract.reviewed_base_tip``。
-    #
-    # 为什么等号必须走：contract 在 prepare 那一刻冻结 ``reviewed_base_tip``，而活 receipt 会被此后
-    # 每一次同步重写。local base 只要前移过一次，等号就**永远**追不上——agent 照提示重跑同步 skill、
-    # 吸收新 tip、留下完全合法的 receipt，判定仍恒等于失败。这正是本仓自己在
-    # ``rvf_bootstrap_gate.py:670-677`` 写下并修好过的同一个病：「用冻结值判罪 = 永久卡死；
-    # 改用当前值判罪 = 自愈」。
-    #
-    # 祖先性对「task 不 stale」这个目标反而**更强**：它证明 task 吸收的 base **不早于** reviewed base。
-    # 「task 确实吸收过某个 base」由 ``validate_scope_tips`` 的四 tip 祖先性覆盖；
-    # 「被审内容 == 落地内容」由 ``candidate_content_manifest_sha256`` 覆盖。冻结值唯一额外证明的
-    # 「是 prepare 时那一次具体的 sync」**没有任何下游判断读它**。
-    #
-    # ⚠ 有意的不对称：``prepare_review_run.py`` 的 ``validated_bootstrap_receipt`` 仍要求
-    # ``absorbed_base_tip == state["local_base_tip"]``——那是**当前值 vs 当前值**，语义正确，
-    # 且它守着「旧 epoch 的 receipt 不得蒙混过关」。**不要**把那一处也改成祖先性。
-    reviewed_base_tip = contract.get("reviewed_base_tip")
-    absorbed_base_tip = payload.get("absorbed_base_tip")
-    if not isinstance(absorbed_base_tip, str) or not GIT_OBJECT_ID_PATTERN.fullmatch(
-        absorbed_base_tip
-    ):
-        raise ValueError("bootstrap receipt absorbed_base_tip is missing or invalid")
-    if not isinstance(reviewed_base_tip, str) or not GIT_OBJECT_ID_PATTERN.fullmatch(
-        reviewed_base_tip
-    ):
-        raise ValueError("scope contract reviewed_base_tip is missing or invalid")
-    if not is_ancestor(repo, reviewed_base_tip, absorbed_base_tip):
-        raise ValueError(
-            "bootstrap receipt absorbed base does not descend from the reviewed base"
-        )
-    if payload.get("wip_status") not in {
-        "NOT_REQUIRED_TASK_WORKTREE_CLEAN",
-        "RESTORED_AND_DROPPED",
-    }:
-        raise ValueError("bootstrap receipt WIP status is not reusable")
-    after_tip = payload.get("task_tip_after_base_absorption")
-    if not isinstance(after_tip, str):
-        raise ValueError("bootstrap receipt task tip is missing")
-    descendant = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", after_tip, current_head],
-        cwd=repo,
-        env=clean_git_environment(),
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if descendant.returncode != 0:
-        raise ValueError("current task HEAD does not descend from the bootstrap receipt")
 
 
 def semantic_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -699,38 +596,6 @@ def validate_receipt_links(
     subject: Mapping[str, Any],
     scope_paths: set[str],
 ) -> None:
-    # K3 的**读侧**对偶：``validate_linked_canonical_artifact`` 会拿 evidence 记录的
-    # ``bootstrap_sha256`` 与活文件现算值严格比对。bootstrap receipt 会被此后每一次同步原地重写，
-    # 于是同一条冻结值判罪在读侧复活——表现为 ``load_candidate_evidence`` 把一份本来合法的 evidence
-    # **静默降级成 "invalid"**，第二轮 land 与 base_drift_integration 复评审因此复现同型死锁。
-    # 这里改走与写侧同一条放宽路径，语义判据换成单调祖先性。
-    # ``parent_evidence`` / ``integration_candidate`` 两条链接**保持原样**：它们不会被第三方重写。
-    expected_bootstrap_path = (
-        git_dir
-        / "base-branch-sync"
-        / "local-base-into-task-worktree-bootstrap-receipt.json"
-    )
-    bootstrap_path, _bootstrap_live_digest = bootstrap_receipt_live_identity(
-        receipts.get("bootstrap_path"),
-        receipts.get("bootstrap_sha256"),
-        label="reviewed task candidate evidence bootstrap receipt",
-        required_path=expected_bootstrap_path,
-    )
-    if bootstrap_path is not None:
-        live_receipt = read_json_object(Path(bootstrap_path), "bootstrap receipt")
-        live_absorbed_base_tip = live_receipt.get("absorbed_base_tip")
-        reviewed_base_tip = subject.get("reviewed_base_tip")
-        if isinstance(reviewed_base_tip, str) and GIT_OBJECT_ID_PATTERN.fullmatch(
-            reviewed_base_tip
-        ):
-            if not isinstance(
-                live_absorbed_base_tip, str
-            ) or not GIT_OBJECT_ID_PATTERN.fullmatch(live_absorbed_base_tip):
-                raise ValueError("bootstrap receipt absorbed_base_tip is missing or invalid")
-            if not is_ancestor(repo, reviewed_base_tip, live_absorbed_base_tip):
-                raise ValueError(
-                    "bootstrap receipt absorbed base does not descend from the reviewed base"
-                )
     parent_path, parent_digest = validate_linked_canonical_artifact(
         receipts, "parent_evidence_path", "parent_evidence_sha256", "parent candidate evidence"
     )
@@ -976,23 +841,6 @@ def write_evidence(repo_argument: Path, run_dir: Path) -> dict[str, Any]:
     evidence_path = git_dir / EVIDENCE_RELATIVE_PATH
     if evidence_path.parent.resolve() != (git_dir / "rvf/evidence").resolve():
         raise ValueError("candidate evidence parent escaped the task git directory")
-    bootstrap_path, bootstrap_digest = bootstrap_receipt_live_identity(
-        contract.get("bootstrap_receipt_path"),
-        contract.get("bootstrap_receipt_digest"),
-        label="bootstrap receipt",
-        required_path=(
-            git_dir
-            / "base-branch-sync"
-            / "local-base-into-task-worktree-bootstrap-receipt.json"
-        ),
-    )
-    validate_bootstrap_receipt_subject(
-        bootstrap_path,
-        contract=contract,
-        repo=repo,
-        common_dir=common_dir,
-        current_head=candidate_head_oid,
-    )
     integration_candidate_path, integration_candidate_digest = optional_receipt(
         contract.get("integration_candidate_receipt_path"),
         contract.get("integration_candidate_receipt_digest"),
@@ -1026,8 +874,6 @@ def write_evidence(repo_argument: Path, run_dir: Path) -> dict[str, Any]:
         ):
             raise ValueError("current candidate evidence does not descend from the contracted parent")
     receipts = {
-        "bootstrap_path": bootstrap_path,
-        "bootstrap_sha256": bootstrap_digest,
         "parent_evidence_path": expected_parent_path,
         "parent_evidence_sha256": expected_parent_digest,
         "integration_candidate_path": integration_candidate_path,

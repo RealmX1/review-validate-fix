@@ -115,19 +115,17 @@ def test_handoff_preserves_unknown_or_conflicting_run_identity(isolated_runtime,
     assert removed == [] and len(kept) == 1 and marker_path.exists()
 
 
-def test_cleanup_removes_only_its_run_and_bootstrap_replay_claim(isolated_runtime):
+
+
+def test_cleanup_removes_only_markers_of_the_completed_run(isolated_runtime):
     repository, _engine, locks = isolated_runtime
     run_dir, marker_path, _record = write_run_and_marker(repository, locks)
-    _other_dir, other_path, _other_record = write_run_and_marker(repository, locks, run_id="other-run", session_id="other-session")
-    marker = locks.read_marker(task_id=None, session_id="test-session", repo=repository)
-    assert locks.claim_bootstrap_replay_in_flight(marker, window_seconds=900)[0]
-    claim_path = locks._bootstrap_replay_claim_path_for(marker_path)
-    assert claim_path.exists()
+    _other_dir, other_path, _other_record = write_run_and_marker(
+        repository, locks, run_id="other-run", session_id="other-session")
     removed, kept = locks.clear_markers_belonging_to_handed_off_run(
-        task_id=None, session_id="test-session", repo=repository, run_id="completed-run", run_dir=run_dir,
-    )
+        task_id=None, session_id="test-session", repo=repository, run_id="completed-run", run_dir=run_dir)
     assert removed == [str(marker_path)] and kept == []
-    assert not marker_path.exists() and not claim_path.exists() and other_path.exists()
+    assert not marker_path.exists() and other_path.exists()
 
 
 @pytest.mark.parametrize("incomplete_marker_key", [None, "task", "session"])

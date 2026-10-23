@@ -20,6 +20,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from independent_review_start_boundary_fixture import fixed_git_coordinates_for_review_start_boundary_unit_test
 
 import pytest
 
@@ -49,7 +50,7 @@ def _isolate_rvf_runtime_environment(tmp_path: Path, monkeypatch: pytest.MonkeyP
     """
     monkeypatch.setattr(prepare_review_run, "bind_review_start_boundary_to_one_run", lambda receipt, run_id, run_dir: (run_id, Path(run_dir) if run_dir is not None else None))
     # 这里只验证 SOW 渲染/门禁；独立消息/Git gate 在专用集成套件运行，不在此重复构造。
-    monkeypatch.setattr(prepare_review_run, "require_review_start_boundary_for_prepare", lambda **kw: {"test_scope": "scope-of-work"})
+    monkeypatch.setattr(prepare_review_run, "require_review_start_boundary_for_prepare", lambda **kw: fixed_git_coordinates_for_review_start_boundary_unit_test(kw["repo"], test_scope="scope-of-work"))
     monkeypatch.setattr(rvf_agent_decision_cli, "require_prepared_run_review_start_boundary", lambda **kw: {"test_scope": "scope-of-work"})
     for name in tuple(os.environ):
         if name.startswith(("RVF_", "CODEX_RVF_", "KANBAN_", "CLINE_KANBAN_")):

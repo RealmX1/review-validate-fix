@@ -20,6 +20,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from independent_review_start_boundary_fixture import fixed_git_coordinates_for_review_start_boundary_unit_test
 from typing import Any
 
 import pytest
@@ -204,9 +205,9 @@ def rvf_state_roots_isolated_from_invoking_shell_environment(
         from _rvf_test_support.loader import load_script_module
         cli = load_script_module("rvf_agent_decision_cli")
         prepare = load_script_module("prepare_review_run")
-        monkeypatch.setattr(cli, "require_review_start_boundary", lambda **kw: {"test_scope":"layered-attribution"})
-        monkeypatch.setattr(cli, "require_prepared_run_review_start_boundary", lambda **kw: {"test_scope":"layered-attribution"})
-        monkeypatch.setattr(prepare, "require_review_start_boundary_for_prepare", lambda **kw: {"test_scope":"layered-attribution"})
+        monkeypatch.setattr(cli, "require_review_start_boundary", lambda **kw: {"test_scope": "layered-attribution"})
+        monkeypatch.setattr(cli, "require_prepared_run_review_start_boundary", lambda **kw: {"test_scope": "layered-attribution"})
+        monkeypatch.setattr(prepare, "require_review_start_boundary_for_prepare", lambda **kw: fixed_git_coordinates_for_review_start_boundary_unit_test(kw["repo"], test_scope="layered-attribution"))
         for module in (cli, prepare):
             monkeypatch.setattr(module, "bind_review_start_boundary_to_one_run", lambda receipt, run_id, run_dir: (run_id, Path(run_dir) if run_dir is not None else None))
     return pinned_roots

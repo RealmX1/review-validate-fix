@@ -105,10 +105,6 @@ SANCTIONED_AGENT_DRIVING_KEY_CONSTRUCTORS: dict[tuple[str, str], str] = {
     ): "UPS turn-riding injection：manual 决策点搭用户自己那条 prompt 的车，不额外开回合。",
     (
         "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_user_prompt_submit.py",
-        "inspect_user_prompt_submit",
-    ): "UPS turn-riding injection：bootstrap checkpoint 上下文，同样搭用户这一条 prompt 的车。",
-    (
-        "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_user_prompt_submit.py",
         "_observe_delivered_decision_point_banner",
     ): (
         "带外决策点正文的 UPS 出口（铁律允许驱动 agent 的「是否发起 RVF 的决策点」那一类）。"

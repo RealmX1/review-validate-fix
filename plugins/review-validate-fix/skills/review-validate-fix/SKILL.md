@@ -66,7 +66,7 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
 
 **用户 rewind 掉横幅之后**：那枚 token 当轮作废（移出去重索引、**不计** decline 冷却与铸造熔断），下一次 Stop 会重新征询一次。所以看到「同一批改动又被问了一遍」且中间发生过 rewind，那是设计行为，不是重复派发。
 
-接受之后**不会再有第二条注入消息**。执行所需的一切从 `rvf start` 的回执里读：`detail.execution_handoff` 带 `target_repo` / `prep_file` / `review_env` / `review_packet` / `scope_contract` / `scope_of_work` / `review_agent_context` / `session_manifest` / `worktree_bootstrap` / `origin_metadata` / `handoff_path` / `intent_artifact_status_file` 与 handoff 契约；人类可读行与 `RVF_AGENT_RESULT_JSON:` 两种形态都有，回执末尾的 `next:` 行已按顺序排好、参数已填好，照抄即可。完整流程：
+接受之后**不会再有第二条注入消息**。执行所需的一切从 `rvf start` 的回执里读：`detail.execution_handoff` 带 `target_repo` / `prep_file` / `review_env` / `review_packet` / `scope_contract` / `scope_of_work` / `review_agent_context` / `session_manifest` / `worktree_bootstrap` / `origin_metadata` / `handoff_path` 与 handoff 契约；人类可读行与 `RVF_AGENT_RESULT_JSON:` 两种形态都有，回执末尾的 `next:` 行已按顺序排好、参数已填好，照抄即可。完整流程：
 
 ```
 rvf start --token <decision-token> [--transcript-path <session.jsonl>] --reason "<一句话理由>"
@@ -127,32 +127,11 @@ rvf decline-dispatched-review --token <dispatch-token> --reason <一句话理由
 >
 > 两条都受同一套 rewind 对账保护：用户 rewind 掉那一段（trigger 或横幅离开祖先链）则锁被 reconcile 清掉。所以「被拽回去跑一轮自己从没见过的 RVF」不该再发生；若仍发生，是缺陷，请如实上报而不是照跑。
 
-### Opt-in 仓库的预审 base 同步
+### 审查与 base 整合
 
-- `prepare_review_run.py` 从 local base ref 对应提交里的 `AGENTS.md` 读取 `RVF-PRE-REVIEW-BASE-SYNC-SKILL:`，不依赖旧 task worktree 自己是否已有该标记。
-- 若返回 `status=bootstrap_required_before_rvf`（退出码 3），先调用标记指定的单向同步 skill，再对同一 scope 重新 prepare；不要在 RVF 内持有 base lock，也不要绕过 gate。
-- 这**不是失败，而是一个可恢复的等待态**。经 dispatch prep 进入时（`rvf start` / kanban follow-up），
-  prepare 返回 `status=waiting_local_base_bootstrap` 并附一枚 `bootstrap_gate` 子记录（见
-  `scripts/rvf_bootstrap_gate.py`）：
-  - `rvf start` 以退出码 `6`（`bootstrap_required`）返回，token 保持 `acknowledged` 并挂上 run 锚点；
-    跑完同步 skill 后先重验证消息与候选；二者仍有效才可 `rvf start --token <t> --retry` 复用同一 run。HEAD、base、候选或会话分支变化时必须重新请求独立分界，不能用旧 bootstrap receipt 代替。
-  - kanban follow-up 的 in-progress 锁改记 `state=waiting_bootstrap`；锁 TTL 到期时会被**复活**而不是清掉重开。
-  - 恢复前一律重新校验 base 身份 / worktree 与 git common-dir 身份 / receipt digest；证据不可信或冲突未解时
-    维持等待（既不进 review 也不清等待态），只有等待期工件确实丢失才安全重来。receipt 首次校验通过后，
-    其路径与 digest 会被**写回仍在等待的 gate**（token payload / 锁 marker），使后续每一轮真的能判出
-    「receipt 被换过」——所以 bootstrap 完成后**不要**再跑一次同步 skill 或改动 receipt。
-  - prepare 重放的结果按类分流，不是一个成功/失败位：`artifact_lost`（prep 文件已过 TTL / 被 sweep）
-    立刻清等待态安全重来；`timeout` 与其余失败一样按**可重试等待**处理——重放跑在独立子进程里
-    （内层预算到点自己写结果退出，外层硬上限按进程组 SIGKILL），收尾后不留在途 prepare 写者，
-    故本轮释放在途占位、下一次 Stop 立刻重试同一个 run 的 prepare。
-  - 并发去重靠起重放**之前**那次 `O_EXCL` 占位：占位只在一次重放调用期间存在，
-    `RVF_KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_IN_FLIGHT_WINDOW_SECONDS` 是它的**接手**窗口（默认按
-    重放预算 + 子进程强杀余量 + 余量推导），只用于持有者崩在半路时让下一个 Stop 接手。
-- 调用同步 skill 时传 `BASE_BRANCH_SYNC_POST_ABSORPTION_REVIEW_OWNER=RVF`，声明吸收后的审查归 RVF。
-- 单向同步只提供 bootstrap receipt、base delta 事实，以及（若上游写了）一份 base↔task intent 复核 artifact；同步流程本身不再做一轮完整语义审查。
-- 其后的 implementation review **仍是普通实现审查**：base delta 本身不进 finding 范围（那是 `review_kind=base_drift_integration` 轮次的职责）。intent artifact 以 context 形式注入 reviewer/fixer，用于**归因分类**与背景理解，**不**扩大也不缩小 finding 范围。
-- intent artifact 缺失或非法时**一律标注放行、绝不阻断**：两侧部署节奏天然不同步，「文件没写出来」不等于「状态不安全」。结局落成机器事实 `intent_artifact_status`（`consumed` / `missing` / `invalid`），写进 run 工件 `base-task-intent-reconciliation-status.json`、handoff `## 状态`，并追加到 `$RVF_HOME/intent-artifact-consumption-outcomes/<repo>.jsonl`。
-- 未 opt-in 的仓库、旧 scope contract 和普通用户维持原行为。
+RVF 审查开审分界固定的任务候选。candidate、比较基线与 base 排除范围在本轮内使用固定 Git OID；本地 base 的后续前移不改变这份审查范围。
+
+`rvf-land` 完成候选提交与 evidence 后，`base-branch-sync` 负责吸收落地时的 base、复核语义交互并按需验证。需要单独审查整合结果时使用 `review_kind=base_drift_integration` 及对应 integration receipt。
 
 ## 模式
 
@@ -249,7 +228,7 @@ token 与 run 目录都可省——`rvf` 按「显式参数 > `RVF_RUN_DIR` > �
 
 ## Handoff
 
-- Handoff 默认写入当前 RVF run 的 `artifacts/handoff.md` 并持续更新（`rvf handoff` 打印落点与 `intent_artifact_status_file`）。
+- Handoff 默认写入当前 RVF run 的 `artifacts/handoff.md` 并持续更新（`rvf handoff` 打印落点）。
 - 最终回复第一行输出 `RVF_HANDOFF_FILE: <绝对路径>`，空一行后按 `references/handoff-template.md` 规定的固定分行标签结构追加极短中文摘要（不要挤成一段）；该模板是摘要结构的唯一详述处。Stop hook 会把该 marker 当作完成信号，run 结束时发送 OS 系统通知（不再自动用编辑器打开 handoff）；不要再手动调用任何「打开 handoff」脚本。
 - **存在任何 `[elevated]` 时，只在所有非 elevated issue 验证/修复完、handoff 与相关 brief 更新完之后，才于 workflow 末端的最终回复里逐条把升级直接摆给用户（简述卡点 + 候选方向）**，绝不只塞进 handoff 正文靠两行标签摘要带过，也不在 review 一发现就当场打断流程去问——升级即「需用户决策」。当某条升级是只有用户能拍板的方案选择（trade-off）时，用 `AskUserQuestion` 把选项摆出来让其当场选。
 - Handoff 只写确认过的事实，不把背景 WIP 或其他 session 的改动混成本轮工作。

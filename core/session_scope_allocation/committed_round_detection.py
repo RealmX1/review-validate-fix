@@ -48,9 +48,10 @@ COMMITTED_ROUND_BASE_REF_ENV = "CODEX_RVF_COMMITTED_ROUND_BASE_REF"
 
 def _local_branch_exists(repo_path: Path, branch: str) -> bool:
     """``refs/heads/<branch>`` 是否存在（best-effort，任何失败返回 False）。"""
+    local_ref = branch if branch.startswith("refs/heads/") else f"refs/heads/{branch}"
     try:
         result = subprocess.run(
-            ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+            ["git", "show-ref", "--verify", "--quiet", local_ref],
             cwd=str(repo_path),
             capture_output=True,
             text=True,
@@ -61,27 +62,36 @@ def _local_branch_exists(repo_path: Path, branch: str) -> bool:
     return result.returncode == 0
 
 
-def _resolve_committed_round_base_ref(repo_path: Path) -> str | None:
-    """committed-round 的 base 分支 ref——把「被 rebase / cherry-pick 压平到本轮第一父链
-    的 base 工作」排除出可审窗口（见 ``diff_tracker._base_ref_exclude_revs`` /
-    ``_list_committed_round_changed_paths``）。
-
-    返回的是**活的 base 分支引用**（如 ``main``），不是 bootstrap 冻结的 base SHA：
-    ``base-branch-sync`` 把 main 顶到 worktree 创建之后才追加的 base 提交（如 monthly-deck）
-    重放进第一父链，只有活引用才能覆盖到它们——冻结 SHA 是这些提交的祖先，``^SHA`` 排不掉。
-
-    优先级：① 环境变量 ``CODEX_RVF_COMMITTED_ROUND_BASE_REF`` 显式覆盖（逃生口 / 测试注入）；
-    ② 本地 ``main`` 分支（base-branch-sync 默认 base，两起实测过触发用的都是它）；③ None。
-    HEAD 在 base 上/之下时绝不排除（否则会减掉会话自己的提交）的发散守卫，统一兜底在
-    diff_tracker 侧，故这里只做纯引用选择。base 是非-main 的特性分支栈式 task 是已记录的残留
-    （main-only 仍严格优于今天的「rebase 路径完全不排除」）。同一 hook 调用内 detection 与
-    allocation 都调本函数、入参只有 repo_path，天然同源（无 ac042be 式不同源风险）。"""
+def resolve_local_review_base_branch_ref(
+    repo_path: Path,
+    *,
+    explicit_local_base_ref: str | None = None,
+    committed_base_ref: str | None = None,
+) -> str | None:
+    """候选登记与 prepare 共用本地 base 选择；远端默认分支只用于选择已有本地分支。"""
+    if explicit_local_base_ref:
+        return explicit_local_base_ref.strip()
+    if committed_base_ref:
+        candidate = committed_base_ref.strip().lstrip("^")
+        if _local_branch_exists(repo_path, candidate):
+            return candidate
     override = os.environ.get(COMMITTED_ROUND_BASE_REF_ENV, "").strip()
     if override:
         return override
+    origin_head = _git_single_line_output(repo_path, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
+    prefix = "refs/remotes/origin/"
+    if origin_head and origin_head.startswith(prefix):
+        candidate = origin_head[len(prefix):]
+        if candidate and _local_branch_exists(repo_path, candidate):
+            return candidate
     if _local_branch_exists(repo_path, "main"):
         return "main"
     return None
+
+
+def _resolve_committed_round_base_ref(repo_path: Path) -> str | None:
+    """解析 committed-round 的活 base ref；开审后由 receipt 固定其 OID。"""
+    return resolve_local_review_base_branch_ref(repo_path)
 
 
 def _git_single_line_output(repo_path: Path, *args: str) -> str | None:
@@ -115,6 +125,22 @@ def _first_commit_is_ancestor_of_second(repo_path: Path, first: str, second: str
     except (FileNotFoundError, OSError):
         return False
     return result.returncode == 0
+
+
+def frozen_committed_round_base_exclusion_ref(
+    repo_path: Path, base_ref: str | None, fixed_base_tip: str | None,
+) -> str | None:
+    """固定 base 排除范围；直接在 base 分支工作时保留本会话自己的提交。"""
+    if not fixed_base_tip:
+        return None
+    head_ref = _git_single_line_output(repo_path, "symbolic-ref", "--quiet", "HEAD")
+    base_branch_ref = (
+        _git_single_line_output(repo_path, "rev-parse", "--symbolic-full-name", base_ref)
+        if base_ref else None
+    )
+    if head_ref and head_ref == base_branch_ref:
+        return None
+    return fixed_base_tip
 
 
 def _resolve_kanban_task_branch_point_from_committed_round_base_ref(repo_path: Path) -> str | None:
