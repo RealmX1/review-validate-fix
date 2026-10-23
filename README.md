@@ -60,7 +60,7 @@ tests/                                                 # 不随 plugin runtime �
 1. 在 task worktree 完成实现和 RVF review。
 2. 使用 `rvf-land` 把已审工作交回 task branch。
 3. 使用 `base-branch-sync` 把完成的 task commit 同步到本地 `main`。
-4. 进入唯一、干净且实际 checkout `refs/heads/main` 的 worktree。
+4. 进入唯一且实际 checkout `refs/heads/main` 的 worktree。
 5. 在 local `main` 执行完整 contract check 和部署入口。
 
 ```bash
@@ -70,6 +70,33 @@ python3 scripts/rvf_local_deploy.py \
   --json
 ```
 
+部署与完整契约检查会先选择已有工具环境，要求 **Python >=3.11、`tomllib` 和同环境 pytest**。
+自动选择优先使用 RVF 自有 `.venv`，其次是已有的 Python 3.12，再检查当前解释器和其他已安装
+Python；调用仓库或当前激活的外部 venv 不自动成为 RVF 的环境。选择器可由系统 Python 3.9
+自举，实际部署与测试会切换到通过预检的解释器，不需要修改系统 Python 或全局 PATH。
+
+需要固定环境时，显式设置绝对路径：
+
+```bash
+export RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE="/path/to/python3.12"
+"$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" scripts/rvf_local_deploy.py \
+  --expected-local-main-commit HEAD --json
+```
+
+预检只发现已有环境，不下载 Python 或安装依赖。显式配置不合格时直接失败，不静默回退；
+缺 pytest 也不会退回版本不足的 Python。单独运行测试时使用
+`"$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest`，避免裸 `pytest` 指向另一份环境。
+可用 `python3 -B scripts/rvf_tool_runtime_python_environment.py` 只查看选择及预检结果。
+
+Python 与 shell 子进程继承固定的 `RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE`；仅本次工具进程的
+PATH 增加一个 `python3` 转发入口，保证嵌套调用也使用同一环境，结束后自动清理。
+部署 JSON/持久回执及契约 timing report 的 `tool_runtime_python` 记录实际绝对路径、版本、
+选择来源和模块预检结果。`python_version_too_old`、`python_dependency_missing`、
+`configuration_missing`、`configuration_read_failed`、`configuration_parse_failed`
+分别表示版本不足、依赖缺失、配置缺失、配置读取失败和配置解析失败。
+Python 预检失败发生在部署锁和安装之前，JSON 的 `phase` 为 `python_runtime_preflight`；
+此时没有生成新的持久部署回执，上一份回执不代表本次结果。
+
 `--expected-local-main-commit` 可接受 commit-ish，入口会先解析成完整 SHA 并要求它精确等于
 local-main HEAD。省略时仍只从当前 local-main HEAD 安装，并把该 SHA 写入 receipt。入口不会
 fetch、push、land、merge 或 sync；门禁失败只给出修复指引并 fail closed。
@@ -78,12 +105,13 @@ fetch、push、land、merge 或 sync；门禁失败只给出修复指引并 fail
 
 - 从 task worktree 或 detached HEAD 运行的旧 installer；
 - 不唯一或未 checkout 的 `refs/heads/main`；
-- `HEAD != refs/heads/main`、dirty worktree 或 expected SHA 不匹配；
+- `HEAD != refs/heads/main` 或 expected SHA 不匹配；
 - merge、rebase、cherry-pick、revert、bisect 等未完成 Git 操作；
 - 缺少必要 capability 的 Codex/Claude Code CLI。
 
-因此，普通源码目录、task worktree 和 dirty tree 都不是可安装来源。无需 Git remote 包含该
-commit：版本和 payload 只由本地、已提交的 local-main 内容生成。
+部署 payload 来自 RVF 专属 deploy 源 worktree 的固定 HEAD；local main 的未提交内容不会
+参与打包，也不会被 stash。无需 Git remote 包含该 commit：版本和 payload 只由本地、
+已提交的 local-main 内容生成。
 
 ## Commit-addressed marketplace release
 

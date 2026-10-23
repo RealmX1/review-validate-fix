@@ -12,6 +12,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from rvf_tool_runtime_python_environment import (
+    ToolRuntimePythonPreflightError,
+    ensure_current_process_uses_selected_python,
+    selected_python_subprocess_environment,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_SKILL = ROOT / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix"
@@ -228,6 +235,8 @@ def main() -> int:
     overall_started_ms = monotonic_ms()
     top_level_steps: list[dict[str, Any]] = []
     shell_steps: list[dict[str, Any]] = []
+    selected_python = None
+    python_preflight_failure = None
 
     def finish(returncode: int, command: list[str]) -> int:
         if timing_report_path is not None:
@@ -242,10 +251,21 @@ def main() -> int:
                 top_level_steps=top_level_steps,
                 shell_steps=shell_steps,
             )
+            if selected_python is not None:
+                report["tool_runtime_python"] = selected_python.receipt_fields()
+            if python_preflight_failure is not None:
+                report.update(python_preflight_failure)
             write_timing_report(timing_report_path, report)
         return returncode
 
     preflight_started_ms = monotonic_ms()
+    try:
+        selected_python = ensure_current_process_uses_selected_python()
+    except ToolRuntimePythonPreflightError as exc:
+        python_preflight_failure = exc.failure_result()
+        print(json.dumps(python_preflight_failure, ensure_ascii=False), file=sys.stderr)
+        top_level_steps.append(timing_step(label="python runtime preflight", source="check_plugin_contracts.py", started_ms=preflight_started_ms, returncode=2))
+        return finish(2, [])
     if not PLUGIN_SKILL.exists():
         print(f"缺少 plugin skill: {PLUGIN_SKILL}", file=sys.stderr)
         top_level_steps.append(
@@ -290,16 +310,17 @@ def main() -> int:
             child_env[TIMING_JSONL_ENV] = str(shell_timing_path)
             child_env[TIMING_SCRIPT_ENV] = str(CONTRACT_SCRIPT)
         shell_started_ms = monotonic_ms()
-        if args.verbose:
-            completed = subprocess.run(command, cwd=ROOT, text=True, env=child_env)
-        else:
-            completed = subprocess.run(
-                command,
-                cwd=ROOT,
-                text=True,
-                capture_output=True,
-                env=child_env,
-            )
+        with selected_python_subprocess_environment(selected_python, child_env) as pinned_environment:
+            if args.verbose:
+                completed = subprocess.run(command, cwd=ROOT, text=True, env=pinned_environment)
+            else:
+                completed = subprocess.run(
+                    command,
+                    cwd=ROOT,
+                    text=True,
+                    capture_output=True,
+                    env=pinned_environment,
+                )
         top_level_steps.append(
             timing_step(
                 label="contract shell script",
