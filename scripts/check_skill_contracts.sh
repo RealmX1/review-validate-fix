@@ -769,6 +769,12 @@ run_step "python compile" python3 -m py_compile \
   "$tests_dir/test_reviewer_harness_probe_result_cache.py"
 
 run_parallel_test_steps
+run_step "tests: rvf_analyze_formal_archive_completion" \
+  python3 -m pytest -q \
+    "$tests_dir/test_rvf_analyze_formal_archive_completion.py" \
+    "$tests_dir/test_invoke_subagent.py" \
+    "$tests_dir/test_rvf_analyze.py" \
+    "$tests_dir/test_analysis_artifacts.py"
 run_step "tests: codex_gui_without_kanban_task_stop_hook_policy" \
   python3 -m pytest -q \
     "$tests_dir/test_codex_gui_without_kanban_task_stop_hook_policy.py" \

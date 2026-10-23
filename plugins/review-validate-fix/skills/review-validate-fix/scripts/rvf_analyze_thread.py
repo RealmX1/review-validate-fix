@@ -24,6 +24,7 @@ review-validate-fix 的会话立即 idle，用户无需等待 analyze 完成。
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from datetime import datetime, timezone
@@ -40,6 +41,10 @@ import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 adap
 from core.run_ledger.run_ledger import safe_token  # noqa: E402
 from core.host_adapter.host_transcript_format_detection import HOST_CLAUDE, HOST_CODEX, detect_transcript_format  # noqa: E402
 from core.temporary_disable_window import TemporaryDisableWindow  # noqa: E402
+from core.host_adapter.current_agent_session_identity_from_environment import (  # noqa: E402
+    CURRENT_AGENT_SESSION_ID_ENVIRONMENT_VARIABLE_NAMES,
+)
+from rvf_analyze_formal_archive_verified_execution import formal_analysis_directory  # noqa: E402
 
 # detached-launch 通用机制（O_EXCL 幂等锁 + 两阶段原子 status + catch-all）抽到共享
 # helper，analyze 线程与 reviewer dispatch 两路复用；analyze 专属决策（host 选择 /
@@ -47,7 +52,6 @@ from core.temporary_disable_window import TemporaryDisableWindow  # noqa: E402
 from rvf_detached_thread import (  # noqa: E402
     LAUNCH_FAILED,
     LAUNCH_LAUNCHED,
-    _atomic_write_json,
     _iso_now,
     launch_detached,
 )
@@ -157,7 +161,7 @@ def select_host(event: dict[str, Any], *, now_utc: datetime | None = None) -> st
     return HOST_CODEX
 
 
-def build_analyze_command(host: str) -> tuple[list[str], bool]:
+def build_analyze_command(host: str, *, analysis_directory: Path) -> tuple[list[str], bool]:
     """返回 ``(argv, uses_stdin)``：headless analyze agent 的调用向量。
 
     本函数是**调用侧 host 分派 facade**：按 ``host`` 选 ``adapters/<host>/
@@ -180,7 +184,9 @@ def build_analyze_command(host: str) -> tuple[list[str], bool]:
     if host == HOST_CLAUDE:
         command = _claude_build_analyze_command(claude_bin=claude_bin())
     else:  # HOST_CODEX（含未知 host 的兜底）
-        command = _codex_build_analyze_command(codex_bin=codex_bin())
+        command = _codex_build_analyze_command(
+            codex_bin=codex_bin(), formal_analysis_directory=analysis_directory
+        )
     return command.argv, command.uses_stdin
 
 
@@ -201,9 +207,9 @@ def launch_detached_analyze_thread(
     启动失败打断 finalize/handoff 主路径。
     """
     del finalize_record  # 目前不需要，保留签名以备未来透传。
-    run_dir = analysis["run_dir"]
+    run_dir = str(Path(analysis["run_dir"]).expanduser().resolve())
     run_name = Path(run_dir).name
-    analysis_dir = Path(analysis["summary_md_path"]).expanduser().parent
+    analysis_dir = Path(run_dir) / "artifacts" / "analysis"
     tmux_session = f"rvf-analyze-{safe_token(run_name)}"
     prompt_path = analysis_dir / PROMPT_FILENAME
     log_path = analysis_dir / LOG_FILENAME
@@ -221,9 +227,18 @@ def launch_detached_analyze_thread(
     }
 
     try:
+        formal_analysis_directory(Path(run_dir))
+        for key, filename in (("summary_md_path", "summary.md"), ("causality_json_path", "causality.json")):
+            if Path(analysis[key]).expanduser().resolve() != analysis_dir / filename:
+                raise ValueError(f"{key} 必须位于当前 run 的正式 analysis 目录")
+        previous_status = (
+            json.loads(status_path.read_text(encoding="utf-8")) if status_path.exists() else {}
+        )
+        if not isinstance(previous_status, dict):
+            raise ValueError("原分析线程状态必须是对象")
         host_selection_override = temporary_force_codex_analysis_host_override()
         host = select_host(event)
-        agent_argv, uses_stdin = build_analyze_command(host)
+        agent_argv, uses_stdin = build_analyze_command(host, analysis_directory=analysis_dir)
 
         analysis_dir.mkdir(parents=True, exist_ok=True)
 
@@ -233,10 +248,17 @@ def launch_detached_analyze_thread(
         prompt_text = rvf_analyze_followup_prompt(analysis)
         prompt_path.write_text(prompt_text, encoding="utf-8")
 
-        exports = {
+        # 与 reviewer 派发一致，显式覆盖 tmux server 可能残留的身份。
+        exports = {name: os.environ.get(name, "") for name in (
+            "KANBAN_TASK_ID", "CLINE_KANBAN_TASK_ID", "KANBAN_HOOK_TASK_ID",
+            *CURRENT_AGENT_SESSION_ID_ENVIRONMENT_VARIABLE_NAMES,
+            "CLAUDECODE", "CURSOR_AGENT", "CODEX_RVF_CLINE_KANBAN_AGENT_ID", "AI_AGENT",
+        )}
+        exports.update(ledger.env())
+        exports.update({
             SUPPRESS_STOP_HOOK_ENV: "1",
             ANALYZE_THREAD_ENV: "1",
-        }
+        })
         started_at = _iso_now()
         status_payload = {
             "schema_version": STATUS_SCHEMA_VERSION,
@@ -252,33 +274,40 @@ def launch_detached_analyze_thread(
             "finished_at": None,
             "launch_status": LAUNCH_LAUNCHED,
             "error": None,
+            "agent_process_returncode": None,
+            "formal_analysis_completion_status": "pending",
+            "formal_analysis_validation_errors": [],
+            "formal_analysis_causality_snapshot_required": bool(
+                previous_status.get("formal_analysis_causality_snapshot_required")
+                or previous_status.get("agent_process_returncode") is not None
+                or previous_status.get("formal_analysis_verified_at")
+            ),
         }
+        if "formal_analysis_causality_snapshot_sha256" in previous_status:
+            status_payload["formal_analysis_causality_snapshot_sha256"] = previous_status[
+                "formal_analysis_causality_snapshot_sha256"
+            ]
         if host_selection_override is not None:
             status_payload["host_selection_override"] = host_selection_override
 
         # analyze prompt 一律走 stdin（``cat <prompt> | <agent>``）；不施加总超时
         # backstop（analyze 补全自有边界，保持既有行为不变）。
-        # post-exit 回调（S8·R23）：analyze agent 退出后守护计数 +1，节点首达则由
-        # guardian 模块派发守护分析；``|| true`` 兜底，绝不影响 analyze 本体与 status。
-        guardian_script = Path(__file__).resolve().parent / "agentic_initiation_guardian_dispatch.py"
+        # 分析专用包装器只在正式归档通过校验后计数；综合退出码供通用线程处理重试。
+        verified_execution_script = Path(__file__).resolve().with_name(
+            "rvf_analyze_formal_archive_verified_execution.py"
+        )
         result = launch_detached(
             session_name=tmux_session,
-            argv=agent_argv,
+            argv=[sys.executable, str(verified_execution_script), "--run-dir", run_dir, "--", *agent_argv],
             stdin_path=prompt_path if uses_stdin else None,
             log_path=log_path,
             status_path=status_path,
             lock_path=lock_path,
             status_payload=status_payload,
+            launch_failure_status_fields={"formal_analysis_completion_status": "failed"},
             exports=exports,
             launch_env={**os.environ, **ledger.env(), **exports},
             idempotency_key=f"rvf-analyze:{run_name}",
-            post_exit_argv=[
-                sys.executable,
-                str(guardian_script),
-                "record-analyze-completion",
-                "--run-dir",
-                run_dir,
-            ],
         )
         return {
             **base,
@@ -291,27 +320,7 @@ def launch_detached_analyze_thread(
         }
     except Exception as exc:  # noqa: BLE001 - 启动失败绝不阻断 finalize/handoff。
         error = f"{type(exc).__name__}: {exc}"
-        try:
-            _atomic_write_json(
-                status_path,
-                {
-                    "schema_version": STATUS_SCHEMA_VERSION,
-                    "run_dir": run_dir,
-                    "run_name": run_name,
-                    "tmux_session": tmux_session,
-                    "launch_status": LAUNCH_FAILED,
-                    "error": error,
-                    "started_at": _iso_now(),
-                    "returncode": None,
-                    "finished_at": None,
-                },
-            )
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            lock_path.unlink()
-        except OSError:
-            pass
+        # 未持有启动锁的调用只返回诊断，不能覆盖其他调用的正式状态或回收其锁。
         return {
             **base,
             "launch_status": LAUNCH_FAILED,

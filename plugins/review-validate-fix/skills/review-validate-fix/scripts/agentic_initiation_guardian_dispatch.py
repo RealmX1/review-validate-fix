@@ -214,7 +214,7 @@ def _default_guardian_analysis_dispatcher(
     prompt_path.write_text("\n".join(prompt_lines), encoding="utf-8")
 
     host = select_host({})
-    agent_argv, uses_stdin = build_analyze_command(host)
+    agent_argv, uses_stdin = build_analyze_command(host, analysis_directory=analysis_dir)
     session_name = f"rvf-guardian-{safe_token(f'milestone-{milestone}')}"
     status_path = analysis_dir / ".guardian-analysis.status.json"
     started_at = _coerce_now(None).isoformat().replace("+00:00", "Z")

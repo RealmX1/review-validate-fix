@@ -29,7 +29,8 @@ from core.subagents.models import InvokeCommand as InvokeCommandFromModels
 # adapter 的当前硬编码向量（去掉 bin 首元素）。Claude 侧 permission-mode 故意是
 # bypassPermissions——见 adapters/claude_code/subagent.py docstring 引用的线上证据
 # （acceptEdits 在 headless 会让 Read/Bash 全被拒、agent 干净退 0 但零产出）。
-_CODEX_TAIL = ["--ask-for-approval", "never", "--sandbox", "workspace-write", "exec", "-"]
+FORMAL_ANALYSIS_DIRECTORY = Path("/formal-analysis")
+_CODEX_TAIL = ["--ask-for-approval", "never", "--sandbox", "workspace-write", "exec", "--add-dir", str(FORMAL_ANALYSIS_DIRECTORY), "-"]
 _CLAUDE_TAIL = ["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "bypassPermissions"]
 
 
@@ -39,7 +40,7 @@ def test_invoke_command_reexported_from_package() -> None:
 
 
 def test_codex_adapter_builds_exec_command() -> None:
-    cmd = codex_build_analyze_command(codex_bin="codex")
+    cmd = codex_build_analyze_command(codex_bin="codex", formal_analysis_directory=FORMAL_ANALYSIS_DIRECTORY)
     assert isinstance(cmd, InvokeCommand)
     assert cmd.uses_stdin is True
     assert cmd.argv == ["codex", *_CODEX_TAIL]
@@ -62,14 +63,14 @@ def test_claude_adapter_builds_stream_json_command() -> None:
 
 def test_adapters_honor_supplied_bin() -> None:
     # bin 由 facade 解析后传入；adapter 不耦合 CODEX_RVF_*_BIN env 约定。
-    assert codex_build_analyze_command(codex_bin="/opt/codex").argv[0] == "/opt/codex"
+    assert codex_build_analyze_command(codex_bin="/opt/codex", formal_analysis_directory=FORMAL_ANALYSIS_DIRECTORY).argv[0] == "/opt/codex"
     assert claude_build_analyze_command(claude_bin="/opt/claude").argv[0] == "/opt/claude"
 
 
 def test_facade_dispatches_by_host_and_preserves_tuple_shape() -> None:
     module = _load("rvf_analyze_thread")
-    codex_argv, codex_stdin = module.build_analyze_command(module.HOST_CODEX)
-    claude_argv, claude_stdin = module.build_analyze_command(module.HOST_CLAUDE)
+    codex_argv, codex_stdin = module.build_analyze_command(module.HOST_CODEX, analysis_directory=FORMAL_ANALYSIS_DIRECTORY)
+    claude_argv, claude_stdin = module.build_analyze_command(module.HOST_CLAUDE, analysis_directory=FORMAL_ANALYSIS_DIRECTORY)
     # facade 仍返回 list（非 tuple），下游 launch_detached_analyze_thread 无需改动。
     assert isinstance(codex_argv, list) and isinstance(claude_argv, list)
     assert codex_stdin is True and claude_stdin is True
@@ -84,7 +85,7 @@ def test_facade_dispatches_by_host_and_preserves_tuple_shape() -> None:
 
 def test_facade_unknown_host_falls_back_to_codex() -> None:
     module = _load("rvf_analyze_thread")
-    fallback_argv, fallback_stdin = module.build_analyze_command("totally-unknown-host")
-    codex_argv, _ = module.build_analyze_command(module.HOST_CODEX)
+    fallback_argv, fallback_stdin = module.build_analyze_command("totally-unknown-host", analysis_directory=FORMAL_ANALYSIS_DIRECTORY)
+    codex_argv, _ = module.build_analyze_command(module.HOST_CODEX, analysis_directory=FORMAL_ANALYSIS_DIRECTORY)
     assert fallback_argv == codex_argv
     assert fallback_stdin is True

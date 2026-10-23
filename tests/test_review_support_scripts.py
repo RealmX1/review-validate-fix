@@ -370,7 +370,7 @@ def _seed_analysis_payload(run_dir: Path) -> dict[str, str]:
 
 def test_rvf_analyze_thread_builds_claude_command(_root: Path | None = None) -> None:
     module = load_rvf_analyze_thread_module()
-    argv, uses_stdin = module.build_analyze_command(module.HOST_CLAUDE)
+    argv, uses_stdin = module.build_analyze_command(module.HOST_CLAUDE, analysis_directory=Path("/formal-analysis"))
     assert uses_stdin is True
     assert Path(argv[0]).name == "claude"
     assert "-p" in argv
@@ -382,14 +382,14 @@ def test_rvf_analyze_thread_builds_claude_command(_root: Path | None = None) -> 
 
 def test_rvf_analyze_thread_builds_codex_command(_root: Path | None = None) -> None:
     module = load_rvf_analyze_thread_module()
-    argv, uses_stdin = module.build_analyze_command(module.HOST_CODEX)
+    argv, uses_stdin = module.build_analyze_command(module.HOST_CODEX, analysis_directory=Path("/formal-analysis"))
     assert uses_stdin is True
     assert Path(argv[0]).name == "codex"
     assert "exec" in argv
     assert argv[-1] == "-"
     assert "--sandbox" in argv and "workspace-write" in argv
     # 未知 host 兜底到 codex 向量。
-    fallback_argv, _ = module.build_analyze_command("totally-unknown-host")
+    fallback_argv, _ = module.build_analyze_command("totally-unknown-host", analysis_directory=Path("/formal-analysis"))
     assert fallback_argv == argv
 
 
@@ -6784,8 +6784,8 @@ def test_detached_wrapper_executes_real_guardian_cli_post_exit(tmp_path: Path) -
     assert counter["last_run_dir"] == str(run_dir)
 
 
-def test_rvf_analyze_thread_wires_guardian_post_exit_cli_signature(tmp_path: Path) -> None:
-    """analyze launcher 生成的 tmux wrapper 含真实 guardian CLI 子命令与 run-dir 参数。"""
+def test_rvf_analyze_thread_wires_verified_archive_execution(tmp_path: Path) -> None:
+    """analyze launcher 把完成计数交给正式归档校验包装器。"""
     module = load_rvf_analyze_thread_module()
     run_dir = tmp_path / "runs" / "rvf-post-exit-wire"
     analysis = _seed_analysis_payload(run_dir)
@@ -6811,8 +6811,8 @@ def test_rvf_analyze_thread_wires_guardian_post_exit_cli_signature(tmp_path: Pat
     assert result["launch_status"] == "launched"
     tmux_argv = json.loads(tmux_calls.read_text(encoding="utf-8").splitlines()[0])["argv"]
     wrapper = tmux_argv[-1]
-    assert str(SCRIPT_DIR / "agentic_initiation_guardian_dispatch.py") in wrapper
-    assert "record-analyze-completion" in wrapper
+    assert str(SCRIPT_DIR / "rvf_analyze_formal_archive_verified_execution.py") in wrapper
+    assert "record-analyze-completion" not in wrapper
     assert "--run-dir" in wrapper and str(run_dir) in wrapper
 
 
@@ -11207,8 +11207,8 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             ),
         ),
         (
-            "rvf_analyze_thread_wires_guardian_post_exit_cli_signature",
-            lambda: test_rvf_analyze_thread_wires_guardian_post_exit_cli_signature(
+            "rvf_analyze_thread_wires_verified_archive_execution",
+            lambda: test_rvf_analyze_thread_wires_verified_archive_execution(
                 root / "analyze-guardian-post-exit-wire"
             ),
         ),

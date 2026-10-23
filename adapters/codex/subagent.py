@@ -23,14 +23,14 @@ import _rvf_pyroot  # noqa: F401  — 确保 pyroot 在 sys.path 上，供 core.
 from core.subagents.models import InvokeCommand, SpawnRecord, iter_jsonl_dicts  # noqa: E402
 
 
-def build_analyze_command(*, codex_bin: str) -> InvokeCommand:
+def build_analyze_command(*, codex_bin: str, formal_analysis_directory: Path) -> InvokeCommand:
     """Codex headless analyze 调用向量：``codex --ask-for-approval never
-    --sandbox workspace-write exec -``，prompt 走 stdin。
+    --sandbox workspace-write exec --add-dir <analysis> -``，prompt 走 stdin。
 
     ``codex_bin`` 由调用方（skill facade）解析后传入，使本 adapter 不耦合 RVF 的
     ``CODEX_RVF_CODEX_BIN`` env 约定。``--sandbox workspace-write`` 允许 analyze
-    agent Edit ``summary.md`` / ``causality.json``；末元素 ``-`` 表示从 stdin 读
-    prompt。
+    agent Edit ``summary.md`` / ``causality.json``；正式归档在业务仓库之外，须显式
+    用 ``--add-dir`` 授权该 run 的 analysis 目录。末元素 ``-`` 表示从 stdin 读 prompt。
     """
     return InvokeCommand(
         argv=[
@@ -40,6 +40,8 @@ def build_analyze_command(*, codex_bin: str) -> InvokeCommand:
             "--sandbox",
             "workspace-write",
             "exec",
+            "--add-dir",
+            str(formal_analysis_directory.expanduser().resolve()),
             "-",
         ],
         uses_stdin=True,
