@@ -184,12 +184,15 @@ def rvf_analyze_followup_prompt(analysis: dict[str, str]) -> str:
         f"RVF_ANALYZE_RUN_DIR: {analysis['run_dir']}\n"
         f"RVF_ANALYZE_SUMMARY_MD: {analysis['summary_md_path']}\n"
         f"RVF_ANALYZE_CAUSALITY_JSON: {analysis['causality_json_path']}\n\n"
-        "这是 RVF finalize 在生成 deterministic analysis scaffold 后注入的 "
-        "$rvf-analyze follow-up。只复盘这个已 finalize 的 run：补全 "
+        "这是 RVF finalize 在生成 deterministic analysis scaffold 后派发的后台补全任务。"
+        "当前 scaffold 已存在，直接补全，不要重新执行 rvf_analyze.py 或覆盖确定性事实。"
+        "只复盘这个已 finalize 的 run：补全 "
         "`artifacts/analysis/summary.md`，并在 "
         "`artifacts/analysis/causality.json` 中填写 issue 到 patch call_id "
         "的候选归因。不要启动新的 `$review-validate-fix`，不要修改被审查源码，"
-        "不要生成新的 handoff。"
+        "不要生成新的 handoff。唯一交付目标是上面两份正式文件；原子写入的中间文件也必须"
+        "位于同一 analysis 目录。无法读取或写回时明确报告失败，不得在业务 worktree、"
+        ".rvf-analysis-writeback-pending 或临时目录保存替代稿。"
     )
 
 
