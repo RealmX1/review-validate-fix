@@ -17,6 +17,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cursor_stream_tool_layer_health import classify_cursor_tool_call_outcome
+from kimi_latest_stable_model_selection import resolve_latest_kimi_managed_stable_model
 import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
 from core.run_ledger.run_ledger import start_run  # noqa: E402
 from core.session_scope_allocation import reviewable_unit_diff_tracker  # noqa: E402
@@ -1342,6 +1343,64 @@ def run_health(
     if emit_output:
         print(completed.stdout.strip())
     return 0
+
+
+def resolve_reviewer_model_commands(
+    config: dict[str, Any],
+    command: list[str],
+    health_command: list[str] | None,
+    *,
+    env: dict[str, str],
+    cwd: Path,
+    timeout: int,
+) -> tuple[list[str], list[str] | None]:
+    source = config.get("reviewer_model_selection_source")
+    if source != "kimi_latest_managed_stable_model":
+        return resolve_oh_my_pi_default_model_commands(
+            config, command, health_command, env=env, cwd=cwd, timeout=timeout,
+        )
+    if not is_kimi_prompt_command(command) or not health_command or not is_kimi_prompt_command(health_command):
+        raise ValueError("Kimi 动态选模要求正式评审和健康检查都使用 kimi")
+    # 原生恢复会话沿用其模型；不将新会话默认策略应用到旧会话。
+    if any(item in {"-S", "--session", "-c", "--continue"} or item.startswith("--session=") for item in command):
+        return command, health_command
+
+    def extract_explicit_model_selector(argv: list[str]) -> tuple[str | None, list[str]]:
+        selectors = []
+        without_model = [argv[0]]
+        index = 1
+        while index < len(argv):
+            item = argv[index]
+            if item in {"-m", "--model"}:
+                if index + 1 >= len(argv) or not argv[index + 1] or argv[index + 1].startswith("-"):
+                    raise ValueError("Kimi 显式模型参数缺少模型值")
+                selectors.append(argv[index + 1])
+                index += 2
+                continue
+            elif item.startswith("--model=") or (item.startswith("-m") and len(item) > 2):
+                selectors.append(item.split("=", 1)[1] if item.startswith("--model=") else item[2:])
+            else:
+                without_model.append(item)
+            index += 1
+        if len(selectors) > 1 or selectors == [""]:
+            raise ValueError("Kimi 显式模型参数为空或重复")
+        return (selectors[0] if selectors else None), without_model
+
+    selected_model, command_without_model = extract_explicit_model_selector(command)
+    health_model, health_without_model = extract_explicit_model_selector(health_command)
+    if selected_model is None and health_model is not None:
+        raise ValueError("Kimi 健康检查不能单独覆盖正式评审的模型")
+    if selected_model is not None and health_model not in {None, selected_model}:
+        raise ValueError("Kimi 正式评审与健康检查的显式模型不一致")
+    if selected_model is None:
+        selected_model = resolve_latest_kimi_managed_stable_model(
+            command[0], env=env, timeout=min(timeout, 10),
+        )
+    # 等价的 -m / --model= 写法统一成同一组 flag，保持后续 parity gate 可比较。
+    return (
+        [command[0], "--model", selected_model, *command_without_model[1:]],
+        [health_command[0], "--model", selected_model, *health_without_model[1:]],
+    )
 
 
 def resolve_oh_my_pi_default_model_commands(
@@ -2721,7 +2780,7 @@ def main() -> int:
         else:
             model_selection_cwd = SKILL_DIR
         if not args.print_label:
-            command, health_command = resolve_oh_my_pi_default_model_commands(
+            command, health_command = resolve_reviewer_model_commands(
                 config,
                 command,
                 health_command,

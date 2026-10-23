@@ -870,15 +870,16 @@ def test_failed_inner_health_is_cached_unavailable_on_the_short_ttl(
     )
 
 
+@pytest.mark.parametrize("source", ["oh_my_pi_default_model_role", "kimi_latest_managed_stable_model"])
 def test_dynamic_default_model_reprobes_and_observes_failure_within_cache_ttl(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str,
 ):
     """动态默认变更后，旧可用缓存不能把已不可用的模型继续送进评审路由。"""
     dispatch = _load_dispatch_reviewers()
     registry, _ = _install_hermetic_probe_harness(dispatch, tmp_path, monkeypatch)
     config_path = tmp_path / registry["harnesses"][HERMETIC_PROBE_HARNESS_ID]["config_path"]
     config = json.loads(config_path.read_text())
-    config["reviewer_model_selection_source"] = "oh_my_pi_default_model_role"
+    config["reviewer_model_selection_source"] = source
     config_path.write_text(json.dumps(config))
     counter = _SpawnCounter()
     state_root = tmp_path / "state"
