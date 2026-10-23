@@ -328,6 +328,13 @@ def test_run_local_deploy_records_local_main_and_official_cli_verification(
         local_main_worktree, "rev-parse", "HEAD"
     )
     assert result["verification"]["cache_payloads_match_active_release"] is True
+    assert result["tool_runtime_python"]["python_version"] == sys.version.split()[0]
+    assert result["tool_runtime_python"]["required_module_preflight_results"] == {
+        "tomllib": "available", "pytest": "available",
+    }
+    receipt = json.loads(Path(result["receipt_path"]).read_text())
+    assert receipt["tool_runtime_python"] == result["tool_runtime_python"]
+    assert all(command[0] == result["tool_runtime_python"]["python_executable_absolute_path"] for command in result["commands"])
 
 
 def _seed_local_main_with_rollback_recording_installer(

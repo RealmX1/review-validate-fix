@@ -40,6 +40,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -53,7 +54,7 @@ TRUST_STATUS_TRUST_TABLE_ABSENT = "trust_table_absent"
 """`config.toml` 里没有 `[hooks.state]`——Codex 还没信任过任何 hook。"""
 
 TRUST_STATUS_UNAVAILABLE = "unavailable"
-"""核对本身做不了（无 config.toml / 无 tomllib / 读不动）。**不是**「一切正常」。"""
+"""核对本身做不了，具体原因由 error_code 单独记录。**不是**「一切正常」。"""
 
 TRUST_STATUS_CHECK_COVERAGE_INCOMPLETE = "check_coverage_incomplete"
 """信任表读到了，但核对**没覆盖到该覆盖的东西**：一条都没核到（``checked == 0``）、有源文件
@@ -119,26 +120,38 @@ def hook_trust_fingerprint(
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
-def read_codex_config_document(codex_home: Path) -> dict[str, Any] | None:
-    """读 `~/.codex/config.toml` 全文；读不到 / 无 tomllib / 解析失败时返回 ``None``。"""
+class CodexConfigurationReadError(RuntimeError):
+    def __init__(self, error_code: str, message: str) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+
+
+def read_codex_config_document(codex_home: Path) -> dict[str, Any]:
+    """读取配置；把环境不足、文件缺失、读取失败和解析失败分别报告。"""
     config_path = Path(codex_home) / "config.toml"
-    if not config_path.is_file():
-        return None
+    if sys.version_info < (3, 11):
+        raise CodexConfigurationReadError("python_version_too_old", "读取 Codex TOML 配置需要 Python >=3.11。")
     try:
-        import tomllib  # noqa: PLC0415 - stdlib ≥3.11；缺席时按「核对不可用」处理
-    except ImportError:
-        return None
+        import tomllib  # noqa: PLC0415
+    except ImportError as exc:
+        raise CodexConfigurationReadError("python_dependency_missing", "Python 环境缺少 tomllib。") from exc
     try:
-        return tomllib.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
+        config_text = config_path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise CodexConfigurationReadError("configuration_missing", f"Codex 配置文件不存在：{config_path}") from exc
+    except OSError as exc:
+        raise CodexConfigurationReadError("configuration_read_failed", f"Codex 配置文件读取失败：{config_path}: {exc}") from exc
+    except UnicodeError as exc:
+        raise CodexConfigurationReadError("configuration_parse_failed", f"Codex 配置不是有效 UTF-8：{config_path}: {exc}") from exc
+    try:
+        return tomllib.loads(config_text)
+    except ValueError as exc:
+        raise CodexConfigurationReadError("configuration_parse_failed", f"Codex TOML 配置解析失败：{config_path}: {exc}") from exc
 
 
 def read_codex_hook_trust_table(codex_home: Path) -> dict[str, Any] | None:
-    """读 `config.toml` 的 `[hooks.state]`；读不到 / 无 tomllib / 无该表时返回 ``None``。"""
+    """读 `[hooks.state]`；配置有效但无该表时返回 None，读取错误保留分类。"""
     parsed = read_codex_config_document(codex_home)
-    if parsed is None:
-        return None
     state = (parsed.get("hooks") or {}).get("state")
     return state if isinstance(state, dict) else None
 
@@ -214,16 +227,23 @@ def verify_codex_hook_trust(
 
     只读、幂等、绝不改 live config。
     """
-    trust_table = read_codex_hook_trust_table(codex_home)
+    try:
+        trust_table = read_codex_hook_trust_table(codex_home)
+    except CodexConfigurationReadError as exc:
+        return {
+            "status": TRUST_STATUS_UNAVAILABLE,
+            "checked": 0,
+            "untrusted": [],
+            "error_code": exc.error_code,
+            "note": str(exc),
+        }
     if trust_table is None:
         return {
             "status": TRUST_STATUS_UNAVAILABLE,
             "checked": 0,
             "untrusted": [],
-            "note": (
-                f"读不到 {Path(codex_home) / 'config.toml'} 的 [hooks.state]（文件缺失 / "
-                "无 tomllib / 解析失败）。这**不是**「一切正常」——本次无法判断 Codex 侧 hook 是否受信。"
-            ),
+            "error_code": "configuration_trust_table_missing",
+            "note": f"Codex 配置中缺少 [hooks.state]：{Path(codex_home) / 'config.toml'}",
         }
 
     checked = 0

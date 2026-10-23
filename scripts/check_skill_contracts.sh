@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 skill_dir="$repo_root/plugins/review-validate-fix/skills/review-validate-fix"
 tests_dir="$repo_root/tests"
 verbose=0
@@ -28,16 +28,39 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
+# 先由轻量选择器自举，再进入固定解释器的工具子进程环境。
+if [ "${RVF_TOOL_RUNTIME_CONTRACT_SHELL_REENTRY:-}" != "$repo_root/scripts/check_skill_contracts.sh" ]; then
+  bootstrap_python="${RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE:-}"
+  if [ -z "$bootstrap_python" ]; then
+    for candidate in "$repo_root/.venv/bin/python" "${HOME}/.local/bin/python3.12" python3.12 python3; do
+      if command -v "$candidate" >/dev/null 2>&1; then
+        bootstrap_python="$(command -v "$candidate")"
+        break
+      fi
+    done
+  fi
+  if [ -z "$bootstrap_python" ] || [ ! -x "$bootstrap_python" ]; then
+    printf 'python_executable_unusable: 无法启动 RVF Python 环境预检：%s\n' "$bootstrap_python" >&2
+    exit 2
+  fi
+  if [ "$verbose" -eq 1 ]; then
+    set -- --verbose
+  fi
+  exec "$bootstrap_python" -B "$repo_root/scripts/rvf_tool_runtime_python_environment.py" \
+    --run-contract-shell "$repo_root/scripts/check_skill_contracts.sh" "$@"
+fi
+"$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -B "$repo_root/scripts/rvf_tool_runtime_python_environment.py" >/dev/null
+
 # 测试卫生守卫（F5·H5b）：本次套件独占一个唯一名的 TMPDIR，于是每个测试的临时仓库 / run / HOME
 # 路径都带着这个名字；脚本末尾扫真实 RVF 状态根，出现引用它的新文件即判测试泄漏。判据与原理见
 # scripts/check_contract_suite_left_no_test_artifacts_in_real_rvf_state_roots.py 的模块 docstring。
-contract_suite_started_at_epoch_seconds="$(python3 -c 'import time; print(time.time())')"
+contract_suite_started_at_epoch_seconds="$("$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -c 'import time; print(time.time())')"
 contract_suite_private_temporary_directory="$(mktemp -d "${TMPDIR:-/tmp}/rvf-contract-suite-private-tmp.XXXXXX")"
 trap 'rm -rf "$contract_suite_private_temporary_directory"' EXIT
 export TMPDIR="$contract_suite_private_temporary_directory"
 
 timestamp_ms() {
-  python3 -c 'import time; print(time.time_ns() // 1000000)'
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -c 'import time; print(time.time_ns() // 1000000)'
 }
 
 record_step_timing() {
@@ -46,7 +69,7 @@ record_step_timing() {
   local duration_ms="$3"
   local execution_mode="${4:-serial}"
   if [ -n "${RVF_CONTRACT_TIMING_JSONL:-}" ] && [ "${RVF_CONTRACT_TIMING_SCRIPT:-}" = "$0" ]; then
-    python3 - "$RVF_CONTRACT_TIMING_JSONL" "$label" "$command_status" "$duration_ms" "$execution_mode" <<'PY' || true
+    "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" - "$RVF_CONTRACT_TIMING_JSONL" "$label" "$command_status" "$duration_ms" "$execution_mode" <<'PY' || true
 import json
 import sys
 from datetime import datetime, timezone
@@ -335,9 +358,9 @@ run_parallel_test_steps() {
     local serial_index
     for serial_index in "${!labels[@]}"; do
       if [ -n "${args[$serial_index]}" ]; then
-        run_step "${labels[$serial_index]}" python3 "${scripts[$serial_index]}" ${args[$serial_index]}
+        run_step "${labels[$serial_index]}" "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" "${scripts[$serial_index]}" ${args[$serial_index]}
       else
-        run_step "${labels[$serial_index]}" python3 "${scripts[$serial_index]}"
+        run_step "${labels[$serial_index]}" "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" "${scripts[$serial_index]}"
       fi
     done
     return
@@ -363,9 +386,9 @@ run_parallel_test_steps() {
       command_status=0
       started_ms="$(timestamp_ms)"
       if [ -n "${args[$index]}" ]; then
-        python3 "${scripts[$index]}" ${args[$index]} >"${output_files[$index]}" 2>&1 || command_status=$?
+        "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" "${scripts[$index]}" ${args[$index]} >"${output_files[$index]}" 2>&1 || command_status=$?
       else
-        python3 "${scripts[$index]}" >"${output_files[$index]}" 2>&1 || command_status=$?
+        "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" "${scripts[$index]}" >"${output_files[$index]}" 2>&1 || command_status=$?
       fi
       ended_ms="$(timestamp_ms)"
       printf '%s\n' "$command_status" >"${status_files[$index]}"
@@ -586,6 +609,8 @@ repo_required_files=(
   "scripts/check_skill_contracts.sh"
   "scripts/install_to_codex.py"
   "scripts/rvf_local_deploy.py"
+  "scripts/rvf_tool_runtime_python_environment.py"
+  "tests/test_rvf_tool_runtime_python_environment.py"
   "scripts/merge_rvf_state_roots.py"
   "tests/test_stop_hook_dispatcher.py"
   "tests/test_codex_gui_without_kanban_task_stop_hook_policy.py"
@@ -675,10 +700,11 @@ run_step "shell syntax: scripts/check_skill_contracts.sh" bash -n "$repo_root/sc
 run_step "shell syntax: scripts/sync-manifest.sh" bash -n "$repo_root/scripts/sync-manifest.sh"
 run_step "manifest sync: scripts/sync-manifest.sh" bash "$repo_root/scripts/sync-manifest.sh"
 
-run_step "python compile" python3 -m py_compile \
+run_step "python compile" "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m py_compile \
   "$repo_root/scripts/check_plugin_contracts.py" \
   "$repo_root/scripts/install_to_codex.py" \
   "$repo_root/scripts/rvf_local_deploy.py" \
+  "$repo_root/scripts/rvf_tool_runtime_python_environment.py" \
   "$repo_root/scripts/merge_rvf_state_roots.py" \
   "$repo_root/scripts/check_contract_suite_left_no_test_artifacts_in_real_rvf_state_roots.py" \
   "$skill_dir/scripts/run_alternative_reviewer.py" \
@@ -770,58 +796,61 @@ run_step "python compile" python3 -m py_compile \
 
 run_parallel_test_steps
 run_step "tests: rvf_analyze_formal_archive_completion" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_rvf_analyze_formal_archive_completion.py" \
     "$tests_dir/test_invoke_subagent.py" \
     "$tests_dir/test_rvf_analyze.py" \
     "$tests_dir/test_analysis_artifacts.py"
 run_step "tests: codex_gui_without_kanban_task_stop_hook_policy" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_codex_gui_without_kanban_task_stop_hook_policy.py" \
     "$tests_dir/test_finalized_run_in_progress_marker_reconciliation.py"
 run_step "tests: rvf_local_deploy" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_developer_local_main_installation.py" \
     "$tests_dir/test_official_cli_local_deploy_verification.py"
+run_step "tests: rvf_tool_runtime_python_environment" \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
+    "$tests_dir/test_rvf_tool_runtime_python_environment.py"
 run_step "tests: merge_rvf_state_roots" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_merge_rvf_state_roots.py"
 run_step "tests: cline_kanban_terminal_delivery_receipt" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_cline_kanban_terminal_delivery_receipt.py"
 run_step "tests: rvf_withdrawn_dispatch_tombstone" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_rvf_withdrawn_dispatch_tombstone.py"
 # 结构性 gate：投给当前活会话的自注入有且只有发起决策点横幅（INV-1 / INV-2）。行为断言，不是
 # grep —— `$review-validate-fix` 这个字面量在仓里到处都是，要钉的是默认发起路径**吐出**的正文。
 run_step "tests: review_initiation_decision_point_is_sole_self_injection" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_review_initiation_decision_point_is_sole_self_injection.py"
 # 结构性 + 行为 gate：Stop 出口的受众分级。驱动 agent 的线上键（decision / hookSpecificOutput）
 # 只能在 core/stop_hook_output_audience 的翻译层里构造（AST 判定，不是字面量扫描）；且同一条
 # 决策在 Claude 下必须落非错误的 additionalContext、在 Codex 下必须落 decision:block。
 run_step "tests: stop_hook_output_audience_contract" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_stop_hook_output_audience_contract.py"
 # agentic 发起路径的 scope-of-work 契约：stub 不得自称手动入口；stub 标记机器可判（dispatch
 # contract gate 据它拒派）；改好的 scope-of-work 有受支持的重渲入口把它渲进已冻结的 packet。
 run_step "tests: agentic_initiation_scope_of_work_contract" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_agentic_initiation_scope_of_work_contract.py"
 # session 归属分层补判（08ac4）：Bash / 子代理 / mv·cp 写的文件按「子代理写工具 → 命令文本 → agent 认领
 # → 时间窗」补判归属；fast-forward 到 base 后不再截掉更早的未提交写入。漏审曾占本会话改动的 68%。
 run_step "tests: layered_session_write_attribution" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_layered_session_write_attribution.py"
 run_step "tests: compact_path_tree_rendering" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_compact_path_tree_rendering.py"
 # land 单步化链路：验证缓存（含结构化 argv 工件 / 失败尾部）→ candidate evidence → rvf_land
 # prepare/commit 端到端。前两份曾经不在任何 gate 里（改了缓存或 evidence 门槛也不会有测试变红），
 # 而 rvf_land 的零执行复用恰恰建立在二者口径一致之上，所以三份一起跑。合并阶段结构化处置（T4）是
 # evidence 的 canonical 计数事实源（全部 dropped 时 N=0 才能 land），同一步一起跑。
 run_step "tests: rvf_land_validation_cache_and_candidate_evidence" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_validation_result_cache_v2.py" \
     "$tests_dir/test_reviewed_task_candidate_evidence.py" \
     "$tests_dir/test_rvf_land_single_step_prepare_and_commit.py" \
@@ -829,35 +858,35 @@ run_step "tests: rvf_land_validation_cache_and_candidate_evidence" \
 # reviewer 结果工件生命周期：三态互转对称且换 kind 必归档（旧规则 request→issues 是死结、
 # request→no_issues 却静默覆写）；重派只重跑 kind: request 的腿，健康腿结果不被覆写。
 run_step "tests: reviewer_result_artifact_lifecycle" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_reviewer_result_artifact_lifecycle.py"
 # fix attempt 因果链：全量物化、越界修改的告警-确认放行、validate-only 只验证并提交 Kanban backlog、
 # apply 状态门与内容漂移冲突。此前这个文件不在任何 gate 里，测试会静默不跑。
 # 迁移用例在干净 HEAD 上就红（极简 v3 库缺 leases 表，backlog 任务 64943 跟踪），修好后删掉这条 -k 排除。
 run_step "tests: rvf_fix_causality" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_rvf_fix_causality.py" \
     -k "not test_diff_tracker_creates_and_migrates_rvf_causality_tables"
 # 范围外问题提交 Kanban backlog：卡片标记、自包含（不 fork 父会话）、主仓 project path、跨 worktree
 # 指纹去重、Kanban 不可用时持久 pending 与重试、不替其他会话的未提交 WIP 提卡。
 run_step "tests: out_of_scope_findings_kanban_backlog_submission" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_out_of_scope_findings_kanban_backlog_submission.py"
 # Codex hook 信任指纹：改了 hook 命令不重新信任 ⇒ Codex 静默跳过该 hook（exec 下零警告），
 # deploy 却报告成功。核对只观测、不改 live config。
 run_step "tests: codex_hook_trust_fingerprint" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_codex_hook_trust_fingerprint.py"
 run_step "codex hook trust fingerprint self-check" \
-  python3 "$repo_root/scripts/codex_hook_trust_fingerprint.py"
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" "$repo_root/scripts/codex_hook_trust_fingerprint.py"
 # 当前会话 host 解析：判据顺序必须「先否定 Claude、后采信 claude-code stamp」。把 Codex 误判成
 # Claude 会让它收到 hookSpecificOutput（stop.command.output 是 additionalProperties:false）⇒
 # 整条 hook 输出 Failed = RVF 在 Codex 上静默停摆；反向误判只是降级，代价不对称。
 run_step "tests: current_session_host_adapter_resolution" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_current_session_host_adapter_resolution.py"
 run_step "stop hook output audience contract self-check" \
-  python3 "$repo_root/core/stop_hook_output_audience/stop_hook_output_audience_contract.py"
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" "$repo_root/core/stop_hook_output_audience/stop_hook_output_audience_contract.py"
 # Kimi 的第三条线材：它的 block 判据是 JS 全等 `permissionDecision !== "deny"`，而 hook 输出
 # schema 是 looseObject ⇒ 拼错字面量、或整条通道被误删，都会**静默降级成 allow 且零报错**
 # （与 Codex「整条 Failed」相反，这里没有任何可观测的失败信号）。所以三处各钉一根钉：
@@ -877,14 +906,14 @@ require_repo_literal "docs/architecture/stop-hook-output-audience-contract.md" \
 # Kimi host 身份与装配：三套 transcript 签名必须两两不相交（相交即静默误判），且每个可被
 # 正向识别的 host 都必须有自己的装配分支（缺分支不会报错，只会静默落进 Codex 兜底）。
 run_step "host transcript format detection self-check" \
-  python3 "$repo_root/core/host_adapter/host_transcript_format_detection.py"
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" "$repo_root/core/host_adapter/host_transcript_format_detection.py"
 # P-5 词表一致性：host 身份词表与 reviewer-registry 的 harness id 是两套独立演化的词表，
 # 前两项（codex / claude_code）历史上恰好同名纯属巧合。Kimi 接入时巧合断裂——host 身份取
 # ``kimi_code_cli`` 而 registry 是 ``kimi_code`` ⇒ 主 harness 排不出 alternative reviewer 池，
 # 200-seed 实测 44% 的 Kimi 会话被 Kimi 自己评审，**全程零报错**（双评审的价值全在异构性上）。
 # 判据是结构性的（遍历 KNOWN_HOST_IDENTITIES），所以加第四个 host 时同样当场炸。
 run_step "host identity / reviewer registry vocabulary consistency" \
-  python3 "$repo_root/scripts/check_host_identity_and_reviewer_registry_harness_id_vocabulary_consistency.py"
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" "$repo_root/scripts/check_host_identity_and_reviewer_registry_harness_id_vocabulary_consistency.py"
 # 上面那条 gate 的第二条断言只有在 VALID_MAIN_HARNESSES 真的派生自 registry 时才有检测力：
 # 一旦被改回手写清单，它就退化成「清单碰巧写全了」的假绿。故把派生实现本身钉死。
 require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/prepare_review_run.py" \
@@ -894,15 +923,15 @@ require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scr
 # registry 落后一个 host，提交前 gate 就红，并造出「必须先部署才能让 gate 转绿」的循环依赖。
 # 两个方向（不读运行时状态 / 手写清单仍当场红）都由这份测试钉住。
 run_step "tests: host_identity_reviewer_registry_vocabulary_gate" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_host_identity_reviewer_registry_vocabulary_gate.py"
 # S-B6 跨 turn 再入预算：宿主的保险丝对 Kimi 完全无效（`stop_hook_active` 恒 false，引擎的
 # 续跑标记每 turn 复位）⇒「driven 一回合 → agent 停下 → 再 driven 一回合」在宿主侧没有上界。
 # 本仓已实测过一次 286 次无上界续跑，所以这道闸必须由 RVF 自带。
 run_step "stop hook reentry budget self-check" \
-  python3 "$repo_root/core/stop_hook_reentry_budget/stop_hook_reentry_budget.py"
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" "$repo_root/core/stop_hook_reentry_budget/stop_hook_reentry_budget.py"
 run_step "tests: stop_hook_reentry_budget" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_stop_hook_reentry_budget.py"
 # 预算的三条复位路径里，「digest 变化」最容易退化成恒真——驱动正文每次都带新铸的
 # RVF_DECISION_TOKEN，拿正文做 digest 等于关掉这道闸。故把「用 reason_code 而非正文」钉死。
@@ -910,46 +939,46 @@ require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scr
   'stable_agent_directive_scope_digest_source=reason_code'
 # 开审前门禁需验证真实隔离 Git 与原生消息 schema，不能仅检查状态字段。
 run_step "tests: review_start_independent_user_turn_boundary" \
-  python3 -m pytest -q "$tests_dir/test_review_start_independent_user_turn_boundary.py" \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q "$tests_dir/test_review_start_independent_user_turn_boundary.py" \
     "$tests_dir/test_review_start_boundary_request_retry.py" \
     "$tests_dir/test_review_without_pre_review_base_absorption.py"
 # Kimi 激活态核对：installed.json 磁盘上**没有** state 字段（persist 只落 9 个），所以判定必须
 # 自己复算；且单条 hook 不过 schema 时 Kimi 只 warn + 丢弃该条、plugin 仍报 ok ⇒「看起来健康、
 # 实际 Stop hook 不存在」是零报错状态。核对脚本本身读 live infra，故只在 fixture 测试里跑。
 run_step "tests: kimi_plugin_activation_state_check" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_kimi_plugin_activation_state_check.py"
 # Kimi 注册安装器：注册在四条跨进程通道上全部不可达 ⇒ 只能写 installed.json。两条风险各钉一根钉：
 # 全量重写会掀掉用户装的其它插件（必须幂等 additive merge）；state 写不进去（persist 只落 9 个
 # 字段）⇒「安装器写完了」不等于「注册生效了」，闭环由独立复算的核对器给。
 run_step "tests: kimi_plugin_registration_installer" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_kimi_plugin_registration_installer.py"
 require_repo_literal "scripts/rvf_local_deploy.py" \
   '"--configure-kimi-plugin-registration",'
 run_step "kimi session layout self-check" \
-  python3 "$repo_root/adapters/kimi/session_layout.py"
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" "$repo_root/adapters/kimi/session_layout.py"
 # Kimi wire 蒸馏 + adapter 行为。三条最容易静默出错的地方：origin.kind 区分真实输入与系统
 # 注入（混同会污染 scope 归属）；think 的正文在 part.think 而非 part.text（取错静默变空串）；
 # 写型工具参数是 path 而非 Claude 的 file_path（照抄会让 artifact_refs 恒为空且不报错）。
 run_step "tests: kimi_host_adapter_and_transcript" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_kimi_host_adapter_and_transcript.py"
 # 结构性 + 行为 gate（F5·H5a）：Stop 事件缺 last_assistant_message 时按 host 读 transcript 找 handoff
 # 标记——漏接一个 host 不报错，只会让它的 RVF run 写完 handoff 却永不 finalize（Kimi 曾 4/4）。
 run_step "tests: rvf_handoff_marker_detection_across_host_transcripts" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_rvf_handoff_marker_detection_across_host_transcripts.py"
 # finalize 本身（标 units reviewed / 释放 lease / 推高水位）。这两份此前不在任何 gate 里，
 # test_rvf_run_finalize 因此从 2026-06-25（a0f206c 的 no-op 守卫）起红了三个月没人看见。
 run_step "tests: rvf_run_finalize" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_rvf_run_finalize.py" \
     "$tests_dir/test_automatic_closeout_bridge.py" \
     "$tests_dir/test_cancel_rvf_run_finalize.py"
 # 测试卫生守卫本身的判据：认得出本次套件的泄漏、放得过活会话的并发写入（F5·H5b）。
 run_step "tests: check_contract_suite_left_no_test_artifacts_in_real_rvf_state_roots" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_check_contract_suite_left_no_test_artifacts_in_real_rvf_state_roots.py"
 require_repo_literal "adapters/kimi/transcript.py" \
   '_ARTIFACT_PATH_ARGUMENT_NAME = "path"'
@@ -993,7 +1022,7 @@ require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scr
 # Kimi hook 入口：事件只有四个字段、**没有 transcript_path**，shim 必须合成它——否则 host 判成
 # Codex ⇒ 发 decision:block ⇒ 被 Kimi 的 looseObject 静默吞掉 ⇒ RVF 完全失声且零报错。
 run_step "tests: kimi_hook_entry_normalization" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_kimi_hook_entry_normalization.py"
 require_repo_literal "plugins/review-validate-fix/.kimi-plugin/plugin.json" '"event": "Stop"'
 require_repo_literal "plugins/review-validate-fix/.kimi-plugin/plugin.json" '"event": "UserPromptSubmit"'
@@ -1013,34 +1042,34 @@ forbid_repo_literal "plugins/review-validate-fix/hooks/hooks.json" 'kimi'
 # 远超 ARG_MAX ⇒ 必须走「argv 只带短指针、正文留在磁盘」。同时钉住 `--dry-run` 打印的是终结后的
 # 真实 argv，且仍停在 pre_run_health 之前（否则零成本预演变成每次烧一次真实 probe）。
 run_step "tests: reviewer_prompt_delivery_contract" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_reviewer_prompt_delivery_contract.py"
 # kimi / omp 结构化 stdout：kimi 无 result 信封（否则整份 JSONL 被当评审正文）；「重试」不等于
 # 「失败」（在首次 429 判死会把可恢复重试变成硬失败腿）；omp 用 --mode json 时报错也退 0，
 # 额度错误必须 typed 识别；omp 的 isError 不是 cursor spawnError 的对偶，刻意不据它 fail-over。
 run_step "tests: reviewer_structured_output_extraction" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_reviewer_structured_output_extraction.py"
 # 健康探针必须与派发命令走同一条后端路径。这条纪律原本只以 cursor 模板里的一段注释存在，
 # claude/codex 两份则原样带着 `auth status` / `login status` —— 同一失效形状，只是还没发作。
 # run rvf-20260811T170157Z：cursor 登录过期时 status 退 0 而 -p 退 1，RVF 因此把死腿选进两腿，
 # 该轮实际只剩单路评审结论却全程自认为做了双评审。
 run_step "tests: reviewer_health_probe_parity" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_reviewer_health_probe_parity.py"
 # reviewer registry 是 additive merge 而非首次 seed：已部署过的机器上 user-local registry
 # 早就存在，若沿用「不存在才 copy」，后续新增的评审腿（kimi_code / oh_my_pi 是第一批）永远
 # 进不去那台机器，而部署照常报成功、派发照常从旧的 3 条腿里选 2 条 —— 无人报错的假绿。
 # 反向也要钉住：merge 不得覆盖用户改过的条目（关掉的腿不能被一次部署重新打开）。
 run_step "tests: reviewer_registry_additive_merge" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_reviewer_registry_additive_merge.py"
 # 同额度池互斥：omp 腿被 pin 到 Codex 订阅，与 codex 腿同模型同账号 ⇒ 抽到这一对时双评审
 # 退化成同一模型评两遍（实测 200 seed 下 16.5%），且该订阅额度耗尽会同时打掉两腿，而
 # fail-over 假设各腿独立。指纹取「额度池」而非模型名：五条腿里只有 omp pin 了模型，
 # 其余四条跟随各自 CLI 的默认模型、随时会变，写模型名第二天就会撒谎。
 run_step "tests: reviewer_quota_pool_exclusive_selection" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_reviewer_quota_pool_exclusive_selection.py"
 # probe 结果缓存：probe_available 每轮对每条 enabled harness 真跑一次 --preflight，那是真实
 # 模型调用（omp 单次实测 input 39,499 tokens），5 条腿后每轮稳态代价可观。缓存只复用一次
@@ -1048,10 +1077,10 @@ run_step "tests: reviewer_quota_pool_exclusive_selection" \
 # 三条方向性不变量必须钉死：读侧任何异常退化成 miss 而非「可用」；成功/失败 TTL 不对称；
 # 派发失败当场作废缓存（否则一条「可用」缓存会在整个 TTL 内自我延续地把死腿喂回选腿层）。
 run_step "tests: reviewer_harness_probe_result_cache" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_reviewer_harness_probe_result_cache.py"
 run_step "tests: trajectory_distill" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_trajectory_distill.py"
 
 require_literal "prompts/reviewer.md" 'RVF_WRITE_REVIEW_RESULT'
@@ -1705,7 +1734,7 @@ require_repo_literal "core/host_adapter/host_adapter_protocol.py" 'def stop_hook
 # sys.path 上而 ModuleNotFoundError。于是「加第 7 个方法会当场触发那条断言」这层保护实际
 # 并不存在。用 env 补上 PYTHONPATH 真正跑它。
 run_step "host adapter protocol self-check" \
-  env PYTHONPATH="$repo_root" python3 "$repo_root/core/host_adapter/host_adapter_protocol.py"
+  env PYTHONPATH="$repo_root" "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" "$repo_root/core/host_adapter/host_adapter_protocol.py"
 require_repo_literal "core/host_adapter/__init__.py" 'from core.host_adapter.host_adapter_protocol import HostAdapter'
 
 # S10f: provider 健康探测中性内核迁 core/provider_health；codex 登录/二进制发现下沉
@@ -1743,7 +1772,7 @@ require_literal "scripts/host_adapter_resolver.py" 'def resolve_host_adapter'
 require_literal "scripts/stop_review_validate_fix.py" 'from host_adapter_resolver import resolve_host_adapter'
 require_literal "scripts/stop_review_validate_fix.py" 'resolve_host_adapter(host).cline_kanban_agent_id()'
 # resolver self-check：两 bundle 满足 HostAdapter Protocol、装配口径正确、各方法行为正确。
-run_step "host adapter resolver self-check" python3 "$skill_dir/scripts/host_adapter_resolver.py"
+run_step "host adapter resolver self-check" "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" "$skill_dir/scripts/host_adapter_resolver.py"
 
 # S10e 父会话来源冻结（PARENT_CONTEXT 簇 → core）：中性冻结核迁
 # core/parent_conversation_context；引擎 parent_conversation_origin 退化为 assembly wrapper
@@ -1932,11 +1961,11 @@ forbid_repo_literal "docs/multi-harness-plugin-guideline/04-anti-patterns.md" '�
 # S8.0（去-codex 重构）：env-namespace 碰撞 gate。防 CODEX_RVF_* → RVF_* 改名半完成
 # ——同一 base 在 CODEX_RVF_ 与裸 RVF_ 两命名空间都被 env 访问 = 运行时变量分裂、
 # 静默损坏（无语法/import 错，未覆盖路径假绿）。ALLOWLIST 在脚本内随坍缩切片收窄。
-python3 "$repo_root/scripts/check_env_namespace_collision.py"
+"$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" "$repo_root/scripts/check_env_namespace_collision.py"
 
 # 必须是最后一个测试相关步骤：它核对的是「上面所有测试跑完之后」真实 RVF 状态根的样子。
 run_step "real RVF state roots hold no artifacts from this contract suite" \
-  python3 "$repo_root/scripts/check_contract_suite_left_no_test_artifacts_in_real_rvf_state_roots.py" \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" "$repo_root/scripts/check_contract_suite_left_no_test_artifacts_in_real_rvf_state_roots.py" \
     --suite-private-temporary-directory "$contract_suite_private_temporary_directory" \
     --suite-started-at-epoch-seconds "$contract_suite_started_at_epoch_seconds"
 
