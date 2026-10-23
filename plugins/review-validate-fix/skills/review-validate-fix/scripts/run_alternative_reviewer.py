@@ -1361,9 +1361,39 @@ def resolve_reviewer_model_commands(
         )
     if not is_kimi_prompt_command(command) or not health_command or not is_kimi_prompt_command(health_command):
         raise ValueError("Kimi 动态选模要求正式评审和健康检查都使用 kimi")
-    # 原生恢复会话沿用其模型；不将新会话默认策略应用到旧会话。
-    if any(item in {"-S", "--session", "-c", "--continue"} or item.startswith("--session=") for item in command):
-        return command, health_command
+    def extract_native_resume_selector(argv: list[str]) -> tuple[list[str], list[str], list[str]]:
+        selector_tokens: list[str] = []
+        canonical_selector: list[str] = []
+        without_resume = [argv[0]]
+        index = 1
+        while index < len(argv):
+            item = argv[index]
+            if item in {"-c", "--continue"}:
+                selector_tokens.append(item)
+                canonical_selector.append("--continue")
+            elif item in {"-S", "--session"}:
+                selector_tokens.append(item)
+                canonical_selector.append("--session")
+                if index + 1 < len(argv) and not argv[index + 1].startswith("-"):
+                    index += 1
+                    selector_tokens.append(argv[index])
+                    canonical_selector.append(argv[index])
+            elif item.startswith("--session=") or (item.startswith("-S") and len(item) > 2):
+                selector_tokens.append(item)
+                canonical_selector.extend(["--session", item.split("=", 1)[1] if item.startswith("--session=") else item[2:]])
+            else:
+                without_resume.append(item)
+            index += 1
+        return selector_tokens, canonical_selector, without_resume
+
+    resume_tokens, resume_selector, _ = extract_native_resume_selector(command)
+    _, health_resume_selector, health_without_resume = extract_native_resume_selector(health_command)
+    if health_resume_selector and health_resume_selector != resume_selector:
+        raise ValueError("Kimi 正式评审与健康检查的原生恢复会话不一致")
+    if resume_tokens:
+        # 探针也恢复同一会话并真实发起最小调用，原生 CLI 因而沿用相同的会话模型。
+        # 复用正式命令的拼写，让后续 parity gate 继续完整验证后端参数。
+        health_command = [*health_without_resume, *resume_tokens]
 
     def extract_explicit_model_selector(argv: list[str]) -> tuple[str | None, list[str]]:
         selectors = []
@@ -1393,6 +1423,9 @@ def resolve_reviewer_model_commands(
     if selected_model is not None and health_model not in {None, selected_model}:
         raise ValueError("Kimi 正式评审与健康检查的显式模型不一致")
     if selected_model is None:
+        # 原生恢复会话沿用其模型；不查询新会话默认目录，也不注入模型覆盖。
+        if resume_tokens:
+            return command, health_command
         selected_model = resolve_latest_kimi_managed_stable_model(
             command[0], env=env, timeout=min(timeout, 10),
         )
