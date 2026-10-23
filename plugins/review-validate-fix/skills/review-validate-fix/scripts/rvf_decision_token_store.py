@@ -18,8 +18,8 @@
   * 去重键 ``(worktree, session_id, candidate_fingerprint)``：同键存在活跃（非终态、且 TTL 未过期或
     run 在途可复活）token 时**拒绝重铸并返回既有 token**——这是注入幂等的硬保证（R25）。
     ``candidate_fingerprint`` 对本模块是**不透明字符串**（由 S2 摘要生成器计算，本模块不实现指纹算法）。
-  * declined 指纹冷却表：decline 时把 ``(worktree, candidate_fingerprint)`` 写入冷却表，摘要生成器
-    在再次注入前查表，指纹未变则不再注入（防 decline→Stop→再注入的 nag 循环）。
+  * declined 指纹冷却表：decline 时把 ``(worktree, session_id, candidate_fingerprint)`` 写入冷却表，
+    同会话再次注入前查表，指纹未变则不再注入；parent / fork / 新会话各自判断，不能互相否决。
   * declined 会话级 snooze（闸 2b）：内容指纹逐字节敏感，工作进行中每次 Stop 都是「新候选」，上面
     的冷却表因此挡不住同一会话里的重复谢绝。decline 时另按 ``(worktree, session_id)`` 记一条
     粗粒度的工作范围快照；在出现真正的工作边界（HEAD 变化 / 范围明显扩大 / 硬 TTL）之前，同会话同
@@ -93,6 +93,7 @@ ENV_CIRCUIT_BREAKER_ROOT = "RVF_AGENTIC_INITIATION_CIRCUIT_BREAKER_ROOT"
 
 DECISION_TOKEN_DIRNAME = "agentic-initiation-decision-tokens"
 DECLINED_FINGERPRINT_DIRNAME = "agentic-initiation-declined-fingerprints"
+SESSION_SCOPED_DECLINED_CANDIDATE_FINGERPRINT_SUBDIRNAME = "session-scoped-declined-candidate-fingerprints"
 CIRCUIT_BREAKER_DIRNAME = "agentic-initiation-circuit-breaker-ledger"
 
 # 去重键各字段的分隔符（ASCII Unit Separator，正常字段值不含）。
@@ -101,7 +102,7 @@ _KEY_FIELD_SEPARATOR = "\x1e"
 # declined 会话级 snooze（闸 2b）的落盘位置：**declined 冷却根下的子目录**。刻意不另立一个根 /
 # 环境变量——它与冷却表同属「agent 谢绝过什么」这一族状态，挂在冷却根下就自动继承冷却根的全部
 # 隔离手段（显式 ``cooldown_root`` / 专用 env / ``$RVF_HOME``），不会出现「测试注入了冷却根、
-# snooze 却写进真实 ~/.rvf」的漏网。冷却表只在根目录顶层放 ``<hash>.json``，子目录与它互不相干。
+# snooze 却写进真实 ~/.rvf」的漏网。会话指纹冷却与 snooze 分别存放在独立子目录。
 # 目录结构：``<snooze 根>/<sha(session_id)>/<sha(worktree)>.json``——按会话分目录，UPS 在开发者
 # 发来真实 prompt 时按会话整目录**重置各 snooze 的「范围扩大」对比基线**（不解除 snooze，见下方
 # 方向 C 的 EXPERIMENT_NODE），无需知道 Stop 侧用的 worktree 字符串。
@@ -508,6 +509,8 @@ class MintResult:
     record: DecisionTokenRecord | None = None
     circuit_breaker: CircuitBreakerStatus | None = None
     message: str | None = None
+    # 仅冷却拒铸时携带命中的本会话记录，供 Stop 日志追溯谢绝来源。
+    session_scoped_declined_candidate_fingerprint_record: dict[str, Any] | None = None
     # 事实一（告知类）：「用户显式推翻了 agent 早前的谢绝」。仅在
     # ``initiated_by_explicit_user_request=True`` 且本次铸造确实**命中**了一条既有 declined 冷却
     # 记录时为 True——命中即已证成，与冷却记录能否被物理删除**无关**。调用方据此把该事实如实告知
@@ -1352,30 +1355,38 @@ def _register_mint_request_and_check_breaker(
 # declined 指纹冷却表
 # ---------------------------------------------------------------------------
 
-def _declined_fingerprint_path(worktree: str, candidate_fingerprint: str, root: str | Path | None) -> Path:
-    key_hash = _digest(worktree, candidate_fingerprint)
-    return declined_fingerprint_root(root) / f"{key_hash}.json"
+def _session_scoped_declined_candidate_fingerprint_path(
+    worktree: str, session_id: str, candidate_fingerprint: str, root: str | Path | None
+) -> Path | None:
+    if not isinstance(session_id, str) or not session_id.strip():
+        return None
+    key_hash = _digest(worktree, session_id, candidate_fingerprint)
+    return declined_fingerprint_root(root) / SESSION_SCOPED_DECLINED_CANDIDATE_FINGERPRINT_SUBDIRNAME / f"{key_hash}.json"
 
 
 def record_declined_fingerprint(
     *,
     worktree: str,
+    session_id: str,
     candidate_fingerprint: str,
     reason: str | None = None,
     token: str | None = None,
     now: datetime | None = None,
     cooldown_root: str | Path | None = None,
-) -> Path:
-    """把 ``(worktree, candidate_fingerprint)`` 写入 declined 冷却表（decline 时调用，幂等覆盖）。
+) -> Path | None:
+    """按 ``(worktree, session_id, candidate_fingerprint)`` 幂等保存本会话的谢绝。
 
-    冷却语义为「指纹未变即持续冷却」：无 TTL，直到候选文件集变化导致指纹变化才不再命中。
+    同会话指纹未变即持续冷却，无 TTL。缺会话身份不落盘，禁止退回全局或共享空身份。
     """
-    path = _declined_fingerprint_path(worktree, candidate_fingerprint, cooldown_root)
+    path = _session_scoped_declined_candidate_fingerprint_path(worktree, session_id, candidate_fingerprint, cooldown_root)
+    if path is None:
+        return None
     _atomic_write_json(
         path,
         {
             "schema_version": SCHEMA_VERSION,
             "worktree": worktree,
+            "session_id": session_id,
             "candidate_fingerprint": candidate_fingerprint,
             "declined_at": format_timestamp(_coerce_now(now)),
             "reason": reason,
@@ -1388,38 +1399,51 @@ def record_declined_fingerprint(
 def is_fingerprint_in_declined_cooldown(
     *,
     worktree: str,
+    session_id: str,
     candidate_fingerprint: str,
     cooldown_root: str | Path | None = None,
 ) -> bool:
-    """查询 ``(worktree, candidate_fingerprint)`` 是否处于 declined 冷却中（供摘要生成器「指纹未变不再注入」）。"""
-    return _declined_fingerprint_path(worktree, candidate_fingerprint, cooldown_root).is_file()
+    """仅查询当前会话的指纹冷却；缺会话身份或记录不可信时不命中。"""
+    return read_declined_fingerprint(
+        worktree=worktree, session_id=session_id, candidate_fingerprint=candidate_fingerprint,
+        cooldown_root=cooldown_root,
+    ) is not None
 
 
 def read_declined_fingerprint(
     *,
     worktree: str,
+    session_id: str,
     candidate_fingerprint: str,
     cooldown_root: str | Path | None = None,
 ) -> dict[str, Any] | None:
-    """读取 declined 冷却记录的完整 payload（不存在或损坏返回 None）。"""
-    path = _declined_fingerprint_path(worktree, candidate_fingerprint, cooldown_root)
-    if not path.is_file():
+    """读取并核对本会话冷却身份；旧全局记录不再参与判定，也不改写历史。"""
+    path = _session_scoped_declined_candidate_fingerprint_path(worktree, session_id, candidate_fingerprint, cooldown_root)
+    if path is None:
         return None
     try:
         parsed = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
-    return parsed if isinstance(parsed, dict) else None
+    if not isinstance(parsed, dict) or any(
+        parsed.get(key) != value
+        for key, value in (("worktree", worktree), ("session_id", session_id), ("candidate_fingerprint", candidate_fingerprint))
+    ):
+        return None
+    return parsed
 
 
 def clear_declined_fingerprint(
     *,
     worktree: str,
+    session_id: str,
     candidate_fingerprint: str,
     cooldown_root: str | Path | None = None,
 ) -> bool:
-    """从冷却表移除某指纹（返回是否真的删除了文件）。"""
-    path = _declined_fingerprint_path(worktree, candidate_fingerprint, cooldown_root)
+    """仅清除当前会话对应指纹的冷却，返回是否真的删除了记录。"""
+    path = _session_scoped_declined_candidate_fingerprint_path(worktree, session_id, candidate_fingerprint, cooldown_root)
+    if path is None:
+        return False
     try:
         path.unlink()
         return True
@@ -2336,7 +2360,7 @@ def mint_decision_token(
 
     1. **去重（注入幂等硬保证，R25）**：``(worktree, session_id, candidate_fingerprint)`` 同键存在活跃
        token 时不重铸、直接返回既有 token（``outcome=deduplicated``；过期可复活者就地复活）。
-    2. **declined 冷却**：指纹处于 declined 冷却中则拒铸（``outcome=declined_cooldown``），防 nag 循环。
+    2. **declined 冷却**：本会话的指纹处于冷却中则拒铸（``outcome=declined_cooldown``），防 nag 循环。
     2b. **declined 会话级 snooze**：本会话在本 worktree 上谢绝过、且尚未出现工作边界（HEAD 变化 /
        范围明显扩大 / 硬 TTL；开发者真实 prompt 只重置「范围扩大」基线）则拒铸（``outcome=declined_session_scope_snooze``）。
        它补的是闸二的盲区——内容一直在变的「边做边停」会话。放在闸二之后、闸三之前：两种 transport
@@ -2368,7 +2392,7 @@ def mint_decision_token(
 
     * 闸二不适用：declined 冷却的语义是「agent 谢绝过就别再骚扰 agent」，而用户显式触发本身就是
       *推翻 agent 的谢绝*。命中冷却时不再拒铸，而是调 :func:`clear_declined_fingerprint`
-      **清掉**那条记录再往下铸。清除而非仅本次绕过：用户既已推翻谢绝，这批改动就该整体重回可审
+      **清掉**本会话那条记录再往下铸。清除而非仅本次绕过：用户既已推翻谢绝，本会话就该重回可审
       状态，否则会出现「手动审得了、后续自动 Stop 仍被同一条陈旧 decline 挡着」的语义割裂。
       **命中与清除是两件事**，分别由两个字段回报：``explicit_user_request_overrode_agent_
       declined_cooldown``（命中即 True，供调用方告知用户与 agent）与
@@ -2418,25 +2442,29 @@ def mint_decision_token(
         # 结论去指导后面怎么写：本次读在锁外、且铸造还没发生，结论到写索引那一刻早已可能过时。
         # 占坑与否一律由下方锁内的那次重读裁决。
 
-    # 闸二：declined 冷却（指纹未变不再注入）。用户显式触发不适用——那正是在推翻 agent 的谢绝，
-    # 此时把冷却记录清掉再往下铸，让这批改动整体重回可审状态。
+    # 闸二：本会话 declined 冷却（指纹未变不再注入）。用户显式触发不适用——那正是在推翻本会话的
+    # 谢绝，只清掉本会话对应记录；parent / fork / 新会话的谢绝互不影响。
     # 这里有**两个互不相干的事实**，必须分开记：**命中**冷却即已证成「用户推翻了 agent 的谢绝」
     # （告知用户与 agent 的唯一依据），而 unlink 成败只决定「这条陈旧冷却是否还会挡住后续自动
     # 路径」。若压成同一个布尔，一次 I/O 失败就会静默吞掉本该必发的推翻告知。
     overrode_agent_declined_cooldown = False
     declined_cooldown_record_still_blocks_automatic_path = False
-    if is_fingerprint_in_declined_cooldown(
-        worktree=worktree, candidate_fingerprint=candidate_fingerprint, cooldown_root=cooldown_root
-    ):
+    declined_fingerprint_record = read_declined_fingerprint(
+        worktree=worktree, session_id=session_id,
+        candidate_fingerprint=candidate_fingerprint, cooldown_root=cooldown_root,
+    )
+    if declined_fingerprint_record is not None:
         if not initiated_by_explicit_user_request:
             return MintResult(
                 outcome=MINT_OUTCOME_DECLINED_COOLDOWN,
-                message="候选指纹处于 declined 冷却中，跳过铸造（指纹未变不再注入）。",
+                message="本会话曾谢绝开审且候选未变，跳过铸造（同会话指纹冷却）。",
+                session_scoped_declined_candidate_fingerprint_record=declined_fingerprint_record,
             )
         overrode_agent_declined_cooldown = True
         # clear 吞掉 OSError 返回 False；删不掉只意味着自动路径仍被挡，不改变「已被推翻」这一事实。
         declined_cooldown_record_still_blocks_automatic_path = not clear_declined_fingerprint(
-            worktree=worktree, candidate_fingerprint=candidate_fingerprint, cooldown_root=cooldown_root
+            worktree=worktree, session_id=session_id,
+            candidate_fingerprint=candidate_fingerprint, cooldown_root=cooldown_root,
         )
 
     # 闸 2b：declined 会话级 snooze（粗粒度工作范围，补闸二「内容一直在变」的盲区）。用户显式触发
@@ -3433,7 +3461,7 @@ def mark_declined(
     ``decline_kind`` 必填，取 :data:`DECLINE_KINDS` 之一，决定谢绝之后多久再问：
 
     * ``structural_not_needed``（R24 / 在途 run、琐碎、非本会话、开发者明确不要审）：把
-      ``(worktree, candidate_fingerprint)`` 写入 declined 冷却表——指纹未变即不再注入；并按
+      ``(worktree, session_id, candidate_fingerprint)`` 写入本会话冷却表——指纹未变即不再注入；并按
       ``(worktree, session_id)`` 写一份会话级 snooze 快照（闸 2b）——内容变了但工作范围没变也不再注入。
       snooze 写入是 best-effort（见 :func:`record_declined_session_scope_snooze`），失败不影响 decline。
     * ``deferred_until_condition``（现在不审，条件满足后再审）：冷却与 snooze **都不写**，只记一条
@@ -3475,6 +3503,7 @@ def mark_declined(
     )
     record_declined_fingerprint(
         worktree=str(updated.payload.get("worktree")),
+        session_id=declined_session_id,
         candidate_fingerprint=str(updated.payload.get("candidate_fingerprint")),
         reason=reason,
         token=updated.token,

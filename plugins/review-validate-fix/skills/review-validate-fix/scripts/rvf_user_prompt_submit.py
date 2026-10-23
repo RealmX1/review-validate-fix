@@ -1066,7 +1066,7 @@ def _manual_decision_additional_context_text(
         )
     if overrode_agent_declined_cooldown or overrode_agent_declined_session_scope_snooze:
         overridden_decline_description = (
-            "你早前对**同一批改动**谢绝过一次 RVF"
+            "你早前在**本会话**对**同一批改动**谢绝过一次 RVF"
             if overrode_agent_declined_cooldown
             else "你早前已在**本会话**对这片工作范围谢绝过 RVF（此后改动还在继续）"
         )
@@ -1132,7 +1132,7 @@ def _handle_manual_decision_point(
 
     **闸二/闸三对本路径不适用**：铸造时传 ``initiated_by_explicit_user_request=True``——命中 declined
     冷却即视为「用户推翻 agent 早前的谢绝」并照常铸（该告知与冷却记录能否清除无关；清除成功还会把
-    这批改动整体放回可审状态，清除失败则仅剩后续自动路径仍被挡，文案如实分叉），铸造
+    本会话放回可审状态，清除失败则仅剩本会话后续自动路径仍被挡，文案如实分叉），铸造
     频率熔断整段跳过（它防的是 agent 递归自发起，手动触发按定义来自用户）。因此本函数不再有
     ``declined_cooldown`` / ``circuit_breaker_tripped`` 分支；除已知 outcome 外一律走 mint anomaly 兜底。
 

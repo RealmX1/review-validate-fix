@@ -3246,8 +3246,9 @@ def run_decline(
     """``decline`` 子命令：mark_declined（终态 + 按 ``decline_kind`` 分流）+ 理由落 append-only ledger。
 
     结构性谢绝：回执如实报告会话级 snooze 是否落盘（读回磁盘，而非假设 mark_declined 一定写成）：
-    落盘了就告诉 agent「本会话内这片工作范围不会再弹横幅，直到提交 / 范围明显扩大」；没落盘（无
-    session_id、候选摘要缺工作范围身份、I/O 失败）就只承诺内容指纹冷却。延后型谢绝：如实告诉 agent
+    落盘了就告诉 agent「本会话内这片工作范围不会再弹横幅，直到提交 / 范围明显扩大」；没落盘（候选
+    摘要缺工作范围身份、I/O 失败）就只承诺已读回的本会话指纹冷却；缺有效 session_id 时不建立
+    指纹冷却，也不声称 snooze 已生效。延后型谢绝：如实告诉 agent
     下一次在什么时候重新征询（同样读回磁盘上的延后记录，没落盘就说「下一次 Stop 即重新征询」）。
 
     理由持久化的落点是**磁盘上的 append-only ledger**（``~/.rvf`` 下，路径可注入），刻意在
@@ -3342,7 +3343,18 @@ def run_decline(
         )
         is not None
     )
-    message = "已谢绝本次审查发起（结构性谢绝）；理由已持久化（rewind 不可抹），候选指纹已入 declined 冷却表（指纹未变不再注入）"
+    session_scoped_declined_candidate_fingerprint_recorded = (
+        token_store.read_declined_fingerprint(
+            worktree=worktree, session_id=session_id or "", candidate_fingerprint=fingerprint,
+            cooldown_root=roots.cooldown_root,
+        ) is not None
+    )
+    message = "已谢绝本次审查发起（结构性谢绝）；理由已持久化（rewind 不可抹）"
+    message += (
+        "，已建立本会话指纹冷却（本会话候选未变不再注入，不影响其他会话）"
+        if session_scoped_declined_candidate_fingerprint_recorded
+        else "，未建立本会话指纹冷却（缺少有效会话身份或冷却记录不可读），后续 Stop 仍可能重新征询"
+    )
     message += (
         "；本会话已 snooze 这片工作范围——直到提交或范围明显扩大（开发者发来新 prompt 后以那一刻为新基线），自动 Stop 不再为它弹横幅。"
         if declined_session_scope_snooze_recorded
@@ -3356,6 +3368,7 @@ def run_decline(
             "declined_reason_ledger": str(ledger_path),
             "candidate_fingerprint": fingerprint,
             "decline_kind": decline_kind,
+            "session_scoped_declined_candidate_fingerprint_recorded": session_scoped_declined_candidate_fingerprint_recorded,
             "declined_session_scope_snooze_recorded": declined_session_scope_snooze_recorded,
         },
     )

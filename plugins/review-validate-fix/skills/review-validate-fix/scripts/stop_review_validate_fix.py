@@ -11444,6 +11444,7 @@ def _decision_point_non_minted_outcome_decision(
         )
 
     if outcome == decision_token_store.MINT_OUTCOME_DECLINED_COOLDOWN:
+        declined_record = mint.session_scoped_declined_candidate_fingerprint_record or {}
         injection_attempt_ledger.record_injection_attempt(
             worktree=worktree,
             session_id=session_id,
@@ -11462,12 +11463,16 @@ def _decision_point_non_minted_outcome_decision(
             cwd=cwd,
             session_id=session_id,
             candidate_fingerprint=fingerprint,
+            declined_by_session_id=declined_record.get("session_id"),
+            declined_decision_token=declined_record.get("token"),
+            declined_at=declined_record.get("declined_at"),
+            decline_reason=declined_record.get("reason"),
         )
         return _decision_point_silent_stop(
             ledger,
             reason_code=REASON_DECISION_POINT_DECLINED_COOLDOWN,
             message=(
-                "review-validate-fix: 候选指纹处于 declined 冷却中（agent 已谢绝且改动未变），"
+                "review-validate-fix: 本会话曾谢绝开审且候选未变（本会话指纹冷却），"
                 "本次 Stop 静默停，不再注入。"
             ),
             repo=repo,

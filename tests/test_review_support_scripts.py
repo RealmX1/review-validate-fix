@@ -7431,7 +7431,7 @@ def test_decision_token_direct_minted_paths_to_ack_and_decline(tmp: Path) -> Non
     assert declined.state == dts.STATE_DECLINED
     assert declined.payload["decline_reason"] == "not this round"
     # decline 顺带把指纹写入冷却表。
-    assert dts.is_fingerprint_in_declined_cooldown(worktree="/wt", candidate_fingerprint="fpB", cooldown_root=cd_root)
+    assert dts.is_fingerprint_in_declined_cooldown(worktree="/wt", session_id="sb", candidate_fingerprint="fpB", cooldown_root=cd_root)
 
 
 def test_decision_token_illegal_transitions_rejected(tmp: Path) -> None:
@@ -7578,7 +7578,7 @@ def test_decision_token_dedup_same_key_returns_existing(tmp: Path) -> None:
 
 
 def test_decision_token_declined_fingerprint_cooldown_write_query(tmp: Path) -> None:
-    """declined 指纹冷却表读写：record/is/read/clear 按 (worktree, fingerprint) 键；
+    """declined 指纹冷却表读写：record/is/read/clear 按 (worktree, session_id, fingerprint) 键；
     冷却命中时 mint 返回 declined_cooldown 且不计入熔断。"""
     dts = load_rvf_decision_token_store_module()
     roots = _decision_token_store_roots(tmp)
@@ -7586,16 +7586,16 @@ def test_decision_token_declined_fingerprint_cooldown_write_query(tmp: Path) -> 
     t0 = _fixed_utc(0)
 
     path = dts.record_declined_fingerprint(
-        worktree="/wt", candidate_fingerprint="fpX", reason="too small", token="0123456789abcdef",
+        worktree="/wt", session_id="sc", candidate_fingerprint="fpX", reason="too small", token="0123456789abcdef",
         now=t0, cooldown_root=cd_root,
     )
     assert path.is_file()
-    assert dts.is_fingerprint_in_declined_cooldown(worktree="/wt", candidate_fingerprint="fpX", cooldown_root=cd_root)
+    assert dts.is_fingerprint_in_declined_cooldown(worktree="/wt", session_id="sc", candidate_fingerprint="fpX", cooldown_root=cd_root)
     # 键隔离：不同 worktree / 不同指纹都不命中。
-    assert not dts.is_fingerprint_in_declined_cooldown(worktree="/wt2", candidate_fingerprint="fpX", cooldown_root=cd_root)
-    assert not dts.is_fingerprint_in_declined_cooldown(worktree="/wt", candidate_fingerprint="fpY", cooldown_root=cd_root)
+    assert not dts.is_fingerprint_in_declined_cooldown(worktree="/wt2", session_id="sc", candidate_fingerprint="fpX", cooldown_root=cd_root)
+    assert not dts.is_fingerprint_in_declined_cooldown(worktree="/wt", session_id="sc", candidate_fingerprint="fpY", cooldown_root=cd_root)
 
-    payload = dts.read_declined_fingerprint(worktree="/wt", candidate_fingerprint="fpX", cooldown_root=cd_root)
+    payload = dts.read_declined_fingerprint(worktree="/wt", session_id="sc", candidate_fingerprint="fpX", cooldown_root=cd_root)
     assert payload is not None and payload["reason"] == "too small"
 
     # 冷却命中 → mint 拒铸为 declined_cooldown，且不记铸造请求。
@@ -7605,9 +7605,9 @@ def test_decision_token_declined_fingerprint_cooldown_write_query(tmp: Path) -> 
     assert dts.count_recent_mint_requests("sc", now=t0, root=cb_root) == 0, "冷却拒铸不应计入熔断"
 
     # clear 幂等：首删 True、再删 False，删后不再命中。
-    assert dts.clear_declined_fingerprint(worktree="/wt", candidate_fingerprint="fpX", cooldown_root=cd_root)
-    assert not dts.clear_declined_fingerprint(worktree="/wt", candidate_fingerprint="fpX", cooldown_root=cd_root)
-    assert not dts.is_fingerprint_in_declined_cooldown(worktree="/wt", candidate_fingerprint="fpX", cooldown_root=cd_root)
+    assert dts.clear_declined_fingerprint(worktree="/wt", session_id="sc", candidate_fingerprint="fpX", cooldown_root=cd_root)
+    assert not dts.clear_declined_fingerprint(worktree="/wt", session_id="sc", candidate_fingerprint="fpX", cooldown_root=cd_root)
+    assert not dts.is_fingerprint_in_declined_cooldown(worktree="/wt", session_id="sc", candidate_fingerprint="fpX", cooldown_root=cd_root)
 
 
 def test_decision_token_mint_explicit_user_request_clears_declined_cooldown(tmp: Path) -> None:
@@ -7622,11 +7622,11 @@ def test_decision_token_mint_explicit_user_request_clears_declined_cooldown(tmp:
     t0 = _fixed_utc(0)
 
     dts.record_declined_fingerprint(
-        worktree="/wt", candidate_fingerprint="fpU", reason="agent declined earlier",
+        worktree="/wt", session_id="su", candidate_fingerprint="fpU", reason="agent declined earlier",
         now=t0, cooldown_root=cd_root,
     )
     # 对照：默认（自动路径）仍被冷却挡住。
-    auto = dts.mint_decision_token(worktree="/wt", session_id="sa", candidate_fingerprint="fpU", now=t0, **roots)
+    auto = dts.mint_decision_token(worktree="/wt", session_id="su", candidate_fingerprint="fpU", now=t0, **roots)
     assert auto.outcome == dts.MINT_OUTCOME_DECLINED_COOLDOWN
     assert auto.explicit_user_request_overrode_agent_declined_cooldown is False
 
@@ -7640,10 +7640,11 @@ def test_decision_token_mint_explicit_user_request_clears_declined_cooldown(tmp:
     assert manual.declined_cooldown_record_still_blocks_automatic_path is False
     # 冷却记录已被物理清除 ⇒ 自动路径也解锁。
     assert not dts.is_fingerprint_in_declined_cooldown(
-        worktree="/wt", candidate_fingerprint="fpU", cooldown_root=cd_root
+        worktree="/wt", session_id="su", candidate_fingerprint="fpU", cooldown_root=cd_root
     )
-    auto_after = dts.mint_decision_token(worktree="/wt", session_id="sa", candidate_fingerprint="fpU", now=t0, **roots)
-    assert auto_after.outcome == dts.MINT_OUTCOME_MINTED
+    auto_after = dts.mint_decision_token(worktree="/wt", session_id="su", candidate_fingerprint="fpU", now=t0, **roots)
+    assert auto_after.outcome == dts.MINT_OUTCOME_DEDUPLICATED
+    assert auto_after.token == manual.token, "冷却已解除，仍须复用同会话尚在等待的决策 token"
 
     # 未命中冷却时两个标志都保持 False（不谎报推翻、也不谎报仍被挡）。
     fresh = dts.mint_decision_token(
@@ -7669,12 +7670,12 @@ def test_decision_token_mint_explicit_user_request_reports_override_even_when_co
     t0 = _fixed_utc(0)
 
     dts.record_declined_fingerprint(
-        worktree="/wt", candidate_fingerprint="fpW", reason="agent declined earlier",
+        worktree="/wt", session_id="sw", candidate_fingerprint="fpW", reason="agent declined earlier",
         now=t0, cooldown_root=cd_root,
     )
 
     # 只让「冷却表目录下的文件」删除失败，其余 unlink（token 落盘等）照常，避免误伤别处。
-    blocked_dir = dts.declined_fingerprint_root(cd_root).resolve()
+    blocked_dir = (dts.declined_fingerprint_root(cd_root) / dts.SESSION_SCOPED_DECLINED_CANDIDATE_FINGERPRINT_SUBDIRNAME).resolve()
     original_unlink = Path.unlink
 
     def unlink_failing_only_inside_declined_cooldown_dir(self, *args, **kwargs):
@@ -7697,10 +7698,13 @@ def test_decision_token_mint_explicit_user_request_reports_override_even_when_co
     # 磁盘事实：记录仍在，自动路径依旧被挡。
     assert manual.declined_cooldown_record_still_blocks_automatic_path is True
     assert dts.is_fingerprint_in_declined_cooldown(
-        worktree="/wt", candidate_fingerprint="fpW", cooldown_root=cd_root
+        worktree="/wt", session_id="sw", candidate_fingerprint="fpW", cooldown_root=cd_root
     )
+    # 手动 token 先终局化，排除活跃 token 去重门，让下一次自动申请确实走到冷却门。
+    dts.acknowledge_decision_token(manual.token, root=roots["root"], now=t0)
+    dts.mark_dispatched(manual.token, strictness="standard", root=roots["root"], now=t0)
     auto_after = dts.mint_decision_token(
-        worktree="/wt", session_id="sa", candidate_fingerprint="fpW", now=t0, **roots
+        worktree="/wt", session_id="sw", candidate_fingerprint="fpW", now=t0, **roots
     )
     assert auto_after.outcome == dts.MINT_OUTCOME_DECLINED_COOLDOWN
 
@@ -9289,7 +9293,7 @@ def test_agent_cli_decline_persists_reason_and_cooldown(tmp: Path) -> None:
 
     # 指纹入 declined 冷却表（指纹未变不再注入）。
     assert dts.is_fingerprint_in_declined_cooldown(
-        worktree=wt, candidate_fingerprint="fpDecline", cooldown_root=roots.cooldown_root
+        worktree=wt, session_id="s1", candidate_fingerprint="fpDecline", cooldown_root=roots.cooldown_root
     )
     # 遥测记 declined。
     assert "declined" in [r["event"] for r in read_jsonl(roots.telemetry_root / f"{tok}.jsonl")]
