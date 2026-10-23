@@ -911,7 +911,8 @@ require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scr
 # 开审前门禁需验证真实隔离 Git 与原生消息 schema，不能仅检查状态字段。
 run_step "tests: review_start_independent_user_turn_boundary" \
   python3 -m pytest -q "$tests_dir/test_review_start_independent_user_turn_boundary.py" \
-    "$tests_dir/test_review_start_boundary_request_retry.py"
+    "$tests_dir/test_review_start_boundary_request_retry.py" \
+    "$tests_dir/test_review_without_pre_review_base_absorption.py"
 # Kimi 激活态核对：installed.json 磁盘上**没有** state 字段（persist 只落 9 个），所以判定必须
 # 自己复算；且单条 hook 不过 schema 时 Kimi 只 warn + 丢弃该条、plugin 仍报 ok ⇒「看起来健康、
 # 实际 Stop hook 不存在」是零报错状态。核对脚本本身读 live infra，故只在 fixture 测试里跑。

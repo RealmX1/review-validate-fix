@@ -119,8 +119,7 @@ def run_request_review_start_boundary(
     changed = summary.get("candidate_fingerprint") != payload.get("candidate_fingerprint")
     if ordinary_source_was_superseded_by_boundary_request and changed:
         return result("review_start_boundary_invalidated", "候选已变化，不能用已撤回来源恢复旧请求")
-    bootstrap_preparation_is_quiescent = bool(payload.get("bootstrap_gate")) and not tokens.bootstrap_replay_claim_path(payload["token"], roots.token_root).exists()
-    if payload.get("state") == "acknowledged" and payload.get("run_anchor_dir") and not (payload.get("last_start_failure") or bootstrap_preparation_is_quiescent):
+    if payload.get("state") == "acknowledged" and payload.get("run_anchor_dir") and not payload.get("last_start_failure"):
         return result("review_start_boundary_invalidated", "此 token 已有准备中的 run；须先结束该准备尝试并释放范围，不能把旧准备转给新候选")
     if not reusing_requested_boundary or changed:
         if payload.get("state") in ("minted", "injected", "acknowledged"):

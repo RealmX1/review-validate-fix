@@ -108,7 +108,7 @@ def _start_fixture(tmp_path, monkeypatch):
     return cli, arguments, receipt
 
 
-@pytest.mark.parametrize('start_outcome', ['launch_preflight', 'provider_health', 'prepare_raised', 'prepare_failed', 'no_unreviewed_scope', 'bootstrap_waiting'])
+@pytest.mark.parametrize('start_outcome', ['launch_preflight', 'provider_health', 'prepare_raised', 'prepare_failed', 'no_unreviewed_scope'])
 def test_incomplete_start_never_activates_automatic_closeout(tmp_path, monkeypatch, start_outcome):
     cli, arguments, receipt = _start_fixture(tmp_path, monkeypatch)
     activations = []
@@ -116,8 +116,6 @@ def test_incomplete_start_never_activates_automatic_closeout(tmp_path, monkeypat
     def prepare(**kwargs):
         if start_outcome == 'prepare_raised':
             raise ValueError('准备异常')
-        if start_outcome == 'bootstrap_waiting':
-            return {'status': cli.rvf_bootstrap_gate.WAITING_STATUS, 'bootstrap_gate': {'required_skill': 'sync-local-base-into-task-worktree-only'}}
         return {'status': 'no_unreviewed_scope' if start_outcome == 'no_unreviewed_scope' else 'failed'}
     arguments['prepare_pipeline'] = prepare
     if start_outcome == 'launch_preflight':
@@ -125,12 +123,6 @@ def test_incomplete_start_never_activates_automatic_closeout(tmp_path, monkeypat
     if start_outcome == 'provider_health':
         arguments['provider_health_requirements_resolver'] = lambda backend: ['provider']
         arguments['provider_health_runner'] = lambda *args: {'status': 'failed', 'provider': 'provider'}
-    if start_outcome == 'bootstrap_waiting':
-        monkeypatch.setattr(cli.rvf_bootstrap_gate, 'reconcile_bootstrap_gate', lambda *args, **kwargs: cli.rvf_bootstrap_gate.BootstrapGateReconciliation(
-            outcome=cli.rvf_bootstrap_gate.OUTCOME_STILL_WAITING,
-            phase=cli.rvf_bootstrap_gate.PHASE_WAITING_FOR_LOCAL_BASE_BOOTSTRAP,
-            reason='等待同步', diagnostic='等待 local base 同步',
-        ))
     result = cli.run_start(**arguments)
     assert result.exit_code != 0
     assert result.token_state == cli.token_store.STATE_ACKNOWLEDGED

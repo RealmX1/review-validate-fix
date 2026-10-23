@@ -140,7 +140,12 @@ def require_review_start_boundary(
     verified = verify_independent_user_turn_boundary(
         receipt, token_payload=token_payload, repo=repo, session_id=session_id,
         native_boundary_reader=reader,
-        candidate_summary_builder=lambda: stop_decision_candidate_summary.build_candidate_summary(event=event, cwd=repo, repo=repo, ledger=None),
+        candidate_summary_builder=lambda: stop_decision_candidate_summary.build_candidate_summary(
+            event=event, cwd=repo, repo=repo, ledger=None,
+            committed_baseline_resolver=lambda *_: receipt.get("comparison_base_tip"),
+            committed_base_ref_resolver=lambda *_: receipt.get("comparison_base_ref"),
+            fixed_committed_round_base_tip=receipt.get("comparison_base_ref_tip"),
+        ),
     )
     # Git/候选核验可能耗时；状态迁移前重新读取活动分支，静态缓存不能成为授权。
     _read_or_reconcile_host_boundary_receipt(token_payload, verified)

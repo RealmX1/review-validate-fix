@@ -99,7 +99,7 @@ commit 的退出码（prepare 的 0 / 10 / 11 / 12 / 13 见上表，commit 按�
 | 26 | 已提交，但 commit 期间 hook 改变了提交内容：改写了文件（`reason_code=candidate_content_changed_during_commit`），或把 stage 集合外的路径加进了本次提交（`reason_code=committed_paths_outside_stage_set`，列在 `committed_paths_outside_stage_set`） | 提交已发生、不回滚；**未封窗、未写 evidence**，下一次 Stop 会照常审这些字节。如实报告被改写的文件；**不要手动封窗、不要伪造 evidence** |
 | 27 | 提交前拒绝：reviewer 报过 issue（或已有处置工件），而合并处置缺失 / 不合法 / 过期（`reason_code=merge_dispositions_check_failed`，明细在 `merge_dispositions_errors`） | 未 stage、未 commit。按明细用 `rvf merge write` 补齐处置（旧 run 的 fix-issue 需重新 upsert 记下 source_refs），`rvf merge check` 复核后重跑 commit。按保留开关留下 scope 外脏文件时 evidence 本就跳过，不做这道预检 |
 
-**land 前后不做任何 base intake。** 「当前 base 吸收了吗」归 prepare 侧门禁：`prepare_review_run.py` 在 `bootstrap_required_before_rvf` 时直接拒绝建 run，能走到 rvf-land 的 run 必然已经过闸。land 侧再加一道会自相矛盾：那道门禁要求的同步会重写 bootstrap receipt，亲手打破它自己依赖的冻结值。残余风险（marker 生效前产生的旧 handoff + 陈旧 worktree）已知且已接受。
+`rvf-land` 针对本轮已审候选提交并写入 evidence。需要回到 base 时，按后续 `base-branch-sync` 流程处理 base 漂移、语义交互与整合验证。
 
 ### 4. 可选 follow-up：按用户已明确请求继续 base-branch-sync
 

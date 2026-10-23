@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from independent_review_start_boundary_fixture import fixed_git_coordinates_for_review_start_boundary_unit_test
 
 from _rvf_test_support.repo import templated_repo
 from _rvf_test_support.compact_path_tree_assertions import paths_from_compact_path_tree_blocks
@@ -455,7 +456,7 @@ def load_hook_module():
     # 保留旧后端/状态测试的职责；真实 gate 与子进程绕过面由专用集成套件验证。
     import types
     from independent_review_start_boundary_fixture import run_subprocess_with_independent_review_start_boundary
-    module.require_review_start_boundary_for_prepare = lambda **kw: {"test_scope": "stop-routing-unit"}
+    module.require_review_start_boundary_for_prepare = lambda **kw: fixed_git_coordinates_for_review_start_boundary_unit_test(kw["repo"], test_scope="stop-routing-unit")
     module.bind_review_start_boundary_to_one_run = lambda **kw: (kw["run_id"], Path(kw["run_dir"]) if kw["run_dir"] is not None else None)
     module.subprocess = types.SimpleNamespace(**vars(subprocess))
     module.subprocess.run = run_subprocess_with_independent_review_start_boundary
@@ -6307,15 +6308,6 @@ def main() -> int:
         test_kanban_followup_stale_takeover_rechecks_marker_before_unlink,
         test_kanban_followup_shared_lock_blocks_second_dispatch_with_different_state_roots,
         test_awaiting_dispatched_agent_marker_skips_rvf_when_main_agent_parks_on_dispatch,
-        test_kanban_followup_waiting_bootstrap_lock_directs_sync_instead_of_handoff,
-        test_kanban_followup_stale_waiting_bootstrap_lock_revives_instead_of_reopening,
-        test_kanban_followup_bootstrap_gate_resume_reuses_run_and_artifact_loss_clears,
-        test_kanban_followup_stale_bootstrap_gate_resume_reactivates_lock,
-        test_kanban_followup_bootstrap_replay_claim_is_atomic_across_concurrent_stops,
-        test_kanban_followup_lock_without_bootstrap_gate_keeps_legacy_stale_consumption,
-        test_kanban_followup_bootstrap_waiting_is_bounded_by_reengage_and_revive_budgets,
-        test_kanban_followup_bootstrap_replay_classifies_artifact_loss_and_retries_after_timeout,
-        test_kanban_followup_bootstrap_reengage_budget_exhausted_diagnostic_splits_replay_pending,
         test_accepted_review_run_receipt_suppresses_repeated_decision_point_injection,
         test_rewound_acceptance_reconciles_receipt_via_decision_token_needle,
         test_kanban_followup_awaiting_agent_decision_lock_skips_without_nudging,
@@ -6503,7 +6495,6 @@ def main() -> int:
         test_revived_in_progress_lock_never_outlives_the_revival_absolute_cap,
         # 心跳坐在 bootstrap「复活预算耗尽 ⇒ 放弃本轮」的 fall-through 上，必须尊重那个放弃。
         # 走调用方，因为只调内层函数的既有守卫对这条缝结构性失明（假绿）。
-        test_bootstrap_revive_budget_exhaustion_is_not_undone_by_run_activity_heartbeat,
     ]
     assert_every_defined_test_is_registered(
         globals(),

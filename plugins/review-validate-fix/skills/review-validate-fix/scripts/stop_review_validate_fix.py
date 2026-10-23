@@ -111,7 +111,6 @@ try:
     import codex_invoked_skill
 except Exception:  # pragma: no cover - structured read is best-effort
     codex_invoked_skill = None
-import rvf_bootstrap_gate
 from kanban_followup_trigger_transcript_presence import (
     TRIGGER_PRESENCE_OFF_ANCESTOR_CHAIN_REWOUND,
     TRIGGER_PRESENCE_ON_ANCESTOR_CHAIN,
@@ -123,7 +122,6 @@ from kanban_followup_trigger_transcript_presence import (
 from kanban_followup_lock import (
     STATE_DELIVERED_AWAITING_AGENT_DECISION as KANBAN_FOLLOWUP_LOCK_STATE_AWAITING_DECISION,
     STATE_IN_PROGRESS as KANBAN_FOLLOWUP_LOCK_STATE_IN_PROGRESS,
-    STATE_WAITING_BOOTSTRAP as KANBAN_FOLLOWUP_LOCK_STATE_WAITING_BOOTSTRAP,
     STATUS_ACTIVE as KANBAN_FOLLOWUP_LOCK_ACTIVE,
     STATUS_STALE as KANBAN_FOLLOWUP_LOCK_STALE,
     marker_state as kanban_followup_lock_state,
@@ -138,11 +136,6 @@ from kanban_followup_lock import (
     seconds_since_last_run_activity as seconds_since_last_in_flight_rvf_run_activity,
     marker_exceeds_revival_absolute_cap as kanban_followup_lock_exceeds_revival_absolute_cap,
     seconds_since_marker_armed as seconds_since_kanban_followup_lock_armed,
-    stamp_bootstrap_gate as stamp_kanban_followup_bootstrap_gate,
-    bootstrap_reengage_count as kanban_followup_bootstrap_reengage_count,
-    bump_bootstrap_reengage_count as bump_kanban_followup_bootstrap_reengage_count,
-    claim_bootstrap_replay_in_flight as claim_kanban_followup_bootstrap_replay_in_flight,
-    release_bootstrap_replay_in_flight as release_kanban_followup_bootstrap_replay_in_flight,
     marker_status as kanban_followup_lock_status,
     read_marker as read_kanban_followup_lock,
     reengage_nudge_count as kanban_followup_lock_nudge_count,
@@ -3521,412 +3514,6 @@ def awaiting_dispatched_agent_decision(
     )
 
 
-KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_TIMEOUT_ENV = (
-    "RVF_KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_TIMEOUT_SECONDS"
-)
-DEFAULT_KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_TIMEOUT_SECONDS = 60
-# 等待态的**终止界**。护住一轮 bootstrap 等待是对的，但无界地护住它只是把 32cad 的「反复重开」
-# 换成同样糟糕的「永久驻留」：agent 若始终没能完成吸收（skill 不可用、冲突无人解、用户已转去
-# 做别的事），锁会一直被复活、Stop 会一直被 block。故给两条界：
-#   - re-engage 预算用尽 → 退回静默 skip（不再硬挡 agent 干停，仍留 user-facing 诊断）；
-#   - 复活次数用尽 → 不再复活，让既有 stale 语义接手清锁，本轮被明确放弃而不是无限驻留。
-KANBAN_FOLLOWUP_BOOTSTRAP_REENGAGE_BUDGET_ENV = (
-    "RVF_KANBAN_FOLLOWUP_BOOTSTRAP_REENGAGE_BUDGET"
-)
-DEFAULT_KANBAN_FOLLOWUP_BOOTSTRAP_REENGAGE_BUDGET = 3
-KANBAN_FOLLOWUP_BOOTSTRAP_REVIVE_BUDGET_ENV = "RVF_KANBAN_FOLLOWUP_BOOTSTRAP_REVIVE_BUDGET"
-DEFAULT_KANBAN_FOLLOWUP_BOOTSTRAP_REVIVE_BUDGET = 3
-# 一次 prepare 重放的**并发**去重窗口。占位在起 replay **之前**抢、在这次
-# `replay_prepare_for_gate` 收尾时释放，所以窗口只需要覆盖「一个还活着的持有者最长可能持有它
-# 多久」= 重放预算 + 子进程强杀余量（`rvf_bootstrap_gate.REPLAY_SUBPROCESS_KILL_GRACE_SECONDS`）
-# + 一段余量；余量的用途是在持有者**崩在半路**（Stop hook 进程被 harness 预算杀掉、机器休眠）时
-# 让下一个 Stop 接手，而不是让占位永久堵死本轮。
-#
-# 刻意**不再**是 15min 量级：那个默认值来自「重放超时后后台 prepare worker 仍在写同一个 run
-# 目录、故整个窗口内不得再起第二次」的旧立论，而重放子进程化之后它已不成立（见下面
-# receipt_valid 分支里对 timeout 的处理）。窗口太长的代价是实打实的：一个本可立刻重试的可恢复
-# 轮次会被白挡满一整个窗口。
-KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_IN_FLIGHT_WINDOW_ENV = (
-    "RVF_KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_IN_FLIGHT_WINDOW_SECONDS"
-)
-KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_IN_FLIGHT_WINDOW_MARGIN_SECONDS = 60
-
-
-def _kanban_followup_bootstrap_replay_in_flight_window_seconds() -> float:
-    """在途重放占位的接手窗口（秒）：默认按重放的**硬上限**推导，env 可覆盖。
-
-    推导而不是写死一个常数，是为了让「窗口 ≥ 一次合法重放的最长时长」这条不变式在
-    `RVF_KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_TIMEOUT_SECONDS` 被调大时自动成立——否则窗口会短于
-    一次仍在跑的重放，另一个 Stop 就能就地接手并起第二次 prepare，正是占位要防的事。
-    """
-    replay_timeout = _kanban_followup_env_int(
-        KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_TIMEOUT_ENV,
-        DEFAULT_KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_TIMEOUT_SECONDS,
-    )
-    derived_default = int(
-        replay_timeout
-        + rvf_bootstrap_gate.REPLAY_SUBPROCESS_KILL_GRACE_SECONDS
-        + KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_IN_FLIGHT_WINDOW_MARGIN_SECONDS
-    )
-    return float(
-        _kanban_followup_env_int(
-            KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_IN_FLIGHT_WINDOW_ENV, derived_default
-        )
-    )
-
-
-BOOTSTRAP_REPLAY_IN_FLIGHT_REASON = "bootstrap_replay_in_flight"
-BOOTSTRAP_REPLAY_INCOMPLETE_REASON = "bootstrap_replay_incomplete"
-# 这两条等待的共同前提是「receipt 已验证通过、只差 prepare 收尾」，与「还没吸收 base」相反：
-# 给 agent 的定向指令必须换成「别再跑同步 skill / 别动 receipt」，否则重跑会产出另一份 receipt，
-# 下一轮按 digest 判 tampered（RVF-002 把 digest 落盘之后这条路径才真正生效）。
-BOOTSTRAP_REPLAY_PENDING_REASONS = frozenset(
-    {BOOTSTRAP_REPLAY_IN_FLIGHT_REASON, BOOTSTRAP_REPLAY_INCOMPLETE_REASON}
-)
-
-
-def _bootstrap_replay_error_text(replay: dict[str, Any] | None) -> str:
-    """从一次重放结果里取出人类可读的 error（缺省空串）。"""
-    if not isinstance(replay, dict):
-        return ""
-    error = replay.get("error")
-    return str(error) if error else ""
-
-
-def _bootstrap_replay_in_flight_reconciliation(
-    reconciliation: rvf_bootstrap_gate.BootstrapGateReconciliation,
-    *,
-    age_seconds: float,
-    window_seconds: float,
-) -> rvf_bootstrap_gate.BootstrapGateReconciliation:
-    """把「**另一个** Stop 此刻正在跑本轮重放」渲染成一条可区分的等待结论（不 resume、不清锁）。
-
-    与 ``bootstrap_replay_incomplete`` 分开：那条是「本进程起的这次重放已经收尾但没成功、下一次
-    Stop 可以立刻再试」，这条是「占位被别人握着，本轮**刻意不起第二次**」——占位只在一次
-    `replay_prepare_for_gate` 调用期间存在，所以它在途 = 真的有另一个进程正在写这个 run。
-    """
-    return rvf_bootstrap_gate.BootstrapGateReconciliation(
-        outcome=rvf_bootstrap_gate.OUTCOME_STILL_WAITING,
-        phase=rvf_bootstrap_gate.PHASE_BOOTSTRAP_INTERRUPTED_RETRYABLE,
-        reason=BOOTSTRAP_REPLAY_IN_FLIGHT_REASON,
-        diagnostic=(
-            "bootstrap receipt 已通过校验，另一个 Stop 此刻正在跑本轮 prepare 重放"
-            f"（占位已在途 {age_seconds:.0f}s / 接手窗口 {window_seconds:.0f}s）；"
-            "为避免同一个 run 目录被并发重复写入，本次不再启动第二次重放。"
-        ),
-        resume_run_id=reconciliation.resume_run_id,
-        resume_run_dir=reconciliation.resume_run_dir,
-    )
-
-
-def _kanban_followup_bootstrap_gate_decision(
-    ledger: RunLedger,
-    *,
-    marker: dict[str, Any],
-    task_id: str | None,
-    session_id: str | None,
-    cwd: str | None,
-    store_expired: bool,
-) -> tuple[bool, StopDecision | None]:
-    """in-progress 锁上挂着 bootstrap 等待 gate 时的读侧判定。返回 ``(handled, decision)``。
-
-    ``handled=False`` = 这把锁与 bootstrap 无关，调用方继续走原有 active / stale 逻辑。
-
-    这里同时堵住 32cad 家族的根因：等待期跨过 1h 锁 TTL 时，原 stale 分支会无条件清锁 +
-    ``return None``，让常规 gate 把这一轮当成「没人在跑」而重铸 token / 重开 run。改为先按
-    gate 重新判定——仍在等 / 冲突未解 / 证据不可信一律 **revive 锁并定向 re-engage**（既不清、
-    也不新开）；receipt 有效才按**原 run** 重放 prepare；只有工件确实丢了才清锁回 fresh。
-    """
-    gate = rvf_bootstrap_gate.gate_of(marker)
-    if not rvf_bootstrap_gate.is_waiting_gate(gate):
-        return False, None
-    assert gate is not None  # narrow for readers
-    marker_path = marker.get("_marker_path")
-    reconciliation = rvf_bootstrap_gate.reconcile_bootstrap_gate(
-        gate, store_expired=store_expired
-    )
-
-    def _event(name: str, **fields: Any) -> None:
-        # reconciliation 的字段一律带 ``bootstrap_`` 前缀落账：它自带 ``phase``/``reason``，
-        # 与 ledger.event 自己的 phase / reason_code 形参同名，直接 spread 会撞成重复关键字。
-        ledger.event(
-            phase="gate",
-            event=name,
-            status="completed",
-            reason_code=f"kanban_followup_bootstrap_{reconciliation.reason}",
-            cwd=cwd,
-            cline_kanban_task_id=task_id,
-            session_id=session_id,
-            kanban_followup_in_progress_marker_path=marker_path,
-            bootstrap_gate=dict(gate),
-            **{f"bootstrap_{key}": value for key, value in reconciliation.to_dict().items()},
-            **fields,
-        )
-
-    def _artifacts_lost(event_name: str) -> tuple[bool, StopDecision | None]:
-        # 等待期工件已消失 → 这一轮无从恢复（也无在途工作可撞）。清锁回 fresh 是安全的，
-        # 并把丢失原因显式落账，避免它表现成一次无声的「锁自己没了」。
-        removed = clear_kanban_followup_lock(
-            task_id=task_id,
-            session_id=session_id,
-            repo=kanban_followup_lock_repository_anchor(cwd=cwd, marker=marker),
-        )
-        _event(event_name, consumed_kanban_followup_in_progress_marker_paths=removed)
-        return True, None
-
-    if reconciliation.outcome == rvf_bootstrap_gate.OUTCOME_ARTIFACT_LOST:
-        return _artifacts_lost("kanban_followup_bootstrap_gate_artifacts_lost")
-
-    if reconciliation.outcome == rvf_bootstrap_gate.OUTCOME_RECEIPT_VALID:
-        # ①「继续持有等待态」前先把校验通过的 receipt 路径/digest 盖回锁上的 gate。
-        # `build_bootstrap_gate` 造 gate 时 receipt 还不存在（digest 恒为 None），没有这一步，
-        # `bootstrap_receipt_digest_changed` 那条篡改判据在真实路径上永远不可达：后续每一轮
-        # 都只做身份校验，一份被替换但仍能通过身份校验的 receipt 不会被判成篡改。
-        gate = rvf_bootstrap_gate.gate_with_verified_receipt(gate, reconciliation)
-        stamp_kanban_followup_bootstrap_gate(marker, gate=gate)
-
-        # ② 起重放**之前**先原子 claim，收尾时释放（见下面的 elif claimed 分支）。抢不到 =
-        # 另一个 Stop 此刻正握着占位跑这一轮重放，本轮绝不能再起第二次（同一 prep / 同一 run_id
-        # 会并发重复写同一个 run 目录）。占位必须**先于** replay 且落在 marker payload 之外：
-        # 事后才写标记的话，两个并发 Stop 会同时读到「无在途标记」并各自进入 replay；
-        # 而写进 marker 的话，另一个 Stop 上面 ① 的整份读-改-写会把刚落的占位抹掉。
-        in_flight_window = _kanban_followup_bootstrap_replay_in_flight_window_seconds()
-        replay: dict[str, Any] | None = None
-        replay_status: str | None = None
-        claimed, in_flight_age = claim_kanban_followup_bootstrap_replay_in_flight(
-            marker, window_seconds=in_flight_window
-        )
-        if not claimed:
-            reconciliation = _bootstrap_replay_in_flight_reconciliation(
-                reconciliation,
-                age_seconds=in_flight_age if in_flight_age is not None else 0.0,
-                window_seconds=in_flight_window,
-            )
-        else:
-            # 抢到了（含「上一枚占位已过接手窗口 → 就地接手」：那个持有者已经崩在半路，
-            # 允许再试一次；prep 若已被另一个 Stop 的重放推进为 completed，本次重放幂等短路直接成功）。
-            replayed = rvf_bootstrap_gate.replay_prepare_for_gate(
-                gate,
-                timeout_seconds=float(
-                    _kanban_followup_env_int(
-                        KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_TIMEOUT_ENV,
-                        DEFAULT_KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_TIMEOUT_SECONDS,
-                    )
-                ),
-            )
-            replay = replayed if isinstance(replayed, dict) else None
-            replay_status = replay.get("status") if replay is not None else None
-        if replay_status in {PENDING, INVALIDATED}:
-            if claimed:
-                release_kanban_followup_bootstrap_replay_in_flight(marker)
-            return True, skip_decision(
-                _bootstrap_replay_error_text(replay) or "开审分界尚未验证，不能恢复正式审查。",
-                ledger, replay_status, cwd=cwd,
-            )
-        if replay_status == rvf_bootstrap_gate.REPLAY_STATUS_COMPLETED:
-            assert replay is not None  # narrow for readers
-            # bootstrap 收尾 → 进入 REVIEWING：摘掉 gate、锁回 in_progress（**不清锁**，
-            # 否则常规 gate 会把这一轮当没人跑而重开），并 force-continue 让 agent 接着审。
-            if store_expired:
-                # 本轮是从 STALE 分支进来的：只把 state 改回 in_progress **不够**。
-                # `stamp_bootstrap_gate` 是读-改-写，会原样保留已经过期的 ``expires_at``，
-                # 于是下一次 Stop 仍判 stale；而此时 gate 已被摘掉 → 本函数 handled=False →
-                # 交还既有 stale 分支 clear_kanban_followup_lock + return None → 常规 gate
-                # 判「没人在跑」→ 为同一个仍在继续的 run 再开一轮 review。正是这套改动本来
-                # 要根治的 32cad 失败模式在这条路径上原样复活。故摘 gate 的同时必须把锁续期
-                # 回 active：下一次 Stop 读到的必须是一把 **active 的 in_progress 锁**。
-                revive_kanban_followup_lock(marker)
-            stamp_kanban_followup_bootstrap_gate(
-                marker, gate=None, state=KANBAN_FOLLOWUP_LOCK_STATE_IN_PROGRESS
-            )
-            _event(
-                "kanban_followup_bootstrap_gate_resolved",
-                resumed_run_id=replay.get("run_id"),
-                resumed_run_dir=replay.get("run_dir"),
-            )
-            return True, reengage_decision(
-                "local base 已吸收、bootstrap receipt 校验通过，本轮 RVF 的 prepare 已就绪"
-                f"（run_id={replay.get('run_id') or '<unknown>'}，"
-                f"run_dir={replay.get('run_dir') or '<unknown>'}）。"
-                "请继续完成**这一轮**的 review 并 handoff，**不要**新开 review。",
-                ledger,
-                reason_code="kanban_followup_bootstrap_resumed",
-                cwd=cwd,
-                cline_kanban_task_id=task_id,
-                session_id=session_id,
-                kanban_followup_in_progress_marker_path=marker_path,
-                active_rvf_run_id=replay.get("run_id"),
-                active_rvf_run_dir=replay.get("run_dir"),
-                **stop_hook_rvf_state_fields(
-                    phase="complete",
-                    backend="kanban-followup",
-                    backend_raw="kanban-followup",
-                    completion_gate="kanban_followup_bootstrap_resumed",
-                ),
-            )
-        elif replay_status == rvf_bootstrap_gate.REPLAY_STATUS_ARTIFACT_LOST:
-            # prep 文件已不可用（TTL 300s ≪ 一次 bootstrap 等待，且 sweep_stale 会删它）：
-            # 这一轮**没有**可恢复的在途工作，继续硬等只会白白熬光 re-engage / revive 预算。
-            # 走与 reconcile 级 artifact_lost 同一条「显式诊断 + 清锁安全重来」路径。
-            reconciliation = rvf_bootstrap_gate.BootstrapGateReconciliation(
-                outcome=rvf_bootstrap_gate.OUTCOME_ARTIFACT_LOST,
-                phase=rvf_bootstrap_gate.PHASE_BOOTSTRAP_INTERRUPTED_RETRYABLE,
-                reason="bootstrap_replay_artifact_lost",
-                diagnostic=(
-                    "bootstrap receipt 已通过校验，但本轮 prepare 的 prep 工件已不可用"
-                    f"（{_bootstrap_replay_error_text(replay) or '<unknown>'}）；"
-                    "本轮无从恢复，已清锁以便安全重来。"
-                ),
-            )
-            return _artifacts_lost("kanban_followup_bootstrap_gate_replay_artifact_lost")
-        elif claimed:
-            # 抢到占位、也确实起了重放，但它既没 completed 也没 artifact_lost（timeout / failed /
-            # 又撞回 waiting_local_base_bootstrap，或契约外地没回传可分类 status）：一律
-            # 「**释放占位** + 维持等待、绝不清锁」，让下一次 Stop 能立刻重试同一个 run 的 prepare。
-            #
-            # timeout 也走这里（而不是扣着占位硬扛满一个替换窗口）：重放跑在独立子进程里
-            # （`rvf_bootstrap_gate._replay_prepare_in_subprocess`）——内层预算到点由子进程写完结果
-            # `os._exit`（那个非守护 prepare worker 线程随进程一起消失），外层硬上限到点按**进程组**
-            # SIGKILL，两种收尾都不留在途的 prepare 写者。原先「`prepare_run_from_prep_file` 只
-            # shutdown(wait=False)、后台 worker 仍在写同一个 run 目录」的保留立论随子进程化失效；
-            # 并发去重本来就由 replay **之前**那次 O_EXCL claim 负责，与超时后是否保留占位无关。
-            # 继续扣着占位只会把一轮本可立刻重试的可恢复失败白拖满窗口，还给 agent 一条事实错误的
-            # 「仍在后台进行」。超时后真正的残留只剩被 orphan 的 git 孙进程（index.lock 量级、秒级
-            # 自消；真撞上也只是下一次重放再报一次可重试失败），远小于任何有意义的窗口。
-            release_kanban_followup_bootstrap_replay_in_flight(marker)
-            replay_error = _bootstrap_replay_error_text(replay)
-            reconciliation = rvf_bootstrap_gate.BootstrapGateReconciliation(
-                outcome=rvf_bootstrap_gate.OUTCOME_STILL_WAITING,
-                phase=rvf_bootstrap_gate.PHASE_BOOTSTRAP_INTERRUPTED_RETRYABLE,
-                reason=BOOTSTRAP_REPLAY_INCOMPLETE_REASON,
-                diagnostic=(
-                    "bootstrap receipt 已通过校验，但本轮 prepare 重放未完成"
-                    f"（status={replay_status or '<unknown>'}"
-                    f"{'，' + replay_error if replay_error else ''}）；"
-                    "重放已收尾、没有在途写者，下一次 Stop 会立刻重试同一个 run 的 prepare。"
-                ),
-                resume_run_id=reconciliation.resume_run_id,
-                resume_run_dir=reconciliation.resume_run_dir,
-            )
-
-    # still_waiting / conflict / tampered（含重放未成）：**既不 resume 也不 clear**。
-    # 锁过期就地复活，让这一轮继续被保护，然后给一条模型可见的定向指令。
-    #
-    # 「等的是什么」必须在**所有**下游出口之前定下来：receipt 已验证通过、只差 prepare 收尾
-    # （replay_pending）与「base 还没吸收」是方向完全相反的两种等待，任何一条出口把前者当后者
-    # 渲染，就是在教人去再跑一次同步 skill —— 那会产出第二份 receipt，下一轮按 digest 判 tampered
-    # 把这一轮锁死。
-    replay_pending = reconciliation.reason in BOOTSTRAP_REPLAY_PENDING_REASONS
-    revive_budget = _kanban_followup_env_int(
-        KANBAN_FOLLOWUP_BOOTSTRAP_REVIVE_BUDGET_ENV,
-        DEFAULT_KANBAN_FOLLOWUP_BOOTSTRAP_REVIVE_BUDGET,
-    )
-    if store_expired:
-        if kanban_followup_lock_revive_count(marker) >= revive_budget:
-            # 复活预算耗尽：本轮 bootstrap 迟迟没完成，交还给既有 stale 语义清锁并明确放弃，
-            # 而不是让一把永不过期的等待锁长期挡住这个 task。
-            _event(
-                "kanban_followup_bootstrap_gate_revive_budget_exhausted",
-                bootstrap_revive_budget=revive_budget,
-            )
-            return False, None
-        revive_kanban_followup_lock(marker)
-    reengage_budget = _kanban_followup_env_int(
-        KANBAN_FOLLOWUP_BOOTSTRAP_REENGAGE_BUDGET_ENV,
-        DEFAULT_KANBAN_FOLLOWUP_BOOTSTRAP_REENGAGE_BUDGET,
-    )
-    if kanban_followup_bootstrap_reengage_count(marker) >= reengage_budget > 0:
-        # 定向指令已给够却仍没进展：不再硬挡 agent 干停（防死循环），但等待态原样保留——
-        # 下一轮 Stop 若发现 receipt 已就绪，仍会按原 run 接续。
-        _event(
-            "kanban_followup_bootstrap_gate_reengage_budget_exhausted",
-            bootstrap_reengage_budget=reengage_budget,
-        )
-        return True, skip_decision(
-            (
-                # replay_pending：base 早已吸收、receipt 也已校验通过，只差 prepare 收尾。这条
-                # 出口落进 ledger summary/events，是事后排障的记录——写成「需要先跑同步 skill」
-                # 会把排障的人推向本函数下方 `bootstrap_replay_pending_reengage_reason` 明确
-                # 禁止的动作（再产一份 receipt → 下一轮判 tampered 锁死本轮）。
-                "本轮 Cline Kanban RVF follow-up 的 pre-review local-base bootstrap **已完成**"
-                f"（run_id={marker.get('run_id') or '<unknown>'}，"
-                f"local base `{gate.get('local_base_ref') or '<unknown>'}` 已吸收、"
-                "bootstrap receipt 已校验通过，只差本轮 prepare 收尾；"
-                "**不要**再跑一次同步 skill 或改动 receipt）；"
-                if replay_pending
-                else "本轮 Cline Kanban RVF follow-up 仍卡在 pre-review local-base bootstrap"
-                f"（run_id={marker.get('run_id') or '<unknown>'}，"
-                f"需要先跑 `{gate.get('required_sync_skill') or '<sync skill>'}` "
-                f"吸收 local base `{gate.get('local_base_ref') or '<unknown>'}`）；"
-            )
-            + "定向提示预算已用尽，本次 Stop 不再打断，也不会新开一轮 RVF。",
-            ledger,
-            "kanban_followup_waiting_local_base_bootstrap",
-            cwd=cwd,
-            backend="kanban-followup",
-            cline_kanban_task_id=task_id,
-            session_id=session_id,
-            kanban_followup_in_progress_marker_path=marker_path,
-            bootstrap_phase=reconciliation.phase,
-            active_rvf_run_id=marker.get("run_id"),
-            active_rvf_run_dir=marker.get("run_dir"),
-            **stop_hook_rvf_state_fields(
-                phase="complete",
-                backend="kanban-followup",
-                backend_raw="kanban-followup",
-                completion_gate="kanban_followup_waiting_local_base_bootstrap",
-            ),
-        )
-    bumped = bump_kanban_followup_bootstrap_reengage_count(marker)
-    _event(
-        (
-            "kanban_followup_bootstrap_gate_replay_pending"
-            if replay_pending
-            else "kanban_followup_bootstrap_gate_waiting"
-        ),
-        lock_revived=store_expired,
-        bootstrap_reengage_count=bumped,
-        bootstrap_reengage_budget=reengage_budget,
-    )
-    return True, reengage_decision(
-        (
-            rvf_bootstrap_gate.bootstrap_replay_pending_reengage_reason(
-                gate,
-                reconciliation,
-                resume_hint=(
-                    "本轮会在下一次 Stop 自动接续 prepare 并进入 review；"
-                    "在那之前 RVF 不会另开一轮。"
-                ),
-            )
-            if replay_pending
-            else rvf_bootstrap_gate.bootstrap_waiting_reengage_reason(
-                gate,
-                reconciliation,
-                resume_hint=(
-                    "完成后本轮会在下一次 Stop 自动接续 prepare 并进入 review；"
-                    "在那之前 RVF 不会另开一轮。"
-                ),
-            )
-        ),
-        ledger,
-        reason_code=f"kanban_followup_bootstrap_{reconciliation.reason}",
-        cwd=cwd,
-        cline_kanban_task_id=task_id,
-        session_id=session_id,
-        kanban_followup_in_progress_marker_path=marker_path,
-        bootstrap_phase=reconciliation.phase,
-        bootstrap_outcome=reconciliation.outcome,
-        active_rvf_run_id=marker.get("run_id"),
-        active_rvf_run_dir=marker.get("run_dir"),
-        **stop_hook_rvf_state_fields(
-            phase="complete",
-            backend="kanban-followup",
-            backend_raw="kanban-followup",
-            completion_gate="kanban_followup_waiting_local_base_bootstrap",
-        ),
-    )
-
-
 # ── 清 kanban-followup 锁时的 tracker lease 回收 ────────────────────────────────────
 # 清锁只写掉「别再催这一轮」这一件事，这一轮 RVF 在 tracker 里占着的 scope lease 不会因此消失。
 # kanban-followup 的 lease 默认 2h（DEFAULT_KANBAN_FOLLOWUP_LEASE_TTL_SECONDS），而 awaiting
@@ -4102,8 +3689,7 @@ def _kanban_followup_awaiting_agent_decision_decision(
 ) -> tuple[bool, StopDecision | None]:
     """处理 ``delivered_awaiting_agent_decision`` 态，返回 ``(handled, decision)``。
 
-    - trigger 确在祖先链上 → **升格**（按有无 bootstrap gate 落到 waiting_bootstrap /
-      in_progress），``handled=False`` 让调用方落回常规分支（nudge 预算等一切照旧）。
+    - trigger 确在祖先链上 → **升格**到 in_progress，``handled=False`` 让调用方落回常规分支。
     - 尚未确认落地且锁仍在 awaiting 短窗内 → ``skip_decision``：**只做互斥去重，不发 nudge**。
       这正是本次要根治的那一格——历史实现在这里会催 agent「收尾这一轮」。
     - awaiting 短窗已过仍未确认 → 清锁 + **释放本轮 lease** 交回常规 gate，按**当时**工作树重新
@@ -4138,7 +3724,7 @@ def _kanban_followup_awaiting_agent_decision_decision(
         if promoted_state:
             return False, None
         # 升格写盘失败（``promote_...`` 只在 OSError 时返回 None）→ **磁盘上这把锁仍是 awaiting**。
-        # 此处绝不能 ``return False, None`` 把它交给下面的常规 in_progress / bootstrap 分支：那条
+        # 此处绝不能 ``return False, None`` 把它交给下面的常规 in_progress 分支：那条
         # 路会对一把「磁盘态仍是未确认接手」的锁发 re-engage nudge——正是本轮要根治的那个行为
         # （ledger 记了 warning 但控制流照走，等于没 fail-closed）。故 fail-closed：往下继续按
         # awaiting 处理（窗口内只互斥去重、不 nudge；窗口已过则回收 + 释放 lease），下一次 Stop
@@ -4350,7 +3936,7 @@ def kanban_followup_in_progress_decision(
         )
         if handled:
             return awaiting_decision
-        # 升格成功（trigger 确在祖先链上）→ 落回下面的常规 in_progress / waiting_bootstrap 分支。
+        # 升格成功（trigger 确在祖先链上）→ 落回下面的常规 in_progress 分支。
         status = kanban_followup_lock_status(marker)
         lock_state = kanban_followup_lock_state(marker)
 
@@ -4390,19 +3976,6 @@ def kanban_followup_in_progress_decision(
                 removed_kanban_followup_in_progress_marker_paths=removed_lock,
             )
             return None
-        # bootstrap 等待：这一轮**还没开始 review**，只是在等 local base 被吸收。必须排在下面的
-        # nudge/skip 之前——那两条都以「review 正在跑、只差 handoff」为前提，对一个还卡在
-        # bootstrap 门前的 agent 发「继续收尾、输出 handoff」是错误指令。
-        handled, bootstrap_decision = _kanban_followup_bootstrap_gate_decision(
-            ledger,
-            marker=marker,
-            task_id=task_id,
-            session_id=session_id,
-            cwd=cwd,
-            store_expired=False,
-        )
-        if handled:
-            return bootstrap_decision
         # B（re-engage nudge）：锁 active 但 agent 停在「未 handoff」处时，历史行为是无条件
         # 返回 {"continue":true} 静默放行 → agent 当回合干停、RVF 不再 force-continue，于是它
         # 被这把锁一路静默挡停直到 handoff/TTL（实测曾冻 47min）。这里改为：在 nudge 预算内
@@ -4504,20 +4077,6 @@ def kanban_followup_in_progress_decision(
             ),
         )
 
-    # 锁已过 TTL（stale / invalid）。清它之前先问一句：这一轮是不是只是**还在等 bootstrap**？
-    # 若是，清锁会让常规 gate 判「没人在跑」而重铸 token / 重开 run——正是历史上那条既漏审又
-    # 多派的路径。等待态一律改为就地复活 + 定向 re-engage，只有工件真丢了才落到下面的清理。
-    handled, bootstrap_decision = _kanban_followup_bootstrap_gate_decision(
-        ledger,
-        marker=marker,
-        task_id=task_id,
-        session_id=session_id,
-        cwd=cwd,
-        store_expired=True,
-    )
-    if handled:
-        return bootstrap_decision
-
     # 心跳续期（B）：清锁之前再问一句「这一轮其实还在跑吗？」
     #
     # 原本这里是无条件清锁 —— 而 TTL 被证实短于它要保护的事件（实测 p50 = 84.3min、53% 超过
@@ -4534,11 +4093,8 @@ def kanban_followup_in_progress_decision(
     # 拿不到证据（run_dir 缺失 / 不可读 / 久无活动）一律**不**续期：抑制性凭证的失败方向必须是
     # 「多问一次」而不是「静默续命」。
     #
-    # 绝对硬顶（F2a：任何 wait 分支都要有与被等对象无关的上界）由**本调用点**负责，不塞进
-    # ``revive_marker`` 的默认行为——bootstrap 等待那条路径有它自己的上界形态（复活次数预算），
-    # 且其中「收尾时把锁续回 active」那一处必须成功，在共享路径上塞墙钟硬顶会把 32cad 回归放
-    # 回来。硬顶自 ``armed_at`` 起算、不随续期前移；越过之后无论 run 写得多勤都不再续——「它还
-    # 在写日志」恰恰是活锁最典型的样子。
+    # 绝对硬顶由本调用点负责。硬顶自 ``armed_at`` 起算，不随续期前移；越过之后无论 run
+    # 写得多勤都不再续，避免仅靠日志写入无限续期。
     #
     # 硬顶要真的是硬顶，需要**两道**判定，缺一道就只是个建议值：
     #   ① 续期之前判「还能不能续」（``..._exceeds_revival_absolute_cap``）；
@@ -4548,18 +4104,8 @@ def kanban_followup_in_progress_decision(
     # 5h59m 的锁被续到 armed + 7.98h，6h 硬顶被整整绕过一个 TTL）。② 之后上界闭合在 armed + cap：
     # 硬顶那一刻锁必然转 stale，回到这里就只剩 ① 那条「不再续、清锁交回常规 gate」的出口。
     #
-    # 第一个合取项是 RVF-003：心跳只对**真的在跑 review** 的锁生效，绝不覆盖 bootstrap 侧刚刚
-    # 作出的放弃决定。上面那次 gate 判定返回 ``handled=False`` 有两种成因，处置**相反**：
-    #   * 这把锁与 bootstrap 无关（没有等待 gate）→ 正是心跳要保护的长 review；
-    #   * 等待 gate 还在、但复活预算已耗尽 → bootstrap 已**明确放弃本轮**，把 stale 语义交还给
-    #     下面的清锁。此时再按 run 活动续期，等于把「3 次复活」的等待上界偷换成「6h 硬顶」。
-    # 判据取 marker 的 ``state`` 而不是 gate 形状，因为真正的理由在证据的语义上：心跳的存活证据
-    # 是「run 目录近期有写入」，而等待态的 run 目录是被 **prepare 重放**写的，不代表 review 在
-    # 推进——receipt 已验证却重放反复失败时，重放本身就刚写过 run 目录，恰好把这条证据变成永动机。
     if (
-        kanban_followup_lock_state(marker)
-        != KANBAN_FOLLOWUP_LOCK_STATE_WAITING_BOOTSTRAP
-        and in_flight_rvf_run_shows_recent_activity(marker)
+        in_flight_rvf_run_shows_recent_activity(marker)
         and not kanban_followup_lock_exceeds_revival_absolute_cap(marker)
         and revive_kanban_followup_lock(
             marker, truncate_expiry_to_revival_absolute_cap=True
@@ -9065,7 +8611,7 @@ def classify_review_initiation_lifecycle(
 
     第 3 条是**兜底**而非主机制：真正的延续在 ``evaluate_stop_event`` 更早处就被
     ``awaiting_dispatched_agent_decision`` / ``kanban_followup_in_progress_decision`` 接走了
-    （两者覆盖 in_progress / waiting_bootstrap / awaiting-decision / pending-in-flight）。走到
+    （两者覆盖 in_progress / awaiting-decision / pending-in-flight）。走到
     这里还能读到活凭证属于不该发生的状态，故写一条 ``warn`` 级 ledger 让它可观测。
     """
     if backend in _RVF_INITIATION_DISABLED_BACKENDS:

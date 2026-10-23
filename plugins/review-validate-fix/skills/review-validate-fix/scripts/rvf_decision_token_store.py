@@ -743,7 +743,7 @@ def _digest(*parts: str) -> str:
 # （``reconcile_stranded_decision_point_delivery_intents``）把一份**确实送达且已被 agent 看到**
 # 的横幅判成搁浅并 ``mark_withdrawn``，``rvf-agent start`` 硬失败。**直接破坏 INV-A。**
 #
-# 互斥用 token 文件旁的独立 flock 锁文件（形状照抄 ``_with_bootstrap_replay_takeover_lock``）。
+# 互斥用 token 文件旁的独立 flock 锁文件。
 # 锁文件名以 ``.`` 开头且以 ``.lock`` 结尾，故 ``sweep_stale_decision_tokens`` 的 ``*.json``
 # 扫描与测试里的 token 计数都看不见它。铁律：**读与写必须在同一把锁内**——只调换语句顺序不构成
 # 互斥，只锁住写入同样不构成互斥（陈旧副本仍会被整份写回去）。
@@ -1125,7 +1125,7 @@ def _dedup_active_lookup(
 #
 # **陈旧回收：不需要，且这是刻意选型。** 互斥由 ``flock`` 提供，锁的所有权绑在「打开文件描述」上
 # ——持有者中途崩溃 / 被硬杀 / 进程退出时内核自动释放，不存在「崩溃后残留把同键铸造永久堵死」的
-# 形态，故既不需要 TTL 窗口也不需要接管逻辑（与 ``claim_bootstrap_replay_in_flight`` 那种 O_EXCL
+# 形态，故既不需要 TTL 窗口也不需要接管逻辑（与文件占位
 # 占位 sidecar 相反：那种占位靠文件**存在性**互斥，才必须自带过窗接管）。磁盘上留下的只是一个空
 # 锁文件，下一次同键铸造直接复用同一个 inode。
 DEDUP_INDEX_MINT_CLAIM_LOCK_SUFFIX = ".dedup-index-mint-claim.lock"
@@ -3217,185 +3217,21 @@ def attach_run_anchor(
     return DecisionTokenRecord(token=record.token, path=record.path, payload=payload)
 
 
-def attach_bootstrap_gate(
-    token: str,
-    *,
-    gate: Mapping[str, Any] | None,
-    root: str | Path | None = None,
-    now: datetime | None = None,
-    ttl_seconds: int = DEFAULT_DECISION_TOKEN_TTL_SECONDS,
-) -> DecisionTokenRecord:
-    """把 pre-review local-base bootstrap 的等待 gate 挂到 token 上（``gate=None`` 即摘除）。
-
-    形状照抄 ``attach_run_anchor``：状态不变、只落盘一枚子记录，仅活跃非终态可挂。gate 让
-    ``start`` 撞上 bootstrap 时不再表现为「一次泛化失败」——token 保持 acknowledged、可
-    ``--retry``，恢复时先按 gate 重验证 base/receipt 身份，验证通过才重放**同一** run 的 prepare。
-    gate 本身由 ``rvf_bootstrap_gate.build_bootstrap_gate`` 按白名单构造，本函数不做二次加工。
-    """
-    now_dt = _coerce_now(now)
-    with _with_decision_token_payload_mutation_lock(
-        _decision_token_path_for_payload_mutation_lock(token, root)
-    ):
-        record = _load_active_record(token, root=root, now=now_dt, ttl_seconds=ttl_seconds)
-        if record.state not in ACTIVE_NONTERMINAL_STATES:
-            raise DecisionTokenStateError(
-                f"只能在活跃非终态挂载 bootstrap gate，当前={record.state}（token={record.token}）"
-            )
-        payload = dict(record.payload)
-        if gate is None:
-            payload.pop("bootstrap_gate", None)
-        else:
-            payload["bootstrap_gate"] = dict(gate)
-        _atomic_write_json(record.path, payload)
-    return DecisionTokenRecord(token=record.token, path=record.path, payload=payload)
-
-
-# ---------------------------------------------------------------------------
-# bootstrap 恢复重放的**进程外原子占位**（入口 A 的 claim 对偶）
-# ---------------------------------------------------------------------------
-#
-# 入口 B（kanban follow-up）已经把「起 prepare 重放之前先原子 claim」认定为真缺陷并加了
-# sidecar + ``O_EXCL`` 抢占（`kanban_followup_lock.claim_bootstrap_replay_in_flight`）。入口 A 是
-# 同一条 contract 的另一半：两个并发的 ``rvf-agent start --retry`` 会各自 reconcile 出
-# ``receipt_valid``，然后各自带**同一个** ``resume_run_id``/``resume_run_dir`` 调
-# ``start_run(run_id=X, run_dir=X)`` —— 同一个 run 目录被并发写，并可能分配出第二条 tracker
-# lease，违反「恢复不得产生重复 lease / reviewer」。
-#
-# 占位刻意**不写进 token payload**：payload 的每个写侧（``attach_bootstrap_gate`` /
-# ``attach_run_anchor`` / ``record_start_failure``）都是「读-改-写整份 payload」。这些写侧现在
-# 已由 ``_with_decision_token_payload_mutation_lock`` 串行化（不再互相抹掉），但**占位本身仍然
-# 必须是 O_EXCL 创建**：占位要回答的是「谁抢到了这一轮重放」，那是一个 test-and-set，不是一次
-# 字段更新——用「先拿锁再读 payload 判断」实现它，等于把内核级的原子抢占降级成一段可被锁降级
-# （best-effort 无锁回退）影响的临界区。故继续用 token 文件旁的独立 sidecar + ``O_EXCL``。
-# 文件名以 ``.`` 开头且不以 ``.json`` 结尾，故 ``sweep_stale_decision_tokens`` 的 ``*.json``
-# 扫描与测试里的 token 计数都看不见它。
-BOOTSTRAP_REPLAY_CLAIM_SUFFIX = ".bootstrap-replay-claim"
-# 默认占位寿命上界：正常路径由 ``release_bootstrap_replay_in_flight`` 在 prepare 收尾后立刻释放，
-# 这个窗口只覆盖「持有者被硬杀、来不及释放」的残留，过窗即可被下一次 start 接手。
-DEFAULT_BOOTSTRAP_REPLAY_CLAIM_WINDOW_SECONDS = 300.0
-
-
-def bootstrap_replay_claim_path(token: str, root: str | Path | None = None) -> Path:
-    """给定 token 的重放占位 sidecar 路径。"""
-    path = decision_token_path(token, root)
-    return path.with_name(f".{path.name}{BOOTSTRAP_REPLAY_CLAIM_SUFFIX}")
-
-
-def _bootstrap_replay_claim_age_seconds(claim_path: Path, *, now: datetime) -> float | None:
-    """占位已持有多久（秒）。文件不在 / 内容坏了一律 None = 「没有可信的在途占位」。"""
-    try:
-        payload = json.loads(claim_path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    raw = payload.get("claimed_at")
-    if not isinstance(raw, str) or not raw.strip():
-        return None
-    try:
-        claimed_at = parse_timestamp(raw)
-    except ValueError:
-        return None
-    return max(0.0, (now - claimed_at).total_seconds())
-
-
 @contextmanager
-def _with_bootstrap_replay_takeover_lock(claim_path: Path):
-    """接手一枚过窗占位时的互斥锁（避免两个进程同时判定「已过期」而双双接手）。"""
-    lock_path = claim_path.with_name(f"{claim_path.name}.takeover.lock")
-    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
-    handle = os.fdopen(fd, "w", encoding="utf-8")
-    try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        yield
-    finally:
+def exclusive_review_start(token: str, *, root: str | Path | None = None):
+    """同一 token 只允许一个启动调用准备 run；进程退出即释放。"""
+    path = decision_token_path(token, root).with_suffix(".review-start.lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as lock:
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except OSError:
-            pass
-        handle.close()
-
-
-def claim_bootstrap_replay_in_flight(
-    token: str,
-    *,
-    window_seconds: float = DEFAULT_BOOTSTRAP_REPLAY_CLAIM_WINDOW_SECONDS,
-    root: str | Path | None = None,
-    now: datetime | None = None,
-) -> tuple[bool, float | None]:
-    """**起 prepare 重放之前**的原子占位，返回 ``(claimed, in_flight_age_seconds)``。
-
-    ``claimed=True`` = 本进程抢到了这一轮重放，调用方可以起 prepare；``claimed=False`` = 已有
-    另一个进程在窗口内持有占位（``in_flight_age_seconds`` 是它的年龄），本轮**不得**再起第二次
-    ——否则同一个 ``resume_run_id`` / run 目录会被并发重复 prepare、并可能分配出第二条 lease。
-
-    抢占用 ``O_EXCL`` 建 sidecar（内核级互斥），**不是**「先读再写」：后者两个并发进程会同时读到
-    「无在途占位」并各自进入重放。占位超过 ``window_seconds`` 视为持有者已死，在 takeover flock
-    下重新校验后接手，一个被杀的进程不会永久堵死这枚 token。
-
-    best-effort：文件系统报错一律放行（返回 ``True``），记账永不阻断决策。
-    """
-    now_dt = _coerce_now(now)
-    claim_path = bootstrap_replay_claim_path(token, root)
-    encoded = (
-        json.dumps(
-            {"claimed_at": format_timestamp(now_dt), "claimed_by_pid": os.getpid()},
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        + "\n"
-    )
-
-    def _create_exclusive() -> None:
-        fd = os.open(str(claim_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(encoded)
-        except Exception:
-            try:
-                claim_path.unlink()
-            except OSError:
-                pass
-            raise
-
-    try:
-        _ensure_parent_dir(claim_path)
-        _create_exclusive()
-        return True, None
-    except FileExistsError:
-        pass
-    except OSError:
-        return True, None
-
-    age = _bootstrap_replay_claim_age_seconds(claim_path, now=now_dt)
-    if age is not None and age < window_seconds:
-        return False, age
-    try:
-        with _with_bootstrap_replay_takeover_lock(claim_path):
-            age = _bootstrap_replay_claim_age_seconds(claim_path, now=now_dt)
-            if age is not None and age < window_seconds:
-                return False, age
-            try:
-                claim_path.unlink()
-            except FileNotFoundError:
-                pass
-            try:
-                _create_exclusive()
-            except FileExistsError:
-                return False, age
-            return True, age
-    except OSError:
-        return True, age
-
-
-def release_bootstrap_replay_in_flight(token: str, root: str | Path | None = None) -> bool:
-    """释放重放占位（prepare 已收尾 / 已确定失败，允许下一次 ``start --retry`` 立刻再试）。绝不抛。"""
-    claim_path = bootstrap_replay_claim_path(token, root)
-    try:
-        claim_path.unlink()
-    except (FileNotFoundError, OSError):
-        return False
-    return True
+            yield True
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def mark_dispatched(

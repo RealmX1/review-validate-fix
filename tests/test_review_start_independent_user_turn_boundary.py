@@ -131,6 +131,130 @@ def test_real_git_snapshot_and_native_independent_message_allow_start(valid_boun
     assert fixture["tokens"].read_decision_token(fixture["token"]).state == "acknowledged"
 
 
+def test_base_advancement_keeps_registered_boundary(valid_boundary):
+    fixture = valid_boundary
+    repo = fixture["repo"]
+    head = git(repo, "rev-parse", "HEAD")
+    tree = git(repo, "rev-parse", "HEAD^{tree}")
+    for index in range(2):
+        tip = git(repo, "commit-tree", tree, "-p", git(repo, "rev-parse", "main"),
+                  "-m", f"test: 其它任务推进 base {index}")
+        git(repo, "update-ref", "refs/heads/main", tip)
+    git(repo, "update-ref", "--no-deref", "HEAD", head)
+    calls = []
+    def prepare(**kwargs):
+        calls.append(kwargs)
+        return {"status": "failed", "error": "只验证开审条件"}
+    result = fixture["cli"].run_start(token=fixture["token"], reason="固定候选开审", prepare_pipeline=prepare)
+    assert result.status == "start_failed"
+    assert len(calls) == 1
+
+
+def test_concurrent_start_prepares_same_token_once(valid_boundary):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    fixture = valid_boundary
+    entered, release = Event(), Event()
+    calls = []
+    def prepare(**kwargs):
+        calls.append(kwargs)
+        entered.set()
+        assert release.wait(10)
+        return {"status": "failed", "error": "合成准备结果"}
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(fixture["cli"].run_start, token=fixture["token"], reason="首次启动", prepare_pipeline=prepare)
+        try:
+            assert entered.wait(10)
+            second = fixture["cli"].run_start(token=fixture["token"], reason="重复启动", prepare_pipeline=prepare)
+            assert second.status == "start_in_flight"
+            assert len(calls) == 1
+        finally:
+            release.set()
+        assert first.result().status == "start_failed"
+
+
+@pytest.mark.parametrize("token", ["not-a-token", "0123456789abcdef"])
+def test_start_cli_invalid_or_missing_token_returns_structured_error(token):
+    cli = importlib.import_module("rvf_agent_decision_cli")
+    completed = subprocess.run(
+        [sys.executable, str(SCRIPT_DIRECTORY / "rvf_agent_decision_cli.py"),
+         "start", "--token", token, "--reason", "检查非法或缺失 token 的回执"],
+        cwd=ROOT, capture_output=True, text=True,
+    )
+    assert completed.returncode == cli.EXIT_TOKEN_STATE
+    assert completed.stdout == ""
+    assert "Traceback" not in completed.stderr
+    result_lines = [line for line in completed.stderr.splitlines()
+                    if line.startswith("RVF_AGENT_RESULT_JSON: ")]
+    assert len(result_lines) == 1
+    result = json.loads(result_lines[0].removeprefix("RVF_AGENT_RESULT_JSON: "))
+    assert result["command"] == "start"
+    assert result["status"] == "error"
+    assert result["exit_code"] == cli.EXIT_TOKEN_STATE
+    assert result["token"] == token
+
+
+@pytest.mark.parametrize("comparison_base_ref", [None, "main"])
+@pytest.mark.parametrize("advance_before", ["manifest", "packet"])
+def test_prepare_keeps_fixed_base_when_base_advances_during_packet(valid_boundary, tmp_path, monkeypatch, comparison_base_ref, advance_before):
+    fixture = valid_boundary
+    preparation = importlib.import_module("prepare_review_run")
+    fixture["tokens"].acknowledge_decision_token(fixture["token"])
+    repo = fixture["repo"]
+    git(repo, "checkout", "--detach", "-q")
+    fixed_base = fixture["receipt"]["comparison_base_ref_tip"]
+    with fixture["transcript"].open("a") as transcript:
+        transcript.write(json.dumps({"timestamp": datetime.now(timezone.utc).isoformat(), "type": "response_item",
+            "payload": {"type": "custom_tool_call", "name": "apply_patch", "call_id": "synthetic-a-py-write",
+                "input": "*** Begin Patch\n*** Update File: a.py\n@@\n-value = 1\n+value = 2\n*** End Patch\n"}}) + "\n")
+    original_run = preparation.run
+    advanced = []
+    def run(command, **kwargs):
+        advancement_trigger_script = preparation.SESSION_MANIFEST if advance_before == "manifest" else preparation.BUILD_PACKET
+        if len(command) > 1 and command[1] == str(advancement_trigger_script):
+            tip = git(repo, "commit-tree", git(repo, "rev-parse", "HEAD^{tree}"), "-p", fixed_base,
+                      "-m", "test: prepare 期间推进 base")
+            git(repo, "update-ref", "refs/heads/main", tip)
+            advanced.append(tip)
+        return original_run(command, **kwargs)
+    monkeypatch.setattr(preparation, "run", run)
+    context = tmp_path / "scope-of-work.md"
+    context.write_text("审查 a.py 中 value 的任务改动。\n")
+    prepared = preparation.prepare_run(repo=repo, session_context=context, session_manifest=None,
+        transcript=fixture["transcript"], base_dir=tmp_path / "runs", max_file_bytes=200_000, max_packet_bytes=0,
+        base_ref=comparison_base_ref, primary_files=["a.py"], background_files=[], exclude_path_prefixes=[],
+        scope_contract_extensions={"review_start_boundary_receipt": fixture["receipt"]})
+    assert len(advanced) == 1
+    contract = json.loads(Path(prepared["scope_contract"]).read_text())
+    assert contract["reviewed_base_tip"] == fixed_base
+    assert contract["comparison_base_tip"] == fixed_base
+    metadata = json.loads(Path(prepared["review_packet_metadata"]).read_text())
+    manifest = json.loads(Path(prepared["session_manifest_file"]).read_text())
+    assert metadata["owned_diff_base_ref"] == fixed_base
+    assert manifest["committed_round_baseline"] == fixed_base
+    assert git(repo, "rev-parse", "main") == advanced[0]
+    assert "value = 2" in Path(prepared["review_packet"]).read_text()
+
+
+def test_default_prepare_allocates_scope_using_boundary_base_tip(valid_boundary, monkeypatch):
+    fixture = valid_boundary
+    git(fixture["repo"], "checkout", "--detach", "-q")
+    cli = fixture["cli"]
+    captured = []
+    def allocate(**kwargs):
+        captured.append(kwargs)
+        return {"status": cli.AGENTIC_INITIATION_TRACKER_SCOPE_NO_UNREVIEWED_SCOPE,
+                "degradation_reason": "合成空范围", "tracker_scope_path": None,
+                "tracker_lease_id": None, "tracker_scope_hash": None, "tracker_unit_count": 0,
+                "allocator_status": "empty", "error": None, "session_manifest_has_owned_paths": True}
+    monkeypatch.setattr(cli, "allocate_agentic_initiation_tracker_review_scope", allocate)
+    result = cli.default_prepare_pipeline(token_record=fixture["tokens"].read_decision_token(fixture["token"]),
+        repo=str(fixture["repo"]), session_id=fixture["payload"]["session_id"],
+        transcript_path=str(fixture["transcript"]), now=datetime.now(timezone.utc))
+    assert result["status"] == cli.PREPARE_STATUS_NO_UNREVIEWED_SCOPE
+    assert captured[0]["committed_base_ref"] == fixture["receipt"]["comparison_base_ref_tip"]
+
+
 @pytest.mark.parametrize("changed", ["candidate", "head", "session", "message_hash", "checkpoint", "hook", "later_turn", "rewind", "comparison_base", "merged_prompt", "file_mode"])
 def test_stale_or_synthetic_boundary_is_rejected_before_prepare(valid_boundary, changed):
     fixture = valid_boundary
@@ -441,7 +565,7 @@ def test_failed_boundary_delivery_keeps_fresh_token_unaccepted(valid_boundary):
     assert fixture["tokens"].read_decision_token(fixture["token"]).state == "withdrawn"
 
 
-def test_local_base_change_without_candidate_content_change_invalidates_boundary(valid_boundary):
+def test_local_base_change_without_candidate_content_change_keeps_boundary(valid_boundary):
     fixture = valid_boundary
     base = fixture["receipt"]["comparison_base_ref"]
     assert base
@@ -450,8 +574,8 @@ def test_local_base_change_without_candidate_content_change_invalidates_boundary
     git(fixture["repo"], "checkout", "--detach", "-q")
     git(fixture["repo"], "update-ref", "refs/heads/" + base, commit)
     result = fixture["cli"].run_start(token=fixture["token"], reason="候选内容看似不变")
-    assert result.status == "review_start_boundary_invalidated"
-    assert fixture["tokens"].read_decision_token(fixture["token"]).state == "minted"
+    assert result.status == "ok"
+    assert fixture["tokens"].read_decision_token(fixture["token"]).state == "acknowledged"
 
 
 def test_legacy_stop_route_cannot_allocate_or_consume_reopen_without_boundary(tmp_path, monkeypatch):
@@ -506,6 +630,30 @@ def test_duplicate_native_message_id_is_not_a_unique_boundary(valid_boundary):
     result = fixture["cli"].run_start(token=fixture["token"], reason="重复原生 ID")
     assert result.status == "review_start_boundary_invalidated"
     assert fixture["tokens"].read_decision_token(fixture["token"]).state == "minted"
+
+
+@pytest.mark.parametrize("comparison_argument", ["base_ref", "committed_baseline"])
+def test_prepare_rejects_comparison_ref_advanced_after_boundary_before_run(valid_boundary, tmp_path, monkeypatch, comparison_argument):
+    fixture = valid_boundary
+    preparation = importlib.import_module("prepare_review_run")
+    fixture["tokens"].acknowledge_decision_token(fixture["token"])
+    repo = fixture["repo"]
+    git(repo, "checkout", "--detach", "-q")
+    fixed_base = fixture["receipt"]["comparison_base_ref_tip"]
+    advanced_base = git(repo, "commit-tree", git(repo, "rev-parse", "HEAD^{tree}"), "-p", fixed_base,
+                        "-m", "test: 分界之后推进显式比较 ref")
+    git(repo, "update-ref", "refs/heads/main", advanced_base)
+    def reject_run_creation(*args, **kwargs):
+        pytest.fail("冲突比较坐标不得创建 run")
+    monkeypatch.setattr(preparation, "start_run", reject_run_creation)
+    with pytest.raises(ValueError, match="比较基线.*开审分界不一致"):
+        preparation.prepare_run(repo=repo, session_context=None, session_manifest=None,
+            transcript=None, base_dir=tmp_path / "runs", max_file_bytes=200_000, max_packet_bytes=0,
+            primary_files=["a.py"], background_files=[], exclude_path_prefixes=[],
+            scope_contract_extensions={"review_start_boundary_receipt": fixture["receipt"]},
+            **{comparison_argument: "main"})
+    assert git(repo, "rev-parse", "HEAD") == fixed_base
+    assert git(repo, "rev-parse", "main") == advanced_base
 
 
 def test_dry_run_diagnostic_never_creates_dispatch_prep_without_boundary(tmp_path, monkeypatch):
@@ -789,6 +937,13 @@ def test_default_start_prepare_dispatch_preserves_real_run_identity(valid_bounda
     prep_path = next((tmp_path / "dispatch-prep-files").glob("*.json"))
     prep_payload = json.loads(prep_path.read_text())
     prepared_contract_snapshot = (contract_path.read_bytes(), contract_path.stat().st_mtime_ns)
+    repeated = cli.run_start(token=fixture["token"], reason="重复读取已准备的 run", retry=True,
+        transcript_path=str(fixture["transcript"]),
+        prepare_pipeline=lambda **kwargs: pytest.fail("同一 token 已准备完成，不得重复 prepare"))
+    assert repeated.status == "ok", repeated
+    assert repeated.detail["run_id"] == logical_run_id
+    assert activations == [fixture["receipt"]]
+    assert (contract_path.read_bytes(), contract_path.stat().st_mtime_ns) == prepared_contract_snapshot
     completed_cache = prepare.prepare_run_from_prep_file(prep_files.PrepFileRecord(token=prep_payload["token"], path=prep_path, payload=prep_payload))
     assert completed_cache["status"] == "completed"
     assert completed_cache["run_id"] == logical_run_id
@@ -804,6 +959,115 @@ def test_default_start_prepare_dispatch_preserves_real_run_identity(valid_bounda
     assert dispatches[0]["run_id"] == logical_run_id
     assert dispatches[0]["run_dir"] == str(run_directory)
     assert binding_path.read_bytes() == frozen_binding
+
+
+def prepare_start_with_retryable_post_prepare_failure(fixture, tmp_path, monkeypatch, failure_phase):
+    cli = fixture["cli"]
+    bridge = importlib.import_module("rvf_automatic_closeout_bridge")
+    tracker = importlib.import_module("core.session_scope_allocation.reviewable_unit_diff_tracker")
+    records = copy.deepcopy(fixture["records"])
+    records.insert(1, {
+        "type": "event_msg", "timestamp": records[-1]["timestamp"],
+        "payload": {"type": "patch_apply_end", "call_id": "owned-a-py-edit", "success": True,
+                    "changes": {str(fixture["repo"] / "a.py"): {
+                        "type": "update", "unified_diff": "@@ -1 +1 @@\n-value = 1\n+value = 2\n"}},
+                    "status": "completed"},
+    })
+    fixture["transcript"].write_text("\n".join(json.dumps(record) for record in records) + "\n")
+    monkeypatch.setenv("CODEX_RVF_LOG_ROOT", str(tmp_path / "isolated-run-logs"))
+    monkeypatch.setenv("CODEX_RVF_PREP_ROOT", str(tmp_path / "dispatch-prep-files"))
+    monkeypatch.setenv("RVF_KANBAN_FOLLOWUP_LOCK_ROOT", str(tmp_path / "isolated-followup-locks"))
+    monkeypatch.setattr(bridge, "capture_before_start", lambda *args, **kwargs: fixture["receipt"])
+    allocations, preparations, bindings, activations = [], [], [], []
+    original_allocate = tracker.allocate_review_scope
+    original_bind = bridge.bind_run
+
+    def allocate(**kwargs):
+        result = original_allocate(**kwargs)
+        allocations.append(result)
+        return result
+
+    def prepare(**kwargs):
+        result = cli.default_prepare_pipeline(**kwargs)
+        preparations.append(result)
+        return result
+
+    def bind(*args, **kwargs):
+        bindings.append(kwargs)
+        if failure_phase == "bind" and len(bindings) == 1:
+            raise RuntimeError("合成的首次绑定失败")
+        return original_bind(*args, **kwargs)
+
+    def activate(receipt):
+        activations.append(receipt)
+        if failure_phase == "activate" and len(activations) == 1:
+            raise RuntimeError("合成的首次激活失败")
+
+    monkeypatch.setattr(tracker, "allocate_review_scope", allocate)
+    monkeypatch.setattr(bridge, "bind_run", bind)
+    monkeypatch.setattr(bridge, "activate_bound_run", activate)
+    arguments = dict(token=fixture["token"], reason="验证准备成功后的失败重试",
+                     transcript_path=str(fixture["transcript"]), prepare_pipeline=prepare,
+                     launch_preflight=lambda **kwargs: (True, None),
+                     provider_health_requirements_resolver=lambda backend: [])
+    failed = cli.run_start(**arguments)
+    assert failed.status == "start_failed", failed
+    assert failed.detail["phase"] == (
+        "bind_automatic_closeout_run" if failure_phase == "bind"
+        else "activate_automatic_closeout_after_run_binding")
+    assert len(preparations) == len(allocations) == 1
+    assert preparations[0]["status"] == "completed"
+    assert allocations[0]["status"] == "allocated"
+    return arguments, preparations, allocations, bindings, activations
+
+
+@pytest.mark.parametrize("failure_phase", ["bind", "activate"])
+def test_start_retry_reuses_completed_prepare_and_lease(valid_boundary, tmp_path, monkeypatch, failure_phase):
+    fixture = valid_boundary
+    cli = fixture["cli"]
+    arguments, preparations, allocations, bindings, activations = prepare_start_with_retryable_post_prepare_failure(
+        fixture, tmp_path, monkeypatch, failure_phase)
+    prepared = copy.deepcopy(preparations[0])
+    artifact_snapshots = {path: (Path(path).read_bytes(), Path(path).stat().st_mtime_ns)
+                          for path in prepared["artifacts"].values()
+                          if isinstance(path, str) and Path(path).is_file()}
+    overlay = cli.read_scope_adjustment(fixture["token"])
+    assert overlay is not None
+    overlay["annotations"] = {"a.py": "保留已有范围说明"}
+    cli.write_scope_adjustment(overlay, token=fixture["token"])
+    repeated = cli.run_start(**arguments, retry=True)
+    assert repeated.status == "ok", repeated
+    assert len(preparations) == len(allocations) == 1
+    assert repeated.detail["run_id"] == prepared["run_id"]
+    assert repeated.detail["run_dir"] == prepared["run_dir"]
+    assert repeated.detail["prepare_artifacts"] == prepared["artifacts"]
+    assert repeated.detail["tracker_scope_allocation"]["tracker_lease_id"] == allocations[0]["lease_id"]
+    assert len(bindings) == (2 if failure_phase == "bind" else 1)
+    assert len(activations) == (2 if failure_phase == "activate" else 1)
+    assert cli.read_scope_adjustment(fixture["token"])["annotations"] == overlay["annotations"]
+    assert {path: (Path(path).read_bytes(), Path(path).stat().st_mtime_ns)
+            for path in artifact_snapshots} == artifact_snapshots
+    successful_retry = cli.run_start(**arguments, retry=True)
+    assert successful_retry.to_dict() == repeated.to_dict()
+    assert len(preparations) == len(allocations) == 1
+    assert len(activations) == (2 if failure_phase == "activate" else 1)
+
+
+@pytest.mark.parametrize("changed", ["candidate", "prepared_run"])
+def test_start_retry_revalidates_boundary_and_prepared_run(valid_boundary, tmp_path, monkeypatch, changed):
+    fixture = valid_boundary
+    arguments, preparations, allocations, bindings, activations = prepare_start_with_retryable_post_prepare_failure(
+        fixture, tmp_path, monkeypatch, "activate")
+    if changed == "candidate":
+        (fixture["repo"] / "a.py").write_text("value = 3\n")
+    else:
+        contract_path = Path(preparations[0]["artifacts"]["scope_contract"])
+        contract = json.loads(contract_path.read_text())
+        contract["run_id"] = "another-run"
+        contract_path.write_text(json.dumps(contract))
+    rejected = fixture["cli"].run_start(**arguments, retry=True)
+    assert rejected.status == "review_start_boundary_invalidated", rejected
+    assert len(preparations) == len(allocations) == len(bindings) == len(activations) == 1
 
 
 def test_real_prepare_rejects_second_token_before_overwriting_scope_contract(valid_boundary, tmp_path, monkeypatch):

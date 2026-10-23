@@ -32,7 +32,7 @@ __all__ = [
     "test_rvf_shortcut_redispatch_reviewers_argv_carries_current_run_dir",
     "test_rvf_command_line_shortcut_shim_install_and_invocation_resolution",
     "test_current_agent_session_id_reads_claude_code_session_id",
-    "test_agent_cli_start_receipt_renders_intent_status_and_ordered_next_steps",
+    "test_agent_cli_start_receipt_renders_ordered_next_steps",
     "test_rvf_wait_awaiting_marker_keeps_stop_silent_while_waiting_and_reengage_returns_after_exit_kill_or_ttl",
     "test_rvf_wait_awaiting_marker_armed_only_on_hosts_that_wake_main_agent_after_background_work",
     "test_rvf_fix_prepare_arms_awaiting_marker_per_attempt_and_full_stop_command_works_from_any_cwd",
@@ -239,7 +239,7 @@ def test_rvf_shortcut_run_context_resolution_priority(root: Path) -> None:
         missing = module.resolve_current_rvf_run_context()
         assert missing.run_dir is None and missing.notes, missing
 
-    # RVF-001 回归：in-flight marker 只认「未过期 + 已接受态（in_progress / waiting_bootstrap）」，
+    # in-flight marker 只认「未过期 + 已接受态（in_progress）」，
     # 且本会话 session 键（``rvf start`` 只写这一键）优先于 kanban task 键；不合格就落到下一层。
     with _process_environment_and_cwd(environment, worktree):
         import kanban_followup_lock  # noqa: PLC0415
@@ -752,8 +752,8 @@ def test_current_agent_session_id_reads_claude_code_session_id(root: Path) -> No
     assert '"CLAUDE_SESSION_ID"' not in source
 
 
-def test_agent_cli_start_receipt_renders_intent_status_and_ordered_next_steps(root: Path) -> None:
-    """start 回执：人类可读行带 intent_artifact_status_file；下一步按顺序排好、参数已填好，且不再出现 rvf-agent。"""
+def test_agent_cli_start_receipt_renders_ordered_next_steps(root: Path) -> None:
+    """start 回执按顺序给出已填好参数的下一步命令。"""
     cli = load_rvf_agent_decision_cli_module()  # noqa: F821
     dts = load_rvf_decision_token_store_module()  # noqa: F821
     roots = _agent_cli_roots(cli, root)  # noqa: F821
@@ -766,19 +766,11 @@ def test_agent_cli_start_receipt_renders_intent_status_and_ordered_next_steps(ro
     )
     stub = _agent_cli_stub_prepare(root)  # noqa: F821
 
-    def _prepare_with_intent_status(**kwargs):
-        prepared = stub(**kwargs)
-        intent = Path(prepared["run_dir"]) / "artifacts" / "base-task-intent-reconciliation-status.json"
-        intent.write_text("{}", encoding="utf-8")
-        prepared["artifacts"]["intent_artifact_status_file"] = str(intent)
-        return prepared
-
     with _only_these_host_session_environment_variables(CLAUDE_CODE_SESSION_ID="sess-receipt"):
         result = cli.run_start(token=token, reason="开审", roots=roots, now=t0,
-                               prepare_pipeline=_prepare_with_intent_status)
+                               prepare_pipeline=stub)
     assert result.exit_code == cli.EXIT_OK, result.message
     rendered = result.render()
-    assert "    - intent_artifact_status_file: " in rendered, rendered
     assert "rvf-agent" not in rendered, rendered
     steps = result.next_steps
     assert [step[0] for step in steps] == ["①", "②", "③", "④", "⑤"], steps
