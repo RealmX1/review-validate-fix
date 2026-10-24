@@ -134,6 +134,8 @@ def test_prepare_review_run_and_command_lock(tmp_path: Path) -> None:
     assert contract["canonical_issues"] == []
     assert contract["primary_files"] == ["tracked.txt"]
     assert contract["fix_allowlist"] == ["tracked.txt"]
+    assert contract["excluded_path_prefixes"] == [".serena/", "secret.txt"]
+    assert contract["excluded_path_prefixes"] == contract["canonical_scope"]["excluded_path_prefixes"]
     assert contract["review_packet_path"] == payload["input_review_packet"]
     assert contract["start_snapshot_path"] == payload["input_before_workspace_snapshot"]
     assert contract["scope_hash"] == payload["scope_contract_payload"]["scope_hash"]

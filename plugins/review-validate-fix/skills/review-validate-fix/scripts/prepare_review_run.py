@@ -829,6 +829,7 @@ def write_scope_contract(
         "protected_files": protected_files,
         "canonical_issues": canonical_issues,
         "fix_allowlist": fix_allowlist,
+        "excluded_path_prefixes": excluded_path_prefixes,
         "primary_units": primary_units,
         "tracker_lease_id": tracker_lease_id,
         "tracker_scope_hash": tracker_scope_hash,
