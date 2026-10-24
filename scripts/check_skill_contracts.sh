@@ -542,6 +542,7 @@ required_files=(
   "scripts/rvf_land.py"
   "scripts/validation_result_cache.py"
   "scripts/write_reviewed_task_candidate_evidence.py"
+  "scripts/reviewed_candidate_completion_facts.py"
   "scripts/rvf_merge_dispositions.py"
   "scripts/rvf_out_of_scope_findings_kanban_backlog_submission.py"
   "scripts/workspace_snapshot.py"
@@ -635,6 +636,7 @@ repo_required_files=(
   "tests/test_rvf_land_single_step_prepare_and_commit.py"
   "tests/test_validation_result_cache_v2.py"
   "tests/test_reviewed_task_candidate_evidence.py"
+  "tests/test_reviewed_candidate_completion_qualification.py"
   "tests/test_rvf_merge_dispositions_structured_merge_phase.py"
   "tests/test_review_initiation_decision_point_is_sole_self_injection.py"
   "tests/test_stop_hook_output_audience_contract.py"
@@ -745,6 +747,7 @@ run_step "python compile" "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m py_compile \
   "$skill_dir/scripts/rvf_land.py" \
   "$skill_dir/scripts/validation_result_cache.py" \
   "$skill_dir/scripts/write_reviewed_task_candidate_evidence.py" \
+  "$skill_dir/scripts/reviewed_candidate_completion_facts.py" \
   "$skill_dir/scripts/rvf_merge_dispositions.py" \
   "$repo_root/core/session_scope_allocation/session_change_manifest.py" \
   "$skill_dir/scripts/workspace_snapshot.py" \
@@ -859,6 +862,7 @@ run_step "tests: rvf_land_validation_cache_and_candidate_evidence" \
   "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_validation_result_cache_v2.py" \
     "$tests_dir/test_reviewed_task_candidate_evidence.py" \
+    "$tests_dir/test_reviewed_candidate_completion_qualification.py" \
     "$tests_dir/test_rvf_land_single_step_prepare_and_commit.py" \
     "$tests_dir/test_rvf_merge_dispositions_structured_merge_phase.py"
 # reviewer 结果工件生命周期：三态互转对称且换 kind 必归档（旧规则 request→issues 是死结、
@@ -1391,7 +1395,7 @@ require_literal "scripts/rvf_out_of_scope_findings_kanban_backlog_submission.py"
 require_literal "SKILL.md" 'rvf merge write'
 require_literal "prompts/validate-fix.md" 'main_agent_self_review'
 require_literal "scripts/rvf_fix_issue.py" 'rvf_merge_dispositions.resolve_fix_issue_source_refs_for_upsert(run_dir, issue_id)'
-require_literal "scripts/write_reviewed_task_candidate_evidence.py" 'rvf_merge_dispositions.require_passing_merge_dispositions('
+require_literal "scripts/reviewed_candidate_completion_facts.py" 'rvf_merge_dispositions.require_passing_merge_dispositions('
 forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/stop_review_validate_fix.py" '"merge-table.md"'
 forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_agent_decision_cli.py" '"merge-table.md"'
 require_literal "prompts/reviewer.md" 'lock-request'

@@ -208,6 +208,32 @@ def write_merge_dispositions_and_upsert_fix_issues(
         assert upserted.returncode == 0, upserted.stderr
 
 
+def record_terminal_fix_attempt(run_dir: Path, issue_id: str, *, status: str = "fixed", applied: bool = True,
+                                attempt_number: int = 1, changed_paths: list[str] | None = None,
+                                scope_expansion: dict | None = None, confirmed_paths: list[str] | None = None) -> Path:
+    """构造终态账本 fixture；真实 apply 流程另由 land 的隔离 Git 回归覆盖。"""
+    run_id = json.loads((run_dir / "summary.json").read_text())["run_id"]
+    attempt_id = f"attempt-{issue_id}-{attempt_number}"
+    directory = run_dir / "artifacts/fix-attempts" / attempt_id
+    directory.mkdir(parents=True)
+    patch = directory / "fix.patch"
+    patch.write_text("fixture patch\n")
+    identity = {"schema_version": 1, "run_id": run_id, "issue_id": issue_id, "attempt_id": attempt_id}
+    attempt = {**identity, "created_at": f"2026-10-24T00:00:{attempt_number:02d}+00:00",
+               "repo": json.loads((run_dir / "summary.json").read_text())["repo"],
+               "status": "applied" if applied and status == "fixed" else status,
+               "scope_expansion": scope_expansion or {},
+               "confirmed_acknowledged_protected_or_background_paths": confirmed_paths or []}
+    result = {**identity, "status": status, "changed_paths": [{"path": path, "op": "modified"} for path in (changed_paths or [])],
+              "scope_expansion": scope_expansion or {}, "fix_patch_path": str(patch)}
+    if status == "validated_and_submitted_to_kanban_backlog":
+        result["kanban_backlog_submission"] = {"issue_id": issue_id, "attempt_id": attempt_id,
+            "groups": [{"outcome": "created_kanban_backlog_task", "kanban_task_id": "fixture-task"}]}
+    (directory / "attempt.json").write_text(json.dumps(attempt))
+    (directory / "result.json").write_text(json.dumps(result))
+    return directory
+
+
 def bind_scope_to_parent_evidence(
     run_dir: Path,
     repo: Path,
@@ -330,7 +356,7 @@ def test_writes_completion_gated_candidate_evidence_for_current_content(tmp_path
 
 
 def test_unabsorbed_base_evidence_is_accepted_by_installed_handback_consumer(tmp_path: Path) -> None:
-    consumer = Path.home() / ".codex/skills/base-branch-sync/scripts/base-branch-sync-evidence-aware-optimistic-handback.py"
+    consumer = Path(os.environ.get("RVF_TEST_HAND_BACK_CONSUMER_SCRIPT", str(Path.home() / ".codex/skills/base-branch-sync/scripts/base-branch-sync-evidence-aware-optimistic-handback.py")))
     if not consumer.is_file():
         pytest.skip("本机未安装跨仓 handback consumer")
     repo = repository(tmp_path / "repo")
@@ -449,6 +475,7 @@ def test_uses_handoff_canonical_issue_count_instead_of_raw_reviewer_issue_count(
         "## Issue 处理结果\n\n- **[fixed]** `tracked.txt:1` - canonical issue\n",
         encoding="utf-8",
     )
+    record_terminal_fix_attempt(run_dir, "RVF-001")
     completed = subprocess.run(
         [sys.executable, str(WRITE_CANDIDATE_EVIDENCE), "--repo", str(repo), "--run-dir", str(run_dir)],
         capture_output=True,
@@ -494,6 +521,8 @@ def test_issues_submitted_to_kanban_backlog_count_as_completed_outcomes(tmp_path
         "## Issue 处理结果\n\n- **[fixed]** `tracked.txt:1` - in-round\n"
     )
     handoff.write_text(body, encoding="utf-8")
+    record_terminal_fix_attempt(run_dir, "RVF-001")
+    record_terminal_fix_attempt(run_dir, "RVF-002", status="validated_and_submitted_to_kanban_backlog")
     refused = subprocess.run(
         [sys.executable, str(WRITE_CANDIDATE_EVIDENCE), "--repo", str(repo), "--run-dir", str(run_dir)],
         capture_output=True,

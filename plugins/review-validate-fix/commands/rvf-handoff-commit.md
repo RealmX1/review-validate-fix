@@ -47,7 +47,7 @@ argument-hint: "<handoff path or pasted handoff content>"
 | exit | 阶段 | 含义 | 怎么办 |
 |---|---|---|---|
 | 0 | prepare / commit | 通过 / 已完成 | prepare 后进入分析；commit 后按输出汇报 |
-| 2 | prepare / commit | 参数或输入错误：缺 `--run-dir`、commit message 为空或仍含草稿占位、`--extra-path` 不在当前 worktree 内 | 未 stage、未 commit。按 stderr 的 `rvf_land: …` 修正后重跑同一条命令 |
+| 2 | 参数/输入错误，或结果工件持久化失败（`land_commit_result_persistence_failed`） | 参数错误时未 stage、未 commit；持久化失败须检查 JSON 的 `status`、`commit_oid` 和 `candidate_evidence`，保存真实 stdout，不盲目重复提交 |
 | 10 | prepare / commit | 目标仓库与当前 worktree 不共享 git common dir，或无法确定目标仓库 | 停止，说明风险 |
 | 11 | prepare / commit | scope 与 dirty 矛盾 | 停止并报告 |
 | 12 | prepare / commit | 有 scope 外脏文件且没带保留开关 | 确属本次工作就加 `--extra-path`；是并行改动就加 `--commit-staged-scope-only-and-leave-unrelated-dirty-paths` 重跑 prepare |
@@ -60,6 +60,7 @@ argument-hint: "<handoff path or pasted handoff content>"
 | 25 | commit | 已提交，但工作树还有保留开关放行范围之外的脏路径 | evidence 跳过；如实报告 `dirty_paths_remaining_beyond_declared_unrelated`，不要补写 evidence |
 | 26 | commit | 已提交，但 commit 期间 hook 改变了提交内容：改写了文件（`reason_code=candidate_content_changed_during_commit`），或把 stage 集合外的路径加进了提交（`reason_code=committed_paths_outside_stage_set`） | 不回滚；**未封窗、未写 evidence**，下一次 Stop 会照常审这些字节。如实报告被改写的文件，**不要手动封窗、不要伪造 evidence** |
 | 27 | commit | 提交前拒绝：合并处置缺失 / 不合法 / 过期（`reason_code=merge_dispositions_check_failed`） | 跨 worktree 模式下 contract 指向 RVF worktree、evidence 本就不写，预检放行，正常不会出现；若出现，按 `merge_dispositions_errors` 用 `rvf merge write` 补齐、`rvf merge check` 复核后重跑 commit |
+| 28 | 提交前完整 evidence 资格检查拒绝；稳定原因码与明细见 `candidate_evidence_qualification` | 未 stage、未 commit。修正 reviewer 完成事实、最新 attempt/result、handoff 数量矛盾、验证、身份、范围或 receipt 后重跑；不得手改 evidence 或冻结工件 |
 
 ## 输出
 
@@ -69,3 +70,17 @@ argument-hint: "<handoff path or pasted handoff content>"
 - commit hash 和 commit message。
 - 验证结果（commit JSON 的 `validation`）。
 - 仍然保留的 unrelated dirty 文件或风险。
+
+## Evidence 资格检查与已有提交恢复
+
+`rvf land check-evidence --repo <worktree> --run-dir <run>` 是完整只读 dry-run：不执行验证、不 stage、不写 run、contract 或 evidence。JSON 的 `status` 为 `eligible`、`refused_fail_closed` 或明确的 skip 状态，`reason_code` 稳定；拒绝时 exit 28。prepare 展示同一资格结果；commit 完成必要验证重放后、staging 前重新检查，缺失/过期处置仍为 exit 27，其余资格拒绝为 exit 28。只有真正需等 commit 才能证明的 HEAD/tree、hook 改写和并发变化留在提交后复核。
+
+完成计数以 reviewer results、merge dispositions、canonical fix-issue 和最新 attempt/result 为准。handoff 的统计句与实际结果条目只核对一致性，正文提及结果标签不会计数。R3 仅在明确兜底路由且两份 canonical mimic 结果完整有效时通过。用户全局 ignore 仅影响判脏，不会隐藏 tracked 修改。
+
+合法 scope expansion 必须有声明、fixed/applied 事实及补丁；protected/background 扩展还需主会话确认。`--extra-path` 只表达 stage 意图，不能替代这些资格。含扩展的 evidence 为 schema version 2，并引用 canonical 扩展凭据；旧 base-branch-sync 消费者必须拒绝该版本，需按跨仓契约升级后验收。普通无扩展候选继续使用 version 1。
+
+已有真实提交且内容仍是同一已审候选时，显式绑定原 run 执行 prepare → commit：`nothing_to_commit` 分支会生成 evidence，不增加实现提交。重复运行应返回 `candidate_evidence.status=reused`，保留最初 reviewed tip 和摘要。
+
+commit 的结构化结果持久化在 `artifacts/rvf-land-commit-result.json`（带 SHA256），不可变历史位于 `artifacts/rvf-land-commit-execution-results/<sha256>.json`；stdout 给出 `land_commit_result_path` / `land_commit_result_sha256`。历史记录绑定 run、worktree、提交前后 HEAD 与内容摘要，拒绝结果不代表提交成功或已进入 local main。
+
+结果工件写入失败时 exit 2，JSON 为 `reason_code=land_commit_result_persistence_failed`；此时必须结合 `status`、`commit_oid` 与 `candidate_evidence` 判断实际结果，提交可能已经完成，不能把 exit 2 一概解释成“未 stage、未 commit”。

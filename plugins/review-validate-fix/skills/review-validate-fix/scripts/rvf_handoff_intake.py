@@ -179,7 +179,7 @@ def repo_snapshot(repo: Path) -> dict[str, Any]:
     code_status, status_out, status_err = run_git_bytes(
         root,
         ["status", "--porcelain=v1", "-z", "-uall"],
-        git_environment_with_user_configuration_without_repository_location_overrides(),
+        {**git_environment_with_user_configuration_without_repository_location_overrides(), "GIT_OPTIONAL_LOCKS": "0"},
     )
     return {
         "repo": str(root),

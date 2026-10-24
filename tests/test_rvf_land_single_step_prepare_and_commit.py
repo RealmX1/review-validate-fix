@@ -490,6 +490,23 @@ def test_prepare_reads_fix_ledger_written_by_real_fix_attempt_script(tmp_path: P
     accepted_section = draft.split("已采纳（fixed 且已合回工作树）：", 1)[1].split("未采纳：", 1)[0]
     assert "- RVF-L1" in accepted_section
     assert "RVF-L1" not in draft.split("未采纳：", 1)[1]
+    # 正式 land 必须消费真实 stop/apply 写出的扩展事实，而非只在 prepare 中展示它。
+    handoff = run_dir / "artifacts/handoff.md"
+    handoff.write_text(handoff.read_text().replace("共 0 条，0 真实修复", "共 1 条，1 真实修复") +
+                       "\n- **[fixed]** `tracked.txt:2` - RVF-L1\n")
+    for name in ("targeted-contract-tests", "handoff-validation-001"):
+        validated = record_validation(tmp_path, repo, run_dir, name, sys.executable, "-c", "print('passed')")
+        assert validated.returncode == 0, validated.stderr
+    assert prepare(tmp_path, repo, run_dir).returncode == 0
+    landed = commit(tmp_path, repo, run_dir)
+    assert landed.returncode == 0, landed.stdout + landed.stderr
+    result = json.loads(landed.stdout)
+    assert result["candidate_evidence"]["status"] == "written"
+    candidate = json.loads(Path(result["candidate_evidence"]["candidate_evidence_path"]).read_text())
+    assert candidate["schema_version"] == 2
+    expansion = json.loads(Path(candidate["scope"]["applied_scope_expansion_receipt_path"]).read_text())
+    assert expansion["expansions"][0]["attempt_id"] == attempt_id
+    assert expansion["expansions"][0]["paths"] == ["fix-helper-outside-reviewed-scope.txt"]
 
 
 
