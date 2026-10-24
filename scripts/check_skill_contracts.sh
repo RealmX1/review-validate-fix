@@ -1071,7 +1071,7 @@ run_step "tests: reviewer_health_probe_parity" \
   "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_reviewer_health_probe_parity.py"
 run_step "tests: kimi_latest_stable_model_selection" \
-  python3 -m pytest -q \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_kimi_latest_stable_model_selection.py"
 # reviewer registry 是 additive merge 而非首次 seed：已部署过的机器上 user-local registry
 # 早就存在，若沿用「不存在才 copy」，后续新增的评审腿（kimi_code / oh_my_pi 是第一批）永远
