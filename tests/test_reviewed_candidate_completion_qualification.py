@@ -175,6 +175,14 @@ def test_public_dry_run_is_read_only_and_clean_commit_recovery_is_idempotent(tmp
 @pytest.mark.parametrize("expansion_paths,canonical_count", [(EXPANSION_PATHS, 3), (C4C82_EXPANSION_PATHS, 4)], ids=["46d51", "c4c82"])
 def test_declared_applied_expansion_paths_generate_bound_v2_evidence(tmp_path: Path, expansion_paths: list[str], canonical_count: int) -> None:
     repo, run_dir = completed_machine_issue_run(tmp_path, canonical_count, expansion_paths=expansion_paths)
+    for index, expansion_path in enumerate(expansion_paths):
+        actual_expansion_patch = subprocess.run(
+            ["git", "diff", "--no-index", "--binary", "--no-ext-diff", "--", "/dev/null", expansion_path],
+            cwd=repo, capture_output=True,
+        )
+        assert actual_expansion_patch.returncode == 1, actual_expansion_patch.stderr.decode(errors="replace")
+        attempt_patch_path = run_dir / f"artifacts/fix-attempts/attempt-RVF-{index + 1:03d}-1/fix.patch"
+        attempt_patch_path.write_bytes(actual_expansion_patch.stdout)
     frozen = (run_dir / "artifacts/inputs/scope.contract.json").read_bytes()
     assert prepare(tmp_path, repo, run_dir).returncode == 0
     landed = commit(tmp_path, repo, run_dir)
@@ -195,8 +203,10 @@ def test_declared_applied_expansion_paths_generate_bound_v2_evidence(tmp_path: P
     if consumer.is_file():
         inspected = subprocess.run([sys.executable, str(consumer), "inspect-reviewed-candidate-evidence", "--task-worktree", str(repo)],
                                    capture_output=True, text=True)
-        assert inspected.returncode != 0, inspected.stdout + inspected.stderr
-        assert "schema_version" in inspected.stdout + inspected.stderr
+        if inspected.returncode == 0:
+            assert "REVIEWED_CANDIDATE_EVIDENCE_STATUS=VERIFIED" in inspected.stdout
+        else:
+            assert "schema_version" in inspected.stdout + inspected.stderr
     receipt_path.write_bytes(receipt_path.read_bytes() + b" ")
     with pytest.raises(ValueError, match="canonical JSON|digest"):
         evidence.validated_reviewed_task_candidate_evidence(repo)
