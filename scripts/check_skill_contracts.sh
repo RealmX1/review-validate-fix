@@ -652,6 +652,7 @@ repo_required_files=(
   "tests/test_reviewer_prompt_delivery_contract.py"
   "tests/test_reviewer_structured_output_extraction.py"
   "tests/test_reviewer_health_probe_parity.py"
+  "tests/test_kimi_latest_stable_model_selection.py"
   "tests/test_reviewer_registry_additive_merge.py"
   "tests/test_reviewer_quota_pool_exclusive_selection.py"
   "tests/test_reviewer_harness_probe_result_cache.py"
@@ -1069,6 +1070,9 @@ run_step "tests: reviewer_structured_output_extraction" \
 run_step "tests: reviewer_health_probe_parity" \
   "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_reviewer_health_probe_parity.py"
+run_step "tests: kimi_latest_stable_model_selection" \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
+    "$tests_dir/test_kimi_latest_stable_model_selection.py"
 # reviewer registry 是 additive merge 而非首次 seed：已部署过的机器上 user-local registry
 # 早就存在，若沿用「不存在才 copy」，后续新增的评审腿（kimi_code / oh_my_pi 是第一批）永远
 # 进不去那台机器，而部署照常报成功、派发照常从旧的 3 条腿里选 2 条 —— 无人报错的假绿。
@@ -1190,6 +1194,8 @@ forbid_literal "config/alternative-reviewer.cursor.json" '"status"'
 require_literal "config/alternative-reviewer.kimi.json" 'argv_prompt_flag_with_prompt_file_pointer'
 require_literal "config/alternative-reviewer.kimi.json" 'alternative-reviewer:kimi-code'
 require_literal "config/alternative-reviewer.kimi.json" 'kimi_stream_json'
+require_literal "config/alternative-reviewer.kimi.json" 'kimi_latest_managed_stable_model'
+require_file "scripts/kimi_latest_stable_model_selection.py"
 forbid_literal "config/alternative-reviewer.kimi.json" '"--yolo"'
 forbid_literal "config/alternative-reviewer.kimi.json" '"--auto"'
 require_literal "config/alternative-reviewer.oh-my-pi.json" 'alternative-reviewer:oh-my-pi'
