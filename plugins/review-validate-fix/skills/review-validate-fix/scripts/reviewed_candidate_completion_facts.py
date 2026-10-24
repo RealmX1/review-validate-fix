@@ -302,7 +302,8 @@ def applied_scope_expansion_facts(applied_attempts: list[dict[str, Any]], scope_
         if (expanded or acknowledged) and not str(metadata.get("reason") or "").strip():
             raise ValueError("scope expansion has no reason")
         outside = changed_paths - scope_paths
-        if not outside <= expanded | acknowledged:
+        # 确认通道只覆盖冻结 guarded 路径；普通外扩仍须声明。
+        if not outside <= expanded | (acknowledged & guarded_changes):
             raise ValueError("applied patch has an undeclared path outside the reviewed scope")
         qualified = outside | acknowledged
         if qualified:
@@ -310,7 +311,9 @@ def applied_scope_expansion_facts(applied_attempts: list[dict[str, Any]], scope_
                 raise ValueError("developer-tool-managed scope expansion is forbidden")
             patch = Path(str(result.get("fix_patch_path", "")))
             expected_patch = run_dir / "artifacts/fix-attempts" / attempt["attempt_id"] / "fix.patch"
-            if patch.absolute() != expected_patch.absolute() or patch.is_symlink() or not patch.is_file():
+            # 祖先路径可以使用别名；补丁本身仍须是绑定 attempt 的普通文件。
+            if (patch.is_symlink() or expected_patch.is_symlink() or not patch.is_file()
+                or patch.resolve() != expected_patch.resolve()):
                 raise ValueError("scope expansion requires its actual applied patch")
             snapshots = {name: facts[name] for name in ("issue", "attempt", "result")}
             expansions.append({"paths": sorted(qualified), "issue_id": attempt["issue_id"], "attempt_id": attempt["attempt_id"],

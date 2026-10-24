@@ -64,7 +64,26 @@
 - 新模块与测试已登记到 `scripts/check_skill_contracts.sh` 的存在、编译和 pytest 执行入口；未在手工注册的 `test_review_support_scripts.py` 添加测试。
 - 完整 `bash scripts/check_skill_contracts.sh` 实际运行并返回 1：Stop hook shard 3/4 的缺 task id 用例因隔离环境的 `provider_health_failed` 提前返回，未进入本次测试组。用相同环境对原始 `a51f959` source snapshot 运行该用例，同样失败且输出相同原因。这不是全量通过，也没有扩大范围修改 Stop hook 或伪造健康结果；本次测试组另已真实执行。
 
-本卡已完成源码自审与上述实际验证；交付采用普通 Git 人工本地收尾，实际提交见人工交付记录。没有新启独立 RVF，不冒用消费 run 的审查结论。未为本卡签发虚构的自动 completed、部署或 PDV 回执。
+首次本地交付时，本卡只完成源码自审与上述实际验证，采用普通 Git 提交。当时把用户允许故障时人工收尾误解成了可以省略 RVF，曾结构性谢绝评审；用户随后明确纠正并显式发起 RVF，已推翻该谢绝。本次独立评审及修复见下节；旧人工交付记录保留为当时事实，不改写历史，也不冒用消费 run 的审查结论。
+
+## 用户纠正后的独立 RVF
+
+本轮 run 为 `rvf-review-start-59fc6292a9490e51`，固定比较 `a51f959a47513a522ddb87aaf6444352b05b5019` 至 `20ddb88d6fa51881d09b1b51a7ed7620f9d4efc3` 的实现，正式覆盖 14/14 个候选文件。通过正式 `start`、scope-of-work 定稿、`dispatch --strictness strict` 和同一 `wait` 等待终态；实际结果为 `plan_status=completed`、有效 reviewer 2/2。
+
+两路独立 external reviewer（oh-my-pi、cursor-cli）各提出两项，四项全部采纳为不同 canonical issue。验证包只接收去来源的 issue，各自在工具创建的 attempt worktree 先复现、再修复，经真实 `fix stop --status fixed`、`rvf apply` 合回；最终 `rvf merge check` 通过，未发生范围扩展。
+
+| Issue | 真实缺陷与最小修复 | 本项隔离回归 |
+| --- | --- | --- |
+| `RVF-001` | 同 run 已有 evidence、HEAD 尚未前移时，修改内容仍能提交后才拒写；提交前增加已有 evidence 内容摘要检查 | 修前 4 failed / 1 passed；修后专项 5 passed，相关 writer/Land 模块 39 passed / 1 skipped。跳过项因隔离 HOME 内没有本机跨仓消费者 |
+| `RVF-002` | 最新 false-positive 结论抹掉旧 attempt 已应用的合法扩展路径；完成状态取最新，stage 路径和确认独立累计真实 applied 补丁 | 真实 prepare/start/stop/apply 生命周期修前 4 failed；修后专项 4 passed、完整 Land 测试文件 24 passed。最新 failed/started 仍拒绝 |
+| `RVF-003` | 普通范围外路径可借 guarded 确认通道跳过声明；确认只覆盖确实命中冻结 guarded 范围的路径，普通外扩仍须声明 | 公开 Land 与 receipt reader 两负例修前失败；修后资格文件 49 passed，protected/background/excluded 正例保留 |
+| `RVF-004` | 补丁祖先目录别名造成同一真实文件身份误拒；比较 resolve 后真实路径，补丁及期望补丁本身仍不得为符号链接 | 修前真实复现 1 failed / 4 passed；修后资格文件 54 passed，覆盖公开 Land、reader、错 run/attempt 和末级符号链接负例 |
+
+`RVF-004` 最初测试有一次 fixture 父目录未创建错误，原日志保留；实际缺陷复现使用后续 `fixer-RVF-004-before-reproduction`，未把 fixture 错误算作产品缺陷证据。各项测试存在重叠，不简单相加。
+
+本轮持久目录：`/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-review-start-59fc6292a9490e51/artifacts/`。`canonical-review-merge-summary.json`、`merge/merge_dispositions.json` 与四个 `fix-attempts/*/result.json` / `fix.patch` 保存实际评审、处置和修复链；`fixer-RVF-*-result.json` / `.log` 保存修前、修后检查。合并后的最终验证由主会话通过 `rvf validate --name handoff-validation-001` 登记，原始输出与退出码保存为 `final-post-review-regression.log` / `final-post-review-regression-result.json`，最终交接见该 run 的 `handoff.md`。
+
+用户纠正的是 RVF 必须实际完成；自动 Land、evidence 登记或 base 同步故障时，仍可按既有授权人工交付已审工作。本次不 push、不合 main、不部署，不以自动账本状态代替实际审查，也未签发虚构的 completed、部署或 PDV 回执。前述全量合同检查的基线失败仍保留，不因专项通过而改写为全量通过。
 
 ## W1 / W2 复算
 

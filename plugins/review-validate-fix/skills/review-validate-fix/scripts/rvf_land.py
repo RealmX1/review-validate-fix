@@ -233,7 +233,7 @@ def applied_fix_attempt_dispositions(run_dir: Path) -> list[dict[str, Any]]:
         if applied:
             applied_paths_by_issue.setdefault(issue_id, set()).update(fix_patch_changed_paths)
             confirmed_paths_by_issue.setdefault(issue_id, set()).update(disposition["confirmed_acknowledged_paths"])
-        # 展示和 stage 也不能让旧 applied attempt 遮住更新的失败；正式资格由结构化完成检查裁定。
+        # 完成状态不能让旧 applied attempt 遮住更新的失败；正式资格由结构化完成检查裁定。
         rank = (0, str(attempt.get("created_at") or ""))
         previous = chosen.get(issue_id)
         if previous is None or rank > previous[0]:
@@ -251,9 +251,9 @@ def applied_fix_attempt_dispositions(run_dir: Path) -> list[dict[str, Any]]:
                 },
             )
     for issue_id, (_rank, disposition) in chosen.items():
-        if disposition["fix_applied_to_worktree"]:
-            disposition["changed_paths"] = sorted(applied_paths_by_issue.get(issue_id, set()))
-            disposition["confirmed_acknowledged_paths"] = sorted(confirmed_paths_by_issue.get(issue_id, set()))
+        # 完成结论取最新 attempt；路径与确认只取历史实际 applied 的补丁，不能被后续误报或失败抹掉。
+        disposition["changed_paths"] = sorted(applied_paths_by_issue.get(issue_id, set()))
+        disposition["confirmed_acknowledged_paths"] = sorted(confirmed_paths_by_issue.get(issue_id, set()))
     return [chosen[issue_id][1] for issue_id in sorted(chosen)]
 
 
@@ -316,8 +316,7 @@ def land_stageable_path_universe(
         else set(intake.get("reviewed_scope_paths") or [])
     )
     for disposition in dispositions:
-        if disposition["fix_applied_to_worktree"]:
-            universe.update(disposition["changed_paths"])
+        universe.update(disposition["changed_paths"])
     contract_not_automatically_stageable_patterns = (
         scope_contract_path_list(contract, LAND_NOT_AUTOMATICALLY_STAGEABLE_SCOPE_CONTRACT_FIELD_NAMES)
         if contract is not None
@@ -329,7 +328,7 @@ def land_stageable_path_universe(
         if isinstance(path, str)
     }
     confirmed_applied_paths = {
-        path for disposition in dispositions if disposition["fix_applied_to_worktree"]
+        path for disposition in dispositions
         for path in disposition.get("confirmed_acknowledged_paths", [])
         if path in disposition["changed_paths"]
     }

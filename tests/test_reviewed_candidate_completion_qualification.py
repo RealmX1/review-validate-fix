@@ -202,9 +202,74 @@ def test_declared_applied_expansion_paths_generate_bound_v2_evidence(tmp_path: P
         evidence.validated_reviewed_task_candidate_evidence(repo)
 
 
-def test_confirmed_background_expansion_is_stageable_and_receipted(tmp_path: Path) -> None:
+def test_public_land_and_receipt_reader_accept_a_patch_path_with_an_ancestor_symlink_alias(tmp_path: Path) -> None:
+    actual_fixture_root = tmp_path / "actual-fixture-root"
+    actual_fixture_root.mkdir()
+    repo, run_dir = completed_machine_issue_run(actual_fixture_root, expansion_paths=EXPANSION_PATHS[:1])
+    aliased_fixture_root = tmp_path / "fixture-ancestor-symlink-alias"
+    aliased_fixture_root.symlink_to(actual_fixture_root, target_is_directory=True)
+    aliased_run_dir = aliased_fixture_root / run_dir.name
+    result_path = run_dir / "artifacts/fix-attempts/attempt-RVF-001-1/result.json"
+    result = json.loads(result_path.read_text())
+    actual_patch_path = Path(result["fix_patch_path"])
+    aliased_patch_path = aliased_run_dir / actual_patch_path.relative_to(run_dir)
+    assert aliased_patch_path.absolute() != actual_patch_path.absolute()
+    assert aliased_patch_path.resolve(strict=True) == actual_patch_path.resolve(strict=True)
+    assert not aliased_patch_path.is_symlink()
+    result["fix_patch_path"] = str(aliased_patch_path)
+    result_path.write_text(json.dumps(result))
+    frozen_contract = (run_dir / "artifacts/inputs/scope.contract.json").read_bytes()
+    prepared = prepare(tmp_path, repo, aliased_run_dir)
+    assert prepared.returncode == 0, prepared.stdout + prepared.stderr
+    landed = commit(tmp_path, repo, aliased_run_dir)
+    assert landed.returncode == 0, landed.stdout + landed.stderr
+    assert json.loads(landed.stdout)["candidate_evidence"]["status"] == "written"
+    payload, _path, _digest = evidence.validated_reviewed_task_candidate_evidence(repo)
+    receipt = json.loads(Path(payload["scope"]["applied_scope_expansion_receipt_path"]).read_text())
+    assert receipt["expansions"][0]["facts"]["result"]["fix_patch_path"] == str(aliased_patch_path)
+    reviewed_contract = json.loads((run_dir / "artifacts/inputs/scope.contract.reviewed.json").read_text())
+    assert canonical_bytes(reviewed_contract) == canonical_bytes(json.loads(frozen_contract))
+
+
+@pytest.mark.parametrize("patch_path_variant", ["patch_file_symlink", "regular_target_of_expected_patch_symlink", "foreign_run", "foreign_attempt"])
+def test_public_land_rejects_a_symlink_patch_or_real_patch_from_another_identity(tmp_path: Path, patch_path_variant: str) -> None:
     repo, run_dir = completed_machine_issue_run(tmp_path, expansion_paths=EXPANSION_PATHS[:1])
-    rewrite_contract(run_dir, background_files=EXPANSION_PATHS[:1], protected_files=EXPANSION_PATHS[:1])
+    result_path = run_dir / "artifacts/fix-attempts/attempt-RVF-001-1/result.json"
+    result = json.loads(result_path.read_text())
+    actual_patch_path = Path(result["fix_patch_path"])
+    if patch_path_variant in {"patch_file_symlink", "regular_target_of_expected_patch_symlink"}:
+        regular_patch_target = tmp_path / "regular-patch-target" / "fix.patch"
+        regular_patch_target.parent.mkdir()
+        regular_patch_target.write_bytes(actual_patch_path.read_bytes())
+        actual_patch_path.unlink()
+        actual_patch_path.symlink_to(regular_patch_target)
+        if patch_path_variant == "regular_target_of_expected_patch_symlink":
+            result["fix_patch_path"] = str(regular_patch_target)
+    elif patch_path_variant == "foreign_run":
+        foreign_patch_path = tmp_path / "foreign-run/artifacts/fix-attempts/attempt-RVF-001-1/fix.patch"
+        foreign_patch_path.parent.mkdir(parents=True)
+        foreign_patch_path.write_bytes(actual_patch_path.read_bytes())
+        result["fix_patch_path"] = str(foreign_patch_path)
+    else:
+        older_attempt = record_terminal_fix_attempt(run_dir, "RVF-001", status="false_positive", attempt_number=0)
+        result["fix_patch_path"] = str(older_attempt / "fix.patch")
+    result_path.write_text(json.dumps(result))
+    prepared = prepare(tmp_path, repo, run_dir)
+    assert prepared.returncode == 0, prepared.stdout + prepared.stderr
+    before = source_and_index_snapshot(repo)
+    refused = commit(tmp_path, repo, run_dir)
+    assert refused.returncode == 28, refused.stdout + refused.stderr
+    assert json.loads(refused.stdout)["reason_code"] == "scope_expansion_invalid"
+    assert source_and_index_snapshot(repo) == before
+    assert not (Path(git(repo, "rev-parse", "--absolute-git-dir")) / evidence.EVIDENCE_RELATIVE_PATH).exists()
+
+
+@pytest.mark.parametrize("guarded_contract_field", ["background_files", "protected_files", "excluded_path_prefixes"])
+def test_confirmed_guarded_expansion_is_stageable_and_receipted(tmp_path: Path, guarded_contract_field: str) -> None:
+    repo, run_dir = completed_machine_issue_run(tmp_path, expansion_paths=EXPANSION_PATHS[:1])
+    guarded_patterns = ([EXPANSION_PATHS[0].rsplit("/", 1)[0] + "/"]
+                        if guarded_contract_field == "excluded_path_prefixes" else EXPANSION_PATHS[:1])
+    rewrite_contract(run_dir, **{guarded_contract_field: guarded_patterns})
     directory = run_dir / "artifacts/fix-attempts/attempt-RVF-001-1"
     metadata = {"acknowledged_protected_or_background_paths": EXPANSION_PATHS[:1], "reason": "主会话已核对归属与内容"}
     for name in ("attempt.json", "result.json"):
@@ -219,6 +284,61 @@ def test_confirmed_background_expansion_is_stageable_and_receipted(tmp_path: Pat
     assert landed.returncode == 0, landed.stdout + landed.stderr
     payload, _path, _digest = evidence.validated_reviewed_task_candidate_evidence(repo)
     assert payload["schema_version"] == 2
+
+
+def test_precommit_rejects_acknowledged_ordinary_scope_expansion_without_declaration(tmp_path: Path) -> None:
+    repo, run_dir = completed_machine_issue_run(tmp_path, expansion_paths=EXPANSION_PATHS[:1])
+    directory = run_dir / "artifacts/fix-attempts/attempt-RVF-001-1"
+    metadata = {"expanded_paths": [], "declared_paths": [],
+                "acknowledged_protected_or_background_paths": EXPANSION_PATHS[:1],
+                "reason": "普通外扩不能借主会话确认绕过声明"}
+    for name in ("attempt.json", "result.json"):
+        path = directory / name
+        payload = json.loads(path.read_text())
+        payload["scope_expansion"] = metadata
+        if name == "attempt.json":
+            payload["confirmed_acknowledged_protected_or_background_paths"] = EXPANSION_PATHS[:1]
+        path.write_text(json.dumps(payload))
+    prepared = prepare(tmp_path, repo, run_dir)
+    assert prepared.returncode == 0, prepared.stdout + prepared.stderr
+    before = source_and_index_snapshot(repo)
+    contract_path = run_dir / "artifacts/inputs/scope.contract.json"
+    frozen_contract = contract_path.read_bytes()
+    refused = commit(tmp_path, repo, run_dir)
+    assert refused.returncode == 28, refused.stdout + refused.stderr
+    assert json.loads(refused.stdout)["reason_code"] == "scope_expansion_invalid"
+    assert source_and_index_snapshot(repo) == before
+    assert contract_path.read_bytes() == frozen_contract
+    assert not (contract_path.parent / "scope.contract.reviewed.json").exists()
+    assert not (Path(git(repo, "rev-parse", "--absolute-git-dir")) / evidence.EVIDENCE_RELATIVE_PATH).exists()
+    assert not (run_dir / "artifacts/applied-scope-expansion-qualification-receipts").exists()
+
+
+def test_receipt_reader_rejects_acknowledged_ordinary_scope_expansion_without_declaration(tmp_path: Path) -> None:
+    repo, run_dir = completed_machine_issue_run(tmp_path, expansion_paths=EXPANSION_PATHS[:1])
+    assert prepare(tmp_path, repo, run_dir).returncode == 0
+    landed = commit(tmp_path, repo, run_dir)
+    assert landed.returncode == 0, landed.stdout + landed.stderr
+    payload, _path, _digest = evidence.validated_reviewed_task_candidate_evidence(repo)
+    receipt_path = Path(payload["scope"]["applied_scope_expansion_receipt_path"])
+    receipt = json.loads(receipt_path.read_text())
+    expansion = receipt["expansions"][0]
+    facts = expansion["facts"]
+    metadata = {"expanded_paths": [], "declared_paths": [],
+                "acknowledged_protected_or_background_paths": EXPANSION_PATHS[:1],
+                "reason": "完整重算摘要也不能让普通外扩跳过声明"}
+    facts["attempt"]["scope_expansion"] = metadata
+    facts["result"]["scope_expansion"] = metadata
+    facts["attempt"]["confirmed_acknowledged_protected_or_background_paths"] = EXPANSION_PATHS[:1]
+    expansion["facts_sha256"] = hashlib.sha256(canonical_bytes(facts)).hexdigest()
+    receipt_digest = hashlib.sha256(canonical_bytes(receipt)).hexdigest()
+    rewritten_receipt_path = receipt_path.with_name(f"{receipt_digest}.json")
+    assert evidence.write_json_with_digest(rewritten_receipt_path, receipt) == receipt_digest
+    payload["scope"].update({"applied_scope_expansion_receipt_path": str(rewritten_receipt_path),
+                             "applied_scope_expansion_receipt_sha256": receipt_digest})
+    contract = json.loads((run_dir / "artifacts/inputs/scope.contract.json").read_text())
+    with pytest.raises(ValueError, match="undeclared path outside the reviewed scope"):
+        evidence.validated_applied_scope_expansion_receipt(payload, contract)
 
 
 @pytest.mark.parametrize("run_id,count", [("rvf-review-start-5a0e72d65bd5c0c4", 4), ("rvf-review-start-780c3041b3ea0ec8", 6)])

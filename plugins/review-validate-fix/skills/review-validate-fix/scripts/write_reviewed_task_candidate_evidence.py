@@ -815,7 +815,15 @@ def prepare_candidate_evidence(
         projected_contract, reviewed_task_tip, archive_contract = project_scope_contract_for_landing(
             repo, contract, contract_path, contract_digest, landed_tip=candidate_head_oid, scope_paths=scope_paths,
         )
-        if existing and projected_contract != contract and existing.get("scope", {}).get("contract_path") == str(contract_path):
+        # 提交前 HEAD 尚未推进，仍须核对既有 evidence 绑定的实际内容。
+        if (
+            existing
+            and existing.get("scope", {}).get("contract_path") == str(contract_path)
+            and (
+                projected_contract != contract
+                or existing["subject"]["candidate_content_manifest_sha256"] != candidate_digest
+            )
+        ):
             raise ValueError("same-run candidate content changed after evidence: a fresh review contract is required")
         now = datetime.now(timezone.utc).isoformat()
         scope = {"contract_path": str(contract_path),
