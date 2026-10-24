@@ -3766,6 +3766,36 @@ def test_rvf_land_commit_leaves_next_stop_without_candidates_under_self_derived_
 
     run_dir = tmp_path / "rvf-run"
     (run_dir / "artifacts").mkdir(parents=True)
+    # 本例只验证封窗状态根；提供有效契约但不 opt-in evidence，避免伪造双评审工件。
+    canonical_scope = {
+        "version": 3,
+        "repo": str(repo.resolve()),
+        "scope_mode": "custom",
+        "primary_files": ["f.txt"],
+        "fix_allowlist": ["f.txt"],
+        "task_change_paths": [],
+        "background_files": [],
+        "protected_files": [],
+        "excluded_path_prefixes": [],
+        "review_kind": "implementation",
+        "base_ref": "main",
+        "remote_name": "origin",
+        "comparison_base_tip": None,
+        "reviewed_base_tip": None,
+        "reviewed_task_tip": None,
+        "candidate_task_tip": None,
+    }
+    contract = {
+        **canonical_scope,
+        "run_id": run_dir.name,
+        "canonical_scope": canonical_scope,
+        "scope_hash": hashlib.sha256(
+            json.dumps(canonical_scope, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+    }
+    contract_path = run_dir / "artifacts" / "inputs" / "scope.contract.json"
+    contract_path.parent.mkdir()
+    contract_path.write_text(json.dumps(contract, ensure_ascii=False), encoding="utf-8")
     handoff_path = run_dir / "artifacts" / "handoff.md"
     handoff_path.write_text(
         "# Review-validate-fix 交接上下文\n\n## 状态\n\n"
@@ -3798,13 +3828,14 @@ def test_rvf_land_commit_leaves_next_stop_without_candidates_under_self_derived_
     land_env = {**self_derived_root_env, "RVF_SESSION_ID": session_id}
     rvf_land_script = SCRIPT.with_name("rvf_land.py")
     prepare = subprocess.run(
-        [sys.executable, str(rvf_land_script), "prepare", "--handoff", str(handoff_path), "--repo", str(repo)],
+        [sys.executable, str(rvf_land_script), "prepare", "--handoff", str(handoff_path), "--repo", str(repo), "--format", "json"],
         capture_output=True,
         text=True,
         cwd=repo,
         env=land_env,
     )
     assert prepare.returncode == 0, (prepare.stdout, prepare.stderr)
+    assert json.loads(prepare.stdout)["candidate_evidence_qualification"]["status"] == "skipped_not_applicable"
     commit = subprocess.run(
         [sys.executable, str(rvf_land_script), "commit", "--run-dir", str(run_dir), "--message-file", "-"],
         input="feat: 加一行\n\n验证：\n[[rvf-land-validation-summary]]\n",
@@ -3818,6 +3849,7 @@ def test_rvf_land_commit_leaves_next_stop_without_candidates_under_self_derived_
     assert land_result["status"] == "committed", land_result
     assert land_result["validation"]["mode"] == "reused_run_validation_index_with_zero_execution", land_result
     assert land_result["round_baseline_seal"]["sealed"] is True, land_result
+    assert land_result["candidate_evidence"]["status"] == "skipped_not_applicable", land_result
     landed_head = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True
     ).stdout.strip()

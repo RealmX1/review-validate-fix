@@ -6,15 +6,11 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
-CODEX_CLI_VERSIONS_WITH_VERIFIED_NATIVE_REWIND_BOUNDARY = frozenset({"0.163.0"})
-
-
-def codex_native_rewind_boundary_capability_is_verified(metadata: Mapping[str, Any]) -> bool:
-    """按已取证的版本与宿主组合裁决；source=vscode 单独不证明 GUI 能力。"""
+def is_codex_tui_transcript_metadata_supported_by_independent_user_turn_boundary_reader(metadata: Mapping[str, Any]) -> bool:
+    """只识别本 reader 支持的事件格式；记录版本不是当前宿主能力证明。"""
     return (
-        all(isinstance(metadata.get(field), str) for field in ("cli_version", "originator", "source"))
-        and metadata.get("cli_version") in CODEX_CLI_VERSIONS_WITH_VERIFIED_NATIVE_REWIND_BOUNDARY
-        and metadata.get("originator") == "codex-tui"
+        metadata.get("originator") == "codex-tui"
+        and isinstance(metadata.get("source"), str)
         and metadata.get("source") in {"cli", "vscode"}
     )
 
@@ -26,7 +22,6 @@ def read_independent_user_turn_boundary_evidence(*, receipt: Mapping[str, Any]) 
     except (OSError, ValueError, KeyError):
         return failure
     session = None
-    native_cli_version = None
     native_originator = None
     native_session_source = None
     current_turn = None
@@ -42,7 +37,6 @@ def read_independent_user_turn_boundary_evidence(*, receipt: Mapping[str, Any]) 
             return failure
         if record.get("type") == "session_meta":
             session = payload.get("id")
-            native_cli_version = payload.get("cli_version")
             native_originator = payload.get("originator")
             native_session_source = payload.get("source")
         if record.get("type") != "event_msg":
@@ -83,8 +77,8 @@ def read_independent_user_turn_boundary_evidence(*, receipt: Mapping[str, Any]) 
     if found is not None and boundary_turn_user_message_count != 1:
         return {**failure, "reason": "决策点被并入已有 user turn，没有独立分界", "reason_code": "native_user_turn_not_independent", "recovery_action": "request_new_boundary_after_turn_completion"}
     # 本机 TUI 的隔离 app-server 路径记录 source=vscode；它不等同于 VS Code 扩展宿主。
-    if not codex_native_rewind_boundary_capability_is_verified({
-        "cli_version": native_cli_version, "originator": native_originator, "source": native_session_source,
+    if not is_codex_tui_transcript_metadata_supported_by_independent_user_turn_boundary_reader({
+        "originator": native_originator, "source": native_session_source,
     }):
-        return {**failure, "capability_unverified": True, "reason": "此 Codex 版本或宿主形态的独立消息与原生回退能力尚未取证", "reason_code": "native_rewind_capability_unverified", "recovery_action": "repair_host_capability"}
+        return {**failure, "capability_unverified": True, "reason": "此转录不符合受支持的 Codex TUI 原生独立消息事件格式", "reason_code": "native_rewind_capability_unverified", "recovery_action": "repair_host_capability"}
     return found or failure

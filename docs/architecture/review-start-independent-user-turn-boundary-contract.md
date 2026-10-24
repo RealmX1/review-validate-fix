@@ -1,6 +1,22 @@
-# RVF 开审前独立消息与 checkpoint 契约
+# RVF 审查候选快照与可选原生回退契约
 
-本契约把自主发起资格与可回退消息分界分开。Agent 可以自己判断条件满足并请求下一次征询；这不等于用户刚刚明确命令开审。任何新一轮正式 RVF 都必须先验证独立消息、会话、当前候选和不可变 Git 快照。RVF 提供消费门禁，cline-kanban 当前源码提供 receipt 捕获与活动分支观测；实际调用缺少完整证据时仍返回 `review_start_boundary_pending`，不能由源码存在推导已安装实例或完整原生链路已经通过验收。未验证其它宿主的原生 rewind 能力，不从 Codex 样本外推。
+普通 RVF 的准入是有效授权、明确范围与不可变候选快照，不要求特定 Agent Harness 发行版本，也不要求宿主具有原生回退接口。
+
+## 普通审查与自动回退分别取证（49d13 / f00ae）
+
+- `review_candidate_snapshot` 使用 `rvf-review-candidate-snapshot/v1`，绑定决策 token、会话、工作目录、候选指纹、HEAD、固定比较坐标及独立 Git commit/tree；不声称存在原生 UserMessage。
+- 快照通过独立 index 创建，不移动 HEAD 或修改真实暂存区。prepare、重试与 dispatch 重验候选内容、权限、链接及 run 归属；仅文件时间变化且内容相同不使普通审查失效。
+- prepare 与范围说明重渲始终用固定 `checkpoint_commit` 生成 packet 的 diff、文件正文及摘要。Git diff 使用临时 bare 元数据与原仓只读对象，隔离活动 `.gitattributes`、真实 index 和全局属性；纯 dirty tracker 仍保留 hunk 投影，超限新增正文在所有 diff 中一并省略。
+- 生效的仓库排除策略及仓库内链接依赖独立冻结。`packet_context_only_paths` 绑定只作为策略上下文捕获的路径；它们不进入候选指纹、primary scope、审查 diff 或新增正文。策略解析在冻结 tree 中完成，支持内部相对、绝对及中间目录链接。
+- `review_start_boundary_receipt` 保持原生凭据 v1，作为可选自动回退证据；它与候选快照是不同对象。无 receipt、无控制端点、未适配的 Harness 或未知发行版本均不阻断普通 review/fix/handoff。
+- `automatic_closeout_eligibility` 记录 `eligible` 或 `unavailable` 及真实原因；不可用时固定为 handoff 后人工 land/base 同步，不伪造正向能力或用户原话。
+- `automatic-closeout-registration.json` 的 `pending/registered/disabled` 是运行注册事实；只有确认 registered 的新运行才发布自动完成通知。绑定、激活失败或响应未知只禁用自动动作，普通 start 仍成功；RVF 的完成通知出口每次核对该记录，避免迟到激活造成双重收尾。
+- 调用身份错误、token 撤销、真实候选变化、错误 run 绑定继续失败关闭。单个原生 reader 的版本、消息或 nonce 检查不再决定普通审查资格。
+- 原生 capture、receipt 读取或校验失败（包括原生 `invalidated`）统一记录资格 `unavailable`，保留原因；原生查询结束后再次独立核验候选，不能让降级掩盖查询期间的内容、HEAD 或权限变化。prepare 显式提供的决策 token/候选快照决定普通授权，环境变量中的原生 receipt 不能替换它。
+- 完成通知冻结与发布均要求注册文件存在、可读、状态为 `registered`，并与原生 receipt 的 token 和 finalization 的 run 一致。缺记录不提供旧运行兼容放行；即使已有冻结通知，注册失效后也不能发布。
+- 直接 prepare 使用 `--decision-token <真实 token>`；无授权、无明确范围时不创建正式 run，不提供通用 bypass 开关。
+
+下文的独立消息、nonce、活动分支和原生回退规则仅约束可选自动恢复。历史事故用于解释这些自动动作为什么需要准确证据，不是普通审查的全局前置要求。
 
 ## 事故与偏差
 
@@ -21,36 +37,36 @@
 
 证据入口是创建需求中的两枚 token、来源更正文档、run handoff 及原始 rollout。只摘录用户消息与工具调用的事件事实，不导出内部推理或整段会话。
 
-## 状态链与正式开始
+## 普通审查与可选自动恢复的状态链
 
 ```mermaid
 flowchart TD
-  stop[Stop: 计算候选并 mint] --> delivery[持久化投递意图 / 发送独立边界标记]
-  delivery --> native[宿主提交原生 UserMessage / 独立 user turn]
-  native --> snapshot[宿主绑定原生回退消息和不可变 Git 内容快照]
-  snapshot --> gate[统一分界 gate: 身份 / token / 候选 / base / 活动会话分支]
-  gate --> start[acknowledge → prepare / lease / 在途凭证]
-  start --> dispatch[再次 gate → dispatch / detached → reviewer]
-  native --> defer[Agent: deferred_until_condition]
-  defer --> condition[Agent 判断前置条件已满足]
-  condition --> request[request-review-start-boundary: 新 token / 新消息请求]
-  request --> delivery
-  user[真实明确用户命令] --> native
-  gate -->|缺证据| pending[等待分界 / 不进入正式审查]
-  gate -->|候选或分支失效| invalid[作废当前分界 / 重新请求]
+  token[有效决策 token 与明确范围] --> snapshot[独立 Git index 冻结候选]
+  snapshot --> gate[普通 gate: 身份 / token / 候选 / 固定比较坐标]
+  gate --> native[单独核验可选原生消息与活动分支]
+  native --> recheck[重新核验普通候选]
+  recheck --> start[acknowledge → prepare / lease / 在途凭证]
+  start --> dispatch[重验普通 gate → dispatch → reviewer]
+  native -->|证据不可用| manual[unavailable → handoff 后人工 land/base]
+  native -->|原生证据成立| eligible[eligible]
+  eligible --> registration[prepare 成功后绑定并激活自动收尾]
+  registration -->|registered 且 token/run 一致| completion[允许自动完成通知]
+  registration -->|失败或未确认| manual
+  gate -->|授权或候选失效| invalid[拒绝普通开审]
+  recheck -->|查询期间候选变化| invalid
 ```
 
 - mint、候选计算、投递意图和 receipt/run 绑定意图是轻量协调记录，不运行 reviewer、不分配审查 lease。
 - `acknowledge` 是最早正式副作用；消费 reopen 意图、分配 lease、创建正式 run/prepare 工件、arm 在途凭证也算正式开始。诊断用 Stop ledger 不等于正式 review run。
-- `start` 在 acknowledge 前验证；默认 prepare 流水线在创建 run 前再验证；直接 `prepare_run`、prep 文件重放以及 reviewer 的直接、CLI、detached 执行均检查同一证据。旧 Stop 路由在 precheck/reopen/allocate 前检查，fork、prep 写入与冻结入口也验证同一条件。off/report-only 和 dry-run 诊断不创建正式 prep 或接受决策，诊断的计划工件不能直接派发。
+- `start` 在 acknowledge 前验证普通授权与候选；默认 prepare 流水线在创建 run 前再验证；直接 `prepare_run`、prep 文件重放以及 reviewer 的直接、CLI、detached 执行均检查同一候选快照。旧 Stop 路由在 precheck/reopen/allocate 前检查，fork、prep 写入与冻结入口也验证同一普通准入条件。off/report-only 和 dry-run 诊断不创建正式 prep 或接受决策，诊断的计划工件不能直接派发。
 - `accepted`、`submitted`、`delivered_and_submit_confirmed`、模型声称消费，以及 `initiated_by_explicit_user_request` 都不是 gate 的授权证明。
 - Git checkpoint 与会话回退是两个能力。隔离 Codex CLI 0.163.0 实测：Stop 的 `<hook_prompt>` 虽在 rollout 中是 role=user，却不是原生独立回退 prompt；独立用户消息可以选中回退，界面说明只回退会话、文件不变。Git 快照负责保存候选内容，不能声称 Codex 原生 rewind 会恢复文件。
 
-## RVF 已实现的门禁
+## 可选自动恢复的原生证据门禁
 
 实现入口：`core/review_start_boundary/review_start_boundary_verification.py`、Codex 原生证据 reader、`scripts/review_start_boundary_gate.py`。
 
-当前只放行已做原生实验的 Codex CLI 0.163.0 TUI（originator=codex-tui，已观察 source=cli/vscode）；Codex GUI、exec 与其它宿主形态不借用这份原生回退证明。原生 session_meta 的版本不在已验证集合时保持 pending，升级后须先重跑原生实验。本次直接启动 TUI 的隔离 app-server 实验原生记录 source=vscode，当前 Kanban TUI 记录 source=cli；source 字段单独不能证明 VS Code 扩展或 GUI 的回退能力。每次首次开审或重入，先验证静态 receipt、原始 JSONL 和 Git 候选，再在状态迁移前重新查询宿主实时活动分支；首次没有静态 receipt 时另先向宿主取一次，最后的实时查询仍不可省略。JSONL 要求 `session_meta.id` 相同、`task_started.turn_attribution.turn_trigger=user`、对应 turn 的 `item_completed.item.type=UserMessage` 和原生 message ID 相符。只存在 `response_item.role=user` 不算证据；后续出现另一用户发起的工作 turn、消息被截断移除或发生已持久化 rollback 都拒绝旧分界。真实 PTY 实验进一步确认：TUI 已显示回退后，原始 rollout 仍保留旧 UserMessage，静态 reader 仍判存在；所以它只证明消息曾存在，活动分支资格必须由本次 nonce 查询的宿主快照证明。重启后也不复用旧分支观测。
+原生 reader 识别 `originator=codex-tui`、`source in {cli,vscode}` 的事件格式，不依据 `cli_version` 放行或拒绝。历史 0.163.0 是实验样本版本；新版本在当前协议与真实宿主证据成立时同样可用，GUI、exec 等形态不会借用 TUI 的回退证明。本次直接启动 TUI 的隔离 app-server 实验原生记录 source=vscode，当前 Kanban TUI 记录 source=cli；source 字段单独不能证明 VS Code 扩展或 GUI 的回退能力。每次执行严格原生资格校验时，先验证静态 receipt、原始 JSONL 和 Git 候选，再在确认原生资格前重新查询宿主实时活动分支；首次没有静态 receipt 时另先向宿主取一次，最后的实时查询仍不可省略。JSONL 要求 `session_meta.id` 相同、`task_started.turn_attribution.turn_trigger=user`、对应 turn 的 `item_completed.item.type=UserMessage` 和原生 message ID 相符。只存在 `response_item.role=user` 不算证据；后续出现另一用户发起的工作 turn、消息被截断移除或发生已持久化 rollback 都拒绝旧分界。真实 PTY 实验进一步确认：TUI 已显示回退后，原始 rollout 仍保留旧 UserMessage，静态 reader 仍判存在；所以它只证明消息曾存在，活动分支资格必须由本次 nonce 查询的宿主快照证明。重启后也不复用旧分支观测。
 
 自动正文必须精确包含本 token 的独立单行边界标记，不能混入其它输入。自动来源的 token 必须为 explicit=false；手动来源必须对应原生明确 `/review-validate-fix`、`$review-validate-fix` 或 `:review-validate-fix` 主 skill 调用，也接受合法的前置文字及命名空间形态，例如 `now $review-validate-fix:review-validate-fix your own work.` 和 `$rvf:review-validate-fix`。UPS 与 verifier 共用纯文本识别与抑制规则；`$rvf:review-validate-fix` 等其它命名空间在 UPS 仍须由 Codex `text_elements` 确认，verifier 先核实 manual UPS provenance，再识别该原文，不扩大 UPS 的文本 fallback。兄弟 `rvf-*` skill、交接正文和被引号包裹的普通提及不能代替主 skill 调用。原文仍须是通过宿主证明的独立 user turn，并同时满足 `initiated_by_explicit_user_request=true`、`developer_manual_trigger_via_user_prompt_submit` provenance、原始消息 SHA256、完整 checkpoint 绑定及实时活动分支证明；合法命令形态本身不构成开审授权。Agent 自填 reason 不参与来源裁决。
 
@@ -58,7 +74,7 @@ flowchart TD
 
 快照必须使用 40 位不可变 commit，tree、HEAD、当前候选指纹、文件身份/mtime/ctime 签名、候选文件内容 SHA256、比较基线及其本地 ref tip 都重新核验。commit 正文必须有且只有一行 `RVF_REVIEW_START_BOUNDARY_BINDING=<JSON>`，内容等于下述绑定字段，不能复用任意 latest commit。Git 子进程清理继承的 `GIT_*` 仓库定位变量。还核对文件类型、执行权限、仓库内符号链接及 gitlink commit；仓库外链接和带未冻结修改的 submodule 拒绝使用本快照证明。
 
-通过验证后，先用排他锁将原生 session/message 绑定到唯一 token 和静态 receipt 摘要，再绑定唯一 `run_id/run_dir`；同一消息不能借给另一 run。相同 token、静态 receipt 摘要、真实 `run_id` 与规范化 `run_dir` 才允许重入。所有 token 的绑定写入共用排他锁，并从同一组不可变 `*.run-binding.json` 记录核对反向归属；既有 run_id 或目录均不能被另一 token 占用。bridge 复用该绑定器，不能重写事实或从目录名推断 run_id；完成通知也使用冻结的真实 run_id。prep 必须在 completed 缓存返回及 startup scope/run 工件落盘前完成验证与占用。相同 run 重入仍须通过 gate。当前实现有意保守：若已准备但未派发的 run 在后续 turn 或候选变化后失效，先终止旧准备并释放范围；不得直接把旧 run 或分界转给新候选。已开始 run 的跨 turn 冻结输入重试优化未在本次放宽。
+通过验证后，先用排他锁将原生 session/message 绑定到唯一 token 和静态 receipt 摘要，再绑定唯一 `run_id/run_dir`；同一消息不能借给另一 run。相同 token、静态 receipt 摘要、真实 `run_id` 与规范化 `run_dir` 才允许重入。所有 token 的绑定写入共用排他锁，并从同一组不可变 `*.run-binding.json` 记录核对反向归属；既有 run_id 或目录均不能被另一 token 占用。bridge 复用该绑定器，不能重写事实或从目录名推断 run_id；完成通知也使用冻结的真实 run_id。prep 必须在 completed 缓存返回及 startup scope/run 工件落盘前完成验证与占用。普通 run 重入仍须通过候选 gate；后续 turn 或原生分支变化只影响自动恢复资格，真实候选变化和错误 run 归属仍拒绝。原生消息不能被直接转给新 token 或新候选。
 
 ## cline-kanban 的生产接口与责任
 
@@ -66,7 +82,7 @@ RVF 发送独立边界标记，使用 `--deliver-when-agent-idle`，空闲等待
 
 cline-kanban 负责证明以下因果次序：目标会话确定 → 原生独立消息提交 → 原生消息/turn 已可选作 rewind 分界 → 针对此消息捕获准确 Git 内容快照 → 提供 receipt。不能把任务卡 latest checkpoint 无条件贴到消息回执上。应捕获准确消息/turn 的 immutable checkpoint，保全 ref 以免被 GC，并在 rewind/重建会话时按活动分支更新或撤销证明。
 
-`kanban task message-status` 应在原有回执中增加 `independent_user_turn_boundary_receipt`。RVF 当前消费者已支持该字段；每次 gate 还会通过 `--review-start-boundary-observation-nonce <本次随机 nonce>` 请求活动分支快照。CLI 若不支持此参数，或没有完整观测时保持 pending。canonical receipt、prep/contract 内的 receipt 和 `RVF_REVIEW_START_BOUNDARY_RECEIPT` 都只定位并冻结静态证明，不能跳过实时查询。现有手动消息也需宿主为其生成可查询的原生消息记录；用户的明确命令本身可以充当消息分界，仍需 checkpoint 和当前分支证明。
+`kanban task message-status` 应在原有回执中增加 `independent_user_turn_boundary_receipt`。RVF 当前消费者已支持该字段；每次 gate 还会通过 `--review-start-boundary-observation-nonce <本次随机 nonce>` 请求活动分支快照。CLI 若不支持此参数，或没有完整观测时，原生资格不可用；普通审查在授权与候选核验通过后继续。canonical receipt、prep/contract 内的 receipt 和 `RVF_REVIEW_START_BOUNDARY_RECEIPT` 都只定位并冻结静态证明，不能跳过实时查询。现有手动消息也需宿主为其生成可查询的原生消息记录；用户的明确命令本身可以充当消息分界，仍需 checkpoint 和当前分支证明。
 
 宿主必须返回 `review_start_boundary_active_branch_observation`，含本次 `request_nonce`、查询的 task/key/session、`native_active_branch_user_message_ids` 和 `native_active_branch_user_turn_id`。边界消息必须恰好出现一次，当前 user turn 必须与 receipt 相同。nonce 必须来自本次请求；不得回显旧查询、用 accepted/submitted 代替，或仅把历史 rollout 末尾当作活动分支。宿主需通过真实原生控制面观察 UI rewind 后的当前分支；无法证明时不返回正向观测。该 producer 的当前源码已提供控制端点查询；每次仍须证明端点属于当前 TUI 及 incarnation，并在查询后复核身份。源码、部署和跨仓原生端到端验收分别记录，不能相互替代。
 
@@ -113,13 +129,13 @@ cline-kanban 负责证明以下因果次序：目标会话确定 → 原生独�
 
 checkpoint 的 JSON 绑定字段见代码 `CHECKPOINT_BINDING_FIELDS`，不含 commit 自身以避免循环哈希。宿主需保留 message→checkpoint 映射；仅有 Git commit 正文不能证明宿主已经提供了原生可选回退。
 
-历史 e9e12 的“producer 尚未实现”是当时状态。当前修复由 RVF 40659 与 cline-kanban 87345 分别在独立 worktree 实施；CLI 异步吞错复用既有 caaa3。源码和隔离联验结果不等于生产安装已更新。Claude Code/Kimi 适配器明确报告能力未取证并保持 pending；不能静默沿用 Codex reader。
+历史 e9e12 的“producer 尚未实现”是当时状态。当前修复由 RVF 40659 与 cline-kanban 87345 分别在独立 worktree 实施；CLI 异步吞错复用既有 caaa3。源码和隔离联验结果不等于生产安装已更新。Claude Code/Kimi 适配器明确报告原生能力未取证；普通审查继续并交接人工收尾，不能静默沿用 Codex reader。
 
 ## 自主恢复与旧路径移除
 
 `rvf request-review-start-boundary --deferred-decision-token <旧 token> --reason "条件满足的自主判断"` 只适用于本会话最近的延后型谢绝。结构性谢绝、旧 token 或其它会话拒绝。普通未开始 token 可用 `--decision-token` 请求新分界；旧分界被撤回，派生 token 的来源仍是自动请求。延后重问仅释放延后条件门，冷却、结构性 snooze、铸造熔断不获得用户显式请求的豁免。
 
-删除旧 `--reopen-own-declined-decision` parser、执行函数、伪口头来源常量、技能指引及旧正向测试。不迁移或重写历史 token。旧 CLI 参数报错，旧缺证据 token 在新 gate 下等待或失效。项目未正式分发，未增加旧入口适配器或兼容框架。
+删除旧 `--reopen-own-declined-decision` parser、执行函数、伪口头来源常量、技能指引及旧正向测试。不迁移或重写历史 token。旧 CLI 参数报错；缺原生证据不阻断有效 token 的普通审查，但不能注册自动恢复。项目未正式分发，未增加旧入口适配器或兼容框架。
 
 推荐方案是“下一独立 turn 重投 + 统一副作用 gate”组合。只重投仍可被直接 prepare/dispatch 绕过；只加 gate 而不提供自主重投会造成无恢复路径。每轮人工确认会削弱用户要求保留的自主性，所以未采用。
 
@@ -133,15 +149,15 @@ checkpoint 的 JSON 绑定字段见代码 `CHECKPOINT_BINDING_FIELDS`，不含 c
 
 | 场景 | 必须观察 | 自动化证据 |
 | --- | --- | --- |
-| 初次自动发起 | 独立原生 UserMessage、候选快照先于 acknowledge/prepare | 专用 pytest：真实隔离 Git、合成宿主事件/实时观测接口替身，正向到真实 prepare；原生 PTY 实验单独验证可回退能力与静态历史的盲区 |
+| 初次普通发起 | 有效 token 与独立候选快照先于 acknowledge/prepare；原生资格单独记录 | 专用 pytest：真实隔离 Git、合成宿主事件/实时观测接口替身，正向到真实 prepare；原生 PTY 实验单独验证可回退能力与静态历史的盲区 |
 | 延后自动恢复 | 新 token、新消息请求，explicit=false，当前 turn 不开审 | 专用 pytest：重复请求、未接受状态、来源字段 |
-| 用户明确手动命令 | 原始独立主 skill 命令（含前置文字与命名空间）+ manual provenance + 新绑定 commit | 专用 pytest 正向；兄弟 skill、交接正文、普通提及、hook 与伪来源反例拒绝 |
-| 条件满足但无新 turn | 不 acknowledge、不 prepare、不分配/派发 | 专用 pytest 反例，不读取 accepted 作为成功 |
-| 重复/失败/迟到/TTL | 相同请求 token/key；失败保持 pending；到期后消息拒绝 | 专用 pytest；Kanban 队列真实提交/消费仍须跨仓验收 |
-| 候选/HEAD/base/bootstrap 改变 | 旧分界失效，不用内容指纹掩盖纯 commit/base 变化 | 专用 pytest 与既有 bootstrap 回归新断言 |
+| 原生手动回退证据 | 原始独立主 skill 命令（含前置文字与命名空间）+ manual provenance + 新绑定 commit | 专用 pytest 正向；兄弟 skill、交接正文、普通提及、hook 与伪来源反例拒绝 |
+| 条件满足但缺原生新 turn | 普通候选可继续；不冒充具备原生回退资格 | 专用 pytest 反例，不读取 accepted 作为成功 |
+| 重复/失败/迟到/TTL | 相同请求 token/key；原生失败降级；真正过期或撤销的 token 拒绝普通开审 | 专用 pytest；Kanban 队列真实提交/消费仍须跨仓验收 |
+| 候选/HEAD/固定比较坐标改变 | 普通快照失效；本地 base 后续推进不替换已冻结坐标 | 专用 pytest 与既有 bootstrap 回归新断言 |
 | rewind/重启 | 撤销分支上的消息不可复用；重启重新读原生事件；一条消息不能绑定另一 run | 专用 pytest；隔离原生 Codex 选择回退实验 |
-| 直接 prepare/dispatch/detached | 缺证据时无正式 run/renderer/reviewer 副作用 | 专用 pytest 及已有 dispatch 子进程回归的显式合成证明 |
-| 其它宿主 | 未验证的能力维持 pending | 适配器行为检查；不宣称原生 E2E 已通过 |
+| 直接 prepare/dispatch/detached | 缺授权或候选证据时无正式副作用；缺原生证据继续普通流程 | 专用 pytest 及已有 dispatch 子进程回归的显式合成证明 |
+| 其它宿主 | 未验证的原生能力为 unavailable，普通审查继续并人工收尾 | 适配器行为检查；不宣称原生 E2E 已通过 |
 
 既有纯状态机/SOW 字段测试用可注入 gate seam 隔离其原有职责；它们不能计作真实分界完成证据。既有 prepare/dispatch 子进程正向回归改用独立测试夹具，生成实际隔离 Git commit、原生事件与 token，不设置生产 bypass。所有研究实例使用临时隔离配置，不写生产历史或事故状态。
 
@@ -159,7 +175,7 @@ checkpoint 的 JSON 绑定字段见代码 `CHECKPOINT_BINDING_FIELDS`，不含 c
 
 自动首投和重请求均在 `--deliver-when-agent-idle` 基础上增加 `--require-native-independent-user-turn-for-session <session-id>`。持久字段 `requiredNativeIndependentUserTurnSessionId` 约束目标原生会话；summary 空闲只作初筛，宿主还须从当前 TUI 控制面证明前一原生 turn 已完成。等待不更新原始 TTL、不增加投递次数、不占用 PTY。身份变化或能力不可用不得退化为普通投递；同 key 的幂等比较包含严格约束。确认首次提交已经形成目标消息的新 turn 后，不得因该新 turn 正在运行而误报失败或补发重复消息。
 
-bridge 与 reader 共用已取证能力判据：`0.163.0` / `codex-tui` / `source in {cli,vscode}`。`codex_cli_rs`、GUI、exec 与未知版本均不借用取证结果。完整 receipt 捕获成功仍不免除 gate 的当前候选验证及本次 nonce 活动分支查询。
+bridge 与 reader 只共享转录格式判定：`codex-tui` / `source in {cli,vscode}`，版本不参与准入。`codex_cli_rs`、GUI、exec 等不同协议形态没有自动回退资格时，普通审查继续。完整 receipt 捕获成功仍不免除 gate 的当前候选验证及本次 nonce 活动分支查询。
 
 `capture-rvf-review-start-boundary` 的响应为判别结果：`status=captured` 必须携带 `receipt`；`status=pending/invalidated` 携带 `reason`、`reason_code`、`recovery_action`，命令以非零退出。未知异常保持错误正文与非零码；exit 0 的空输出、坏 JSON 或不完整对象也不能算捕获成功。receipt v1 的字段和 checkpoint 绑定不变。
 

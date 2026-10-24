@@ -4,9 +4,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import posixpath
+import re
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
 from compact_path_tree_rendering import render_compact_path_tree_block  # noqa: E402
 from core.session_scope_allocation import reviewable_unit_diff_tracker  # noqa: E402
+from core.review_start_boundary.review_start_boundary_verification import repository_git_environment  # noqa: E402
 from review_scope_excluded_path_prefixes import (  # noqa: E402
     REVIEW_VALIDATE_FIX_REPO_LOCAL_IGNORE_FILE_NAME,
     load_review_scope_excluded_path_prefixes,
@@ -32,6 +37,7 @@ def run_git(repo: Path, args: list[str]) -> str:
         check=False,
         capture_output=True,
         text=True,
+        env=repository_git_environment(),
     )
     if completed.returncode != 0:
         raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or f"git {' '.join(args)} failed")
@@ -42,7 +48,7 @@ def git_root(repo: Path) -> Path:
     return Path(run_git(repo, ["rev-parse", "--show-toplevel"]).strip()).resolve()
 
 
-def commit_is_ancestor_of_head(repo: Path, commit: str) -> bool:
+def commit_is_ancestor_of_head(repo: Path, commit: str, head_ref: str = "HEAD") -> bool:
     """True iff <commit> is an ancestor of HEAD (or HEAD itself).
 
     Mirrors core.session_scope_allocation.committed_round_detection._commit_is_ancestor_of_head;
@@ -54,11 +60,12 @@ def commit_is_ancestor_of_head(repo: Path, commit: str) -> bool:
     if not commit:
         return False
     completed = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", commit, "HEAD"],
+        ["git", "merge-base", "--is-ancestor", commit, head_ref],
         cwd=repo,
         check=False,
         capture_output=True,
         text=True,
+        env=repository_git_environment(),
     )
     return completed.returncode == 0
 
@@ -67,6 +74,7 @@ def resolve_owned_diff_base_ref(
     repo: Path,
     session_manifest: dict[str, Any] | None,
     base_ref_override: str | None = None,
+    *, head_ref: str = "HEAD",
 ) -> str:
     """Resolve the diff base for the path-restricted owned-diff.
 
@@ -86,9 +94,136 @@ def resolve_owned_diff_base_ref(
         if isinstance(manifest_baseline, str) and manifest_baseline.strip():
             candidates.append(manifest_baseline.strip())
     for candidate in candidates:
-        if commit_is_ancestor_of_head(repo, candidate):
+        if commit_is_ancestor_of_head(repo, candidate, head_ref):
             return candidate
     return "HEAD"
+
+
+class FrozenCandidatePacketGitSource:
+    """只从固定 tree/blob 读取 reviewer 代码输入，不观察活动文件或真实 index。"""
+
+    def __init__(self, repo: Path, commit: str):
+        if len(commit) not in (40, 64) or any(character not in "0123456789abcdef" for character in commit):
+            raise ValueError("冻结 packet 必须使用完整且不可变的候选 commit OID")
+        if run_git(repo, ["rev-parse", "--verify", commit + "^{commit}"]).strip() != commit:
+            raise ValueError("冻结 packet 的候选 commit 无效")
+        parents = run_git(repo, ["rev-list", "--parents", "-n", "1", commit]).split()
+        if len(parents) != 2:
+            raise ValueError("冻结 packet 的候选快照必须绑定唯一原始 HEAD")
+        self.repository_root = repo
+        self.frozen_candidate_commit_sha = commit
+        self.frozen_origin_worktree_head_commit_sha = parents[1]
+        self.frozen_added_paths_with_omitted_contents: set[str] = set()
+        self.frozen_packet_context_only_paths: set[str] = set()
+        self.frozen_added_paths_outside_review_scope: set[str] = set()
+        self.frozen_diff_presentation_config_arguments: list[str] = []
+        # 保留分配侧影响 hunk 分段的参数；属性和外部 driver 仍完全隔离。
+        for setting in ("diff.algorithm", "diff.indentheuristic", "diff.interhunkcontext"):
+            configured = subprocess.run(["git", "config", "--get", setting], cwd=repo,
+                                        env=repository_git_environment(), capture_output=True, text=True, check=False)
+            if configured.returncode == 0:
+                self.frozen_diff_presentation_config_arguments.extend(["-c", setting + "=" + configured.stdout.strip()])
+            elif configured.returncode != 1:
+                raise RuntimeError("无法读取分配侧的 Git diff 渲染参数")
+
+    def render_raw_diff_from_immutable_git_objects(self, arguments: list[str]) -> str:
+        """以临时 bare 元数据和原仓只读对象库渲染 raw diff，隔离所有活动 attributes。"""
+        objects = Path(run_git(self.repository_root, ["rev-parse", "--git-path", "objects"]).strip())
+        if not objects.is_absolute():
+            objects = self.repository_root / objects
+        environment = {**repository_git_environment(), "GIT_CONFIG_GLOBAL": "/dev/null",
+                       "GIT_CONFIG_SYSTEM": "/dev/null", "GIT_ATTR_NOSYSTEM": "1"}
+        with tempfile.TemporaryDirectory(prefix="rvf-frozen-packet-git-") as directory:
+            initialize_command = ["git", "-c", "core.attributesFile=/dev/null", "init", "--bare", "--quiet", "--template="]
+            if len(self.frozen_candidate_commit_sha) == 64:
+                initialize_command.append("--object-format=sha256")
+            initialized = subprocess.run([*initialize_command, directory],
+                                         env=environment, capture_output=True, text=True, check=False)
+            if initialized.returncode:
+                raise RuntimeError("无法初始化冻结 packet 的只读 Git 渲染环境")
+            environment.update(GIT_DIR=directory, GIT_OBJECT_DIRECTORY=str(objects.resolve()),
+                               GIT_INDEX_FILE=str(Path(directory) / "empty-render-index"))
+            result = subprocess.run(["git", "-c", "core.attributesFile=/dev/null", *self.frozen_diff_presentation_config_arguments, *arguments], cwd=self.repository_root, env=environment,
+                                    capture_output=True, text=True, check=False)
+            if result.returncode:
+                raise RuntimeError(result.stderr.strip() or "冻结 Git diff 渲染失败")
+            return result.stdout
+
+    def list_frozen_candidate_added_paths(self, excluded_prefixes: list[str]) -> list[str]:
+        # 快照相对原始 HEAD 新增的文件也包含已暂存新增项；两者都需要冻结正文。
+        raw = self.render_raw_diff_from_immutable_git_objects(["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--diff-filter=A", "--name-only", "-z",
+                                  self.frozen_origin_worktree_head_commit_sha, self.frozen_candidate_commit_sha, "--", ".", *exclude_pathspecs(excluded_prefixes)])
+        return sorted(path for path in raw.split("\0") if path and path not in self.frozen_packet_context_only_paths)
+
+    def read_frozen_tree_entry(self, path: str) -> list[str] | None:
+        raw = run_git(self.repository_root, ["ls-tree", "-z", self.frozen_candidate_commit_sha, "--", ":(literal)" + path])
+        return raw.split("\0", 1)[0].split("\t", 1)[0].split() if raw else None
+
+    def read_frozen_blob_text_and_metadata(self, path: str, max_bytes: int, *, follow_symlinks: bool = False, require_valid_utf8_text: bool = False) -> tuple[str | None, dict[str, Any]]:
+        entry = self.read_frozen_tree_entry(path)
+        if follow_symlinks:
+            remaining_components = deque(path.split("/"))
+            resolved_components: list[str] = []
+            expanded_symlink_count = 0
+            while remaining_components:
+                component = remaining_components.popleft()
+                if component in ("", "."):
+                    continue
+                if component == "..":
+                    if not resolved_components:
+                        raise ValueError("冻结审查排除策略的符号链接指向仓库外")
+                    resolved_components.pop()
+                    continue
+                prefix = "/".join([*resolved_components, component])
+                entry = self.read_frozen_tree_entry(prefix)
+                if entry is None:
+                    break
+                if entry[0] == "120000":
+                    expanded_symlink_count += 1
+                    if expanded_symlink_count > 40:
+                        raise ValueError("冻结审查排除策略包含循环符号链接")
+                    target = run_git(self.repository_root, ["cat-file", "blob", entry[2]])
+                    if posixpath.isabs(target):
+                        root_prefix = str(self.repository_root).rstrip("/")
+                        if target == root_prefix:
+                            target = ""
+                        elif target.startswith(root_prefix + "/"):
+                            target = target[len(root_prefix) + 1:]
+                        else:
+                            raise ValueError("冻结审查排除策略的符号链接指向仓库外")
+                        resolved_components.clear()
+                    # 先展开链接，再按实际目录处理后续 '..'；不能预先 normpath。
+                    remaining_components.extendleft(reversed(target.split("/")))
+                elif remaining_components and entry[1] != "tree":
+                    entry = None
+                    break
+                else:
+                    resolved_components.append(component)
+            else:
+                entry = self.read_frozen_tree_entry("/".join(resolved_components)) if resolved_components else None
+        if entry is None or entry[1] != "blob":
+            return None, {"size": 0, "sha256": None, "omitted": True, "reason": "冻结 tree 中不是普通 blob"}
+        size = int(run_git(self.repository_root, ["cat-file", "-s", entry[2]]).strip())
+        digest = hashlib.sha256()
+        chunks = []
+        process = subprocess.Popen(["git", "cat-file", "blob", entry[2]], cwd=self.repository_root,
+                                   env=repository_git_environment(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        assert process.stdout is not None
+        with process.stdout:
+            for chunk in iter(lambda: process.stdout.read(64 * 1024), b""):
+                digest.update(chunk)
+                if size <= max_bytes:
+                    chunks.append(chunk)
+        _, stderr = process.communicate()
+        if process.returncode:
+            raise RuntimeError(stderr.decode("utf-8", "replace") or "无法读取冻结 blob")
+        info = {"size": size, "sha256": digest.hexdigest(), "git_mode": entry[0], "git_object_id": entry[2]}
+        if size > max_bytes:
+            return None, {**info, "omitted": True, "reason": f"size exceeds max_file_bytes={max_bytes}"}
+        content = b"".join(chunks)
+        if b"\0" in content:
+            return None, {**info, "omitted": True, "reason": "binary file"}
+        return content.decode("utf-8", "strict" if require_valid_utf8_text else "replace"), {**info, "omitted": False}
 
 
 def exclude_pathspecs(exclude_prefixes: list[str]) -> list[str]:
@@ -221,18 +356,38 @@ def validate_session_manifest(manifest: dict[str, Any] | None, root: Path, path:
         raise ValueError(f"session manifest has no owned paths; refusing to build empty Session-Owned scope: {path}")
 
 
-def diff_for_paths(repo: Path, paths: list[str], exclude_prefixes: list[str], base_ref: str = "HEAD") -> str:
+def diff_for_paths(repo: Path, paths: list[str], exclude_prefixes: list[str], base_ref: str = "HEAD", frozen_candidate_source: FrozenCandidatePacketGitSource | None = None) -> str:
     if not paths:
         return ""
-    args = ["diff", "--find-renames", base_ref, "--", *paths]
+    if frozen_candidate_source and base_ref == "HEAD":
+        base_ref = frozen_candidate_source.frozen_origin_worktree_head_commit_sha
+    args = ["diff", "--find-renames", base_ref]
+    if frozen_candidate_source:
+        args.extend(["--no-ext-diff", "--no-textconv", frozen_candidate_source.frozen_candidate_commit_sha])
+    args.extend(["--", *([":(literal)" + path for path in paths] if frozen_candidate_source else paths)])
     if exclude_prefixes:
         args.extend(exclude_pathspecs(exclude_prefixes))
+    if frozen_candidate_source:
+        args.extend(":(exclude,literal)" + path for path in sorted(
+            frozen_candidate_source.frozen_added_paths_with_omitted_contents | frozen_candidate_source.frozen_packet_context_only_paths
+            | frozen_candidate_source.frozen_added_paths_outside_review_scope))
+        return frozen_candidate_source.render_raw_diff_from_immutable_git_objects(args).rstrip()
     return run_git(repo, args).rstrip()
 
 
-def filter_diff_for_hunk_headers(diff_text: str, allowed_headers: set[str]) -> str:
-    if not diff_text or not allowed_headers:
+def review_packet_hunk_line_range_key(header: str) -> tuple[int, int, int, int] | str:
+    """范围身份只取行区间，忽略 attributes/diff driver 产生的函数标题后缀。"""
+    match = re.match(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", header)
+    if match is None:
+        return header.rstrip()
+    return (int(match[1]), int(match[2] or 1), int(match[3]), int(match[4] or 1))
+
+
+def filter_diff_for_hunk_headers(diff_text: str, allowed_headers: set[str], *, require_complete_projection: bool = False) -> str:
+    if not allowed_headers:
         return diff_text.rstrip()
+    allowed_ranges = {review_packet_hunk_line_range_key(header) for header in allowed_headers}
+    matched_ranges = set()
     output: list[str] = []
     file_header: list[str] = []
     in_allowed_hunk = False
@@ -247,8 +402,10 @@ def filter_diff_for_hunk_headers(diff_text: str, allowed_headers: set[str]) -> s
             continue
         if line.startswith("@@"):
             in_any_hunk = True
-            normalized = reviewable_unit_diff_tracker._normalize_header(line)
-            in_allowed_hunk = normalized in allowed_headers
+            line_range = review_packet_hunk_line_range_key(line)
+            in_allowed_hunk = line_range in allowed_ranges
+            if in_allowed_hunk:
+                matched_ranges.add(line_range)
             if in_allowed_hunk and not emitted_header:
                 output.extend(file_header)
                 emitted_header = True
@@ -260,22 +417,20 @@ def filter_diff_for_hunk_headers(diff_text: str, allowed_headers: set[str]) -> s
             continue
         if in_allowed_hunk:
             output.append(line)
+    if require_complete_projection and allowed_ranges - matched_ranges:
+        raise ValueError("冻结候选无法完整投影已分配的 hunk 范围；须核对分配侧与渲染侧的 diff 设置")
     return "\n".join(output).rstrip()
 
 
-def diff_for_tracker_scope(repo: Path, tracker_scope: dict[str, Any], exclude_prefixes: list[str], base_ref: str = "HEAD") -> str:
+def diff_for_tracker_scope(repo: Path, tracker_scope: dict[str, Any], exclude_prefixes: list[str], base_ref: str = "HEAD", frozen_candidate_source: FrozenCandidatePacketGitSource | None = None) -> str:
     paths = [path for path in tracker_scope.get("paths", []) if isinstance(path, str)]
     if not paths:
         return ""
-    # When diffing against a committed-round baseline (base_ref != HEAD), the tracker's recorded
-    # hunk_headers were computed against a different base (HEAD-vs-worktree for dirty units,
-    # baseline..HEAD for committed units). A baseline-vs-worktree diff renumbers/merges hunks —
-    # most acutely on a file with both a committed and a residual-dirty hunk — so hunk-header
-    # filtering would match nothing and silently drop the whole Allocated diff (false-green). Fall
-    # back to path-level diffs of the already-allocated paths to keep the committed (and dirty)
-    # work visible. base_ref == "HEAD" keeps the exact hunk-filtered behavior below (byte-equal).
-    if base_ref != "HEAD":
-        chunks = [diff_for_paths(repo, [path], exclude_prefixes, base_ref) for path in paths]
+    # 真正跨已提交基线时，原始 hunk 坐标可能合并或重新编号，按已分配路径投影。
+    # 纯 dirty 的 HEAD 即使已固定为 OID，也必须保持 hunk 过滤并完整核对授权区间。
+    is_frozen_head_base = frozen_candidate_source is not None and base_ref == frozen_candidate_source.frozen_origin_worktree_head_commit_sha
+    if base_ref != "HEAD" and not is_frozen_head_base:
+        chunks = [diff_for_paths(repo, [path], exclude_prefixes, base_ref, frozen_candidate_source) for path in paths]
         return "\n".join(chunk for chunk in chunks if chunk).rstrip()
     hunk_headers_by_path: dict[str, set[str]] = {}
     path_level_paths: set[str] = set()
@@ -292,12 +447,18 @@ def diff_for_tracker_scope(repo: Path, tracker_scope: dict[str, Any], exclude_pr
             path_level_paths.add(path)
     chunks: list[str] = []
     for path in paths:
+        if frozen_candidate_source and path in (
+            frozen_candidate_source.frozen_added_paths_with_omitted_contents | frozen_candidate_source.frozen_packet_context_only_paths
+            | frozen_candidate_source.frozen_added_paths_outside_review_scope
+        ):
+            continue
         if path in path_level_paths or path not in hunk_headers_by_path:
-            chunk = diff_for_paths(repo, [path], exclude_prefixes, base_ref)
+            chunk = diff_for_paths(repo, [path], exclude_prefixes, base_ref, frozen_candidate_source)
         else:
             chunk = filter_diff_for_hunk_headers(
-                diff_for_paths(repo, [path], exclude_prefixes, base_ref),
+                diff_for_paths(repo, [path], exclude_prefixes, base_ref, frozen_candidate_source),
                 hunk_headers_by_path[path],
+                require_complete_projection=frozen_candidate_source is not None,
             )
         if chunk:
             chunks.append(chunk)
@@ -314,19 +475,47 @@ def build_packet(
     exclude_prefixes: list[str] | None = None,
     allow_missing_session_context: bool = False,
     base_ref_override: str | None = None,
+    frozen_candidate_commit: str | None = None,
+    frozen_packet_context_only_paths: list[str] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     root = git_root(repo)
-    all_exclude_prefixes = load_review_scope_excluded_path_prefixes(root, exclude_prefixes or [])
+    frozen_source = FrozenCandidatePacketGitSource(root, frozen_candidate_commit) if frozen_candidate_commit else None
+    if frozen_source:
+        for path in frozen_packet_context_only_paths or []:
+            if Path(path).is_absolute() or ".." in Path(path).parts:
+                raise ValueError("冻结 packet 上下文路径必须位于仓库内")
+            frozen_source.frozen_packet_context_only_paths.add(path)
+    frozen_ignore_text = None
+    if frozen_source is not None:
+        frozen_ignore_text = ""
+        if frozen_source.read_frozen_tree_entry(REVIEW_VALIDATE_FIX_REPO_LOCAL_IGNORE_FILE_NAME):
+            frozen_ignore_text, info = frozen_source.read_frozen_blob_text_and_metadata(
+                REVIEW_VALIDATE_FIX_REPO_LOCAL_IGNORE_FILE_NAME, 1024 * 1024, follow_symlinks=True, require_valid_utf8_text=True,
+            )
+            if frozen_ignore_text is None:
+                if info.get("reason") != "冻结 tree 中不是普通 blob":
+                    raise ValueError("冻结的审查排除策略不可读")
+                frozen_ignore_text = ""
+    all_exclude_prefixes = load_review_scope_excluded_path_prefixes(
+        root, exclude_prefixes or [], repo_local_ignore_file_text=frozen_ignore_text,
+    )
+    session_manifest = load_session_manifest(session_manifest_path)
+    owned_diff_base_ref = resolve_owned_diff_base_ref(
+        root, session_manifest, base_ref_override,
+        head_ref=frozen_source.frozen_origin_worktree_head_commit_sha if frozen_source else "HEAD",
+    )
+    if frozen_source and owned_diff_base_ref == "HEAD":
+        owned_diff_base_ref = frozen_source.frozen_origin_worktree_head_commit_sha
     generated = datetime.now(timezone.utc).isoformat()
     status_args = ["status", "--short", "-uall"]
     diff_args = ["diff", "--find-renames", "HEAD", "--"]
+    if frozen_source:
+        status_args = ["diff", "--no-ext-diff", "--no-textconv", "--name-status", owned_diff_base_ref, frozen_source.frozen_candidate_commit_sha]
+        diff_args = ["diff", "--no-ext-diff", "--no-textconv", "--find-renames", owned_diff_base_ref, frozen_source.frozen_candidate_commit_sha, "--"]
     if all_exclude_prefixes:
         status_args.extend(["--", ".", *exclude_pathspecs(all_exclude_prefixes)])
         diff_args.extend([".", *exclude_pathspecs(all_exclude_prefixes)])
-    status = run_git(root, status_args).rstrip()
-    diff = run_git(root, diff_args).rstrip()
-    untracked = untracked_files(root, all_exclude_prefixes)
-    session_manifest = load_session_manifest(session_manifest_path)
+    untracked = frozen_source.list_frozen_candidate_added_paths(all_exclude_prefixes) if frozen_source else untracked_files(root, all_exclude_prefixes)
     validate_session_manifest(session_manifest, root, session_manifest_path)
     owned_paths = session_owned_paths(session_manifest)
 
@@ -357,6 +546,25 @@ def build_packet(
                 and isinstance(scope_candidate.get("paths"), list)
             ):
                 tracker_scope = scope_candidate
+    if frozen_source:
+        if session_manifest is not None:
+            visible_added_paths = set(tracker_scope["paths"]) if tracker_scope is not None else (
+                set(session_owned_dirty_paths(session_manifest)) | set(session_owned_committed_round_paths(session_manifest))
+            )
+            frozen_source.frozen_added_paths_outside_review_scope = set(untracked) - visible_added_paths
+        for path in untracked:
+            entry = frozen_source.read_frozen_tree_entry(path)
+            if entry and entry[1] == "blob" and int(run_git(root, ["cat-file", "-s", entry[2]]).strip()) > max_file_bytes:
+                frozen_source.frozen_added_paths_with_omitted_contents.add(path)
+        diff_args.extend(":(exclude,literal)" + path for path in sorted(
+            frozen_source.frozen_added_paths_with_omitted_contents | frozen_source.frozen_packet_context_only_paths
+            | frozen_source.frozen_added_paths_outside_review_scope))
+        status_args.extend(":(exclude,literal)" + path for path in sorted(frozen_source.frozen_packet_context_only_paths))
+        status = frozen_source.render_raw_diff_from_immutable_git_objects(status_args).rstrip()
+        diff = frozen_source.render_raw_diff_from_immutable_git_objects(diff_args).rstrip()
+    else:
+        status = run_git(root, status_args).rstrip()
+        diff = run_git(root, diff_args).rstrip()
     session_context_text = ""
     if session_context is None:
         if not allow_missing_session_context:
@@ -370,6 +578,7 @@ def build_packet(
             raise ValueError(f"session context file is empty: {session_context}")
     metadata: dict[str, Any] = {
         "generated": generated,
+        "frozen_candidate_commit": frozen_source.frozen_candidate_commit_sha if frozen_source else None,
         "repo": str(root),
         "max_file_bytes": max_file_bytes,
         "ignore_file": REVIEW_VALIDATE_FIX_REPO_LOCAL_IGNORE_FILE_NAME,
@@ -415,11 +624,10 @@ def build_packet(
         path for path in metadata["tracker_scope_paths"] if isinstance(path, str)
     ] if tracker_scope is not None else sorted(set(owned_dirty_paths) | set(owned_committed_round_paths))
     owned_path_set = set(owned_diff_paths)
-    owned_diff_base_ref = resolve_owned_diff_base_ref(root, session_manifest, base_ref_override)
     if tracker_scope is not None:
-        owned_diff = diff_for_tracker_scope(root, tracker_scope, all_exclude_prefixes, owned_diff_base_ref)
+        owned_diff = diff_for_tracker_scope(root, tracker_scope, all_exclude_prefixes, owned_diff_base_ref, frozen_source)
     else:
-        owned_diff = diff_for_paths(root, owned_diff_paths, all_exclude_prefixes, owned_diff_base_ref) if session_manifest is not None else ""
+        owned_diff = diff_for_paths(root, owned_diff_paths, all_exclude_prefixes, owned_diff_base_ref, frozen_source) if session_manifest is not None else ""
     owned_untracked = [path for path in untracked if path in owned_path_set]
     background_untracked = [path for path in untracked if path not in owned_path_set]
     metadata["session_owned_diff_paths"] = owned_diff_paths
@@ -439,7 +647,8 @@ def build_packet(
         "- Reviewer/validator subagents may run inside RVF task worktrees where `.venv` is a symlink to the parent worktree. If `.venv/bin/python` cannot import the modules under review, prefer `python3 -m <module>` against the system interpreter or create a temporary venv in the task worktree; do NOT depend on the parent worktree's `.venv`.",
         "- For Python tests, prefer `python3 -m pytest <target>`. Direct `pytest` may be missing on PATH inside a fresh task worktree.",
         "- Do not treat a source checkout or plugin cache as runtime state; canonical mutable state is under `RVF_USER_LOCAL_DATA_ROOT` (default `~/.rvf/user-local-data/`).",
-        "- 本 review-packet 反映 RVF dispatch 触发瞬间 origin worktree 的 dirty snapshot；origin 之后的继续编辑不会回流到本 task worktree。`unattributed dirty paths` 列于下方仅作上下文，**不属于本轮 review 范围**。",
+        (f"- 代码输入与排除策略来自固定 Git 候选 `{frozen_source.frozen_candidate_commit_sha}`；新增文件列表也包含快照中的已暂存新增项。"
+         if frozen_source else "- 本 review-packet 反映 RVF dispatch 触发瞬间 origin worktree 的 dirty snapshot；origin 之后的继续编辑不会回流到本 task worktree。`unattributed dirty paths` 列于下方仅作上下文，**不属于本轮 review 范围**。"),
         "",
     ]
 
@@ -710,11 +919,14 @@ def build_packet(
         for rel in inline_untracked:
             path = root / rel
             lines.extend([f"### {rel}", ""])
-            if not path.is_file():
+            if frozen_source is not None:
+                content, info = frozen_source.read_frozen_blob_text_and_metadata(rel, max_file_bytes)
+            elif not path.is_file():
                 metadata["untracked_files"].append({"path": rel, "omitted": True, "reason": "not a regular file"})
                 lines.extend([f"omitted: not a regular file at packet build time", ""])
                 continue
-            content, info = read_text(path, max_file_bytes)
+            else:
+                content, info = read_text(path, max_file_bytes)
             info["path"] = rel
             metadata["untracked_files"].append(info)
             lines.extend([note_from_info(info), ""])
@@ -732,6 +944,8 @@ def build_packet(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Build a self-contained review packet for review-validate-fix.")
     parser.add_argument("--repo", required=True, help="Target git repository.")
+    parser.add_argument("--frozen-candidate-commit", help="从此不可变候选 commit 渲染全部代码输入，不读取活动文件。")
+    parser.add_argument("--frozen-packet-context-only-path", action="append", default=[], help="只用于解析冻结策略的上下文路径，不进入审查 diff 或新增正文。")
     parser.add_argument("--session-context", help="Required file containing the main-agent work summary.")
     parser.add_argument("--session-manifest", help="Optional JSON manifest describing paths owned by this Codex session.")
     parser.add_argument("--output", help="Write packet to this file instead of stdout.")
@@ -772,6 +986,8 @@ def main() -> int:
             args.exclude_path_prefix,
             args.allow_missing_session_context,
             args.base_ref,
+            args.frozen_candidate_commit,
+            args.frozen_packet_context_only_path,
         )
         if args.max_packet_bytes and metadata["packet_bytes"] > args.max_packet_bytes:
             raise ValueError(

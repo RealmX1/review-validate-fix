@@ -140,17 +140,34 @@ def verify_independent_user_turn_boundary(
             invalid("自动决策点必须是独立边界标记，不能混入其它用户输入")
     else:
         invalid("不接受 Agent 自述或未知来源作为分界")
+    return verify_candidate_git_snapshot(
+        receipt, token_payload=token_payload, repo=repo,
+        candidate_summary_builder=candidate_summary_builder,
+        binding_prefix=CHECKPOINT_BINDING_PREFIX, binding_fields=CHECKPOINT_BINDING_FIELDS,
+        require_filesystem_identity=True,
+    )
+
+
+def verify_candidate_git_snapshot(
+    receipt: Mapping[str, Any], *, token_payload: Mapping[str, Any], repo: str,
+    candidate_summary_builder: Callable[[], Mapping[str, Any]], binding_prefix: str,
+    binding_fields: tuple[str, ...], require_filesystem_identity: bool,
+) -> dict[str, Any]:
+    """验证冻结 Git 输入；原生可回退消息由独立层验证。"""
+    def invalid(reason: str) -> None:
+        raise ReviewStartBoundaryNotVerified(INVALIDATED, reason)
+    expected_fingerprint = token_payload.get("candidate_fingerprint")
     commit = receipt["checkpoint_commit"]
     if len(commit) != 40 or any(c not in "0123456789abcdef" for c in commit):
         invalid("checkpoint 必须绑定不可变 commit，不能只提供 latest ref")
     if git_output(repo, "rev-parse", f"{commit}^{{tree}}") != receipt["checkpoint_tree"]:
         invalid("checkpoint tree 已不匹配")
-    binding_lines = [line[len(CHECKPOINT_BINDING_PREFIX):] for line in git_output(repo, "show", "-s", "--format=%B", commit).splitlines() if line.startswith(CHECKPOINT_BINDING_PREFIX)]
+    binding_lines = [line[len(binding_prefix):] for line in git_output(repo, "show", "-s", "--format=%B", commit).splitlines() if line.startswith(binding_prefix)]
     try:
         binding = json.loads(binding_lines[0]) if len(binding_lines) == 1 else None
     except ValueError:
         binding = None
-    if binding != {key: receipt.get(key) for key in CHECKPOINT_BINDING_FIELDS}:
+    if binding != {key: receipt.get(key) for key in binding_fields}:
         invalid("不可变 checkpoint 没有绑定这条消息、token 与候选；不能复用 latest checkpoint")
     if git_output(repo, "rev-parse", "HEAD") != receipt["worktree_head_commit_sha"]:
         invalid("HEAD 在分界之后改变，须重新请求分界")
@@ -160,7 +177,7 @@ def verify_independent_user_turn_boundary(
         raise ReviewStartBoundaryNotVerified(INVALIDATED, "当前候选无法重新核验") from exc
     if current.get("candidate_fingerprint") != expected_fingerprint:
         invalid("候选在分界之后改变，须重新请求分界")
-    if receipt.get("candidate_filesystem_state_sha256") != candidate_filesystem_state_sha256(repo, current.get("candidates", [])):
+    if require_filesystem_identity and receipt.get("candidate_filesystem_state_sha256") != candidate_filesystem_state_sha256(repo, current.get("candidates", [])):
         invalid("候选文件在分界之后被修改或重建，即便内容已写回原样也须重新请求分界")
     summary = token_payload.get("candidate_summary") or {}
     if receipt.get("comparison_base_tip") != summary.get("committed_round_baseline") or current.get("committed_round_baseline") != summary.get("committed_round_baseline"):

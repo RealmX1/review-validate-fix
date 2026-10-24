@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import subprocess
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,8 +23,22 @@ def fixed_git_coordinates_for_review_start_boundary_unit_test(repo, *, test_scop
             cwd=repo, env=environment, capture_output=True, text=True)
         return result.stdout.strip() if result.returncode == 0 else None
     base_ref = _resolve_committed_round_base_ref(Path(repo))
-    return {"test_scope": test_scope, "worktree_head_commit_sha": commit("HEAD"),
+    head = commit("HEAD")
+    checkpoint = None
+    if head is not None:
+        with tempfile.TemporaryDirectory(prefix="rvf-unit-test-candidate-index-") as directory:
+            snapshot_environment = dict(environment, GIT_INDEX_FILE=str(Path(directory) / "index"))
+            def snapshot_git(*arguments):
+                return subprocess.run(["git", "-c", "core.hooksPath=/dev/null", *arguments], cwd=repo,
+                                      env=snapshot_environment, check=True, capture_output=True, text=True).stdout.strip()
+            snapshot_git("read-tree", head)
+            snapshot_git("add", "--all")
+            tree = snapshot_git("write-tree")
+            checkpoint = snapshot_git("commit-tree", tree, "-p", head, "-m", "test: 冻结独立单元测试候选")
+    return {"test_scope": test_scope, "worktree_head_commit_sha": head, "checkpoint_commit": checkpoint,
             "comparison_base_ref": base_ref, "comparison_base_ref_tip": commit(base_ref),
+            "local_review_base_ref": base_ref, "local_review_base_tip": commit(base_ref),
+            "automatic_closeout_eligibility": {"status": "unavailable", "reason_code": "isolated_unit_test_host"},
             "comparison_base_tip": None}
 
 

@@ -22,6 +22,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from rvf_tool_runtime_python_environment import (
+    ToolRuntimePythonPreflightError,
+    ValidatedToolRuntimePythonEnvironment,
+    ensure_current_process_uses_selected_python,
+    select_tool_runtime_python_environment,
+    selected_python_subprocess_environment,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER_REPOSITORY_RELATIVE_PATH = "scripts/rvf_local_deploy.py"
@@ -966,6 +975,30 @@ def run_local_deploy(
     expected_local_main_commit: str | None = None,
     runner_path: Path | None = None,
 ) -> dict[str, Any]:
+    try:
+        selected_python = select_tool_runtime_python_environment()
+    except ToolRuntimePythonPreflightError as exc:
+        raise DeployError(str(exc), exit_code=2, result=exc.failure_result()) from exc
+    with selected_python_subprocess_environment(selected_python, os.environ) as environment:
+        return _run_local_deploy_using_validated_python(
+            repository_hint=repository_hint,
+            home=home,
+            expected_local_main_commit=expected_local_main_commit,
+            runner_path=runner_path,
+            selected_python=selected_python,
+            subprocess_environment=environment,
+        )
+
+
+def _run_local_deploy_using_validated_python(
+    *,
+    repository_hint: Path,
+    home: Path,
+    expected_local_main_commit: str | None,
+    runner_path: Path | None,
+    selected_python: ValidatedToolRuntimePythonEnvironment,
+    subprocess_environment: dict[str, str],
+) -> dict[str, Any]:
     home = home.expanduser().resolve()
     resolved_runner_path = (runner_path or Path(__file__)).expanduser().resolve()
     source = validate_local_main_deployment_source(
@@ -974,7 +1007,7 @@ def run_local_deploy(
         expected_local_main_commit=expected_local_main_commit,
     )
     deployment_source_worktree = deployment_source_worktree_path(home)
-    environment = {**os.environ, "HOME": str(home)}
+    environment = {**subprocess_environment, "HOME": str(home)}
     user_local_data_root = _user_local_data_root(home, environment)
     environment["RVF_USER_LOCAL_DATA_ROOT"] = str(user_local_data_root)
     contract_environment = dict(environment)
@@ -1041,6 +1074,7 @@ def run_local_deploy(
                 "lock_path": str(lock_path),
                 "receipt_path": str(result_receipt_path),
                 "commands": commands,
+                "tool_runtime_python": selected_python.receipt_fields(),
                 **observe_deploy_host_concurrency_conditions(),
             }
             if error is not None:
@@ -1076,9 +1110,10 @@ def run_local_deploy(
         # 失败 receipt 也要能带上「失败前已经拿到的现场」，所以先绑定，避免异常处置分支撞上未绑定名。
         contract_output: str | None = None
         installer_receipt: dict[str, Any] | None = None
-        contract_command = [sys.executable, str(paths["contract"])]
+        python_executable = selected_python.python_executable_absolute_path
+        contract_command = [python_executable, str(paths["contract"])]
         installer_command = [
-            sys.executable,
+            python_executable,
             str(paths["installer"]),
             "--deployment-source-worktree",
             str(deployment_source_worktree),
@@ -1124,7 +1159,7 @@ def run_local_deploy(
             if isinstance(installer_receipt_path, str) and installer_receipt_path:
                 installation_receipt_path = Path(installer_receipt_path).expanduser().resolve()
             verifier_command = [
-                sys.executable,
+                python_executable,
                 str(paths["verifier"]),
                 "--installation-receipt",
                 str(installation_receipt_path),
@@ -1191,7 +1226,7 @@ def run_local_deploy(
             rollback_result: dict[str, Any] | None = None
             rollback_error: str | None = None
             if installation_mutation_phase_started:
-                rollback_command = [sys.executable, str(paths["installer"])]
+                rollback_command = [python_executable, str(paths["installer"])]
                 if previous_installation_receipt is None:
                     rollback_command.append(
                         "--rollback-remove-current-installation"
@@ -1303,7 +1338,7 @@ def run_local_deploy(
             rvf_command_line_shortcut_shim = install_rvf_command_line_shortcut_shim(
                 home=home,
                 deployed_plugin_payload_root=deployed_plugin_payload_root,
-                python_executable=sys.executable,
+                python_executable=python_executable,
             )
         except OSError as exc:
             rvf_command_line_shortcut_shim = {
@@ -1499,15 +1534,6 @@ def _sole_review_validate_fix_registration_in_codex_config(
 
         codex_home = Path(home) / ".codex"
         document = trust.read_codex_config_document(codex_home)
-        if document is None:
-            return {
-                "status": "unavailable",
-                "selectors": [],
-                "note": (
-                    f"读不到 {codex_home / 'config.toml'}（文件缺失 / 无 tomllib / 解析失败）；"
-                    "本次无法判断 Codex 侧是否存在多份 RVF 注册。"
-                ),
-            }
         registration_sources = (
             trust.rvf_plugin_selector_registration_sources_in_codex_config(document)
         )
@@ -1517,6 +1543,7 @@ def _sole_review_validate_fix_registration_in_codex_config(
         return {
             "status": "unavailable",
             "selectors": [],
+            "error_code": getattr(exc, "error_code", "configuration_check_failed"),
             "note": f"Codex config 里的 RVF 注册核对失败：{type(exc).__name__}: {exc}",
         }
     selectors = list(registration_sources)
@@ -1650,6 +1677,7 @@ def _observe_codex_hook_trust(
         return {
             "status": "unavailable",
             "checked": 0,
+            "error_code": getattr(exc, "error_code", "configuration_check_failed"),
             "untrusted": [],
             "missing_sources": [],
             "sources_without_any_trust_entry": [],
@@ -1660,6 +1688,7 @@ def _observe_codex_hook_trust(
 
 def _print_text(result: dict[str, Any]) -> None:
     print("RVF local-main official CLI deploy OK")
+    print("工具 Python:", json.dumps(result["tool_runtime_python"], ensure_ascii=False))
     print("local main worktree:", result["local_main_worktree"])
     print("local main commit:", str(result["local_main_commit"])[:12])
     print("local main 未提交文件数:", len(result.get("local_main_dirty_paths") or []))
@@ -1830,6 +1859,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     try:
+        try:
+            ensure_current_process_uses_selected_python()
+        except ToolRuntimePythonPreflightError as exc:
+            raise DeployError(str(exc), exit_code=2, result=exc.failure_result()) from exc
         result = run_local_deploy(
             repository_hint=ROOT,
             home=Path.home(),

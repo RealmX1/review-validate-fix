@@ -60,11 +60,21 @@ def test_verified_tui_capture_and_reader_agree(capture_fixture, source):
     assert len(state["calls"]) == 2
 
 
+@pytest.mark.parametrize("version", ["0.164.0", "future-native-cli", None])
+def test_native_protocol_evidence_does_not_depend_on_recorded_cli_version(capture_fixture, version):
+    payload, receipt, state, write_transcript = capture_fixture
+    metadata = {"originator": "codex-tui", "source": "vscode"}
+    if version is not None:
+        metadata["cli_version"] = version
+    write_transcript(metadata)
+    assert read_independent_user_turn_boundary_evidence(receipt=receipt)["independent_user_turn_verified"] is True
+    assert bridge.capture_before_start(payload, transcript_path=receipt["transcript_path"], task_id="task") == receipt
+
+
 @pytest.mark.parametrize("metadata", [
     {"originator": "Codex Desktop", "source": "vscode", "cli_version": "0.163.0"},
     {"originator": "codex_exec", "source": "exec", "cli_version": "0.163.0"},
     {"originator": "codex_cli_rs", "source": "cli", "cli_version": "0.163.0"},
-    {"originator": "codex-tui", "source": "vscode", "cli_version": "0.164.0"},
     {"originator": "other-harness", "source": "cli", "cli_version": "0.163.0"},
     {"originator": "codex-tui", "source": {}, "cli_version": "0.163.0"},
 ])
@@ -108,22 +118,13 @@ def test_captured_identity_mismatch_stays_invalidated(capture_fixture, changed_f
     ({"status": "pending", "reason": "等待原生回合完成", "reason_code": "native_turn_not_completed", "recovery_action": "wait_for_native_turn_completion"}, 12, "native_turn_not_completed", "wait_for_native_turn_completion"),
     ({"status": "invalidated", "reason": "同 turn 消息混入", "reason_code": "native_user_turn_not_independent", "recovery_action": "request_new_boundary_after_turn_completion"}, 12, "native_user_turn_not_independent", "request_new_boundary_after_turn_completion"),
 ])
-def test_capture_failures_do_not_acknowledge_or_request_immediate_redelivery(capture_fixture, monkeypatch, response, returncode, reason_code, recovery_action):
-    import rvf_agent_decision_cli as cli
-
+def test_native_capture_failure_retains_typed_reason_without_claiming_capture(capture_fixture, response, returncode, reason_code, recovery_action):
     payload, receipt, state, _ = capture_fixture
     state.update(response=response, returncode=returncode)
-    monkeypatch.setattr(cli, "_current_kanban_task_id_from_env", lambda: "task")
-    monkeypatch.setattr(cli.token_store, "read_decision_token", lambda *args, **kwargs: SimpleNamespace(payload=payload, state="injected"))
-    def forbidden(*args, **kwargs):
-        pytest.fail("缺失分界时不得 acknowledge、prepare 或查询后续 gate")
-    monkeypatch.setattr(cli.token_store, "acknowledge_decision_token", forbidden)
-    monkeypatch.setattr(cli, "require_review_start_boundary", forbidden)
-    result = cli.run_start(token=payload["token"], reason="合成捕获失败", transcript_path=receipt["transcript_path"], prepare_pipeline=forbidden)
-    assert result.exit_code == 12
-    assert result.detail["reason_code"] == reason_code
-    assert result.detail["recovery_action"] == recovery_action
-    assert result.next_steps == []
+    with pytest.raises(ReviewStartBoundaryNotVerified) as error:
+        bridge.capture_before_start(payload, transcript_path=receipt["transcript_path"], task_id="task")
+    assert error.value.reason_code == reason_code
+    assert error.value.recovery_action == recovery_action
 
 
 def test_delivery_client_binds_strict_independent_turn_to_expected_session(capture_fixture):

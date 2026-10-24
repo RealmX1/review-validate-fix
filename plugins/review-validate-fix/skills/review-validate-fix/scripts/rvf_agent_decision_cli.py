@@ -1343,7 +1343,9 @@ def default_prepare_pipeline(
         "scope_of_work_candidate_paths": _initial_auto_scope_paths(candidate_summary, None),
         "rvf_run": {
             "run_id": ledger.run_id,
-            "review_start_boundary_receipt": verified_boundary_receipt,
+            "review_candidate_snapshot": verified_boundary_receipt,
+            "review_start_boundary_receipt": verified_boundary_receipt.get("native_review_start_boundary_receipt"),
+            "automatic_closeout_eligibility": verified_boundary_receipt["automatic_closeout_eligibility"],
             "run_dir": str(ledger.run_dir),
             "artifacts_dir": str(artifacts_dir),
             "scope_contract_path": str(artifacts_dir / "inputs" / "scope.contract.json"),
@@ -1614,8 +1616,9 @@ def run_start(
     )
     provider_health_runner = provider_health_runner or _default_provider_health_runner
 
-    # 宿主先持久化原生分界，失败不得 acknowledge 或创建正式 run；此时尚不激活自动收尾等待。
+    # 原生捕获只准备可选自动恢复；普通候选 gate 独立裁决，捕获阶段不激活自动收尾等待。
     automatic_closeout_receipt = None
+    native_boundary_capture_failure = None
     lookup_before_start = token_store.read_decision_token(token, root=roots.token_root, now=now_dt)
     before_payload = getattr(lookup_before_start, "payload", None)
     if isinstance(before_payload, Mapping):
@@ -1623,22 +1626,22 @@ def run_start(
         resolved_transcript, _ = resolve_start_transcript_path(explicit_transcript_path=transcript_path, candidate_summary=candidate)
         try:
             automatic_closeout_receipt = rvf_automatic_closeout_bridge.capture_before_start(before_payload, transcript_path=resolved_transcript, task_id=_current_kanban_task_id_from_env())
-        except ReviewStartBoundaryNotVerified as exc:
-            return CommandResult(
-                command="start", status=exc.status, exit_code=EXIT_REVIEW_START_BOUNDARY_NOT_VERIFIED,
-                token=token, token_state=getattr(lookup_before_start, "state", None), message=exc.reason,
-                detail={"phase": "capture_independent_review_start_boundary", "reason_code": exc.reason_code, "recovery_action": exc.recovery_action},
-            )
         except Exception as exc:
-            return CommandResult(command="start", status="start_failed", exit_code=EXIT_START_FAILED, token=token, token_state=getattr(lookup_before_start, "state", None), message=f"无法登记自动 RVF 开审分界：{exc}", detail={"phase":"capture_independent_review_start_boundary"})
+            native_boundary_capture_failure = exc
 
     # 分界 gate 必须先于 acknowledge、reopen 消费、run 创建与 lease 分配。
     if lookup_before_start.payload is not None and lookup_before_start.state in ("minted", "injected", "acknowledged"):
         try:
-            require_review_start_boundary(
+            review_start_snapshot = require_review_start_boundary(
                 token_payload=lookup_before_start.payload,
                 repo=repo or str(lookup_before_start.payload.get("worktree") or ""),
                 session_id=session_id, transcript_path=transcript_path,
+                native_boundary_capture_failure=native_boundary_capture_failure,
+            )
+            # 已绑定快照不可被重试改写；本次捕获失败仍不能借缓存资格发起新的自动注册。
+            automatic_closeout_receipt = (
+                review_start_snapshot.get("native_review_start_boundary_receipt")
+                if native_boundary_capture_failure is None else None
             )
         except ReviewStartBoundaryNotVerified as exc:
             return CommandResult(
@@ -1870,21 +1873,11 @@ def run_start(
     scope_artifact_path = write_scope_adjustment(overlay, token=token, root=roots.scope_adjustment_root)
     auto_scope_paths = overlay["auto_scope_paths"]
 
-    if automatic_closeout_receipt is not None:
-        if not overlay.get("automatic_closeout_run_binding_completed"):
-            try:
-                rvf_automatic_closeout_bridge.bind_run(automatic_closeout_receipt, Path(run_dir), run_id=run_id)
-            except Exception as exc:
-                return _fail(f"无法绑定自动收尾 run：{exc}", phase="bind_automatic_closeout_run")
-            overlay["automatic_closeout_run_binding_completed"] = True
-            write_scope_adjustment(overlay, token=token, root=roots.scope_adjustment_root)
-        if not overlay.get("automatic_closeout_activation_completed"):
-            try:
-                rvf_automatic_closeout_bridge.activate_bound_run(automatic_closeout_receipt)
-            except Exception as exc:
-                return _fail(f"无法激活已绑定 run 的自动收尾：{exc}", phase="activate_automatic_closeout_after_run_binding")
-            overlay["automatic_closeout_activation_completed"] = True
-            write_scope_adjustment(overlay, token=token, root=roots.scope_adjustment_root)
+    automatic_closeout_registration = rvf_automatic_closeout_bridge.register_optional_automatic_closeout(
+        automatic_closeout_receipt, Path(run_dir), run_id=run_id, decision_token=token,
+    )
+    overlay["automatic_closeout_registration"] = automatic_closeout_registration
+    write_scope_adjustment(overlay, token=token, root=roots.scope_adjustment_root)
 
     review_scope_coverage = _review_scope_coverage_of_overlay(overlay)
 
@@ -1951,6 +1944,8 @@ def run_start(
     )
     # 如实报告正式审查覆盖了多少候选（08ac4：回执原先只报候选数，覆盖不全时 agent 多数不告诉用户）。
     scope_mode_note += " " + _render_review_scope_coverage_line(review_scope_coverage, token=token)
+    if automatic_closeout_registration["status"] != "registered":
+        scope_mode_note += " 本轮自动回退与收尾不可用；继续 review/fix/handoff，交接后人工 land/base 同步。"
     completed_result = CommandResult(
         command="start", status="ok", exit_code=EXIT_OK, token=token,
         token_state=token_store.STATE_ACKNOWLEDGED,
@@ -1971,6 +1966,7 @@ def run_start(
             "transcript_path_source": transcript_path_source,
             "tracker_scope_allocation": dict(tracker_scope_allocation),
             "review_scope_coverage": review_scope_coverage,
+            "automatic_closeout_registration": automatic_closeout_registration,
         },
     )
     overlay["completed_start_command_result"] = asdict(completed_result)

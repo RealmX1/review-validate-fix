@@ -228,6 +228,10 @@ def test_notification_failure_retries_publication_without_repeating_finalize(
         run_dir,
         run_id=summary["run_id"],
     )
+    # 通知失败重试只针对已确认注册的运行；不能靠缺失注册记录进入该路径。
+    (run_dir / "artifacts" / "automatic-closeout-registration.json").write_text(json.dumps({
+        "run_id": summary["run_id"], "decision_token": decision_token, "status": "registered",
+    }), encoding="utf-8")
     (run_dir / "artifacts" / "handoff.md").write_text("RVF 已完成\n", encoding="utf-8")
     event = {"transcript_path": str(transcript), "session_id": "S", "cwd": str(repo)}
     side_effects = {}

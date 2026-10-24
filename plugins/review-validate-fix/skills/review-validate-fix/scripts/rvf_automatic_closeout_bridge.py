@@ -13,7 +13,7 @@ from typing import Any, Mapping
 
 import cline_kanban_client as kanban
 import _rvf_pyroot  # noqa: F401
-from adapters.codex.review_start_independent_user_turn_evidence import codex_native_rewind_boundary_capability_is_verified
+from adapters.codex.review_start_independent_user_turn_evidence import is_codex_tui_transcript_metadata_supported_by_independent_user_turn_boundary_reader
 from core.review_start_boundary.review_start_boundary_verification import PENDING, INVALIDATED, ReviewStartBoundaryNotVerified
 
 
@@ -54,9 +54,9 @@ def capture_before_start(payload: Mapping[str, Any], *, transcript_path: str | N
         metadata = first.get('payload', {}) if isinstance(first, dict) and first.get('type') == 'session_meta' else {}
     except (OSError, ValueError):
         metadata = {}
-    if not isinstance(metadata, Mapping) or not codex_native_rewind_boundary_capability_is_verified(metadata):
+    if not isinstance(metadata, Mapping) or not is_codex_tui_transcript_metadata_supported_by_independent_user_turn_boundary_reader(metadata):
         raise ReviewStartBoundaryNotVerified(
-            PENDING, '此 Codex 版本或宿主形态的独立消息与原生回退能力尚未取证',
+            PENDING, '此转录不符合受支持的 Codex TUI 原生独立消息事件格式',
             reason_code='native_rewind_capability_unverified', recovery_action='repair_host_capability',
         )
     repo = Path(str(payload['worktree'])).resolve()
@@ -110,7 +110,7 @@ def bind_run(receipt: Mapping[str, Any] | None, run_dir: Path, *, run_id: str) -
         raise ValueError('自动收尾的开审分界与已冻结 receipt 不一致')
 
 
-def activate_bound_run(receipt: Mapping[str, Any]) -> None:
+def activate_bound_run(receipt: Mapping[str, Any]) -> dict[str, Any]:
     # 捕获分界只保存不可变身份；宿主从已落盘的精确 run-binding 核验后才进入完成等待。
     # 可重试失败与无可审范围都不会留下等待不存在 run 的活跃记录。
     repo = Path(str(receipt['worktree'])).resolve()
@@ -123,12 +123,71 @@ def activate_bound_run(receipt: Mapping[str, Any]) -> None:
         '--decision-token', str(receipt['decision_token']),
     )
     result = kanban.run_command(command, cwd=repo, env=kanban.runtime_env(kanban.task_runtime_port(task_cmd=task_cmd)), timeout=60)
-    activated_receipt = json.loads(result.stdout)['receipt']
+    response = json.loads(result.stdout)
+    activated_receipt = response['receipt']
     if activated_receipt != receipt:
         raise ValueError('宿主激活的 RVF 开审分界与已绑定 receipt 不一致')
+    return response
+
+
+def register_optional_automatic_closeout(receipt: Mapping[str, Any] | None, run_dir: Path, *, run_id: str, decision_token: str) -> dict[str, Any]:
+    """注册失败只降级自动收尾；未确认状态禁止消费者执行恢复副作用。"""
+    path = run_dir / 'artifacts' / 'automatic-closeout-registration.json'
+    if receipt is not None and receipt.get('decision_token') != decision_token:
+        raise ValueError('自动收尾附加凭据与审查 token 不一致')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_suffix('.lock').open('a') as lock:
+        import fcntl
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if path.exists():
+            prior = json.loads(path.read_text(encoding='utf-8'))
+            if prior.get('run_id') != run_id or prior.get('decision_token') != decision_token:
+                raise ValueError('自动收尾注册记录属于另一 token/run')
+            if prior.get('status') in {'registered', 'disabled'}:
+                return prior
+        state = {'run_id':run_id, 'decision_token':decision_token, 'status':'pending'}
+        def save() -> None:
+            temporary = path.with_suffix(f'.{uuid.uuid4().hex}.pending-write')
+            try:
+                with temporary.open('w', encoding='utf-8') as handle:
+                    json.dump(state, handle, ensure_ascii=False, sort_keys=True)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, path)
+                descriptor = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+            finally:
+                temporary.unlink(missing_ok=True)
+        save()
+        phase = 'bind'
+        try:
+            if receipt is None:
+                state.update(status='disabled', reason_code='native_rewind_evidence_unavailable')
+            else:
+                bind_run(receipt, run_dir, run_id=run_id)
+                phase = 'activate'
+                activation = activate_bound_run(receipt)
+                if isinstance(activation, dict) and activation.get('automaticCloseoutActivationStatus') == 'skipped_no_completed_pre_review_conversation_prefix':
+                    state.update(status='disabled', reason_code='no_completed_pre_review_conversation_prefix')
+                else:
+                    state['status'] = 'registered'
+        except Exception as exc:
+            state.update(status='disabled', failed_phase=phase, reason_code='automatic_closeout_registration_not_confirmed', error_type=type(exc).__name__)
+        save()
+        return state
 
 
 def _completion_notification_identity(run_dir: Path, finalized: Mapping[str, Any]) -> dict[str, Any] | None:
+    registration_path = run_dir / 'artifacts' / 'automatic-closeout-registration.json'
+    try:
+        registration = json.loads(registration_path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(registration, dict) or registration.get('status') != 'registered' or registration.get('run_id') != finalized.get('run_id'):
+        return None
     if finalized.get('errors') or finalized.get('decision_kind') not in {'handoff', 'handoff-advisory'}:
         return
     run_dir = run_dir.resolve()
@@ -136,6 +195,8 @@ def _completion_notification_identity(run_dir: Path, finalized: Mapping[str, Any
     if not path.is_file():
         return
     receipt = json.loads(path.read_text(encoding='utf-8'))
+    if registration.get('decision_token') != receipt.get('decision_token'):
+        return None
     if not finalized.get('completed_at'):
         return
     from review_start_boundary_gate import review_start_boundary_receipt_path, bind_review_start_boundary_to_one_run
