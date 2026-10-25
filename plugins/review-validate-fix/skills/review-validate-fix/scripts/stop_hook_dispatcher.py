@@ -1197,6 +1197,14 @@ def main() -> int:
         emit(disabled_gui_payload)
         return 0
 
+    if isinstance(cwd, str):
+        from independent_backup_route import should_suppress_normal_stop
+        if should_suppress_normal_stop(Path(cwd)):
+            return emit_terminal_payload(
+                ledger, status="skipped", reason_code="independent_backup_route_owns_or_completed_candidate",
+                message="存在独立备用路线控制记录，普通自动路径保持静默",
+                detail="读取持久接续记录；不重复发起普通 RVF 或自动收尾。",
+            )
     if suppress_requested():
         ledger.event(
             phase="dev-sync",

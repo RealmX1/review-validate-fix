@@ -11958,6 +11958,14 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
     cwd_value = event.get("cwd")
     cwd = cwd_value if isinstance(cwd_value, str) and cwd_value else None
 
+    if cwd:
+        from independent_backup_route import should_suppress_normal_stop
+        if should_suppress_normal_stop(Path(cwd)):
+            return skip_decision(
+                "存在备用路线控制记录；读取持久接续状态并保留原失败，不重入普通自动路径。",
+                ledger, "independent_backup_route_owns_or_completed_candidate", cwd=cwd,
+            )
+
     if is_truthy(os.environ.get(RVF_ANALYZE_THREAD)):
         return skip_decision(
             "检测到 RVF_ANALYZE_THREAD：当前 Stop event 来自 detached "

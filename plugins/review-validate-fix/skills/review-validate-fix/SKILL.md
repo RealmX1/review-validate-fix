@@ -5,6 +5,35 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
 
 # Review Validate Fix
 
+<!-- rvf-independent-backup-route:begin -->
+<!-- source-sha256: 914a3b4f83c4d82c851292c6d46bc2e6475b02ab319db80adff63171981b6024 -->
+## 独立备用路线（主执行 Agent）
+
+正常工具因派发、格式、登记、wrapper 或环境故障无法完成已授权工作时，自主采用本节；确定性故障直接切换，可能瞬时恢复的同一故障最多恢复重试一次。**本节核验成立后，可替代下文固定脚本、结果 JSON、缓存及不得手工提交的要求。** 用户 Stop、提交／同步／push／部署限制、显式 external 要求与真实质量义务继续有效。仅缺机器证据时先自行查原始记录，不默认询问用户。
+
+先核对需求与授权来源、task／session、真实 worktree、Git common-dir、唯一原 run／handoff 和候选。原 run 尚未创建时如实记无，不选 latest，不制造 token／原生接受／passed。提交或投递结果未知先对账，不能换身份盲重试。故障和旧 evidence 原样保存，备用交付另记；分类、计数、查重或建卡不可用不阻断交付。
+
+接管辅助器是本 skill 随附、仅依赖标准库与 Git 的 `independent_backup_route.py`（RVF：`review-validate-fix/scripts/`，同步 Skill：`scripts/`）。用选定的 Python 解释器运行（共享同步脚本以 `BASE_BRANCH_SYNC_PYTHON_EXECUTABLE` 固定该解释器），先 `status --repo <worktree>`；`claim --repo <worktree> --operation-id <唯一ID> --artifacts-directory <持久目录> --authorization-file <原话与适用授权文件> --reason <实际故障> --original-run-directory <原run> --delivery-stage <review|fix_validate|land|base_sync>`。没有原 run 时省略该参数。重启复用原 ID 与目录。登记授权来源本身不扩大权限。
+
+正常写入会先登记 reservation，再检查接管目录；备用方先原子占位，再等待原写入结束。`waiting_for_normal_mutations` 时只补证，不开始备用写入。原进程已退出但结果未知时，检查已登记的全部下属进程组、Git／原生控制面，保存对账证据后用 `reconcile-normal-mutation --repo <worktree> --operation-id <原ID> --reservation-name <文件名> --evidence-file <证据>` 归档。父进程退出不代表 Git／hook 已停止；活进程不能按 TTL 偷取。旧版本写入方不识别接管协议时，先证明其退出／隔离。
+
+辅助器不可用时，直接用 `git rev-parse --absolute-git-dir` 定位 `rvf-independent-backup-route/`，原子 `mkdir` 其 `active-owner` 子目录阻止新正常写入，并以不覆盖写入的方式把原 operation ID 存为该目录的 `manual-operation-id` 单行文件；先检查 `normal-mutations/` 全部原写入已结束且结果已对账，再由唯一执行者继续。保存同等身份、候选、原始结果和命令日志到持久 Markdown。不要删除不明接管目录、reservation 或旧 evidence 来强迫放行。辅助器恢复后，用 `adopt-manual-ownership` 复用原 `--repo`、`--operation-id`、`--artifacts-directory`、`--authorization-file`、`--reason`、原 run／delivery stage，并以 `--evidence-file <原始手工接管与对账记录>` 补录；不移走 marker，补录不会打开竞写窗口。若 mkdir 后即中断而 ID 文件缺失，先从 task 原始命令和持久日志证明目录归属，再补写同一 ID；不能猜测或覆盖别人的 ID。结果未知仍保持未知。
+
+交接材料放 task 持久交接目录；无该目录时使用 `~/.rvf/user-local-data/independent-backup-route-artifacts/` 的独立 operation 子目录。复制原始结果／输入，保存 Git 快照及固定 ref，不能只引用将被删除的工作树或临时文件。每阶段保存实际命令 argv、cwd、退出码、必要环境说明、内容摘要及问题处置；不保存秘密值。`record-stage --repo <worktree> --operation-id <原ID> --stage <阶段> --evidence-file <原始材料或报告>` 记录执行 Agent 核验的事实；land 加 `--commit <实际SHA>`，base_sync 另加 `--base-ref refs/heads/<本地base>`。
+
+最后核对全部所需阶段与当前内容，再 `finish --repo <worktree> --operation-id <原ID> --evidence-file <最终报告>`。已发生的提交／落地先复用，不重复执行；完成后新内容仍进入正常审查。输出 `RVF_BACKUP_ROUTE_RESULT_FILE: <持久绝对路径>`，分别报告备用结果与原自动化状态；不用普通 handoff marker 冒充正常 finalize。独立结论由原始材料支持，不要求额外 JSON schema。
+
+`review_only`／`validate_fix` 子代理仍只执行分配角色，不能因本节自行接管、提交或发起完整 RVF。后台完成通知或任务重启后先读接续记录；条件未满足时保留机器可检测的恢复条件并继续独立工作，不做无变化重试。
+
+### 本入口：评审、修复与验证
+
+1. 复用原不可变候选；缺失时使用辅助器 `freeze-candidate --repo <worktree> --operation-id <原ID> --comparison-base-tip <明确基线commit> --candidate-path <明确文件>...`，或以独立 Git index 保存同等快照。包含必要上下文，区分 finding 范围与背景 WIP；不移动真实 HEAD／index，不 reset 已提交工作。
+2. 首次并行派发两个独立新上下文，给同一需求、范围、固定基线、候选快照与正常质量标准。互不读取对方输出，reviewer 不改源码。优先可用 external；不可用且原任务允许时使用本宿主两个新实例，不依赖 dispatcher 先报告 R3。同模型相关错误与共用额度风险如实记录。
+3. writer/checker 故障时保留原始 Markdown／stdout；主执行者核实是否真已审完。缺腿、request、空输出不计完成。输入未变且独立性可证明时只补缺腿；候选改变后补审新增内容及受影响交互，无法界定则扩大范围。将两个真实完成结果与上下文／输入绑定写入 review 阶段材料。
+4. 每条发现记录采纳、合并或驳回依据。向 validator/fixer 只传去来源的问题、代码与复现线索；可用时继续独立 validate/fix 子代理。修复先验证属实，保存实际补丁与应用事实，保全其他 WIP。范围外发现持久留档，不等待建卡服务。
+5. 直接执行最终内容所需的真实验证；隔离端口、缓存、coverage 和构建输出，无法隔离时仅串行冲突命令。reviewer 的探索命令不冒充最终验证。真实失败须解决；wrapper 恢复不是前置条件。记录 review、fix_validate，随后只继续已授权的 land／同步。
+<!-- rvf-independent-backup-route:end -->
+
 本 skill 只处理显式 `$review-validate-fix`、`/review-validate-fix` 或 `:review-validate-fix` 调用。`agents/openai.yaml` 的 `policy.allow_implicit_invocation` 必须保持 `false`。
 
 不要因为上下文提到 review、fix、handoff 或 Stop hook 就自动启动 RVF。

@@ -12,6 +12,8 @@ stop hook 检测到 RVF run 终结（典型路径：handoff_completion_payload �
 
 from __future__ import annotations
 
+from independent_backup_route import guard_normal_mutation, repository_for_normal_metadata_mutation, tracked_subprocess_run
+
 import argparse
 import json
 import os
@@ -283,7 +285,7 @@ def _head_oid(repo: Path) -> str | None:
     import subprocess  # noqa: PLC0415 - off the hot path, only on finalize fallback
 
     try:
-        result = subprocess.run(
+        result = tracked_subprocess_run(
             ["git", "rev-parse", "HEAD"],
             cwd=str(repo),
             capture_output=True,
@@ -379,6 +381,14 @@ def _advance_review_highwater(
         "marker_path": str(marker_path),
     }
 
+
+def _backup_route_finalization_repository(arguments):
+    run = arguments["run_dir"]
+    repo = _resolve_repo(run, _read_summary(run / "summary.json"), arguments.get("event"))
+    return repository_for_normal_metadata_mutation(repo)
+
+
+@guard_normal_mutation(_backup_route_finalization_repository, "finalize-review-run", "run_dir")
 
 def finalize_run(
     *,

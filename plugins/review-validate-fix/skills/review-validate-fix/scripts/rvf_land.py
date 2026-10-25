@@ -22,6 +22,8 @@ base-branch-sync 不并入本脚本，仍由 agent 在之后按 skill 调用。
 
 from __future__ import annotations
 
+from independent_backup_route import normal_worktree_mutation, tracked_subprocess_run
+
 import argparse
 import json
 import os
@@ -138,7 +140,7 @@ class RvfLandHardGateFailure(Exception):
 
 
 def run_git(repo_root: Path, *arguments: str, check: bool = False) -> subprocess.CompletedProcess[str]:
-    completed = subprocess.run(
+    completed = tracked_subprocess_run(
         ["git", "-C", str(repo_root), *arguments],
         capture_output=True,
         text=True,
@@ -894,7 +896,7 @@ def replay_structured_validation_commands(repo_root: Path, run_dir: Path) -> lis
             invocation += ["--environment-key", key]
         if entry["requires_base_worktree_context"]:
             invocation.append("--requires-base-worktree-context")
-        completed = subprocess.run(
+        completed = tracked_subprocess_run(
             [*invocation, "--", *entry["argv"]],
             capture_output=True,
             text=True,
@@ -990,9 +992,42 @@ def command_commit(args: argparse.Namespace) -> int:
     # 只认显式 --run-dir：reviewer 子进程与 Codex task shell 都带着 RVF_RUN_DIR（指向活 run），
     # 环境变量回退会把别处 shell 的 land 引到那个 run 上。
     run_dir = Path(args.run_dir).expanduser().resolve()
+    repo_root = Path(repository_identity(Path(args.repo).expanduser().resolve())[0]).resolve()
+    result: dict[str, Any] | None = None
+    failure_output = None
+    result_persistence_started = False
+    result_persistence_completed = False
+    try:
+        with normal_worktree_mutation(repo_root, "rvf-land-commit", run_dir):
+            try:
+                result = land_commit_result_from_prepare_plan(args, run_dir, repo_root)
+            except RvfLandHardGateFailure as failure:
+                result = {"status": "refused", **failure.as_payload()}
+                failure_output = failure.details.get("failure_output")
+            plan = read_json_object_or_none(prepare_plan_artifact_path(run_dir)) or {}
+            if result["status"] != "refused" or plan.get("repo_root") == str(repo_root):
+                result_persistence_started = True
+                persist_land_commit_result(run_dir, repo_root, result)
+                result_persistence_completed = True
+    except (OSError, RuntimeError, ValueError) as exc:
+        if result is None or not result_persistence_started or result_persistence_completed:
+            raise
+        # 异常先退出保护区间以保留 unknown reservation，再回显已发生的提交或拒绝。
+        result["land_commit_result_persistence_error"] = str(exc)
+        if result["status"] != "refused":
+            result.update({"exit_code": RVF_LAND_EXIT_USAGE_ERROR,
+                           "reason_code": "land_commit_result_persistence_failed"})
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if failure_output:
+        print(failure_output, file=sys.stderr)
+    return result["exit_code"]
+
+
+def land_commit_result_from_prepare_plan(
+    args: argparse.Namespace, run_dir: Path, repo_root: Path,
+) -> dict[str, Any]:
     message = read_commit_message(args.message_file)
     plan = load_prepare_plan(run_dir)
-    repo_root = Path(repository_identity(Path(args.repo).expanduser().resolve())[0]).resolve()
     if plan.get("cross_worktree_gate_failed"):
         raise RvfLandHardGateFailure(
             RVF_LAND_EXIT_CROSS_WORKTREE_HANDOFF,
@@ -1017,13 +1052,7 @@ def command_commit(args: argparse.Namespace) -> int:
         failure.details.setdefault("dirty_paths_changed_since_prepare", dirty_paths_changed_since_prepare)
         raise
     result["dirty_paths_changed_since_prepare"] = dirty_paths_changed_since_prepare
-    try:
-        persist_land_commit_result(run_dir, repo_root, result)
-    except (OSError, RuntimeError, ValueError) as exc:
-        result.update({"exit_code": RVF_LAND_EXIT_USAGE_ERROR, "reason_code": "land_commit_result_persistence_failed",
-                       "land_commit_result_persistence_error": str(exc)})
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-    return result["exit_code"]
+    return result
 
 
 def land_commit_after_prepare_plan_checks(
@@ -1306,15 +1335,6 @@ def main(argv: list[str] | None = None) -> int:
         return command_commit(args)
     except RvfLandHardGateFailure as failure:
         result = {"status": "refused", **failure.as_payload()}
-        if args.subcommand == "commit":
-            run_dir = Path(args.run_dir).expanduser().resolve()
-            plan = read_json_object_or_none(prepare_plan_artifact_path(run_dir)) or {}
-            try:
-                repo = Path(repository_identity(Path(args.repo).expanduser().resolve())[0]).resolve()
-                if plan.get("repo_root") == str(repo):
-                    persist_land_commit_result(run_dir, repo, result)
-            except (OSError, RuntimeError, ValueError) as exc:
-                result["land_commit_result_persistence_error"] = str(exc)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         failure_output = failure.details.get("failure_output")
         if failure_output:
