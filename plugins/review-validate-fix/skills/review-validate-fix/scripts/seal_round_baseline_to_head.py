@@ -22,6 +22,8 @@ dirty 闸 + finalize 的 no-op 守卫兜底）。
 
 from __future__ import annotations
 
+from independent_backup_route import BackupRouteOwned, normal_worktree_mutation, tracked_subprocess_run
+
 import argparse
 import os
 import subprocess
@@ -42,7 +44,7 @@ SEAL_PROMPT_EXCERPT = "rvf-land seal (round baseline advanced to landed HEAD)"
 
 def _git_toplevel(cwd: str) -> str | None:
     try:
-        result = subprocess.run(
+        result = tracked_subprocess_run(
             ["git", "rev-parse", "--show-toplevel"],
             cwd=cwd,
             capture_output=True,
@@ -59,7 +61,7 @@ def _git_toplevel(cwd: str) -> str | None:
 
 def _git_head_oid(repo: str) -> str | None:
     try:
-        result = subprocess.run(
+        result = tracked_subprocess_run(
             ["git", "rev-parse", "HEAD"],
             cwd=repo,
             capture_output=True,
@@ -92,7 +94,7 @@ def _resolve_session_id() -> str | None:
     return resolve_current_agent_session_id_from_environment()
 
 
-def seal_round_baseline_to_head(repo_arg: str | None = None) -> dict[str, Any]:
+def _seal_round_baseline_to_head_without_backup_ownership(repo_arg: str | None = None) -> dict[str, Any]:
     """封窗本体。返回 diagnostic dict；``sealed`` 为 True 表示 marker 已推进。
 
     永不抛异常：所有失败折叠成 ``{"sealed": False, "reason": ...}``。
@@ -156,6 +158,18 @@ def seal_round_baseline_to_head(repo_arg: str | None = None) -> dict[str, Any]:
         "task_id": task_id,
         "session_id": session_id,
     }
+
+
+def seal_round_baseline_to_head(repo_arg: str | None = None) -> dict[str, Any]:
+    """沿用 best-effort 诊断接口；接管时不推进原正常基线。"""
+    repo = _git_toplevel(repo_arg or os.getcwd())
+    if repo is None:
+        return _seal_round_baseline_to_head_without_backup_ownership(repo_arg)
+    try:
+        with normal_worktree_mutation(Path(repo), "seal-round-baseline"):
+            return _seal_round_baseline_to_head_without_backup_ownership(repo_arg)
+    except (BackupRouteOwned, OSError, ValueError) as exc:
+        return {"sealed": False, "reason": f"backup_route_or_mutation_evidence_unavailable:{exc}", "repo": repo}
 
 
 def main(argv: list[str] | None = None) -> int:

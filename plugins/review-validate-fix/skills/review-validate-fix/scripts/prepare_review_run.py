@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+from independent_backup_route import guard_normal_mutation, tracked_subprocess_run
+
 
 import argparse
 import hashlib
@@ -115,7 +117,7 @@ def git_repository_location_clean_environment() -> dict[str, str]:
 
 
 def run(cmd: list[str], *, cwd: Path | None = None) -> str:
-    completed = subprocess.run(
+    completed = tracked_subprocess_run(
         cmd,
         cwd=cwd,
         check=False,
@@ -142,7 +144,7 @@ def _local_base_ref_full_name(local_base_ref: str) -> str:
         raise ValueError("local base ref must resolve below refs/heads/")
     else:
         full_ref = f"refs/heads/{candidate}"
-    valid = subprocess.run(
+    valid = tracked_subprocess_run(
         ["git", "check-ref-format", full_ref],
         check=False,
         capture_output=True,
@@ -332,11 +334,18 @@ def review_agent_context_text(
             "Use the variables above in commands and notes instead of expanding the run artifacts directory. The result artifact is protocol output and is the only file a review-only agent may write intentionally.",
         ]
     )
+    skill = Path(__file__).resolve().parents[1] / "SKILL.md"
+    if skill.is_file():
+        body = skill.read_text(encoding="utf-8")
+        begin = "<!-- rvf-independent-backup-route:begin -->"
+        end = "<!-- rvf-independent-backup-route:end -->"
+        if begin in body and end in body:
+            lines.extend(["", begin + body.split(begin, 1)[1].split(end, 1)[0] + end])
     return "\n".join(lines) + "\n"
 
 
 def run_git(repo: Path, args: list[str], *, text: bool = True) -> str | bytes:
-    completed = subprocess.run(
+    completed = tracked_subprocess_run(
         ["git", *args],
         cwd=repo,
         env=git_repository_location_clean_environment(),
@@ -352,7 +361,7 @@ def run_git(repo: Path, args: list[str], *, text: bool = True) -> str | bytes:
 
 
 def is_tracked_path(repo: Path, rel_path: str) -> bool:
-    completed = subprocess.run(
+    completed = tracked_subprocess_run(
         ["git", "ls-files", "--error-unmatch", "--", rel_path],
         cwd=repo,
         check=False,
@@ -751,7 +760,7 @@ def validated_integration_candidate_receipt(
         run(["git", "cat-file", "-e", f"{receipt[tip_name]}^{{commit}}"], cwd=repo)
 
     def changed_paths(older_tip: str, newer_tip: str) -> list[str]:
-        completed = subprocess.run(
+        completed = tracked_subprocess_run(
             ["git", "diff", "--name-only", "-z", older_tip, newer_tip],
             cwd=repo,
             env=git_repository_location_clean_environment(),
@@ -988,6 +997,7 @@ def build_worktree_bootstrap(
     }
 
 
+@guard_normal_mutation("repo", "prepare-review-run")
 def prepare_run(
     *,
     repo: Path,

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+from independent_backup_route import guard_normal_mutation, tracked_subprocess_run
+
 import argparse
 import json
 import os
@@ -59,7 +61,7 @@ def _run(
     check: bool = True,
     text: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    completed = subprocess.run(
+    completed = tracked_subprocess_run(
         ["git", *args],
         cwd=str(repo),
         capture_output=True,
@@ -1019,6 +1021,13 @@ def _ownership_classification_for_acknowledged_path(path: str, scope_contract: d
         return "用户声明的排除区（excluded_path_prefixes）"
     return "合同未登记"
 
+
+def _backup_route_fix_attempt_target(arguments):
+    attempt = _load_attempt(arguments["run_dir"], arguments["attempt_id"])
+    return _optional_repo(arguments.get("target_repo_override"), attempt)
+
+
+@guard_normal_mutation(_backup_route_fix_attempt_target, "apply-fix-attempt", "run_dir")
 
 def apply_fix_attempt(
     *,

@@ -34,7 +34,11 @@ double-review 的一腿。它只：
 """
 from __future__ import annotations
 
+from contextvars import copy_context
+from independent_backup_route import durable_json, guard_normal_mutation, tracked_subprocess_run
+
 import argparse
+import hashlib
 from datetime import datetime, timezone
 import json
 import os
@@ -864,6 +868,23 @@ def _rotate_review_request_leg_artifacts(
     return rotated
 
 
+def _backup_route_dispatch_repository(arguments):
+    # 原有开审资格核验先于接管登记；非仓库或未开审输入仍按原契约拒绝。
+    supplemental_qualification = arguments.get("supplemental_review_qualification_path")
+    if supplemental_qualification is not None:
+        from supplemental_land_completion import require_supplemental_review_dispatch_qualification
+        require_supplemental_review_dispatch_qualification(
+            supplemental_qualification, review_packet_path=arguments.get("review_packet"),
+            **{name: arguments.get(name) for name in ("repo", "scope_contract", "run_id", "run_dir")},
+        )
+    else:
+        require_prepared_run_review_start_boundary(
+            **{name: arguments.get(name) for name in ("repo", "scope_contract", "run_id", "run_dir")}
+        )
+    return arguments.get("repo")
+
+
+@guard_normal_mutation(_backup_route_dispatch_repository, "dispatch-reviewers", "run_dir")
 def execute_plan(
     plan: dict[str, Any],
     *,
@@ -879,6 +900,8 @@ def execute_plan(
     available: list[str] | None = None,
     max_fallback_rounds: int = 2,
     initial_dispatch_indices: list[int] | None = None,
+    reviewer_command_output_directory: Path | None = None,
+    supplemental_review_qualification_path: Path | None = None,
 ) -> dict[str, Any]:
     """派发 plan 的两路 external reviewer，回填 returncode / result path / status。
 
@@ -915,7 +938,6 @@ def execute_plan(
     仍优先（``status: failed``），但 reason 追加 ``_with_review_request_pending`` 后缀自报混合，
     否则主会话只会去等配额/修 auth，那条 request 从头到尾没进过 Contract Gate。
     """
-    require_prepared_run_review_start_boundary(repo=repo, scope_contract=scope_contract, run_id=run_id, run_dir=run_dir)
     reviewers = plan.get("reviewers", [])
     cooled: set[str] = set()
     # 本轮内失败过的 harness（含额度与非额度）——只用于排除替换候选，不落 cooldown。
@@ -940,7 +962,21 @@ def execute_plan(
                 run_dir=run_dir,
             )
             try:
-                completed = subprocess.run(cmd)
+                if reviewer_command_output_directory is None:
+                    completed = tracked_subprocess_run(cmd)
+                else:
+                    reviewer_command_output_directory.mkdir(parents=True, exist_ok=True)
+                    output_stem = reviewer_command_output_directory / reviewer["reviewer_id"]
+                    # 嵌入机器 JSON 接口时保留各腿原始输出，避免子进程 stdout 混入调用方协议。
+                    with Path(str(output_stem) + ".stdout.log").open("ab") as stdout_log, Path(str(output_stem) + ".stderr.log").open("ab") as stderr_log:
+                        completed = tracked_subprocess_run(cmd, stdout=stdout_log, stderr=stderr_log)
+                    receipt = {"schema": "rvf-reviewer-command-execution-result", "schema_version": 1,
+                               "run_id": run_id, "repo": repo, "reviewer_id": reviewer["reviewer_id"],
+                               "packet_sha256": hashlib.sha256(Path(review_packet).read_bytes()).hexdigest(),
+                               "returncode": completed.returncode, "completed_at": datetime.now(timezone.utc).isoformat()}
+                    receipt_bytes = json.dumps(receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+                    durable_json(reviewer_command_output_directory / "execution-results" / (hashlib.sha256(receipt_bytes).hexdigest() + ".json"), receipt)
+                    durable_json(Path(str(output_stem) + ".execution-result.json"), receipt)
                 local_results[index] = completed.returncode
             except OSError as exc:  # pragma: no cover - 启动失败
                 local_results[index] = 1
@@ -950,7 +986,7 @@ def execute_plan(
             for index in indices:
                 _run(index)
         else:
-            threads = [threading.Thread(target=_run, args=(index,)) for index in indices]
+            threads = [threading.Thread(target=copy_context().run, args=(_run, index)) for index in indices]
             for thread in threads:
                 thread.start()
             for thread in threads:
