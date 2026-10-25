@@ -6426,6 +6426,13 @@ def load_agentic_initiation_guardian_dispatch_module():
     return module
 
 
+def guardian_completed_run_directory(tmp_path: Path, run_name: str) -> str:
+    """每次完成事件使用真实存在且互不混淆的自产 run 目录。"""
+    run_directory = tmp_path / "synthetic-completed-analysis-runs" / run_name
+    run_directory.mkdir(parents=True, exist_ok=True)
+    return str(run_directory)
+
+
 def test_guardian_analyze_completion_milestones_and_retirement(tmp_path: Path) -> None:
     """S8·R23 守护节点计数:analyze 完成累计 1/2/4/8/16 首达各派一次守护分析;
     16 后守护下线(guardian_retired)并给出 R9 删除确认提示(含 reviewed_head 前置);
@@ -6446,7 +6453,7 @@ def test_guardian_analyze_completion_milestones_and_retirement(tmp_path: Path) -
         retirement_prompts: list[str] = []
         for i in range(1, 18):
             result = guardian.record_analyze_completion(
-                run_dir=f"/tmp/run-{i}",
+                run_dir=guardian_completed_run_directory(tmp_path, f"milestone-run-{i}"),
                 root=root,
                 guardian_analysis_dispatcher=fake_dispatcher,
             )
@@ -6471,6 +6478,7 @@ def test_guardian_analyze_completion_milestones_and_retirement(tmp_path: Path) -
             raise RuntimeError("boom")
 
         result = guardian.record_analyze_completion(
+            run_dir=guardian_completed_run_directory(tmp_path, "failed-guardian-dispatch-run"),
             root=tmp_path / "guardian-root-2", guardian_analysis_dispatcher=broken_dispatcher
         )
         assert result["status"] == "recorded" and result["analyze_completion_count"] == 1
@@ -6510,11 +6518,13 @@ def test_guardian_failed_milestones_retry_and_retire_only_after_success(
 
     root = tmp_path / "retry"
     first = guardian.record_analyze_completion(
+        run_dir=guardian_completed_run_directory(tmp_path, "first-failed-milestone-run"),
         root=root, guardian_analysis_dispatcher=broken_dispatcher
     )
     assert first["analyze_completion_count"] == 1
     assert first["milestone_dispatched"] is None and "dispatch_error" in first
     second = guardian.record_analyze_completion(
+        run_dir=guardian_completed_run_directory(tmp_path, "second-completed-milestone-run"),
         root=root,
         guardian_analysis_dispatcher=lambda **kw: {
             "launch_status": "launched",
@@ -6530,6 +6540,7 @@ def test_guardian_failed_milestones_retry_and_retire_only_after_success(
 
     # 返回 launch_failed（非抛异常）同样不能误记成功。
     returned_failure = guardian.record_analyze_completion(
+        run_dir=guardian_completed_run_directory(tmp_path, "returned-dispatch-failure-run"),
         root=tmp_path / "returned-launch-failure",
         guardian_analysis_dispatcher=lambda **_kw: {
             "launch_status": "launch_failed",
@@ -6553,6 +6564,7 @@ def test_guardian_failed_milestones_retry_and_retire_only_after_success(
         encoding="utf-8",
     )
     failed_16 = guardian.record_analyze_completion(
+        run_dir=guardian_completed_run_directory(tmp_path, "sixteenth-completed-run"),
         root=retirement_root, guardian_analysis_dispatcher=broken_dispatcher
     )
     assert failed_16["analyze_completion_count"] == 16
@@ -6560,6 +6572,7 @@ def test_guardian_failed_milestones_retry_and_retire_only_after_success(
     assert failed_16["retirement_prompt"] is None
 
     retried_16 = guardian.record_analyze_completion(
+        run_dir=guardian_completed_run_directory(tmp_path, "seventeenth-completed-run"),
         root=retirement_root,
         guardian_analysis_dispatcher=lambda **_kw: {"launch_status": "already_running"},
     )
@@ -6593,6 +6606,7 @@ def test_guardian_counter_read_modify_write_is_serialized(tmp_path: Path) -> Non
         results = list(
             pool.map(
                 lambda _i: guardian.record_analyze_completion(
+                    run_dir=guardian_completed_run_directory(tmp_path, f"concurrent-completed-run-{_i}"),
                     root=analyze_root,
                     guardian_analysis_dispatcher=lambda **_kw: {"launch_status": "launched"},
                 ),
@@ -6628,7 +6642,8 @@ def test_guardian_initiation_liveness_alarm_paths(tmp_path: Path) -> None:
         guardian.record_stop_event_heartbeat(now=now)
         assert guardian.evaluate_initiation_layer_liveness(now=now) is None
         # seed 历史活跃证据(analyze 完成计数)→ stop>0 且注入/review 双零 → 告警。
-        guardian.record_analyze_completion(guardian_analysis_dispatcher=noop_dispatcher)
+        guardian.record_analyze_completion(run_dir=guardian_completed_run_directory(tmp_path, "liveness-activation-run"),
+                                          guardian_analysis_dispatcher=noop_dispatcher)
         alarm = guardian.evaluate_initiation_layer_liveness(now=now)
         assert alarm is not None, alarm
         assert alarm["alarm"] == "initiation_layer_suspected_silent_death"
@@ -6644,7 +6659,8 @@ def test_guardian_initiation_liveness_alarm_paths(tmp_path: Path) -> None:
 
         clean_root = tmp_path / "guardian-root-injection-branch"
         guardian.record_stop_event_heartbeat(now=now, root=clean_root)
-        guardian.record_analyze_completion(root=clean_root, guardian_analysis_dispatcher=noop_dispatcher)
+        guardian.record_analyze_completion(run_dir=guardian_completed_run_directory(tmp_path, "liveness-injection-run"),
+                                          root=clean_root, guardian_analysis_dispatcher=noop_dispatcher)
         assert guardian.evaluate_initiation_layer_liveness(now=now, root=clean_root) is not None
         injection_ledger.record_injection_attempt(
             worktree=str(tmp_path / "repo"),
@@ -6675,6 +6691,7 @@ def test_guardian_liveness_utc_day_bucket_boundary(tmp_path: Path) -> None:
         root = tmp_path / "guardian"
         guardian.record_stop_event_heartbeat(now=now, root=root)
         guardian.record_analyze_completion(
+            run_dir=guardian_completed_run_directory(tmp_path, "liveness-day-bucket-run"),
             now=now,
             root=root,
             guardian_analysis_dispatcher=lambda **_kw: {"launch_status": "launched"},

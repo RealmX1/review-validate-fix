@@ -544,6 +544,7 @@ required_files=(
   "scripts/validation_result_cache.py"
   "scripts/write_reviewed_task_candidate_evidence.py"
   "scripts/reviewed_candidate_completion_facts.py"
+  "scripts/fix_attempt_scope_expansion_classification.py"
   "scripts/rvf_merge_dispositions.py"
   "scripts/rvf_out_of_scope_findings_kanban_backlog_submission.py"
   "scripts/workspace_snapshot.py"
@@ -639,6 +640,7 @@ repo_required_files=(
   "tests/test_validation_result_cache_v2.py"
   "tests/test_reviewed_task_candidate_evidence.py"
   "tests/test_reviewed_candidate_completion_qualification.py"
+  "tests/test_canonical_issue_path_scope_expansion_recovery.py"
   "tests/test_rvf_merge_dispositions_structured_merge_phase.py"
   "tests/test_review_initiation_decision_point_is_sole_self_injection.py"
   "tests/test_stop_hook_output_audience_contract.py"
@@ -754,6 +756,7 @@ run_step "python compile" "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m py_compile \
   "$skill_dir/scripts/validation_result_cache.py" \
   "$skill_dir/scripts/write_reviewed_task_candidate_evidence.py" \
   "$skill_dir/scripts/reviewed_candidate_completion_facts.py" \
+  "$skill_dir/scripts/fix_attempt_scope_expansion_classification.py" \
   "$skill_dir/scripts/rvf_merge_dispositions.py" \
   "$repo_root/core/session_scope_allocation/session_change_manifest.py" \
   "$skill_dir/scripts/workspace_snapshot.py" \
@@ -810,6 +813,18 @@ run_step "python compile" "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m py_compile \
 run_parallel_test_steps
 run_step "tests: rvf_analyze_formal_archive_completion" \
   "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
+    "$tests_dir/test_review_run_lifecycle_analysis_recovery.py" \
+    "$tests_dir/test_review_run_timestamp_resource_boundaries.py" \
+    "$tests_dir/test_finalization_progress_and_subagent_capture_coverage.py" \
+    "$tests_dir/test_prepared_review_run_terminal_archive.py" \
+    "$tests_dir/test_terminal_archive_recovery_control_plane.py" \
+    "$tests_dir/test_dispatcher_writer_execution_evidence.py" \
+    "$tests_dir/test_dispatcher_prelaunch_failure_recovery.py" \
+    "$tests_dir/test_dispatcher_terminal_archive_launch_serialization.py" \
+    "$tests_dir/test_terminal_archive_intent_index_recovery.py" \
+    "$tests_dir/test_analysis_automatic_attempt_recovery.py" \
+    "$tests_dir/test_analysis_input_recovery_and_completion_accounting.py" \
+    "$tests_dir/test_codex_native_edit_completion_deduplication.py" \
     "$tests_dir/test_rvf_analyze_formal_archive_completion.py" \
     "$tests_dir/test_invoke_subagent.py" \
     "$tests_dir/test_rvf_analyze.py" \
@@ -874,6 +889,7 @@ run_step "tests: rvf_land_validation_cache_and_candidate_evidence" \
     "$tests_dir/test_validation_result_cache_v2.py" \
     "$tests_dir/test_reviewed_task_candidate_evidence.py" \
     "$tests_dir/test_reviewed_candidate_completion_qualification.py" \
+    "$tests_dir/test_canonical_issue_path_scope_expansion_recovery.py" \
     "$tests_dir/test_supplemental_land_completion.py" \
     "$tests_dir/test_rvf_land_single_step_prepare_and_commit.py" \
     "$tests_dir/test_rvf_merge_dispositions_structured_merge_phase.py"

@@ -801,6 +801,9 @@ def build_merge_dispositions_payload(run_dir: Path, decisions: Mapping[str, Any]
 
 def write_merge_dispositions(run_dir: Path, decisions: Mapping[str, Any]) -> tuple[Path, str, dict[str, Any]]:
     payload = build_merge_dispositions_payload(run_dir, decisions)
+    from core.run_ledger.review_run_lifecycle import observe_bound_review_run_component_phase
+
+    observe_bound_review_run_component_phase(run_dir, phase="merge")
     path = merge_dispositions_path(run_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     digest = write_json_with_digest(path, payload)
