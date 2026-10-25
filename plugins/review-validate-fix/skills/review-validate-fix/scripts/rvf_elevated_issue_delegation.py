@@ -195,7 +195,7 @@ def validate_native_authorization(snapshot: dict[str, Any], authorization: dict[
     records = snapshot.get("records")
     if not isinstance(records, list) or not records:
         raise DelegationEvidenceError("缺少原生授权快照")
-    if run_id not in canonical_json_bytes(records).decode("utf-8"):
+    if not re.search(r"(?<![A-Za-z0-9._-])" + re.escape(run_id) + r"(?![A-Za-z0-9._-])", canonical_json_bytes(records).decode("utf-8")):
         raise DelegationEvidenceError("原生授权上下文没有绑定该 run，不能复用其他审查的同名 issue 决定")
     session = None
     current_turn = None

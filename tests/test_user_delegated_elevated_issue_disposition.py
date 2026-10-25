@@ -408,3 +408,12 @@ def test_native_approval_cannot_be_reused_for_another_run_with_same_issue_id(tmp
     result = run_delegation(tmp_path, repo, run_dir, "record", request_file)
     assert result.returncode == 11, result.stdout + result.stderr
     assert "没有绑定该 run" in result.stdout
+
+
+def test_native_authorization_rejects_a_different_run_that_contains_the_expected_id_as_prefix(tmp_path: Path) -> None:
+    repo, run_dir, request_file = delegated_issue_fixture(tmp_path, mode="direct_delegation")
+    request = json.loads(request_file.read_bytes())
+    native = Path(request["authorization"]["transcript_path"])
+    native.write_text(native.read_text().replace("rvf-candidate-evidence-test", "rvf-candidate-evidence-test-other"))
+    result = run_delegation(tmp_path, repo, run_dir, "record", request_file)
+    assert result.returncode == 11 and "没有绑定该 run" in result.stdout
