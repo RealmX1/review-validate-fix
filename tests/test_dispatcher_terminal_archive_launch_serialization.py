@@ -291,8 +291,8 @@ def test_orphan_preparation_receipts_share_the_same_generation_budget(native_dis
     for _ in range(3):
         interrupted = fixture["start"]("launch", "exit_after_unpointed_receipt")
         fixture["finish"](interrupted, expected=78)
-    # 代次索引只是缓存；原status仍未指向新nonce时，也必须从全部receipt重建预算。
-    (fixture["status"].parent / "dispatcher-writer-prelaunch-recovery-input-generation.json").unlink()
+    # 原status未指向新执行时，也直接从全部精确receipt恢复预算，不维护第二份索引。
+    assert not (fixture["status"].parent / "dispatcher-writer-prelaunch-recovery-input-generation.json").exists()
     recovering = fixture["start"]("launch", "normal")
     fixture["finish"](recovering)
     outcome = fixture["result"]("launch", "normal")
