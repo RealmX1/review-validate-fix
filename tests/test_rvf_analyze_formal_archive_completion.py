@@ -419,6 +419,8 @@ raise SystemExit(subprocess.run(['/bin/sh','-c',sys.argv[-1]],env=environment).r
     assert incomplete["formal_analysis_completion_status"] == "incomplete"
     assert json.loads(counter_path.read_text())["analyze_completion_count"] == 0
     monkeypatch.setenv("FAKE_ANALYSIS_FILL", "1")
+    # 新执行版本是可检测的恢复证据；单改产物不重置持久尝试预算。
+    fake_agent.write_text(fake_agent.read_text() + "\n# 修复候选版本一\n")
     assert module.launch_detached_analyze_thread(event={}, ledger=Ledger(), analysis=analysis)["launch_status"] == "launched"
     illegal_retry = json.loads(status_path.read_text())
     assert illegal_retry["returncode"] != 0
@@ -434,6 +436,7 @@ raise SystemExit(subprocess.run(['/bin/sh','-c',sys.argv[-1]],env=environment).r
     assert json.loads(counter_path.read_text())["analyze_completion_count"] == 0
     snapshot_path.write_bytes(snapshot_bytes)
     monkeypatch.setenv("FAKE_ANALYSIS_FILL", "2")
+    fake_agent.write_text(fake_agent.read_text() + "\n# 修复候选版本二\n")
     assert module.launch_detached_analyze_thread(event={}, ledger=Ledger(), analysis=analysis)["launch_status"] == "launched"
     completed = json.loads(status_path.read_text())
     assert completed["returncode"] == 0

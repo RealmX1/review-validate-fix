@@ -24,6 +24,7 @@ prompt 冻结 / 自抑制 env；dispatch 的 run 解析 / 子命令拼装）仍�
 from __future__ import annotations
 
 import json
+import contextlib
 import os
 import secrets
 import shlex
@@ -43,6 +44,8 @@ DETACHED_LAUNCH_RESERVED_STATUS_FIELD_NAMES = frozenset({
     "schema_version", "run_dir", "run_name", "host", "tmux_session", "command",
     "pid", "started_at", "armed_at", "returncode", "finished_at", "launch_status",
     "error", "lock_path", "status_path", "idempotency_key",
+    "dispatcher_writer_execution_id", "dispatcher_writer_execution_evidence_path", "dispatcher_writer_execution_entrypoint_sha256",
+    "dispatcher_writer_execution_launch_boundary_status", "dispatcher_writer_execution_tmux_attempted_at",
 })
 
 # run-with-timeout backstop 命中 wall-clock 上限时的退出码：沿用 ``timeout(1)`` /
@@ -148,7 +151,8 @@ def _tmux_session_alive(session_name: str) -> bool:
     """``tmux has-session`` 探活：仅当能**确定性**断定 session 不存在时才回 False。
 
     - has-session 跑完、returncode 0 → session 存活 → True。
-    - has-session 跑完、returncode≠0（含「无此 session」「无 server」）→ 确定不存在 → False。
+    - has-session 跑完、returncode≠0（含「无此 session」「无 server」）→ 确定 tmux 不存在 → False。
+      这不证明脱离该 session 的 dispatcher writer 已退出；该角色另核验实际执行回执。
     - 探活本身失败（tmux 二进制不可用 / PATH 问题 / 超时 / 任何异常）→ **无法确认** →
       **保守回 True（当作可能存活）**。这是「绝不误删活锁」不变量的关键：tmux 临时不可用
       时，决不能把仍在跑的 detached session 误判为死、进而删它的锁。代价是 tmux 持续不可用
@@ -183,8 +187,32 @@ def _detached_run_finished_clean(status_path: Path) -> bool:
     return payload.get("returncode") == 0
 
 
+def probe_dispatcher_tmux_session_before_new_execution(session_name: str, dispatcher_tmux_executable: str,
+    dispatcher_launch_environment: dict[str, str]) -> dict[str, Any]:
+    """只读检查已有资源；占用/无法查询不消耗执行代，原生exec拒绝仍走正式创建补证。"""
+    query_argv = [dispatcher_tmux_executable, "has-session", "-t", session_name]
+    try:
+        queried = subprocess.run(query_argv, capture_output=True, text=True, check=False, env=dispatcher_launch_environment, timeout=10)
+    except (FileNotFoundError, PermissionError) as native_query_creation_error:
+        import errno
+
+        exact_native_exec_rejection = (native_query_creation_error.errno in (errno.ENOENT, errno.EACCES, errno.EPERM)
+            and str(native_query_creation_error.filename) == dispatcher_tmux_executable)
+        return {"status": "query_unavailable", "native_exec_rejection": exact_native_exec_rejection,
+            "argv": query_argv, "error": f"{type(native_query_creation_error).__name__}: {native_query_creation_error}"}
+    except (OSError, subprocess.SubprocessError) as query_error:
+        return {"status": "query_unavailable", "argv": query_argv, "error": f"{type(query_error).__name__}: {query_error}"}
+    result = {"argv": query_argv, "returncode": queried.returncode, "stdout": queried.stdout, "stderr": queried.stderr}
+    if queried.returncode == 0:
+        return {**result, "status": "occupied"}
+    diagnostics = (queried.stderr + queried.stdout).lower()
+    absent = (queried.returncode == 1 and not diagnostics.strip()) or any(message in diagnostics for message in ("can't find session", "cannot find session", "no such session", "no server running", "no sessions")) or (
+        "no such file or directory" in diagnostics and ("error connecting" in diagnostics or "failed to connect" in diagnostics))
+    return {**result, "status": "absent" if absent else "query_unavailable"}
+
+
 def _reclaim_stale_detached_lock(
-    *, lock_path: Path, session_name: str, status_path: Path
+    *, lock_path: Path, session_name: str, status_path: Path, require_actual_dispatcher_writer_execution_evidence: bool = False,
 ) -> int | None:
     """detached 幂等锁的 staleness 判定 + 单次重夺。
 
@@ -202,7 +230,15 @@ def _reclaim_stale_detached_lock(
     全程兜底：任何异常 → None（保守保留 already_running，绝不误删活锁）。
     """
     try:
-        if _tmux_session_alive(session_name):
+        if require_actual_dispatcher_writer_execution_evidence:
+            from dispatcher_writer_execution_evidence import observe_dispatcher_writer_execution_delivery_or_boot_exit_evidence
+
+            observed = observe_dispatcher_writer_execution_delivery_or_boot_exit_evidence(status_path)
+            if observed["dispatcher_writers_may_still_write"] or observed.get("actual_dispatcher_writer_delivery_returncode") == 0:
+                return None
+            if observed.get("evidence_kind") not in ("dispatcher_launch_not_attempted", "dispatcher_tmux_process_creation_failed") and _tmux_session_alive(session_name):
+                return None
+        elif _tmux_session_alive(session_name):
             return None
         if _detached_run_finished_clean(status_path):
             return None
@@ -213,6 +249,16 @@ def _reclaim_stale_detached_lock(
             return None
     except Exception:  # noqa: BLE001
         return None
+
+
+@contextlib.contextmanager
+def _dispatcher_writer_execution_launch_metadata_lock(lock_path: Path):
+    from dispatcher_writer_execution_evidence import dispatcher_writer_execution_terminal_archive_admission_lock
+
+    if lock_path.is_symlink():
+        raise ValueError("dispatcher许可锁必须绑定正式run的幂等锁路径")
+    with dispatcher_writer_execution_terminal_archive_admission_lock(lock_path.parent.parent.parent):
+        yield
 
 
 def launch_detached(
@@ -231,6 +277,7 @@ def launch_detached(
     total_timeout_seconds: float | None = None,
     tmux_timeout: float = 30.0,
     post_exit_argv: list[str] | None = None,
+    require_actual_dispatcher_writer_execution_evidence: bool = False,
 ) -> dict[str, Any]:
     """把 ``argv`` 派进 detached tmux session ``session_name``。
 
@@ -250,13 +297,19 @@ def launch_detached(
     """
     exports = exports or {}
     lock_acquired = False
+    payload = dict(status_payload)
     try:
         failure_status_fields = dict(launch_failure_status_fields or {})
         reserved_overrides = failure_status_fields.keys() & DETACHED_LAUNCH_RESERVED_STATUS_FIELD_NAMES
+        reserved_overrides |= {field_name for field_name in failure_status_fields if field_name.startswith("dispatcher_writer_execution_")}
         if reserved_overrides:
             raise ValueError(f"失败扩展字段不能覆盖启动状态：{', '.join(sorted(reserved_overrides))}")
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.touch(exist_ok=True)
+        if require_actual_dispatcher_writer_execution_evidence and (
+                status_path.resolve() != Path(payload["run_dir"]).resolve() / "artifacts/reviewers/.dispatch-thread.status.json"
+                or lock_path.parent.resolve() != status_path.parent.resolve()):
+            raise ValueError("dispatcher共同许可锁与正式状态路径归属不符")
 
         # 每-run O_EXCL 锁：第二次 launch 命中 FileExistsError → 默认 already_running
         # （不重写 status：首个 launch 已写过，保留其 started_at 等启动期字段）。
@@ -264,52 +317,132 @@ def launch_detached(
         # run 未干净完成，则该锁是陈旧锁（死 tmux 后内层命令失败/被杀，finalize 只回写
         # returncode、从不删锁），删后单次重夺以放行重派；其余情形仍幂等地保持
         # already_running。
-        try:
-            fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            fd = _reclaim_stale_detached_lock(
-                lock_path=lock_path,
-                session_name=session_name,
-                status_path=status_path,
+        metadata_owner = _dispatcher_writer_execution_launch_metadata_lock(lock_path) if require_actual_dispatcher_writer_execution_evidence else contextlib.nullcontext()
+        with metadata_owner:
+            if require_actual_dispatcher_writer_execution_evidence:
+                from dispatcher_writer_execution_evidence import (
+                    DISPATCHER_WRITER_EXECUTION_PRELAUNCH_RECOVERY_ATTEMPTS_PER_INPUT_GENERATION,
+                    observe_dispatcher_writer_execution_delivery_or_boot_exit_evidence,
+                    observe_dispatcher_writer_execution_prelaunch_recovery_inputs,
+                    recover_unattempted_dispatcher_preparations_with_admission_lock_held,
+                    assert_dispatcher_launch_not_prohibited_by_terminal_archive_intent,
+                    bind_dispatcher_prelaunch_input_generation_with_admission_lock_held,
+                )
+                from core.run_ledger.review_run_lifecycle import read_json_object
+
+                if payload.get("session_id") is None:
+                    payload["session_id"] = read_json_object(Path(payload["run_dir"]) / "summary.json").get("session_id")
+                summary_session_id = read_json_object(Path(payload["run_dir"]) / "summary.json").get("session_id")
+                if summary_session_id is not None and payload.get("session_id") != summary_session_id:
+                    raise ValueError("dispatcher恢复的显式会话归属与正式summary矛盾")
+                payload["total_timeout_seconds"] = total_timeout_seconds
+                dispatcher_tmux_executable_argv0 = tmux_bin()
+                payload["dispatcher_writer_execution_tmux_executable_argv0"] = dispatcher_tmux_executable_argv0
+                payload["dispatcher_writer_execution_tmux_executable_search_path"] = (launch_env if launch_env is not None else {**os.environ, **exports}).get("PATH")
+                try:
+                    previous_dispatcher_execution_receipts = recover_unattempted_dispatcher_preparations_with_admission_lock_held(status_path, payload)
+                except (OSError, ValueError, KeyError, TypeError) as preparing_recovery_error:
+                    return {"launch_status": LAUNCH_ALREADY_RUNNING, "returncode": None, "tmux_command": None,
+                        "error": f"{type(preparing_recovery_error).__name__}: {preparing_recovery_error}",
+                        "recovery_condition": "精确准备/交付回执及关键归属恢复一致后，在共同许可锁内自动重验"}
+                if status_path.exists() or status_path.is_symlink() or (status_path.parent / "dispatcher-writer-executions").exists():
+                    previous_dispatcher_execution_observation = observe_dispatcher_writer_execution_delivery_or_boot_exit_evidence(status_path)
+                    if (previous_dispatcher_execution_observation["dispatcher_writers_may_still_write"]
+                            or previous_dispatcher_execution_observation.get("actual_dispatcher_writer_delivery_returncode") == 0):
+                        return {"launch_status": LAUNCH_ALREADY_RUNNING, "returncode": None, "error": None, "tmux_command": None,
+                                "recovery_condition": previous_dispatcher_execution_observation.get("recovery_condition")}
+                    previous_dispatcher_status_payload = json.loads(status_path.read_text(encoding="utf-8"))
+                    if (any(previous_dispatcher_status_payload.get(field_name) != payload.get(field_name)
+                            for field_name in ("kind", "run_id", "session_id", "tmux_session", "command"))
+                            or Path(previous_dispatcher_status_payload["run_dir"]).resolve() != Path(payload["run_dir"]).resolve()
+                            or Path(previous_dispatcher_status_payload["repo"]).resolve() != Path(payload["repo"]).resolve()):
+                        raise ValueError("dispatcher 恢复不能替换已有执行的精确归属或启动命令")
+                    if previous_dispatcher_execution_observation.get("evidence_kind") in ("dispatcher_launch_not_attempted", "dispatcher_tmux_process_creation_failed", "dispatcher_monitor_child_process_creation_failed"):
+                        payload["dispatcher_writer_execution_previous_prelaunch_failure_evidence_path"] = previous_dispatcher_execution_observation["dispatcher_writer_execution_evidence_path"]
+                assert_dispatcher_launch_not_prohibited_by_terminal_archive_intent(status_path, payload)
+                current_dispatcher_prelaunch_inputs = observe_dispatcher_writer_execution_prelaunch_recovery_inputs(argv, total_timeout_seconds,
+                    dispatcher_tmux_executable_argv0, payload["dispatcher_writer_execution_tmux_executable_search_path"])
+                current_dispatcher_prelaunch_inputs = bind_dispatcher_prelaunch_input_generation_with_admission_lock_held(status_path, payload, current_dispatcher_prelaunch_inputs, previous_dispatcher_execution_receipts)
+                generation_receipt_count = sum(receipt["dispatcher_writer_execution_prelaunch_recovery_generation_sha256"]
+                    == current_dispatcher_prelaunch_inputs["dispatcher_writer_execution_prelaunch_recovery_generation_sha256"] for receipt in previous_dispatcher_execution_receipts)
+                if generation_receipt_count >= DISPATCHER_WRITER_EXECUTION_PRELAUNCH_RECOVERY_ATTEMPTS_PER_INPUT_GENERATION:
+                    return {"launch_status": LAUNCH_FAILED, "returncode": None, "error": "该输入代的精确准备回执已耗尽三次预算", "tmux_command": None,
+                        "recovery_state": "waiting_for_dispatcher_prelaunch_input_change",
+                        "recovery_condition": "入口/可执行条件或恢复实现内容变化后自动重验；孤立准备回执同样计数"}
+                tmux_preflight = probe_dispatcher_tmux_session_before_new_execution(session_name, dispatcher_tmux_executable_argv0,
+                    launch_env if launch_env is not None else {**os.environ, **exports})
+                if tmux_preflight["status"] == "occupied" or (tmux_preflight["status"] == "query_unavailable" and not tmux_preflight.get("native_exec_rejection")):
+                    return {"launch_status": LAUNCH_ALREADY_RUNNING, "returncode": None, "error": tmux_preflight.get("error"), "tmux_command": None,
+                        "recovery_state": "waiting_for_tmux_session_release" if tmux_preflight["status"] == "occupied" else "waiting_for_tmux_query_recovery",
+                        "recovery_condition": "精确tmux资源释放或查询恢复后自动重验；等待不创建新receipt或消耗次数",
+                        "tmux_preflight_observation": tmux_preflight}
+                payload["dispatcher_writer_execution_tmux_resource_preflight"] = tmux_preflight
+                payload.update(current_dispatcher_prelaunch_inputs)
+                payload["dispatcher_writer_execution_prelaunch_recovery_attempt_number"] = generation_receipt_count + 1
+            try:
+                fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                fd = _reclaim_stale_detached_lock(lock_path=lock_path, session_name=session_name,
+                    status_path=status_path, require_actual_dispatcher_writer_execution_evidence=require_actual_dispatcher_writer_execution_evidence)
+                if fd is None:
+                    outcome = {"launch_status": LAUNCH_ALREADY_RUNNING, "returncode": None, "error": None, "tmux_command": None}
+                    if require_actual_dispatcher_writer_execution_evidence:
+                        outcome.update({"recovery_state": "waiting_for_dispatcher_lock_or_evidence_recovery",
+                            "recovery_condition": "精确tmux资源/查询及执行回执恢复后自动重验；等待不消耗新准备次数"})
+                    return outcome
+            lock_acquired = True
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(f"{idempotency_key or session_name}\n{_iso_now()}\n")
+            payload["launch_status"] = LAUNCH_LAUNCHED
+            if require_actual_dispatcher_writer_execution_evidence:
+                from dispatcher_writer_execution_evidence import (
+                    initialize_dispatcher_writer_execution_binding_before_entrypoint_read,
+                    complete_dispatcher_writer_execution_entrypoint_content_binding,
+                )
+
+                payload = initialize_dispatcher_writer_execution_binding_before_entrypoint_read(status_path, payload)
+                if total_timeout_seconds is None or total_timeout_seconds <= 0:
+                    raise ValueError("dispatcher writer monitor 必须具有明确正数总时限")
+                payload = complete_dispatcher_writer_execution_entrypoint_content_binding(status_path)
+            _atomic_write_json(status_path, payload)
+
+            effective_argv = (
+                _run_with_timeout_argv(total_timeout_seconds, argv)
+                if total_timeout_seconds is not None
+                else list(argv)
             )
-            if fd is None:
-                return {
-                    "launch_status": LAUNCH_ALREADY_RUNNING,
-                    "returncode": None,
-                    "error": None,
-                    "tmux_command": None,
-                }
-        lock_acquired = True
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(f"{idempotency_key or session_name}\n{_iso_now()}\n")
+            if require_actual_dispatcher_writer_execution_evidence:
+                from dispatcher_writer_execution_evidence import build_dispatcher_writer_execution_monitor_argv
 
-        payload = dict(status_payload)
-        payload["launch_status"] = LAUNCH_LAUNCHED
-        _atomic_write_json(status_path, payload)
+                effective_argv = build_dispatcher_writer_execution_monitor_argv(status_path, payload, total_timeout_seconds)
+            shell_command = _build_wrapper_shell(
+                argv=effective_argv,
+                log_path=log_path,
+                status_path=status_path,
+                exports=exports,
+                stdin_path=stdin_path,
+                post_exit_argv=post_exit_argv,
+            )
+            tmux_command = [dispatcher_tmux_executable_argv0 if require_actual_dispatcher_writer_execution_evidence else tmux_bin(), "new-session", "-d", "-s", session_name, shell_command]
+            env = launch_env if launch_env is not None else {**os.environ, **exports}
+            if require_actual_dispatcher_writer_execution_evidence:
+                from dispatcher_writer_execution_evidence import record_dispatcher_writer_execution_tmux_attempt_with_admission_lock_held
 
-        effective_argv = (
-            _run_with_timeout_argv(total_timeout_seconds, argv)
-            if total_timeout_seconds is not None
-            else list(argv)
-        )
-        shell_command = _build_wrapper_shell(
-            argv=effective_argv,
-            log_path=log_path,
-            status_path=status_path,
-            exports=exports,
-            stdin_path=stdin_path,
-            post_exit_argv=post_exit_argv,
-        )
-        tmux_command = [tmux_bin(), "new-session", "-d", "-s", session_name, shell_command]
-        env = launch_env if launch_env is not None else {**os.environ, **exports}
-        completed = subprocess.run(
-            tmux_command,
-            capture_output=True,
-            text=True,
-            check=False,
-            env=env,
-            timeout=tmux_timeout,
-        )
+                payload = record_dispatcher_writer_execution_tmux_attempt_with_admission_lock_held(status_path, payload["dispatcher_writer_execution_id"], tmux_command)
+        if require_actual_dispatcher_writer_execution_evidence:
+            from dispatcher_writer_execution_evidence import run_dispatcher_tmux_launcher_with_native_process_creation_evidence
+
+            completed = run_dispatcher_tmux_launcher_with_native_process_creation_evidence(
+                status_path, payload["dispatcher_writer_execution_id"], tmux_command, env, tmux_timeout)
+        else:
+            completed = subprocess.run(
+                tmux_command,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+                timeout=tmux_timeout,
+            )
 
         if completed.returncode != 0:
             combined = (completed.stderr + completed.stdout).lower()
@@ -333,7 +466,8 @@ def launch_detached(
             payload["returncode"] = completed.returncode
             _atomic_write_json(status_path, payload)
             # launch 失败时释放锁，便于后续重新 launch。
-            _unlink_quiet(lock_path)
+            if not require_actual_dispatcher_writer_execution_evidence:
+                _unlink_quiet(lock_path)
             return {
                 "launch_status": LAUNCH_FAILED,
                 "returncode": completed.returncode,
@@ -351,15 +485,29 @@ def launch_detached(
         error = f"{type(exc).__name__}: {exc}"
         if lock_acquired:
             try:
-                failure = {**status_payload, **failure_status_fields}
-                failure["launch_status"] = LAUNCH_FAILED
-                failure["error"] = error
-                failure.setdefault("returncode", None)
-                failure.setdefault("finished_at", None)
-                _atomic_write_json(status_path, failure)
+                failure_metadata_owner = _dispatcher_writer_execution_launch_metadata_lock(lock_path) if require_actual_dispatcher_writer_execution_evidence else contextlib.nullcontext()
+                with failure_metadata_owner:
+                    if require_actual_dispatcher_writer_execution_evidence and payload.get("dispatcher_writer_execution_id"):
+                        from dispatcher_writer_execution_evidence import record_dispatcher_writer_execution_failure_before_tmux_attempt
+
+                        latest_dispatcher_failure_status = json.loads(status_path.read_text(encoding="utf-8"))
+                        if latest_dispatcher_failure_status.get("dispatcher_writer_execution_id") != payload["dispatcher_writer_execution_id"]:
+                            raise ValueError("dispatcher 失败清理不能覆盖其他执行绑定")
+                        payload = latest_dispatcher_failure_status
+                        try:
+                            payload = record_dispatcher_writer_execution_failure_before_tmux_attempt(status_path, payload["dispatcher_writer_execution_id"], error)
+                        except ValueError:
+                            pass
+                    failure = {**payload, **failure_status_fields}
+                    failure["launch_status"] = LAUNCH_FAILED
+                    failure["error"] = error
+                    failure.setdefault("returncode", None)
+                    failure.setdefault("finished_at", None)
+                    _atomic_write_json(status_path, failure)
             except Exception:  # noqa: BLE001
                 pass
-            _unlink_quiet(lock_path)
+            if not require_actual_dispatcher_writer_execution_evidence:
+                _unlink_quiet(lock_path)
         return {
             "launch_status": LAUNCH_FAILED,
             "returncode": None,

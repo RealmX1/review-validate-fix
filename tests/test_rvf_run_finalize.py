@@ -59,6 +59,8 @@ def _make_run(tmp_path: Path, repo: Path, transcript: Path) -> Path:
                 "run_id": "rvf-test-run",
                 "status": "started",
                 "reason_code": "test",
+                "review_run_started_at": "2026-05-05T00:00:01Z",
+                "review_run_start_evidence_source": "synthetic_review_start_receipt",
                 "repo": str(repo),
                 "events_path": str(run_dir / "events.jsonl"),
                 "artifacts_dir": str(artifacts),

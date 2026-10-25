@@ -54,6 +54,23 @@ def inject(**deps: object) -> None:
     globals().update(deps)
 
 
+def write_dispatcher_launch_fixture_with_absent_tmux_session(path: Path) -> Path:
+    """初次派发fixture：查询明确无session，只有new-session属于启动记录。"""
+    path.write_text(
+        "#!/usr/bin/env python3\nimport json,os,sys\n"
+        "if len(sys.argv)>1 and sys.argv[1]=='has-session': raise SystemExit(1)\n"
+        "calls=os.environ.get('FAKE_TMUX_CALLS')\n"
+        "if calls:\n"
+        "    with open(calls,'a',encoding='utf-8') as output: output.write(json.dumps({'argv':sys.argv[1:]})+'\\n')\n"
+        "diagnostic=os.environ.get('FAKE_TMUX_STDERR')\n"
+        "if diagnostic: sys.stderr.write(diagnostic)\n"
+        "raise SystemExit(int(os.environ.get('FAKE_TMUX_RETURNCODE','0')))\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o700)
+    return path
+
+
 def test_dispatch_reviewers_detached_launch_wiring(root: Path) -> None:
     """--execute --detached：self-fork dispatch_reviewers.py --execute 进 tmux，立即返回 status 路径。"""
     import contextlib
@@ -61,11 +78,12 @@ def test_dispatch_reviewers_detached_launch_wiring(root: Path) -> None:
 
     d = load_dispatch_reviewers_module()
     root.mkdir(parents=True, exist_ok=True)
-    fake_tmux = write_fake_tmux_script(root / "tmux.py")
+    fake_tmux = write_dispatcher_launch_fixture_with_absent_tmux_session(root / "tmux.py")
     calls = root / "calls.jsonl"
     run_dir = root / "runs" / "rvf-disp-unit"
     reviewers_dir = run_dir / "artifacts" / "reviewers"
     reviewers_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "summary.json").write_text(json.dumps({"run_id": run_dir.name, "run_dir": str(run_dir), "repo": "/repo"}))
 
     class _Ledger:
         run_id = "rvf-disp-unit"
@@ -146,11 +164,12 @@ def test_dispatch_reviewers_detached_exports_codex_rvf_log_root(root: Path) -> N
 
     d = load_dispatch_reviewers_module()
     root.mkdir(parents=True, exist_ok=True)
-    fake_tmux = write_fake_tmux_script(root / "tmux.py")
+    fake_tmux = write_dispatcher_launch_fixture_with_absent_tmux_session(root / "tmux.py")
     calls = root / "calls.jsonl"
     run_dir = root / "runs" / "rvf-disp-unit"
     reviewers_dir = run_dir / "artifacts" / "reviewers"
     reviewers_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "summary.json").write_text(json.dumps({"run_id": run_dir.name, "run_dir": str(run_dir), "repo": "/repo"}))
     log_root = root / "rvf-log-root"
 
     class _Ledger:
@@ -321,12 +340,20 @@ def test_dispatch_reviewers_detached_candidate_summary_ignores_stale_server_iden
         "keys=('kanban_task_id','session_id','candidate_path_count','candidate_fingerprint','committed_round_baseline')\n"
         "print(json.dumps({'native_session':session,'summary':{key:summary.get(key) for key in keys}}))\n"
     )
-    probe_argv = [sys.executable, "-B", "-c", probe_source, str(SCRIPT_DIR), str(repository)]
+    probe_source += (
+        "from pathlib import Path\n"
+        "from dispatcher_writer_execution_evidence import run_actual_dispatcher_with_writer_execution_evidence\n"
+        "raise SystemExit(run_actual_dispatcher_with_writer_execution_evidence(lambda:0,dispatcher_script_path=Path(__file__).resolve()))\n"
+    )
+    probe_script = root / "actual-detached-identity-probe.py"
+    probe_script.write_text(probe_source, encoding="utf-8")
+    probe_argv = [sys.executable, str(probe_script), str(SCRIPT_DIR), str(repository)]
     server_environment_path = root / "fixed-tmux-server-environment.json"
     fake_tmux = root / "tmux-with-fixed-server-environment.py"
     fake_tmux.write_text(
         f"#!{sys.executable}\n"
         "import json,os,subprocess,sys\n"
+        "if len(sys.argv)>1 and sys.argv[1]=='has-session': raise SystemExit(1)\n"
         "from pathlib import Path\n"
         "environment=json.loads(Path(os.environ['FIXED_TMUX_SERVER_ENVIRONMENT_PATH']).read_text())\n"
         "raise SystemExit(subprocess.run(['/bin/sh','-c',sys.argv[-1]],env=environment).returncode)\n",
@@ -354,6 +381,9 @@ def test_dispatch_reviewers_detached_candidate_summary_ignores_stale_server_iden
             ).stdout)
             assert expected["summary"]["candidate_path_count"] == (1 if current_identity else 0)
             case_directory = root / f"server-stale-{server_has_stale_identity}-parent-{index}"
+            case_directory.mkdir(parents=True)
+            (case_directory / "summary.json").write_text(json.dumps({"run_id": case_directory.name,
+                "run_dir": str(case_directory), "repo": str(repository), "session_id": expected["native_session"]}))
             ledger = SimpleNamespace(
                 run_id=case_directory.name, correlation_id="synthetic-detached-identity",
                 root=root / "isolated-log-root", run_dir=case_directory, event=lambda **kwargs: None,
@@ -366,11 +396,11 @@ def test_dispatch_reviewers_detached_candidate_summary_ignores_stale_server_iden
                 d, "_build_detached_child_argv", return_value=probe_argv,
             ), contextlib.redirect_stdout(io.StringIO()):
                 assert d.launch_detached_dispatch(
-                    argparse.Namespace(total_timeout=30), ledger, case_directory / "reviewers",
+                    argparse.Namespace(total_timeout=30), ledger, case_directory / "artifacts/reviewers",
                     repo=str(repository), review_packet=None, session_context=None,
                     scope_contract="/synthetic-scope-contract",
                 ) == 0
-            reviewers_directory = case_directory / "reviewers"
+            reviewers_directory = case_directory / "artifacts/reviewers"
             status = json.loads((reviewers_directory / d.DISPATCH_STATUS_FILENAME).read_text())
             log = (reviewers_directory / d.DISPATCH_LOG_FILENAME).read_text()
             assert status["returncode"] == 0, (status, log)
@@ -450,12 +480,20 @@ def test_dispatch_reviewers_detached_preserves_parent_harness_marker_and_candida
         "keys=('kanban_task_id','session_id','candidate_path_count','candidate_fingerprint','committed_round_baseline')\n"
         "print(json.dumps({'harness':resolve_parent_harness_identity(),'marker_path':marker['_marker_path'],'marker_baseline':marker['baseline_head'],'summary':{key:summary.get(key) for key in keys}}))\n"
     )
-    probe_argv = [sys.executable, "-B", "-c", probe_source, str(SCRIPT_DIR), str(repository)]
+    probe_source += (
+        "from pathlib import Path\n"
+        "from dispatcher_writer_execution_evidence import run_actual_dispatcher_with_writer_execution_evidence\n"
+        "raise SystemExit(run_actual_dispatcher_with_writer_execution_evidence(lambda:0,dispatcher_script_path=Path(__file__).resolve()))\n"
+    )
+    probe_script = root / "actual-detached-harness-probe.py"
+    probe_script.write_text(probe_source, encoding="utf-8")
+    probe_argv = [sys.executable, str(probe_script), str(SCRIPT_DIR), str(repository)]
     server_environment_path = root / "fixed-tmux-server-environment.json"
     fake_tmux = root / "tmux-with-fixed-harness-environment.py"
     fake_tmux.write_text(
         f"#!{sys.executable}\n"
         "import json,os,subprocess,sys\n"
+        "if len(sys.argv)>1 and sys.argv[1]=='has-session': raise SystemExit(1)\n"
         "from pathlib import Path\n"
         "environment=json.loads(Path(os.environ['FIXED_TMUX_SERVER_ENVIRONMENT_PATH']).read_text())\n"
         "raise SystemExit(subprocess.run(['/bin/sh','-c',sys.argv[-1]],env=environment).returncode)\n",
@@ -492,6 +530,9 @@ def test_dispatch_reviewers_detached_preserves_parent_harness_marker_and_candida
             assert stale["summary"]["candidate_fingerprint"] != expected["summary"]["candidate_fingerprint"]
             server_environment_path.write_text(json.dumps(server_environment), encoding="utf-8")
             case_directory = root / case_name
+            case_directory.mkdir(parents=True)
+            (case_directory / "summary.json").write_text(json.dumps({"run_id": case_name,
+                "run_dir": str(case_directory), "repo": str(repository), "session_id": shared_identity["RVF_SESSION_ID"]}))
             ledger = SimpleNamespace(
                 run_id=case_name, correlation_id="synthetic-detached-harness",
                 root=log_root, run_dir=case_directory, event=lambda **kwargs: None,
@@ -504,11 +545,11 @@ def test_dispatch_reviewers_detached_preserves_parent_harness_marker_and_candida
                 d, "_build_detached_child_argv", return_value=probe_argv,
             ), contextlib.redirect_stdout(io.StringIO()):
                 assert d.launch_detached_dispatch(
-                    argparse.Namespace(total_timeout=30), ledger, case_directory / "reviewers",
+                    argparse.Namespace(total_timeout=30), ledger, case_directory / "artifacts/reviewers",
                     repo=str(repository), review_packet=None, session_context=None,
                     scope_contract="/synthetic-scope-contract",
                 ) == 0
-            reviewers_directory = case_directory / "reviewers"
+            reviewers_directory = case_directory / "artifacts/reviewers"
             status = json.loads((reviewers_directory / d.DISPATCH_STATUS_FILENAME).read_text())
             log = (reviewers_directory / d.DISPATCH_LOG_FILENAME).read_text()
             assert status["returncode"] == 0, (status, log)

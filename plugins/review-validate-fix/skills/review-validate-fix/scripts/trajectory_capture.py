@@ -61,7 +61,8 @@ import hashlib
 import json
 import shutil
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +70,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 core.* import
 
+from core.run_ledger.review_run_lifecycle import (  # noqa: E402
+    parse_timezone_aware_review_run_timestamp_utc,
+    review_run_timestamp_is_within_optional_bounds,
+)
 from subagent_capture import capture_all_subagents  # noqa: E402
 from core.host_adapter.host_transcript_format_detection import (  # noqa: E402
     HOST_CLAUDE,
@@ -261,9 +266,8 @@ def find_rvf_start_in_claude_jsonl(
         if matched is None:
             continue
         ts = record.get("timestamp") if isinstance(record.get("timestamp"), str) else None
-        if since_timestamp is not None:
-            if ts is None or ts < since_timestamp:
-                continue
+        if not review_run_timestamp_is_within_optional_bounds(ts, window_start=since_timestamp):
+            continue
         latest = CutPoint(
             line_index=line_index,
             byte_offset=byte_start,
@@ -287,8 +291,8 @@ def find_rvf_start_in_jsonl(
 
     ``since_timestamp``（ISO8601 UTC 字符串，例如 ``"2026-05-04T04:18:29Z"``）：仅匹配
     ``record["timestamp"] >= since_timestamp`` 的 trigger 行。用于同会话连续两次 RVF
-    的场景——第二次 finalize 不应把第一次的 RVF trigger 当 cut。本仓库 timestamp
-    统一带 ``Z`` 后缀的 UTC ISO8601，字典序即时间序，无需 datetime 解析。
+    的场景——第二次 finalize 不应把第一次的 RVF trigger 当 cut。比较带时区的真实
+    时刻，不能依赖 ISO 字符串精度或 UTC offset 的表示形式。
 
     Host 耦合：此函数透过 ``_codex_user_message_text`` 解析 user message，
     只识别 Codex rollout schema。若未来要支持 Claude Code transcript，
@@ -307,9 +311,8 @@ def find_rvf_start_in_jsonl(
         if matched is None:
             continue
         ts = record.get("timestamp") if isinstance(record.get("timestamp"), str) else None
-        if since_timestamp is not None:
-            if ts is None or ts < since_timestamp:
-                continue
+        if not review_run_timestamp_is_within_optional_bounds(ts, window_start=since_timestamp):
+            continue
         latest = CutPoint(
             line_index=line_index,
             byte_offset=byte_start,
@@ -320,6 +323,23 @@ def find_rvf_start_in_jsonl(
     if latest is None:
         return None
     return dataclasses.replace(latest, line_count_total=last_index + 1)
+
+
+def _cut_at_review_run_start(path: Path, started_at: str, *, host_kind: str = HOST_CODEX) -> CutPoint | None:
+    """以已接受的不可变开审时刻切片，允许发起消息早于 acknowledge。"""
+    if parse_timezone_aware_review_run_timestamp_utc(started_at) is None:
+        return None
+    cut = None
+    last_index = -1
+    for line_index, byte_start, _byte_end, record in _iter_jsonl_with_offsets(path):
+        last_index = line_index
+        if cut is not None or not isinstance(record, dict):
+            continue
+        timestamp = _kimi_record_timestamp(record) if host_kind == HOST_KIMI_CODE else record.get("timestamp")
+        if review_run_timestamp_is_within_optional_bounds(timestamp, window_start=started_at):
+            cut = CutPoint(line_index=line_index, byte_offset=byte_start, timestamp=timestamp,
+                           marker_matched="review_run_started_at", line_count_total=0)
+    return dataclasses.replace(cut, line_count_total=last_index + 1) if cut else None
 
 
 def _kimi_user_message_text(record: dict[str, Any]) -> str | None:
@@ -383,7 +403,10 @@ def _kimi_record_timestamp(record: dict[str, Any]) -> str | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     try:
-        moment = datetime.fromtimestamp(value / 1000.0, timezone.utc)
+        microseconds = Decimal(str(value)) * 1000
+        if microseconds != microseconds.to_integral_value():
+            return None
+        moment = datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=int(microseconds))
     except (OverflowError, OSError, ValueError):
         return None
     return moment.isoformat().replace("+00:00", "Z")
@@ -416,9 +439,8 @@ def find_rvf_start_in_kimi_wire_jsonl(
         if matched is None:
             continue
         ts = _kimi_record_timestamp(record)
-        if since_timestamp is not None:
-            if ts is None or ts < since_timestamp:
-                continue
+        if not review_run_timestamp_is_within_optional_bounds(ts, window_start=since_timestamp):
+            continue
         latest = CutPoint(
             line_index=line_index,
             byte_offset=byte_start,
@@ -832,23 +854,22 @@ def capture_run(
     else:
         # 同会话或无法判定 → 同会话切片逻辑
         if current_transcript is not None:
-            # 当 summary.json 里有 prepare 时刻 timestamp 时，作为 marker 的下界，
-            # 防止同一会话内连续两次 RVF 时错把第一次的 marker 当成本 run 的 cut。
+            # 起点来自精确 run 的接受记录；组件最后更新时间不能替代开审时刻。
             since_timestamp: str | None = None
             try:
                 summary_path = run_dir / "summary.json"
                 if summary_path.is_file():
                     summary_payload = json.loads(summary_path.read_text(encoding="utf-8"))
                     if isinstance(summary_payload, dict):
-                        ts_value = summary_payload.get("timestamp")
-                        if isinstance(ts_value, str) and ts_value:
-                            since_timestamp = ts_value
-            except (OSError, json.JSONDecodeError):
+                        from core.run_ledger.review_run_lifecycle import review_run_start_evidence
+
+                        since_timestamp, _start_source = review_run_start_evidence(run_dir, summary_payload)
+            except (OSError, ValueError):
                 since_timestamp = None
-            cut = _host_find_rvf_start(post_host_kind)(
-                current_transcript,
-                since_timestamp=since_timestamp,
-            )
+            cut = (_cut_at_review_run_start(current_transcript, since_timestamp, host_kind=post_host_kind)
+                   if since_timestamp else None)
+            if cut is None:
+                cut = _host_find_rvf_start(post_host_kind)(current_transcript, since_timestamp=since_timestamp)
             if cut is not None:
                 pre_kind = "same-session-slice"
                 post_kind = "same-session-slice"
@@ -930,10 +951,31 @@ def capture_run(
     }
     rvf_rollout = rvf_dir / "rollout.jsonl"
     if rvf_rollout.exists():
+        terminal_at = event.get("review_run_terminal_observed_at")
+        if parse_timezone_aware_review_run_timestamp_utc(terminal_at) is not None:
+            kept_lines = []
+            for raw_line in rvf_rollout.read_bytes().splitlines(keepends=True):
+                try:
+                    record = json.loads(raw_line)
+                except ValueError:
+                    continue
+                timestamp = ((_kimi_record_timestamp(record) if post_host_kind == HOST_KIMI_CODE else record.get("timestamp"))
+                             if isinstance(record, dict) else None)
+                # 无时刻的元数据仍保留原文；后续窗口统计不会将其认定为已归属事件。
+                if (parse_timezone_aware_review_run_timestamp_utc(timestamp) is None
+                        or review_run_timestamp_is_within_optional_bounds(timestamp, window_end=terminal_at)):
+                    kept_lines.append(raw_line)
+            rvf_rollout.write_bytes(b"".join(kept_lines))
+            post_manifest.update({"review_run_terminal_at": terminal_at,
+                                  "captured_size_bytes": rvf_rollout.stat().st_size,
+                                  "captured_sha256": _sha256_file(rvf_rollout)})
+            (rvf_dir / "rollout.manifest.json").write_text(json.dumps(post_manifest, ensure_ascii=False, indent=2) + "\n")
+        native_identity = {"native_session_id": event_session_id} if post_host_kind == HOST_CODEX else {}
         distilled, distill_index = _host_distill(post_host_kind)(
             rollout_path=rvf_rollout,
             rollout_filename="rollout.jsonl",
             repo=repo,
+            **native_identity,
         )
         write_jsonl(distilled, rvf_dir / "trajectory.jsonl")
         (rvf_dir / "trajectory.index.json").write_text(

@@ -55,6 +55,9 @@ tests/                                                 # 不随 plugin runtime �
 运行期改动进入 `plugins/review-validate-fix/`、`core/` 或 `adapters/`；仓库级安装、验证工具和
 测试进入顶层 `scripts/` 与 `tests/`。plugin runtime 不携带仓库级测试或安装器。
 
+固定候选、非成功轮次归档、后台分析恢复及资源计量口径见
+[固定候选 RVF 与终态分析恢复](docs/architecture/fixed-candidate-review-run-analysis-recovery.md)。
+
 开发者安装的前置顺序固定为：
 
 1. 在 task worktree 完成实现和 RVF review。

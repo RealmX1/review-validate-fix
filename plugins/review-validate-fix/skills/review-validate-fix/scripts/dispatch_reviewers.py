@@ -1410,7 +1410,7 @@ def launch_detached_dispatch(
     （failed→1、``blocked_on_reviewer_request``→``DISPATCH_BLOCKED_ON_REVIEWER_REQUEST_EXIT_CODE``），
     线程已死时锁会被判陈旧并重夺，主会话处置完 reviewer request 后能经同一入口重派。
     """
-    require_prepared_run_review_start_boundary(repo=repo, scope_contract=scope_contract, run_id=ledger.run_id if ledger else None, run_dir=ledger.run_dir if ledger else None)
+    prepared_boundary = require_prepared_run_review_start_boundary(repo=repo, scope_contract=scope_contract, run_id=ledger.run_id if ledger else None, run_dir=ledger.run_dir if ledger else None)
     reviewers_dir.mkdir(parents=True, exist_ok=True)
     status_path = reviewers_dir / DISPATCH_STATUS_FILENAME
     log_path = reviewers_dir / DISPATCH_LOG_FILENAME
@@ -1430,6 +1430,8 @@ def launch_detached_dispatch(
     status_payload = {
         "schema_version": DISPATCH_STATUS_SCHEMA_VERSION,
         "kind": "dispatch",
+        "repo": repo,
+        "session_id": (prepared_boundary or {}).get("session_id"),
         "run_id": ledger.run_id,
         "run_dir": str(ledger.run_dir),
         "run_name": run_name,
@@ -1468,6 +1470,7 @@ def launch_detached_dispatch(
         launch_env={**os.environ, **detached_dispatch_environment_exports},
         idempotency_key=f"rvf-dispatch:{run_name}",
         total_timeout_seconds=args.total_timeout,
+        require_actual_dispatcher_writer_execution_evidence=True,
     )
 
     ledger.event(
@@ -1829,4 +1832,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from dispatcher_writer_execution_evidence import run_actual_dispatcher_with_writer_execution_evidence
+
+    raise SystemExit(run_actual_dispatcher_with_writer_execution_evidence(main, dispatcher_script_path=Path(__file__).resolve()))

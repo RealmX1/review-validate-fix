@@ -367,6 +367,9 @@ def prepare_fix_attempt(
     if worktree.exists():
         raise ValueError(f"attempt worktree already exists: {worktree}")
     attempt_dir.mkdir(parents=True, exist_ok=True)
+    from core.run_ledger.review_run_lifecycle import observe_bound_review_run_component_phase
+
+    observe_bound_review_run_component_phase(run_dir, phase="validate_fix")
     _run(repo, ["worktree", "add", "--detach", str(worktree), base_head])
     # 观察面 = 真实工作区：全部 dirty / untracked 都物化进 attempt（不再只叠 boundary 内的），
     # 修改权仍由 stop 时的 boundary / 声明 / 确认三档控制。baseline 提交含全部 WIP，

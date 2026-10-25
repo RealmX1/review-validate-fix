@@ -151,7 +151,7 @@ def test_discover_spawned_agents_picks_up_collab_events(tmp_path: Path) -> None:
     assert spawns[0].role == "explorer"
     assert spawns[0].nickname == "Faraday"
     assert spawns[0].call_id == "call_spawn_a"
-    assert spawns[0].ts == "t2"
+    assert spawns[0].ts == "t1"
     assert spawns[1].role == "worker"
     assert spawns[1].nickname == "Tesla"
     # prompt should round-trip

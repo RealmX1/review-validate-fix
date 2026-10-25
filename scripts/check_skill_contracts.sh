@@ -808,6 +808,18 @@ run_step "python compile" "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m py_compile \
 run_parallel_test_steps
 run_step "tests: rvf_analyze_formal_archive_completion" \
   "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
+    "$tests_dir/test_review_run_lifecycle_analysis_recovery.py" \
+    "$tests_dir/test_review_run_timestamp_resource_boundaries.py" \
+    "$tests_dir/test_finalization_progress_and_subagent_capture_coverage.py" \
+    "$tests_dir/test_prepared_review_run_terminal_archive.py" \
+    "$tests_dir/test_terminal_archive_recovery_control_plane.py" \
+    "$tests_dir/test_dispatcher_writer_execution_evidence.py" \
+    "$tests_dir/test_dispatcher_prelaunch_failure_recovery.py" \
+    "$tests_dir/test_dispatcher_terminal_archive_launch_serialization.py" \
+    "$tests_dir/test_terminal_archive_intent_index_recovery.py" \
+    "$tests_dir/test_analysis_automatic_attempt_recovery.py" \
+    "$tests_dir/test_analysis_input_recovery_and_completion_accounting.py" \
+    "$tests_dir/test_codex_native_edit_completion_deduplication.py" \
     "$tests_dir/test_rvf_analyze_formal_archive_completion.py" \
     "$tests_dir/test_invoke_subagent.py" \
     "$tests_dir/test_rvf_analyze.py" \
