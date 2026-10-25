@@ -15,7 +15,9 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 from independent_review_start_boundary_fixture import fixed_git_coordinates_for_review_start_boundary_unit_test
 
 from _rvf_test_support.repo import templated_repo
@@ -2870,6 +2872,384 @@ def test_kanban_task_workspace_mismatch_uses_task_lookup_without_workspace_env(t
         if line.strip()
     ]
     assert [call["argv"][0] for call in calls] == ["list"]
+
+
+@contextmanager
+def _isolated_workspace_guard_lookup(tmp_path: Path):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    isolated_environment = {
+        key: value for key, value in os.environ.items()
+        if not key.startswith(("CODEX_RVF_", "RVF_", "KANBAN_", "CLINE_KANBAN_"))
+    }
+    home = tmp_path / "isolated-home"
+    home.mkdir()
+    fake_client = tmp_path / "workspace-lookup-fake-client.py"
+    fake_client.write_text(
+        "import os, pathlib, sys\n"
+        "root = pathlib.Path(os.environ['WORKSPACE_LOOKUP_TEST_ROOT'])\n"
+        "assert sys.argv[1] == 'list', sys.argv\n"
+        "with (root / 'list-client-calls.txt').open('a') as handle: handle.write('list\\n')\n"
+        "if os.environ.get('WORKSPACE_LOOKUP_REPLACE_STATE'):\n"
+        "    (root / 'kanban-state/workspaces/project/sessions.json').write_bytes((root / 'replacement-sessions.json').read_bytes())\n"
+        "sys.stdout.buffer.write((root / 'list-response.json').read_bytes())\n"
+        "sys.stderr.write(os.environ.get('WORKSPACE_LOOKUP_LIST_STDERR', ''))\n"
+        "sys.exit(int(os.environ.get('WORKSPACE_LOOKUP_LIST_RETURNCODE', '0')))\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "list-response.json").write_text('{"ok": true, "tasks": []}', encoding="utf-8")
+    isolated_environment.update({
+        "HOME": str(home),
+        "RVF_HOME": str(tmp_path / "rvf-home"),
+        "RVF_USER_LOCAL_DATA_ROOT": str(tmp_path / "rvf-user-local-data"),
+        "CODEX_RVF_CLINE_KANBAN_STATE_DIR": str(tmp_path / "kanban-state"),
+        "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
+        "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "isolated fake task",
+        "KANBAN_TASK_ID": "workspace-guard-task",
+        "WORKSPACE_LOOKUP_TEST_ROOT": str(tmp_path),
+    })
+    with patch.dict(os.environ, isolated_environment, clear=True):
+        module = load_hook_module()
+        ledger = _make_test_ledger(module, tmp_path / "run-logs")
+        yield module, ledger
+
+
+def _write_workspace_guard_sessions(tmp_path: Path, workspace: Path, *, project: str = "project") -> Path:
+    sessions_path = tmp_path / "kanban-state" / "workspaces" / project / "sessions.json"
+    sessions_path.parent.mkdir(parents=True, exist_ok=True)
+    sessions_path.write_text(json.dumps({"session": {"taskId": "workspace-guard-task", "workspacePath": str(workspace)}}, ensure_ascii=False), encoding="utf-8")
+    return sessions_path
+
+
+def _lookup_workspace_guard(module, ledger, cwd_git_root: Path) -> dict:
+    return module.lookup_cline_kanban_task_workspace(
+        task_id="workspace-guard-task", project_path=str(cwd_git_root),
+        cwd_git_root=cwd_git_root, ledger=ledger,
+    )
+
+
+def test_workspace_guard_unique_state_workspace_skips_list_and_rechecks_final_guard(tmp_path: Path) -> None:
+    with _isolated_workspace_guard_lookup(tmp_path) as (module, ledger):
+        workspace = init_repo(tmp_path / "task-workspace", dirty=True)
+        nested_cwd = workspace / "nested-cwd"
+        nested_cwd.mkdir()
+        _write_workspace_guard_sessions(tmp_path, workspace)
+        assert module.kanban_task_workspace_guard_payload(event={}, cwd=str(nested_cwd), ledger=ledger) is None
+        events = _read_ledger_events(ledger)
+        assert events[-1]["event"] == "kanban_task_workspace_guard_matched"
+        lookup = events[-1]["workspace_lookup"]
+        assert lookup["source"] == "kanban_state_session_workspace"
+        assert lookup["task_list_lookup"]["invoked"] is False
+        assert lookup["fallback_reason"] is None
+        assert not (tmp_path / "list-client-calls.txt").exists()
+        artifact = json.loads(Path(lookup["artifact"]).read_text())
+        assert artifact["workspace_path"] == str(workspace.resolve())
+        assert artifact["state_lookup"]["state_scan_metrics"]["files_read"] == 1
+
+
+def test_workspace_guard_duplicate_same_resolved_workspace_is_unique(tmp_path: Path) -> None:
+    with _isolated_workspace_guard_lookup(tmp_path) as (module, ledger):
+        workspace = init_repo(tmp_path / "task-workspace", dirty=False)
+        alias = tmp_path / "workspace-symlink"
+        alias.symlink_to(workspace, target_is_directory=True)
+        _write_workspace_guard_sessions(tmp_path, workspace)
+        _write_workspace_guard_sessions(tmp_path, alias, project="other-project")
+        lookup = _lookup_workspace_guard(module, ledger, workspace)
+        assert len(lookup["matches"]) == 1
+        assert lookup["task_list_lookup"]["invoked"] is False
+
+
+def test_workspace_guard_direct_workspace_env_precedes_state_and_list(tmp_path: Path) -> None:
+    with _isolated_workspace_guard_lookup(tmp_path) as (module, ledger):
+        workspace = init_repo(tmp_path / "task-workspace", dirty=False)
+        os.environ["KANBAN_TASK_WORKSPACE_PATH"] = str(workspace)
+        with patch.object(module, "lookup_kanban_task_workspace_from_state", side_effect=AssertionError("direct env 不应扫描 state")):
+            assert _lookup_workspace_guard(module, ledger, workspace) == {
+                "workspace_path": str(workspace), "source": "kanban_workspace_env",
+            }
+        assert not (tmp_path / "list-client-calls.txt").exists()
+
+
+def test_workspace_guard_state_path_probe_errors_fall_back_and_preserve_mismatch(tmp_path: Path) -> None:
+    for shape in ("workspace-symlink-loop", "dangling-workspace-symlink", "dangling-sessions-symlink", "sessions-symlink-loop"):
+        case = tmp_path / shape
+        with _isolated_workspace_guard_lookup(case) as (module, ledger):
+            unrelated_workspace = init_repo(case / "unrelated-dirty-workspace", dirty=True)
+            task_workspace = init_repo(case / "task-workspace", dirty=False)
+            _write_workspace_guard_sessions(case, unrelated_workspace)
+            invalid_project_directory = case / "kanban-state/workspaces/invalid-project"
+            if shape == "workspace-symlink-loop":
+                invalid_project_directory.symlink_to(invalid_project_directory, target_is_directory=True)
+            elif shape == "dangling-workspace-symlink":
+                invalid_project_directory.symlink_to(case / "missing-project", target_is_directory=True)
+            else:
+                invalid_project_directory.mkdir()
+                invalid_sessions_path = invalid_project_directory / "sessions.json"
+                invalid_sessions_path.symlink_to(
+                    invalid_sessions_path if shape == "sessions-symlink-loop" else case / "missing-sessions.json"
+                )
+            (case / "list-response.json").write_text(json.dumps({
+                "tasks": [{"id": "workspace-guard-task", "workspacePath": str(task_workspace)}],
+            }))
+            state_lookup = module.lookup_kanban_task_workspace_from_state(
+                task_id="workspace-guard-task", project_path=str(unrelated_workspace),
+            )
+            assert state_lookup["errors"], (shape, state_lookup)
+            assert state_lookup["state_scan_metrics"]["files_read"] == 1
+            payload = module.kanban_task_workspace_guard_payload(event={}, cwd=str(unrelated_workspace), ledger=ledger)
+            assert payload["continue"] is True
+            assert "decision" not in payload
+            assert "kanban_task_workspace_mismatch" in payload["systemMessage"], shape
+            assert (case / "list-client-calls.txt").read_text().splitlines() == ["list"]
+
+
+def test_workspace_guard_state_projects_without_sessions_remain_complete(tmp_path: Path) -> None:
+    with _isolated_workspace_guard_lookup(tmp_path) as (module, ledger):
+        workspace = init_repo(tmp_path / "task-workspace", dirty=False)
+        _write_workspace_guard_sessions(tmp_path, workspace)
+        (tmp_path / "kanban-state/workspaces/project-without-sessions").mkdir()
+        (tmp_path / "kanban-state/workspaces/ordinary-file").write_text("普通文件")
+        lookup = _lookup_workspace_guard(module, ledger, workspace)
+        assert lookup["errors"] == []
+        assert lookup["state_scan_metrics"]["files_read"] == 1
+        assert lookup["task_list_lookup"]["invoked"] is False
+        assert not (tmp_path / "list-client-calls.txt").exists()
+
+
+def test_workspace_guard_unsafe_state_shapes_fall_back_to_list(tmp_path: Path) -> None:
+    for shape in ("missing-state", "missing-task", "ambiguous", "malformed", "non-object", "invalid-utf8", "missing-directory", "not-git", "cwd-mismatch", "read-error", "disappeared-state-file", "enumeration-error", "symlink-loop"):
+        case = tmp_path / shape
+        with _isolated_workspace_guard_lookup(case) as (module, ledger):
+            workspace = init_repo(case / "task-workspace", dirty=False)
+            sessions_path = _write_workspace_guard_sessions(case, workspace)
+            if shape == "missing-state":
+                shutil.rmtree(case / "kanban-state")
+            elif shape == "missing-task":
+                sessions_path.write_text('{"session": {"taskId": "another-task"}}')
+            elif shape == "ambiguous":
+                _write_workspace_guard_sessions(case, init_repo(case / "another-workspace", dirty=False), project="other-project")
+            elif shape in ("malformed", "non-object", "invalid-utf8"):
+                malformed = _write_workspace_guard_sessions(case, workspace, project="other-project")
+                malformed.write_bytes({"malformed": b"{", "non-object": b"[]", "invalid-utf8": b"\xff"}[shape])
+            elif shape in ("missing-directory", "not-git", "cwd-mismatch", "symlink-loop"):
+                candidate = case / "invalid-workspace"
+                if shape == "not-git":
+                    candidate.mkdir()
+                elif shape == "cwd-mismatch":
+                    init_repo(candidate, dirty=False)
+                elif shape == "symlink-loop":
+                    candidate.symlink_to(candidate)
+                _write_workspace_guard_sessions(case, candidate)
+            (case / "list-response.json").write_text(json.dumps({"tasks": [{"id": "workspace-guard-task", "workspacePath": str(workspace)}]}))
+            read_bytes = Path.read_bytes
+            iterdir = Path.iterdir
+            def guarded_read(path):
+                if shape == "read-error" and path == sessions_path:
+                    raise PermissionError("隔离读取失败")
+                if shape == "disappeared-state-file" and path == sessions_path:
+                    raise FileNotFoundError("已发现的 sessions 文件在读取前消失")
+                return read_bytes(path)
+            def guarded_enumeration(path):
+                if shape == "enumeration-error" and path == case / "kanban-state/workspaces":
+                    raise PermissionError("隔离枚举失败")
+                return iterdir(path)
+            with patch.object(Path, "read_bytes", guarded_read), patch.object(Path, "iterdir", guarded_enumeration):
+                lookup = _lookup_workspace_guard(module, ledger, workspace)
+            assert lookup["source"] == "cline_kanban_task_list_workspace", (shape, lookup)
+            assert lookup["workspace_path"] == str(workspace)
+            assert lookup["fallback_reason"] is not None
+            assert (case / "list-client-calls.txt").read_text().splitlines() == ["list"]
+
+
+def test_workspace_guard_state_scan_reports_actual_utf8_bytes_and_parse_errors(tmp_path: Path) -> None:
+    with _isolated_workspace_guard_lookup(tmp_path) as (module, _ledger):
+        workspace = init_repo(tmp_path / "中文目录", dirty=False)
+        sessions = _write_workspace_guard_sessions(tmp_path, workspace)
+        malformed = _write_workspace_guard_sessions(tmp_path, workspace, project="malformed-project")
+        malformed.write_bytes(b"{")
+        lookup = module.lookup_kanban_task_workspace_from_state(task_id="workspace-guard-task", project_path=str(workspace))
+        assert len(sessions.read_bytes()) > len(sessions.read_text(encoding="utf-8"))
+        assert lookup["state_scan_metrics"]["files_read"] == 2
+        assert lookup["state_scan_metrics"]["bytes_read"] == len(sessions.read_bytes()) + 1
+        assert lookup["state_scan_metrics"]["duration_ms"] >= 0
+        assert len(lookup["errors"]) == 1
+
+
+def test_workspace_guard_json_decoder_resource_errors_fall_back_and_preserve_mismatch(tmp_path: Path) -> None:
+    json_nesting_depth = 10_000
+    decoder_failures = {
+        "oversized-integer": (b'{"value":' + b"9" * 5000 + b"}", "ValueError"),
+        "deep-nesting": (b'{"value":' + b"[" * json_nesting_depth + b"0" + b"]" * json_nesting_depth + b"}", "RecursionError"),
+    }
+    for shape, (invalid_json_bytes, expected_error_type) in decoder_failures.items():
+        case = tmp_path / shape
+        with _isolated_workspace_guard_lookup(case) as (module, ledger):
+            unrelated_workspace = init_repo(case / "中文错误目录", dirty=True)
+            task_workspace = init_repo(case / "task-workspace", dirty=False)
+            valid_sessions = _write_workspace_guard_sessions(case, unrelated_workspace)
+            invalid_sessions = _write_workspace_guard_sessions(case, unrelated_workspace, project="invalid-project")
+            invalid_sessions.write_bytes(invalid_json_bytes)
+            (case / "list-response.json").write_text(json.dumps({
+                "tasks": [{"id": "workspace-guard-task", "workspacePath": str(task_workspace)}],
+            }))
+            state_lookup = module.lookup_kanban_task_workspace_from_state(
+                task_id="workspace-guard-task", project_path=str(unrelated_workspace),
+            )
+            assert len(state_lookup["matches"]) == 1
+            assert any(f"{expected_error_type}:" in error for error in state_lookup["errors"]), state_lookup
+            assert state_lookup["state_scan_metrics"]["files_read"] == 2
+            assert state_lookup["state_scan_metrics"]["bytes_read"] == len(valid_sessions.read_bytes()) + len(invalid_json_bytes)
+            payload = module.kanban_task_workspace_guard_payload(event={}, cwd=str(unrelated_workspace), ledger=ledger)
+            assert payload["continue"] is True
+            assert "decision" not in payload
+            assert "kanban_task_workspace_mismatch" in payload["systemMessage"], shape
+            assert (case / "list-client-calls.txt").read_text().splitlines() == ["list"]
+
+
+def test_workspace_guard_list_fallback_rechecks_state_after_client_failure(tmp_path: Path) -> None:
+    with _isolated_workspace_guard_lookup(tmp_path) as (module, ledger):
+        workspace = init_repo(tmp_path / "task-workspace", dirty=False)
+        original_workspace = init_repo(tmp_path / "old-workspace", dirty=False)
+        sessions = _write_workspace_guard_sessions(tmp_path, original_workspace)
+        (tmp_path / "replacement-sessions.json").write_text(json.dumps({"session": {"taskId": "workspace-guard-task", "workspacePath": str(workspace)}}))
+        os.environ["WORKSPACE_LOOKUP_REPLACE_STATE"] = "1"
+        os.environ["WORKSPACE_LOOKUP_LIST_RETURNCODE"] = "2"
+        os.environ["WORKSPACE_LOOKUP_LIST_STDERR"] = "隔离 client 失败"
+        lookup = _lookup_workspace_guard(module, ledger, workspace)
+        assert lookup["workspace_path"] == str(workspace.resolve())
+        assert lookup["task_list_lookup"]["returncode"] == 2
+        assert lookup["task_list_lookup"]["error"] == "隔离 client 失败"
+        assert "fallback_state_scan_metrics" in json.loads(Path(lookup["artifact"]).read_text())
+        assert str(workspace) in sessions.read_text()
+
+
+def test_workspace_guard_invalid_list_json_preserves_unresolved_verdict(tmp_path: Path) -> None:
+    with _isolated_workspace_guard_lookup(tmp_path) as (module, ledger):
+        workspace = init_repo(tmp_path / "task-workspace", dirty=False)
+        (tmp_path / "list-response.json").write_bytes(b"{")
+        lookup = _lookup_workspace_guard(module, ledger, workspace)
+        assert lookup["source"] == "cline_kanban_workspace_lookup_invalid_json"
+        assert lookup["workspace_path"] is None
+        assert "JSONDecodeError" in lookup["error"]
+
+
+def test_workspace_guard_compact_artifact_and_events_never_copy_list_stdout(tmp_path: Path) -> None:
+    with _isolated_workspace_guard_lookup(tmp_path) as (module, ledger):
+        workspace = init_repo(tmp_path / "task-workspace", dirty=False)
+        stdout = json.dumps({"tasks": [], "unrelated_payload": "正文不得复制" * 100_000}, ensure_ascii=False).encode("utf-8")
+        (tmp_path / "list-response.json").write_bytes(stdout)
+        assert module.kanban_task_workspace_guard_payload(event={}, cwd=str(workspace), ledger=ledger) is None
+        event = _read_ledger_events(ledger)[-1]
+        lookup = event["workspace_lookup"]
+        artifact = Path(lookup["artifact"])
+        assert artifact.stat().st_size < 16_384
+        assert "正文不得复制" not in artifact.read_text()
+        assert "正文不得复制" not in json.dumps(event, ensure_ascii=False)
+        assert lookup["task_list_lookup"]["stdout_bytes"] == len(stdout)
+        assert lookup["task_list_lookup"]["stdout_sha256"] == hashlib.sha256(stdout).hexdigest()
+        assert lookup["task_list_lookup"]["error"] is None
+
+
+def test_workspace_guard_full_stdout_requires_explicit_debug_and_stays_out_of_events(tmp_path: Path) -> None:
+    with _isolated_workspace_guard_lookup(tmp_path) as (module, ledger):
+        workspace = init_repo(tmp_path / "task-workspace", dirty=False)
+        os.environ["CODEX_RVF_CLINE_KANBAN_WORKSPACE_LOOKUP_DEBUG_FULL_STDOUT"] = "1"
+        lookup = _lookup_workspace_guard(module, ledger, workspace)
+        artifact = json.loads(Path(lookup["artifact"]).read_text())
+        assert artifact["stdout"] == (tmp_path / "list-response.json").read_text()
+        assert "stdout" not in lookup["task_list_lookup"]
+
+
+def test_workspace_guard_list_spawn_failure_uses_state_fallback(tmp_path: Path) -> None:
+    with _isolated_workspace_guard_lookup(tmp_path) as (module, ledger):
+        workspace = init_repo(tmp_path / "task-workspace", dirty=False)
+        with patch.object(module.subprocess, "run", side_effect=OSError("隔离启动失败")):
+            lookup = _lookup_workspace_guard(module, ledger, workspace)
+        assert lookup["workspace_path"] is None
+        assert lookup["task_list_lookup"]["returncode"] is None
+        assert "隔离启动失败" in lookup["task_list_lookup"]["error"]
+
+
+def test_workspace_guard_state_mismatch_still_blocks_unrelated_dirty_repo(tmp_path: Path) -> None:
+    with _isolated_workspace_guard_lookup(tmp_path) as (module, ledger):
+        dirty = init_repo(tmp_path / "unrelated-dirty-workspace", dirty=True)
+        task_workspace = init_repo(tmp_path / "task-workspace", dirty=False)
+        _write_workspace_guard_sessions(tmp_path, task_workspace)
+        payload = module.kanban_task_workspace_guard_payload(event={}, cwd=str(dirty), ledger=ledger)
+        assert payload["continue"] is True
+        assert "decision" not in payload
+        assert "kanban_task_workspace_mismatch" in payload["systemMessage"]
+        assert (tmp_path / "list-client-calls.txt").read_text().splitlines() == ["list"]
+
+
+def test_workspace_guard_foreign_project_task_id_collision_preserves_mismatch(tmp_path: Path) -> None:
+    with _isolated_workspace_guard_lookup(tmp_path) as (module, ledger):
+        canonical_project = init_repo_with_head(tmp_path / "canonical-project")
+        task_workspace = tmp_path / "task-worktree"
+        run(["git", "worktree", "add", "--detach", str(task_workspace), "HEAD"], canonical_project)
+        foreign_workspace = init_repo(tmp_path / "foreign-dirty-project", dirty=True)
+        os.environ["KANBAN_PROJECT_PATH"] = str(canonical_project)
+        _write_workspace_guard_sessions(tmp_path, foreign_workspace, project="foreign-project")
+        (tmp_path / "list-response.json").write_text(json.dumps({
+            "tasks": [{"id": "workspace-guard-task", "workspacePath": str(task_workspace)}],
+        }))
+        payload = module.kanban_task_workspace_guard_payload(event={}, cwd=str(foreign_workspace), ledger=ledger)
+        assert payload is not None
+        assert payload["continue"] is True
+        assert "decision" not in payload
+        assert "kanban_task_workspace_mismatch" in payload["systemMessage"]
+        assert (tmp_path / "list-client-calls.txt").read_text().splitlines() == ["list"]
+
+
+def test_workspace_guard_canonical_project_and_linked_task_worktree_skip_list_without_extra_git_queries(tmp_path: Path) -> None:
+    with _isolated_workspace_guard_lookup(tmp_path) as (module, ledger):
+        canonical_project = init_repo_with_head(tmp_path / "canonical-project")
+        task_workspace = tmp_path / "task-worktree"
+        run(["git", "worktree", "add", "--detach", str(task_workspace), "HEAD"], canonical_project)
+        nested_cwd = task_workspace / "nested-cwd"
+        nested_cwd.mkdir()
+        os.environ["KANBAN_PROJECT_PATH"] = str(canonical_project)
+        _write_workspace_guard_sessions(tmp_path, task_workspace)
+        with patch.object(module.subprocess, "run", wraps=subprocess.run) as git_queries:
+            assert module.kanban_task_workspace_guard_payload(event={}, cwd=str(nested_cwd), ledger=ledger) is None
+        event = _read_ledger_events(ledger)[-1]
+        assert event["event"] == "kanban_task_workspace_guard_matched"
+        assert event["workspace_lookup"]["task_list_lookup"]["invoked"] is False
+        assert event["workspace_lookup"]["fallback_reason"] is None
+        assert not (tmp_path / "list-client-calls.txt").exists()
+        assert len([call for call in git_queries.call_args_list if call.args[0][0] == "git"]) <= 3
+
+
+def test_workspace_guard_unverified_project_repository_identity_falls_back_to_list(tmp_path: Path) -> None:
+    for shape in ("missing-project", "non-git-project", "project-git-query-failed", "project-git-spawn-failed"):
+        case = tmp_path / shape
+        with _isolated_workspace_guard_lookup(case) as (module, ledger):
+            workspace = init_repo(case / "task-workspace", dirty=False)
+            project_path = case / "canonical-project"
+            if shape == "non-git-project":
+                project_path.mkdir()
+            elif shape != "missing-project":
+                init_repo(project_path, dirty=False)
+            _write_workspace_guard_sessions(case, workspace)
+            (case / "list-response.json").write_text(json.dumps({
+                "tasks": [{"id": "workspace-guard-task", "workspacePath": str(workspace)}],
+            }))
+            original_run = subprocess.run
+            def guarded_git_query(command, *args, **kwargs):
+                if command[:3] == ["git", "-C", str(project_path)]:
+                    if shape == "project-git-spawn-failed":
+                        raise OSError("隔离项目 Git 启动失败")
+                    if shape == "project-git-query-failed":
+                        return subprocess.CompletedProcess(command, 128, stdout="", stderr="隔离项目 Git 查询失败")
+                return original_run(command, *args, **kwargs)
+            with patch.object(module.subprocess, "run", guarded_git_query):
+                lookup = module.lookup_cline_kanban_task_workspace(
+                    task_id="workspace-guard-task", project_path=str(project_path),
+                    cwd_git_root=workspace, ledger=ledger,
+                )
+            assert lookup["source"] == "cline_kanban_task_list_workspace", (shape, lookup)
+            assert lookup["workspace_path"] == str(workspace)
+            assert lookup["fallback_reason"] is not None
+            assert (case / "list-client-calls.txt").read_text().splitlines() == ["list"]
 
 
 def test_fork_experiment_without_boundary_never_prepares_manual_or_continuation(
@@ -6356,6 +6736,23 @@ def main() -> int:
         test_review_reopen_reconciles_abandoned_followup_lock,
         test_kanban_task_workspace_mismatch_skips_unrelated_dirty_repo,
         test_kanban_task_workspace_mismatch_uses_task_lookup_without_workspace_env,
+        test_workspace_guard_unique_state_workspace_skips_list_and_rechecks_final_guard,
+        test_workspace_guard_duplicate_same_resolved_workspace_is_unique,
+        test_workspace_guard_direct_workspace_env_precedes_state_and_list,
+        test_workspace_guard_state_path_probe_errors_fall_back_and_preserve_mismatch,
+        test_workspace_guard_state_projects_without_sessions_remain_complete,
+        test_workspace_guard_unsafe_state_shapes_fall_back_to_list,
+        test_workspace_guard_state_scan_reports_actual_utf8_bytes_and_parse_errors,
+        test_workspace_guard_json_decoder_resource_errors_fall_back_and_preserve_mismatch,
+        test_workspace_guard_list_fallback_rechecks_state_after_client_failure,
+        test_workspace_guard_invalid_list_json_preserves_unresolved_verdict,
+        test_workspace_guard_compact_artifact_and_events_never_copy_list_stdout,
+        test_workspace_guard_full_stdout_requires_explicit_debug_and_stays_out_of_events,
+        test_workspace_guard_list_spawn_failure_uses_state_fallback,
+        test_workspace_guard_state_mismatch_still_blocks_unrelated_dirty_repo,
+        test_workspace_guard_foreign_project_task_id_collision_preserves_mismatch,
+        test_workspace_guard_canonical_project_and_linked_task_worktree_skip_list_without_extra_git_queries,
+        test_workspace_guard_unverified_project_repository_identity_falls_back_to_list,
         test_cline_kanban_mode_marks_unavailable_when_task_start_fails,
         test_fork_experiment_without_boundary_never_prepares_manual_or_continuation,
         test_missing_desktop_control_fail_policy_reports,
