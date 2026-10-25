@@ -836,6 +836,7 @@ def _seed_finalize_run_dir(
     state: Path,
     repo: Path,
     run_id: str = "rvf-child",
+    session_id: str | None = None,
 ) -> tuple[Path, Path]:
     _ensure_initial_commit(repo)
     run_dir = state / "runs" / run_id
@@ -847,6 +848,7 @@ def _seed_finalize_run_dir(
         json.dumps(
             {
                 "run_id": run_id,
+                "session_id": session_id,
                 "status": "started",
                 "reason_code": "test",
                 "repo": str(repo),
@@ -934,7 +936,7 @@ def test_handoff_marker_finalizes_run_artifacts_same_session(tmp_path: Path) -> 
     hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
     state = tmp_path / "state"
-    run_dir, handoff = _seed_finalize_run_dir(state=state, repo=repo)
+    run_dir, handoff = _seed_finalize_run_dir(state=state, repo=repo, session_id="child-session")
     rvf_home = tmp_path / "rvf-home"
     receipt = _seed_bound_automatic_closeout_receipt_and_synthetic_registration(run_dir, repo, rvf_home)
     transcript = _write_same_session_transcript_with_marker(

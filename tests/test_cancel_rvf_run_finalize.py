@@ -5,6 +5,7 @@ import argparse
 import json
 import subprocess
 from pathlib import Path
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +20,13 @@ SCRIPT_DIR = (
 
 
 from _rvf_test_support.loader import load_script_module as _load
+
+
+@pytest.fixture(autouse=True)
+def isolated_terminal_archive_background_work(tmp_path, monkeypatch):
+    monkeypatch.setenv("RVF_USER_LOCAL_DATA_ROOT", str(tmp_path / "isolated-user-local"))
+    archive = _load("review_run_terminal_archive")
+    monkeypatch.setattr(archive, "surface_rvf_analyze_advisory", lambda **kwargs: None)
 
 
 def _git(repo: Path, *args: str) -> None:

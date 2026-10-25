@@ -582,6 +582,40 @@ def test_failed_boundary_delivery_keeps_fresh_token_unaccepted(valid_boundary):
     assert fixture["tokens"].read_decision_token(fixture["token"]).state == "withdrawn"
 
 
+@pytest.mark.parametrize("previous_run_already_terminated", [False, True])
+def test_new_boundary_archives_superseded_failed_preparation_and_preserves_independent_turn_gate(
+    valid_boundary, tmp_path, monkeypatch, previous_run_already_terminated,
+):
+    fixture = valid_boundary
+    request = importlib.import_module("rvf_review_start_boundary_request")
+    archive = importlib.import_module("review_run_terminal_archive")
+    from core.run_ledger.review_run_lifecycle import record_review_run_phase
+    monkeypatch.setattr(archive, "surface_rvf_analyze_advisory", lambda **kwargs: None)
+    old_run = tmp_path / "previous-prepared-review-run"
+    (old_run / "artifacts").mkdir(parents=True)
+    (old_run / "summary.json").write_text(json.dumps({"run_id": old_run.name,
+        "repo": str(fixture["repo"]), "session_id": fixture["payload"]["session_id"]}))
+    record_review_run_phase(old_run, run_id=old_run.name, phase="prepare",
+                            observed_at="2026-10-25T00:00:00Z", starts_review_run=True)
+    fixture["tokens"].acknowledge_decision_token(fixture["token"])
+    fixture["tokens"].attach_run_anchor(fixture["token"], run_dir=str(old_run))
+    if previous_run_already_terminated:
+        archive.request_review_run_terminal_archive(run_dir=old_run, decision_kind="declined",
+            reason="候选发生真实变化，结束旧准备", event={"session_id": fixture["payload"]["session_id"]})
+    else:
+        fixture["tokens"].record_start_failure(fixture["token"], reason="准备步骤失败，决定建立新分界")
+    result = request.run_request_review_start_boundary(decision_token=fixture["token"], reason="准备新的独立轮次",
+        candidate_summary_builder=lambda event, repo: dict(fixture["payload"]["candidate_summary"]),
+        boundary_sender=lambda **fields: {"terminal_delivery_status": "accepted_pending_submit_confirmation"})
+    assert result.status == "review_start_boundary_pending", result
+    assert result.token != fixture["token"]
+    assert fixture["tokens"].read_decision_token(result.token).state == "minted"
+    assert fixture["tokens"].read_decision_token(fixture["token"]).state == "withdrawn"
+    archived = json.loads((old_run / "artifacts/review-run-terminal-archive-request.json").read_text())
+    assert archived["status"] == "archived"
+    assert archived["decision_kind"] == ("declined" if previous_run_already_terminated else "superseded")
+
+
 def test_local_base_change_without_candidate_content_change_keeps_boundary(valid_boundary):
     fixture = valid_boundary
     base = fixture["receipt"]["comparison_base_ref"]

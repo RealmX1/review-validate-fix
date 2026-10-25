@@ -131,6 +131,8 @@ rvf decline-dispatched-review --token <dispatch-token> --reason <一句话理由
 
 RVF 审查开审分界固定的任务候选。candidate、比较基线与 base 排除范围在本轮内使用固定 Git OID；本地 base 的后续前移不改变这份审查范围。
 
+默认自动流程在计划草拟后、实现完成后及 RVF 准备阶段均不吸收 base。可以只读查看 local main 的变化并记录交互风险；不要执行预审 merge/rebase，也不要为追赶浮动 main 重新准备候选。真实候选改变时保留旧快照，通过正式恢复入口建立新候选和分界，不就地修改旧 fingerprint。
+
 `rvf-land` 完成候选提交与 evidence 后，`base-branch-sync` 负责吸收落地时的 base、复核语义交互并按需验证。需要单独审查整合结果时使用 `review_kind=base_drift_integration` 及对应 integration receipt。
 
 ## 模式

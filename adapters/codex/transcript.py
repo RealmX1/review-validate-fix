@@ -13,6 +13,7 @@ output 既可能是 ``function_call_output`` 也可能是 ``custom_tool_call_out
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -113,6 +114,7 @@ def _distill_codex_record(
     byte_offsets: list[int],
     has_legacy_apply_patch_tool_call: bool = False,
     legacy_apply_patch_paths: set[str] | None = None,
+    native_session_id: str | None = None,
 ) -> TranscriptRecord | None:
     line_number = record.get("_line_number") or 0
     raw_ref = {
@@ -155,6 +157,23 @@ def _distill_codex_record(
 
     if record_type == "event_msg" and payload:
         sub = payload.get("type")
+        if sub == "item_completed":
+            item = payload.get("item")
+            if (not isinstance(item, dict) or item.get("type") != "FileChange"
+                    or item.get("status") != "completed" or not native_session_id
+                    or payload.get("thread_id") != native_session_id):
+                return None
+            patch_text = synthesize_apply_patch_text_from_patch_apply_end({
+                "success": True, "changes": item.get("changes"),
+            })
+            if not patch_text:
+                return None
+            artifact_refs, operation_count = _artifact_refs_from_patch_text(patch_text, repo, line_number)
+            # 嵌套工具的原生编辑 ID 来自 FileChange，不能猜成外层 functions.exec 的 call_id。
+            native_edit_id = item.get("id")
+            return _rec(kind="tool_result", tool="apply_patch",
+                        call_id=native_edit_id if isinstance(native_edit_id, str) and native_edit_id else None,
+                        summary=f"FileChange completed {operation_count} file(s)", artifact_refs=artifact_refs)
         if sub in {"task_started", "task_complete"}:
             return _rec(
                 kind="phase_marker",
@@ -198,6 +217,8 @@ def _distill_codex_record(
                 artifact_refs=[],
             )
         if sub == "patch_apply_end":
+            if native_session_id and payload.get("thread_id") not in (None, native_session_id):
+                return None
             # 新 Codex（gpt-5.6-sol 世代）把编辑工具统一成 custom_tool_call name=``exec``、
             # apply_patch 以 JS 文本内嵌在 input，旧的 apply_patch 工具调用消失——那条
             # tool_call 分支不再产出 artifact_refs，issue↔patch 因果归属会全盲。
@@ -306,8 +327,14 @@ def distill_codex_jsonl(
     rollout_path: Path,
     rollout_filename: str,
     repo: Path | None,
+    native_session_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     records, offsets = _read_jsonl_with_offsets(rollout_path)
+    header_session_id = next((record["payload"].get("id") for record in records
+                              if record.get("type") == "session_meta" and isinstance(record.get("payload"), dict)), None)
+    if header_session_id and native_session_id and header_session_id != native_session_id:
+        raise ValueError("原生 transcript 与绑定会话身份不符")
+    native_session_id = native_session_id or header_session_id
     distilled: list[dict[str, Any]] = []
     counts: dict[str, int] = {}
     # 旧 Codex 对同一编辑同时发 apply_patch 工具调用与 patch_apply_end；工具调用已带 artifact_refs。
@@ -327,6 +354,7 @@ def distill_codex_jsonl(
             arguments = p.get("arguments") if p.get("type") == "function_call" else p.get("input")
             if isinstance(arguments, str) and arguments:
                 legacy_apply_patch_paths |= _apply_patch_paths(arguments, repo)
+    seen_native_edit_completions: set[tuple[str, str, str]] = set()
     for record in records:
         out = _distill_codex_record(
             record,
@@ -335,9 +363,23 @@ def distill_codex_jsonl(
             byte_offsets=offsets,
             has_legacy_apply_patch_tool_call=has_legacy_apply_patch_tool_call,
             legacy_apply_patch_paths=legacy_apply_patch_paths,
+            native_session_id=native_session_id,
         )
         if out is None:
             continue
+        payload = record.get("payload")
+        if (native_session_id and isinstance(out.call_id, str) and out.call_id
+                and record.get("type") == "event_msg" and isinstance(payload, dict)
+                and payload.get("type") in {"item_completed", "patch_apply_end"}
+                and out.kind == "tool_result" and out.tool == "apply_patch"):
+            changes = (payload["item"].get("changes") if payload["type"] == "item_completed"
+                       else payload.get("changes"))
+            changes_sha256 = hashlib.sha256(json.dumps(changes, sort_keys=True).encode()).hexdigest()
+            completion_identity = (native_session_id, out.call_id, changes_sha256)
+            # 同会话、同原生编辑和相同变更才去重；同路径的后续编辑仍保留。
+            if completion_identity in seen_native_edit_completions:
+                continue
+            seen_native_edit_completions.add(completion_identity)
         kind = out.kind or "unknown"
         counts[kind] = counts.get(kind, 0) + 1
         distilled.append(out.to_dict())

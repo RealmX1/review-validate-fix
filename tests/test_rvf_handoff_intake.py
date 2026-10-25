@@ -472,6 +472,8 @@ def test_handoff_intake_uses_candidate_evidence_before_nested_markdown_validatio
     )
     handoff = tmp_path / "handoff.md"
     handoff.write_text(
+        f"- run id: `{evidence['review']['run_id']}`\n"
+        f"- scope contract: `{evidence['scope']['contract_path']}`\n\n"
         "## 验证\n\n### Scoped verification (in-contract)\n\n"
         "- `pytest tests/test_example.py::test_case[param-id]` -> passed\n",
         encoding="utf-8",
@@ -550,6 +552,25 @@ def test_handoff_intake_does_not_reuse_same_content_evidence_from_another_run(
     assert payload["validation_evidence_source"] == "foreign_run_candidate_evidence"
     assert payload["validation_records"] == []
     assert payload["validation_commands"] == ["npm test"]
+
+
+def test_handoff_intake_requires_run_and_scope_binding_before_reusing_evidence(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    _evidence_path, evidence, _record_path = create_valid_reviewed_candidate_evidence_fixture(
+        tmp_path, repo, cache_key_character="d", command_digest_character="e", environment_digest_character="f",
+    )
+    handoff = tmp_path / "handoff.md"
+    validation = "## 验证\n\n- `npm test` -> passed\n"
+    for identity, expected_status in (
+        ("", "unbound_run"),
+        (f"- run id: `{evidence['review']['run_id']}`\n", "unbound_scope"),
+    ):
+        handoff.write_text(identity + validation, encoding="utf-8")
+        payload = json.loads(run([sys.executable, str(SCRIPT), "--handoff", str(handoff), "--repo", str(repo)]).stdout)
+        assert payload["candidate_evidence_status"] == expected_status
+        assert payload["validation_records"] == []
+        assert payload["validation_commands"] == ["npm test"]
+        assert payload["candidate_evidence_identity_recovery_condition"]
 
 
 def test_handoff_intake_treats_incomplete_candidate_evidence_as_invalid_not_stale(
