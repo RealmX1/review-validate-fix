@@ -34,6 +34,9 @@ double-review 的一腿。它只：
 """
 from __future__ import annotations
 
+from contextvars import copy_context
+from independent_backup_route import guard_normal_mutation, tracked_subprocess_run
+
 import argparse
 from datetime import datetime, timezone
 import json
@@ -864,6 +867,15 @@ def _rotate_review_request_leg_artifacts(
     return rotated
 
 
+def _backup_route_dispatch_repository(arguments):
+    # 原有开审资格核验先于接管登记；非仓库或未开审输入仍按原契约拒绝。
+    require_prepared_run_review_start_boundary(
+        **{name: arguments.get(name) for name in ("repo", "scope_contract", "run_id", "run_dir")}
+    )
+    return arguments.get("repo")
+
+
+@guard_normal_mutation(_backup_route_dispatch_repository, "dispatch-reviewers", "run_dir")
 def execute_plan(
     plan: dict[str, Any],
     *,
@@ -915,7 +927,6 @@ def execute_plan(
     仍优先（``status: failed``），但 reason 追加 ``_with_review_request_pending`` 后缀自报混合，
     否则主会话只会去等配额/修 auth，那条 request 从头到尾没进过 Contract Gate。
     """
-    require_prepared_run_review_start_boundary(repo=repo, scope_contract=scope_contract, run_id=run_id, run_dir=run_dir)
     reviewers = plan.get("reviewers", [])
     cooled: set[str] = set()
     # 本轮内失败过的 harness（含额度与非额度）——只用于排除替换候选，不落 cooldown。
@@ -940,7 +951,7 @@ def execute_plan(
                 run_dir=run_dir,
             )
             try:
-                completed = subprocess.run(cmd)
+                completed = tracked_subprocess_run(cmd)
                 local_results[index] = completed.returncode
             except OSError as exc:  # pragma: no cover - 启动失败
                 local_results[index] = 1
@@ -950,7 +961,7 @@ def execute_plan(
             for index in indices:
                 _run(index)
         else:
-            threads = [threading.Thread(target=_run, args=(index,)) for index in indices]
+            threads = [threading.Thread(target=copy_context().run, args=(_run, index)) for index in indices]
             for thread in threads:
                 thread.start()
             for thread in threads:
