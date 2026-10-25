@@ -27,7 +27,22 @@ dispatcher 的 reservation 覆盖派发、等待、reroute 与结果处理。已
 
 阶段材料明确标记 `attestation_origin=executing_agent`。Agent 仍须读取两份真实完成结果、区分 request／未完成、核对去来源处置和实际验证。辅助器只核对记录和 Git 基本事实，不把文件存在包装成机器认证的评审成功。
 
-完成结果先刷盘，再登记原 run 已消费，最后原子归档接管 marker。完成重试复用原结果；只有当前 HEAD、工作树与 index 内容仍相同才抑制旧 Stop 路线，新内容不被隐藏。stage fact 保留内容寻址历史；原始材料复制至持久目录，候选 Git 对象保留固定 ref，不能依赖临时目录或将被回收的 worktree。
+完成结果先刷盘，再登记原 run 已消费，最后原子归档接管 marker。完成重试复用原结果。Stop 分别核验两种事实：
+
+- 原 run 的历史消费：精确原 run 目录、operation、独立 worktree Git 目录与持久完成记录一致即可成立；后续提交改变 HEAD 不撤销它。先对账同 run 的在途／pending 凭证，再判断 nudge、过期续期或重投；清理失败仍不得催办这个 run，其他 run 的凭证继续保留。清凭证前须核验并回收原 run 的 tracker lease，避免旧 unit 继续 assigned；回收失败保留凭证供后续 Stop 自动重试。
+- 当前候选的覆盖：当前 HEAD、工作树原始字节与 index 仍匹配才静默跳过新发起。先经 `git --show-toplevel` 解析真实 worktree 根，子目录和符号链接入口得到同一指纹；独立 worktree 的控制目录保持隔离。新内容交回现有候选判断，历史消费不被当作新内容已审。
+
+内部只读查询分别返回历史消费证据和当前覆盖证据；CLI action 与参数不变。消费索引缺失、损坏或不可读时，核验同 operation 的 Git 内完成记录；该记录缺失／损坏时，沿原接管身份定位持久 `backup-route-delivery-result.json`，核对 run、operation、worktree 和原 artifact 目录。中断的完成写入可由此恢复消费／归档。修复损坏索引前保留原字节，原失败、token、普通 receipt 与阶段历史不改写。
+
+缺口按目标 run 归属：有效接管身份能证明属于其他 run 的坏记录，不阻断目标 run 的正常续跑；已归档且属于目标 run 的持久原件缺失仍是 `unknown`，不能推断未消费。tracker artifact 缺失时从原生只读账本补证精确 run／lease／worktree 归属；未知或不一致时不释放，不把其他 run 的 lease 借来清理。
+
+pending 发布、带身份清理和通知盖戳共用按 task 区分的 sidecar 写锁，身份读取与删除在锁内；它与外层派发闸分开，避免重入死锁。原子 JSON 快照仍供只读查询。
+
+dispatcher 只在接管仍有效时直接静默退出；接管已归档且候选已覆盖或分页待核验时，保留 suppress／goal／plan-operation／handoff／analyze 等既有宿主守卫，再跳过 dev sync 并交核心 Stop 按 run 对账，避免绕过守卫或吞掉另一轮合法续跑。
+
+每次补证最多检查 32 个历史 operation，另允许精确消费索引或上一份已覆盖 observation 指定的一个 operation 优先复核。分页游标、未解决缺口、候选内容指纹与机器可检测的恢复条件保存在 worktree Git 控制目录，后续 Stop 跨进程接续；候选 HEAD／index／原始字节变化时丢弃旧分页与覆盖缓存资格。尚有下一页时保持 `unknown`，以独立 `developer_only` 出口等待机器补证，不按“未覆盖”重新发起，也不宣称已覆盖；命中后优先重新核验原 operation。查尽仍缺证据时保留真实缺口，不以坏历史永久隐藏新内容；已知消费事实的未知状态继续只暂停依赖它的催办／续期／重投。真正未完成的另一 run 先经过既有续跑预算判断。宿主线材仍归 HostAdapter。
+
+stage fact 保留内容寻址历史；原始材料复制至持久目录，候选 Git 对象保留固定 ref，不能依赖临时目录或将被回收的 worktree。
 
 ## 跨仓交付
 

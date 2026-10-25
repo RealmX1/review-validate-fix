@@ -642,6 +642,8 @@ repo_required_files=(
   "tests/test_rvf_merge_dispositions_structured_merge_phase.py"
   "tests/test_review_initiation_decision_point_is_sole_self_injection.py"
   "tests/test_stop_hook_output_audience_contract.py"
+  "tests/test_independent_backup_route.py"
+  "tests/test_independent_backup_route_stop_followup.py"
   "tests/test_session_scoped_declined_candidate_fingerprint_cooldown.py"
   "tests/test_kimi_host_adapter_and_transcript.py"
   "tests/test_agentic_initiation_scope_of_work_contract.py"
@@ -843,6 +845,10 @@ run_step "tests: review_initiation_decision_point_is_sole_self_injection" \
 run_step "tests: stop_hook_output_audience_contract" \
   "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_stop_hook_output_audience_contract.py"
+run_step "tests: independent_backup_route_and_stop_followup" \
+  "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
+    "$tests_dir/test_independent_backup_route.py" \
+    "$tests_dir/test_independent_backup_route_stop_followup.py"
 run_step "tests: session_scoped_declined_candidate_fingerprint_cooldown" \
   "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
     "$tests_dir/test_session_scoped_declined_candidate_fingerprint_cooldown.py"

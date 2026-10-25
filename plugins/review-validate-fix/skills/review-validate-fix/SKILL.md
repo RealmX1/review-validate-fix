@@ -6,7 +6,7 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
 # Review Validate Fix
 
 <!-- rvf-independent-backup-route:begin -->
-<!-- source-sha256: 914a3b4f83c4d82c851292c6d46bc2e6475b02ab319db80adff63171981b6024 -->
+<!-- source-sha256: 50628c9e95ad36589bc86404b63cf10f3421f6769b80693baeee520b70d8d670 -->
 ## 独立备用路线（主执行 Agent）
 
 正常工具因派发、格式、登记、wrapper 或环境故障无法完成已授权工作时，自主采用本节；确定性故障直接切换，可能瞬时恢复的同一故障最多恢复重试一次。**本节核验成立后，可替代下文固定脚本、结果 JSON、缓存及不得手工提交的要求。** 用户 Stop、提交／同步／push／部署限制、显式 external 要求与真实质量义务继续有效。仅缺机器证据时先自行查原始记录，不默认询问用户。
@@ -22,6 +22,10 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
 交接材料放 task 持久交接目录；无该目录时使用 `~/.rvf/user-local-data/independent-backup-route-artifacts/` 的独立 operation 子目录。复制原始结果／输入，保存 Git 快照及固定 ref，不能只引用将被删除的工作树或临时文件。每阶段保存实际命令 argv、cwd、退出码、必要环境说明、内容摘要及问题处置；不保存秘密值。`record-stage --repo <worktree> --operation-id <原ID> --stage <阶段> --evidence-file <原始材料或报告>` 记录执行 Agent 核验的事实；land 加 `--commit <实际SHA>`，base_sync 另加 `--base-ref refs/heads/<本地base>`。
 
 最后核对全部所需阶段与当前内容，再 `finish --repo <worktree> --operation-id <原ID> --evidence-file <最终报告>`。已发生的提交／落地先复用，不重复执行；完成后新内容仍进入正常审查。输出 `RVF_BACKUP_ROUTE_RESULT_FILE: <持久绝对路径>`，分别报告备用结果与原自动化状态；不用普通 handoff marker 冒充正常 finalize。独立结论由原始材料支持，不要求额外 JSON schema。
+
+原 run 已消费与当前候选覆盖分别核验：后续提交改变 HEAD 不复活旧 run，新内容也不因历史消费被当作已审。Stop 先按精确 run、operation 与 worktree Git 目录对账在途／pending 凭证，再考虑续跑或重投；清理失败不得再催原 run，其他 run 保留。索引缺失／损坏时自动查同 operation 的持久完成原件，有界分页进度和缺口落盘供下次 Stop 接续；仍无法核验则记 `unknown` 与重验条件，诊断不驱动新回合。根目录、子目录与符号链接入口统一按真实 worktree 根计算候选指纹。
+
+尚未查尽分页时静默等待机器补证，不提前视为未覆盖；命中记录在候选未变时优先重新核验，候选变化则重置旧游标／缓存资格。无关 run 的已知坏记录不冻结其他 run；同 run 的归档原件缺失仍保留未知。清理前先核验并回收精确 tracker lease，缺 artifact 从原生账本补证，失败保留凭证自动重试；pending 发布和清理使用共同写锁，避免误删另一 run。dispatcher 转交仍遵守宿主既有 plan 等守卫。
 
 `review_only`／`validate_fix` 子代理仍只执行分配角色，不能因本节自行接管、提交或发起完整 RVF。后台完成通知或任务重启后先读接续记录；条件未满足时保留机器可检测的恢复条件并继续独立工作，不做无变化重试。
 

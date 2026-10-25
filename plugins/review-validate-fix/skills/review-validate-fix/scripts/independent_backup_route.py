@@ -33,6 +33,7 @@ CONTROL_DIRECTORY_NAME = "rvf-independent-backup-route"
 STAGES = ("review", "fix_validate", "land", "base_sync")
 CURRENT_NORMAL_MUTATION_RESERVATIONS = ContextVar("current_normal_mutation_reservations", default=())
 NORMAL_MUTATION_RESERVATION_UPDATE_LOCK = threading.Lock()
+STOP_COMPLETION_RECOVERY_OPERATION_LIMIT = 32
 
 
 class BackupRouteOwned(RuntimeError):
@@ -88,7 +89,12 @@ def guard_normal_mutation(repository_argument: str, operation: str, run_argument
 
 
 def control_directory(repo: Path) -> Path:
-    return Path(git(repo, "rev-parse", "--absolute-git-dir")) / CONTROL_DIRECTORY_NAME
+    return Path(git(repo, "rev-parse", "--absolute-git-dir")).resolve() / CONTROL_DIRECTORY_NAME
+
+
+def resolve_worktree_root(repo: Path) -> Path:
+    """仓内子目录与符号链接入口共享真实 worktree 根，独立 worktree 仍各自隔离。"""
+    return Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
 
 
 def repository_for_normal_metadata_mutation(repo: Path | str | None) -> Path | None:
@@ -102,7 +108,7 @@ def repository_for_normal_metadata_mutation(repo: Path | str | None) -> Path | N
         if any(marker_present(parent / ".git") for parent in (path, *path.parents)):
             raise
         return None
-    return path
+    return resolve_worktree_root(path)
 
 
 def marker_present(path: Path) -> bool:
@@ -277,6 +283,7 @@ def source_task_worktrees(repo: Path, tip: str, explicit_worktree: Path | None) 
 def normal_worktree_mutation(repo: Path, operation: str, run_dir: Path | None = None,
                             source_task_tip: str | None = None, source_task_worktree: Path | None = None):
     """正常写入必须覆盖完整副作用区间；异常结果保留供接管对账。"""
+    repo = resolve_worktree_root(repo)
     root = control_directory(repo)
     reservation = root / "normal-mutations" / f"{uuid.uuid4().hex}.json"
     value = {"pid": os.getpid(), "process_identity": capture_process_identity(os.getpid()),
@@ -338,6 +345,7 @@ def assert_backup_route_ready(repo: Path, operation_id: str) -> dict:
 
 def prepare_backup_route_identity(repo: Path, operation_id: str, artifacts: Path, authorization: Path,
                                   reason: str, original_run: Path | None, delivery_stage: str) -> dict:
+    repo = resolve_worktree_root(repo)
     validate_operation_id(operation_id)
     consumed = consumed_run_record(repo, original_run)
     if consumed is not None and marker_present(consumed):
@@ -653,6 +661,7 @@ def record_stage_fact(repo: Path, operation_id: str, stage: str, evidence: Path,
 
 
 def freeze_candidate(repo: Path, operation_id: str, paths: list[str], comparison_base: str) -> dict:
+    repo = resolve_worktree_root(repo)
     identity = assert_backup_route_ready(repo, operation_id)
     if not paths:
         raise ValueError("必须显式给出候选与必要上下文路径，不能默认全量 dirty")
@@ -698,6 +707,7 @@ def freeze_candidate(repo: Path, operation_id: str, paths: list[str], comparison
 
 
 def worktree_content_fingerprint(repo: Path) -> str:
+    repo = resolve_worktree_root(repo)
     environment = repository_git_environment()
     digest = hashlib.sha256(b"rvf-independent-backup-route-content-v2")
     def append_field(label: bytes, content: bytes):
@@ -723,10 +733,19 @@ def worktree_content_fingerprint(repo: Path) -> str:
 
 
 def read_completed_operation_result(repo: Path, operation_id: str) -> dict:
+    validate_operation_id(operation_id)
     result = json.loads((control_directory(repo) / "completed-operations" / f"{operation_id}.json").read_text())
+    return validate_completed_operation_result(repo, operation_id, result)
+
+
+def validate_completed_operation_result(repo: Path, operation_id: str, result: dict) -> dict:
     if (not isinstance(result, dict) or result.get("status") != "backup_closed"
             or result.get("operation_id") != operation_id
-            or result.get("worktree_git_directory") != git(repo, "rev-parse", "--absolute-git-dir")):
+            or result.get("worktree_git_directory") != str(control_directory(repo).parent)
+            or not isinstance(result.get("final_head"), str)
+            or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", result["final_head"])
+            or not isinstance(result.get("content_fingerprint"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", result["content_fingerprint"])):
         raise BackupRouteOwned("已完成记录的 worktree／operation 身份不一致")
     return result
 
@@ -735,7 +754,15 @@ def restore_completed_operation_bookkeeping(repo: Path, result: dict) -> None:
     """恢复历史完成事实的消费与归档，不以当前新候选内容否定原完成。"""
     root, operation_id = control_directory(repo), result["operation_id"]
     if result.get("original_run_directory"):
-        durable_json(consumed_run_record(repo, Path(result["original_run_directory"])), result)
+        consumed = consumed_run_record(repo, Path(result["original_run_directory"]))
+        if consumed.is_file() and consumed.stat().st_size:
+            try:
+                existing = json.loads(consumed.read_text())
+            except (OSError, ValueError):
+                existing = None
+            if existing != result:
+                evidence_copy(consumed, root / "recovered-consumption-record-originals")
+        durable_json(consumed, result)
     marker = root / "active-owner"
     if marker_present(marker):
         try:
@@ -764,12 +791,19 @@ def recover_completed_active_owner(repo: Path) -> None:
         return
     if isinstance(operation_id, str):
         validate_operation_id(operation_id)
-        if (control_directory(repo) / "completed-operations" / f"{operation_id}.json").is_file():
-            restore_completed_operation_bookkeeping(repo, read_completed_operation_result(repo, operation_id))
+        evidence = read_backup_operation_completion_evidence(repo, operation_id)
+        if evidence is not None:
+            completed = control_directory(repo) / "completed-operations" / f"{operation_id}.json"
+            if evidence["completion_record_path"] != str(completed):
+                if completed.is_file() and completed.stat().st_size:
+                    evidence_copy(completed, control_directory(repo) / "recovered-completion-record-originals")
+                durable_json(completed, evidence["result"])
+            restore_completed_operation_bookkeeping(repo, evidence["result"])
 
 
 def finish_backup_route(repo: Path, operation_id: str, report: Path) -> dict:
     validate_operation_id(operation_id)
+    recover_completed_active_owner(repo)
     completed = control_directory(repo) / "completed-operations" / f"{operation_id}.json"
     if completed.is_file():
         result = read_completed_operation_result(repo, operation_id)
@@ -810,39 +844,255 @@ def finish_backup_route(repo: Path, operation_id: str, report: Path) -> dict:
     return result
 
 
+def read_backup_operation_completion_evidence(repo: Path, operation_id: str,
+                                            consumption_locator: dict | None = None) -> dict | None:
+    """只读：优先核对 Git 内完成记录，缺失时沿同 operation 身份查持久交付原件。"""
+    validate_operation_id(operation_id)
+    root = control_directory(repo)
+    completed = root / "completed-operations" / f"{operation_id}.json"
+    failures = []
+    try:
+        return {"result": read_completed_operation_result(repo, operation_id), "completion_record_path": str(completed)}
+    except FileNotFoundError:
+        pass
+    except (BackupRouteOwned, OSError, ValueError) as exc:
+        failures.append(f"{completed}: {exc}")
+    locators = [consumption_locator] if consumption_locator else []
+    for marker in (root / "active-owner", root / "closed-ownership-markers" / operation_id):
+        try:
+            identity = json.loads((marker / "identity.json").read_text())
+            if not isinstance(identity, dict):
+                raise ValueError("接管身份不是对象")
+            if identity.get("operation_id") == operation_id:
+                locators.append(identity)
+            elif marker == root / "closed-ownership-markers" / operation_id:
+                raise ValueError("已归档接管身份的 operation 不一致")
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            failures.append(f"{marker}: {exc}")
+    for identity in locators:
+        if (identity.get("operation_id") != operation_id
+                or identity.get("worktree_git_directory") != str(root.parent)
+                or not isinstance(identity.get("artifacts_directory"), str)
+                or not Path(identity["artifacts_directory"]).is_absolute()):
+            failures.append("持久交付定位信息的 worktree／operation 身份不一致")
+            continue
+        delivery = Path(identity["artifacts_directory"]) / "backup-route-delivery-result.json"
+        try:
+            result = validate_completed_operation_result(repo, operation_id, json.loads(delivery.read_text()))
+            if any(result.get(field) != identity.get(field) for field in (
+                "original_run_directory", "artifacts_directory", "worktree_git_directory", "operation_id",
+            )):
+                raise ValueError("持久交付结果与原接管身份不一致")
+            return {"result": result, "completion_record_path": str(delivery)}
+        except FileNotFoundError as exc:
+            if identity is consumption_locator or marker_present(root / "closed-ownership-markers" / operation_id):
+                failures.append(f"{delivery}: {exc}")
+        except (BackupRouteOwned, OSError, ValueError) as exc:
+            failures.append(f"{delivery}: {exc}")
+    if failures:
+        raise BackupRouteOwned("；".join(failures))
+    return None
+
+
+def backup_completion_recovery_operation_page(root: Path, after_operation: str | None = None,
+                                             priority_operation: str | None = None) -> tuple[list[str], str | None]:
+    """限制每次补证的 operation 数；游标由调用方持久保存，重启后继续下一页。"""
+    operations = {path.stem for path in (root / "completed-operations").glob("*.json")}
+    operations.update(path.name for path in (root / "closed-ownership-markers").glob("*"))
+    try:
+        identity = json.loads((root / "active-owner" / "identity.json").read_text())
+        if isinstance(identity, dict) and isinstance(identity.get("operation_id"), str):
+            operations.add(identity["operation_id"])
+    except (OSError, ValueError):
+        pass
+    remaining = sorted(name for name in operations if name != priority_operation and (not after_operation or name > after_operation))
+    page = remaining[:STOP_COMPLETION_RECOVERY_OPERATION_LIMIT]
+    next_operation = page[-1] if len(remaining) > len(page) else None
+    return ([priority_operation] if priority_operation else []) + page, next_operation
+
+
+def backup_operation_identity_excludes_original_run(repo: Path, operation_id: str, original_run: str) -> bool:
+    """仅凭同 worktree、同 operation 的完整身份，排除其他 run 的补证缺口。"""
+    root, identified_runs = control_directory(repo), set()
+    archive = root / "closed-ownership-markers" / operation_id
+    for marker in (root / "active-owner", archive):
+        try:
+            identity = json.loads((marker / "identity.json").read_text())
+        except FileNotFoundError:
+            if marker_present(marker):
+                return False
+            continue
+        except (OSError, ValueError):
+            return False
+        if not isinstance(identity, dict):
+            return False
+        if marker != archive and identity.get("operation_id") != operation_id:
+            continue
+        if (identity.get("operation_id") != operation_id
+                or identity.get("worktree_git_directory") != str(root.parent)
+                or not isinstance(identity.get("artifacts_directory"), str)
+                or not Path(identity["artifacts_directory"]).is_absolute()
+                or "original_run_directory" not in identity):
+            return False
+        identity_run = identity["original_run_directory"]
+        if identity_run is not None and (not isinstance(identity_run, str) or not Path(identity_run).is_absolute()):
+            return False
+        identified_runs.add(identity_run)
+    return len(identified_runs) == 1 and original_run not in identified_runs
+
+
+def read_original_run_backup_consumption_evidence(repo: Path, run_dir: Path,
+                                                after_operation: str | None = None) -> dict:
+    """只读历史消费事实；当前 HEAD／候选变化不撤销原 run 已交付的事实。"""
+    root, original_run = control_directory(repo), str(run_dir.expanduser().resolve())
+    consumed = consumed_run_record(repo, Path(original_run))
+    locator, failures = None, []
+    try:
+        locator = json.loads(consumed.read_text())
+        if (not isinstance(locator, dict) or locator.get("original_run_directory") != original_run
+                or locator.get("worktree_git_directory") != str(root.parent)):
+            raise ValueError("消费记录的精确 run／worktree 身份不一致")
+        validate_operation_id(locator.get("operation_id"))
+    except FileNotFoundError:
+        locator = None
+    except (OSError, ValueError, TypeError) as exc:
+        locator = None
+        failures.append(f"{consumed}: {exc}")
+    operations, next_operation = backup_completion_recovery_operation_page(root, after_operation, (locator or {}).get("operation_id"))
+    for operation_id in operations:
+        try:
+            operation_locator = locator if locator and locator["operation_id"] == operation_id else None
+            evidence = read_backup_operation_completion_evidence(repo, operation_id, operation_locator)
+            if evidence and evidence["result"].get("original_run_directory") == original_run:
+                return {"status": "consumed", "original_run_directory": original_run, **evidence}
+        except (BackupRouteOwned, OSError, ValueError) as exc:
+            if not backup_operation_identity_excludes_original_run(repo, operation_id, original_run):
+                failures.append(f"{operation_id}: {exc}")
+    if locator is not None:
+        failures.append("消费索引存在，但尚缺同 operation、同 run 的持久完成记录")
+    return {"status": "unknown" if failures or next_operation else "not_consumed",
+            "original_run_directory": original_run, "verification_gaps": failures,
+            "recovery_after_operation": next_operation,
+            "recovery_condition": "后续 Stop 自动接续下一页补证；同 operation 的完成记录与身份恢复可读后重新核验"}
+
+
+def preserve_stop_backup_verification_observation(root: Path, name: str, observation: dict) -> None:
+    try:
+        digest = hashlib.sha256(json.dumps(observation, sort_keys=True).encode()).hexdigest()
+        durable_json(root / (name + "-history") / f"{digest}.json", observation)
+        durable_json(root / (name + ".json"), observation)
+    except OSError:
+        pass
+
+
+def read_stop_backup_verification_observation(root: Path, name: str) -> dict:
+    try:
+        value = json.loads((root / (name + ".json")).read_text())
+        if not isinstance(value, dict):
+            return {}
+        if not isinstance(value.get("recovery_after_operation"), str):
+            value.pop("recovery_after_operation", None)
+        value["verification_gaps"] = [gap for gap in value.get("verification_gaps", []) if isinstance(gap, str)] if isinstance(value.get("verification_gaps"), list) else []
+        return value
+    except (OSError, ValueError):
+        return {}
+
+
+def continue_stop_backup_verification_page(previous: dict, evidence: dict) -> dict:
+    """跨页保留未解决缺口；一轮扫描结束后重置游标，下轮重新补证旧缺口。"""
+    if previous.get("recovery_after_operation") and evidence["status"] in {"not_consumed", "not_covered", "unknown"}:
+        gaps = list(dict.fromkeys([*previous.get("verification_gaps", []), *evidence.get("verification_gaps", [])]))
+        if gaps:
+            evidence.update(status="unknown", verification_gaps=gaps)
+    return evidence
+
+
+def reconcile_original_run_backup_consumption(repo: Path, run_dir: Path) -> dict:
+    """补证只修消费索引与接管归档；失败历史、token 和正常 receipt 都不改写。"""
+    root = control_directory(repo)
+    consumed = consumed_run_record(repo, run_dir)
+    observation_name = "stop-original-run-verification-" + consumed.stem
+    previous = read_stop_backup_verification_observation(root, observation_name)
+    evidence = continue_stop_backup_verification_page(previous, read_original_run_backup_consumption_evidence(
+        repo, run_dir, previous.get("recovery_after_operation")))
+    if evidence["status"] == "consumed":
+        try:
+            result = evidence["result"]
+            if not consumed.is_file() or consumed.read_bytes() != (json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode():
+                restore_completed_operation_bookkeeping(repo, result)
+        except (BackupRouteOwned, OSError, ValueError) as exc:
+            # 补写失败不能抹去已经核验的历史完成，也不能再催旧 run。
+            evidence["bookkeeping_recovery_error"] = str(exc)
+    if evidence["status"] != "not_consumed" or previous:
+        preserve_stop_backup_verification_observation(root, observation_name, evidence)
+    return evidence
+
+
+def read_current_candidate_backup_coverage_evidence(repo: Path, after_operation: str | None = None,
+                                                  *, previous_verification_observation: dict | None = None) -> dict:
+    """只读当前覆盖；历史消费既不代替新内容的审查，也不要求新 HEAD 等于历史 HEAD。"""
+    root = control_directory(repo)
+    if marker_present(root / "active-owner"):
+        return {"status": "owned"}
+    operations, next_operation = backup_completion_recovery_operation_page(root, after_operation)
+    if not operations and not previous_verification_observation:
+        return {"status": "not_covered", "verification_gaps": [], "recovery_after_operation": None}
+    try:
+        fingerprint, head = worktree_content_fingerprint(repo), optional_head(repo)
+    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+        return {"status": "unknown", "verification_gaps": [str(exc)], "recovery_after_operation": None,
+                "recovery_condition": "Git／文件读取恢复后重新核验当前候选，不复用旧分页与覆盖缓存"}
+    priority_operation = None
+    requested_after_operation = after_operation
+    if previous_verification_observation is not None:
+        if previous_verification_observation.get("candidate_content_fingerprint") != fingerprint:
+            after_operation = None
+        elif previous_verification_observation.get("status") == "covered":
+            previous_result = previous_verification_observation.get("result")
+            if isinstance(previous_result, dict) and isinstance(previous_result.get("operation_id"), str):
+                priority_operation = previous_result["operation_id"]
+    if after_operation != requested_after_operation or priority_operation is not None:
+        operations, next_operation = backup_completion_recovery_operation_page(root, after_operation, priority_operation)
+    failures = []
+    for operation_id in operations:
+        try:
+            evidence = read_backup_operation_completion_evidence(repo, operation_id)
+            if evidence and evidence["result"].get("final_head") == head:
+                if evidence["result"]["content_fingerprint"] == fingerprint:
+                    return {"status": "covered", "candidate_content_fingerprint": fingerprint, **evidence}
+        except (BackupRouteOwned, OSError, ValueError, subprocess.CalledProcessError) as exc:
+            failures.append(f"{operation_id}: {exc}")
+    return {"status": "unknown" if failures or next_operation else "not_covered",
+            "candidate_content_fingerprint": fingerprint, "verification_gaps": failures,
+            "recovery_after_operation": next_operation,
+            "recovery_condition": "后续 Stop 自动接续补证；Git／文件读取恢复后重新核验当前候选"}
+
+
 def should_suppress_normal_stop(repo: Path) -> bool:
     try:
         root = control_directory(repo)
     except (ValueError, OSError, subprocess.CalledProcessError):
         return False
-    def preserve_unknown(exc: Exception, path: Path, normal_stop_suppressed: bool = False) -> None:
-        observation = {"status": "unknown", "record_path": str(path), "error_type": type(exc).__name__,
-                       "reason": str(exc), "normal_stop_suppressed": normal_stop_suppressed,
-                       "recovery_condition": "原完成记录与 Git／文件读取恢复后，自动重新核验当前候选内容"}
-        try:
-            digest = hashlib.sha256(json.dumps(observation, sort_keys=True).encode()).hexdigest()
-            durable_json(root / "stop-content-verification-observations" / f"{digest}.json", observation)
-            durable_json(root / "stop-content-verification-observation.json", observation)
-        except OSError:
-            pass
+    observation_name = "stop-content-verification-observation"
     try:
         recover_completed_active_owner(repo)
     except (BackupRouteOwned, OSError, ValueError, subprocess.CalledProcessError) as exc:
-        preserve_unknown(exc, root / "active-owner", marker_present(root / "active-owner"))
-    if marker_present(root / "active-owner"):
-        return True
-    for path in (root / "completed-operations").glob("*.json"):
-        try:
-            value = json.loads(path.read_text())
-            if (not isinstance(value, dict) or value.get("status") != "backup_closed"
-                    or value.get("operation_id") != path.stem
-                    or value.get("worktree_git_directory") != str(root.parent)):
-                raise ValueError("完成记录的状态或 worktree／operation 身份无效")
-            if value.get("final_head") == git(repo, "rev-parse", "HEAD") and value.get("content_fingerprint") == worktree_content_fingerprint(repo):
-                return True
-        except (OSError, ValueError, subprocess.CalledProcessError) as exc:
-            preserve_unknown(exc, path)
-    return False
+        preserve_stop_backup_verification_observation(root, observation_name, {
+            "status": "unknown", "verification_gaps": [str(exc)],
+            "recovery_condition": "同 operation 完成记录与接管身份恢复可读后自动对账归档"})
+    previous = read_stop_backup_verification_observation(root, observation_name)
+    evidence = read_current_candidate_backup_coverage_evidence(
+        repo, previous.get("recovery_after_operation"), previous_verification_observation=previous)
+    if (evidence.get("candidate_content_fingerprint") is not None
+            and previous.get("candidate_content_fingerprint") == evidence["candidate_content_fingerprint"]):
+        evidence = continue_stop_backup_verification_page(previous, evidence)
+    if evidence["status"] != "not_covered" or previous:
+        preserve_stop_backup_verification_observation(root, observation_name, evidence)
+    # 尚有下一页时先等待机器补证；记录损坏但本轮已查尽时仍允许新候选进入正常判断。
+    return evidence["status"] in {"owned", "covered"} or (
+        evidence["status"] == "unknown" and bool(evidence.get("recovery_after_operation")))
 
 
 def main() -> int:
@@ -875,8 +1125,8 @@ def main() -> int:
     missing = [name for name in fields.get(args.action, []) if getattr(args, name) is None]
     if missing:
         parser.error("缺少必要参数：" + ", ".join(missing))
-    repo = args.repo.resolve()
     try:
+        repo = resolve_worktree_root(args.repo)
         if args.action == "status":
             value = inspect_backup_route(repo)
         elif args.action == "claim":

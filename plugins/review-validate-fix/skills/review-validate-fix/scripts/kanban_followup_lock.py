@@ -990,6 +990,24 @@ def _pending_task_path(task_id: str, root: Path | None = None) -> Path:
     return _pending_root(root) / f"task-{safe_token(task_id)}.json"
 
 
+@contextmanager
+def _hold_pending_marker_writer_serialization_lock(pending_path: Path):
+    """让发布、身份核验后删除及读改写共用一把锁，避免新 run 的 pending 被旧清理误删。
+
+    与外层派发闸使用不同 sidecar，已持派发闸时也能安全调用。临界区只做本地凭证 I/O，
+    不调用其他 pending 写者；纯读仍依赖原子 JSON 替换。锁文件保持原位，避免分裂锁身份。
+    """
+    lock_path = pending_path.with_name(f".{pending_path.name}.writer-serialization.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    file_descriptor = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(file_descriptor, "w", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+
 def pending_ttl_seconds() -> float:
     raw = os.environ.get(PENDING_TTL_ENV)
     if raw is None or not raw.strip():
@@ -1117,7 +1135,8 @@ def write_pending_marker(
         redispatch_attempt_count=redispatch_attempt_count,
     )
     target = _pending_task_path(task_id, root)
-    _atomic_write(target, payload)
+    with _hold_pending_marker_writer_serialization_lock(target):
+        _atomic_write(target, payload)
     return target
 
 
@@ -1210,22 +1229,30 @@ def clear_pending_marker(
     *,
     task_id: str | None,
     token: str | None = None,
+    run_id: str | None = None,
+    run_dir: str | Path | None = None,
     root: Path | None = None,
 ) -> list[str]:
     if not (isinstance(task_id, str) and task_id.strip()):
         return []
-    # token 防误清：若磁盘上的 pending 已被一条更新的 dispatch（不同 token）覆盖，
-    # 一条迟到的旧投递确认不应清掉这把仍未确认的新 pending。
-    if token is not None:
-        existing = read_pending_marker(task_id=task_id, root=root)
-        if isinstance(existing, dict):
-            stored = existing.get("token")
-            if isinstance(stored, str) and stored and stored != token:
-                return []
     path = _pending_task_path(task_id, root)
     try:
-        path.unlink()
-    except (FileNotFoundError, OSError):
+        with _hold_pending_marker_writer_serialization_lock(path):
+            # 身份核验和删除必须与发布串行化，两次无锁读取仍会误删后来发布的新 run。
+            if token is not None or run_id is not None or run_dir is not None:
+                existing = read_pending_marker(task_id=task_id, root=root)
+                if (run_id is not None or run_dir is not None) and not isinstance(existing, dict):
+                    return []
+                if isinstance(existing, dict):
+                    if (run_id is not None or run_dir is not None) and not marker_belongs_to_handed_off_run(
+                        existing, run_id=run_id, run_dir=run_dir,
+                    ):
+                        return []
+                    stored = existing.get("token")
+                    if token is not None and isinstance(stored, str) and stored and stored != token:
+                        return []
+            path.unlink()
+    except OSError:
         return []
     return [str(path)]
 
@@ -1291,25 +1318,23 @@ def stamp_pending_notified(
         return False
     path = _pending_task_path(task_id, root)
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        return False
-    if not isinstance(payload, dict):
-        return False
-    if token is not None:
-        stored = payload.get("token")
-        if isinstance(stored, str) and stored and stored != token:
-            return False
-    payload.pop("_marker_path", None)
-    stamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    payload["last_notified_at"] = stamp.isoformat().replace("+00:00", "Z")
-    try:
-        payload["notify_count"] = int(payload.get("notify_count") or 0) + 1
-    except (TypeError, ValueError):
-        payload["notify_count"] = 1
-    try:
-        _atomic_write(path, payload)
-    except OSError:
+        with _hold_pending_marker_writer_serialization_lock(path):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                return False
+            if token is not None:
+                stored = payload.get("token")
+                if isinstance(stored, str) and stored and stored != token:
+                    return False
+            payload.pop("_marker_path", None)
+            stamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+            payload["last_notified_at"] = stamp.isoformat().replace("+00:00", "Z")
+            try:
+                payload["notify_count"] = int(payload.get("notify_count") or 0) + 1
+            except (TypeError, ValueError):
+                payload["notify_count"] = 1
+            _atomic_write(path, payload)
+    except (OSError, json.JSONDecodeError):
         return False
     return True
 
