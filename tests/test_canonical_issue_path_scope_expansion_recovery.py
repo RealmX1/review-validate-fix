@@ -20,6 +20,7 @@ from test_rvf_land_single_step_prepare_and_commit import (
 
 sys.path.insert(0, str(SCRIPT_DIRECTORY))
 import write_reviewed_task_candidate_evidence as evidence
+from reviewed_candidate_completion_facts import actual_fix_patch_changed_paths
 
 
 ISSUE_PRIMARY_PATH = "web-ui/src/components/board-card-session-activity.ts"
@@ -32,13 +33,15 @@ DIRECT_DEPENDENCY_PATHS = [
 
 
 def prepare_canonical_issue_outside_frozen_scope(
-    tmp_path: Path, *, reviewed_dependency: bool = False,
+    tmp_path: Path, *, reviewed_dependency: bool = False, primary_contents: str | None = "原有内容\n",
 ) -> tuple[Path, Path, dict, list[str]]:
     repo = repository(tmp_path / "repo")
     for relative in [ISSUE_PRIMARY_PATH, *DIRECT_DEPENDENCY_PATHS]:
         path = repo / relative
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("原有内容\n", encoding="utf-8")
+        contents = primary_contents if relative == ISSUE_PRIMARY_PATH else "原有内容\n"
+        if contents is not None:
+            path.write_text(contents, encoding="utf-8")
     git(repo, "add", "--all")
     git(repo, "commit", "-m", "test: 建立被审工作以外的既有文件")
     run_dir = create_completed_run(tmp_path, repo)
@@ -175,7 +178,7 @@ def test_formal_land_recovers_old_primary_path_classification_without_rewriting_
 
 @pytest.mark.parametrize("mutation", [
     "undeclared_dependency", "validate_only", "foreign_run", "missing_patch_path", "patch_without_primary",
-    "unprepared_issue_path", "forged_declaration_source",
+    "unprepared_issue_path", "forged_declaration_source", "primary_rename_from_trailer", "primary_self_rename",
 ])
 def test_primary_path_recovery_never_admits_unproven_expansion(tmp_path: Path, mutation: str) -> None:
     repo, run_dir, stopped = apply_canonical_issue_fix(
@@ -184,8 +187,16 @@ def test_primary_path_recovery_never_admits_unproven_expansion(tmp_path: Path, m
     directory = run_dir / "artifacts/fix-attempts" / stopped["attempt_id"]
     if mutation == "missing_patch_path":
         (directory / "fix.patch").write_text("不能证明主路径的补丁\n")
-    elif mutation == "patch_without_primary":
-        (directory / "fix.patch").write_text(git(repo, "diff", "--binary", "--", DIRECT_DEPENDENCY_PATHS[0]))
+    elif mutation in {"patch_without_primary", "primary_rename_from_trailer", "primary_self_rename"}:
+        patch = git(repo, "diff", "--binary", "--", DIRECT_DEPENDENCY_PATHS[0]) + "\n"
+        if mutation == "primary_rename_from_trailer":
+            patch += f"rename from {ISSUE_PRIMARY_PATH}\n"
+        elif mutation == "primary_self_rename":
+            patch += (
+                f"diff --git a/{ISSUE_PRIMARY_PATH} b/{ISSUE_PRIMARY_PATH}\n"
+                f"similarity index 100%\nrename from {ISSUE_PRIMARY_PATH}\nrename to {ISSUE_PRIMARY_PATH}\n"
+            )
+        (directory / "fix.patch").write_text(patch)
     else:
         for filename in ("attempt.json", "result.json"):
             path = directory / filename
@@ -204,9 +215,11 @@ def test_primary_path_recovery_never_admits_unproven_expansion(tmp_path: Path, m
                 payload["run_id"] = "foreign-run"
             path.write_text(json.dumps(payload))
     before = source_and_index_snapshot(repo)
+    artifact_bytes = {path: path.read_bytes() for path in run_dir.rglob("*") if path.is_file()}
     checked = run_land(tmp_path, repo, "check-evidence", "--repo", str(repo), "--run-dir", str(run_dir))
     assert checked.returncode == 28, checked.stdout + checked.stderr
     assert source_and_index_snapshot(repo) == before
+    assert {path: path.read_bytes() for path in run_dir.rglob("*") if path.is_file()} == artifact_bytes
     assert not (run_dir / "artifacts/applied-scope-expansion-qualification-receipts").exists()
 
 
@@ -284,3 +297,72 @@ def test_canonical_issue_rename_keeps_both_ends_in_applied_expansion_receipt(tmp
     patch.write_bytes(patch.read_bytes() + b"\n")
     with pytest.raises(ValueError, match="facts do not prove"):
         evidence.validated_reviewed_task_candidate_evidence(repo)
+
+
+@pytest.mark.parametrize("operation", ["empty_file_created", "empty_file_deleted", "mode_changed", "copy_created"])
+def test_zero_numstat_file_operations_keep_their_actual_paths_through_formal_land(
+    tmp_path: Path, operation: str,
+) -> None:
+    primary_contents = None if operation in {"empty_file_created", "copy_created"} else ""
+    repo, run_dir, attempt, common = prepare_canonical_issue_outside_frozen_scope(
+        tmp_path, primary_contents=primary_contents,
+    )
+    worktree = Path(attempt["worktree_path"])
+    primary = worktree / ISSUE_PRIMARY_PATH
+    if operation == "empty_file_deleted":
+        primary.unlink()
+    elif operation == "mode_changed":
+        primary.chmod(0o755)
+    elif operation == "copy_created":
+        primary.write_bytes((worktree / DIRECT_DEPENDENCY_PATHS[0]).read_bytes())
+    else:
+        primary.write_bytes(b"")
+    git(worktree, "add", "--all")
+    stopped = run_fix_ledger_script(tmp_path, "rvf_fix_attempt.py", "stop", "--attempt-id", attempt["attempt_id"],
+                                   "--status", "fixed", *common)
+    directory = run_dir / "artifacts/fix-attempts" / attempt["attempt_id"]
+    if operation == "copy_created":
+        # 等价的真实 Git copy 补丁只改目的路径；来源文件保持原样。
+        copy_patch = git(worktree, "diff", "--binary", "--find-copies-harder", "--find-copies=100%", "HEAD") + "\n"
+        assert "copy from " in copy_patch
+        (directory / "fix.patch").write_text(copy_patch)
+    applied = run_fix_ledger_script(tmp_path, "rvf_fix_attempt.py", "apply", "--attempt-id", attempt["attempt_id"],
+                                   "--target-repo", str(repo), *common)
+    assert applied["status"] == "applied"
+    git(repo, "worktree", "remove", "--force", str(worktree))
+    assert actual_fix_patch_changed_paths((directory / "fix.patch").read_bytes(), repo) == {ISSUE_PRIMARY_PATH}
+    (run_dir / "artifacts/handoff.md").write_text(
+        "- handoff_status: COMPLETED\n- review_status: COMPLETED\n\n共 1 条，1 真实修复 / 0 误报 / 0 升级\n"
+    )
+    assert record_validation(tmp_path, repo, run_dir, "targeted-contract-tests", sys.executable,
+                             "-c", "print('passed')").returncode == 0
+    frozen_contract_bytes = (run_dir / "artifacts/inputs/scope.contract.json").read_bytes()
+    original_bytes = {path: path.read_bytes() for path in (
+        run_dir / "artifacts/handoff.md", run_dir / "artifacts/fix-issues/RVF-004.json",
+        *(directory / filename for filename in ("attempt.json", "result.json", "fix.patch")),
+    )}
+    assert prepare(tmp_path, repo, run_dir).returncode == 0
+    landed = commit(tmp_path, repo, run_dir)
+    assert landed.returncode == 0, landed.stdout + landed.stderr
+    payload, _path, _digest = evidence.validated_reviewed_task_candidate_evidence(repo)
+    receipt = json.loads(Path(payload["scope"]["applied_scope_expansion_receipt_path"]).read_text())
+    assert receipt["expansions"][0]["paths"] == [ISSUE_PRIMARY_PATH]
+    assert {entry["path"] for entry in stopped["changed_paths"]} == {ISSUE_PRIMARY_PATH}
+    assert {path: path.read_bytes() for path in original_bytes} == original_bytes
+    assert canonical_bytes(json.loads((run_dir / "artifacts/inputs/scope.contract.reviewed.json").read_text())) == frozen_contract_bytes
+
+
+def test_rename_and_copy_keep_paths_bound_to_each_parsed_diff(tmp_path: Path) -> None:
+    repo = repository(tmp_path / "repo")
+    original = '原有 "带引号"\t文件.txt'
+    renamed = '重命名 "带引号"\t文件.txt'
+    copied = "复制目的文件.txt"
+    (repo / original).write_text("保留相同内容\n", encoding="utf-8")
+    git(repo, "add", "--all")
+    git(repo, "commit", "-m", "test: 建立带引号的来源文件")
+    git(repo, "mv", original, renamed)
+    (repo / copied).write_bytes((repo / renamed).read_bytes())
+    git(repo, "add", "--all")
+    patch = git(repo, "diff", "--binary", "--find-copies-harder", "--find-copies=100%", "HEAD") + "\n"
+    assert "copy from " in patch and "rename from " in patch
+    assert actual_fix_patch_changed_paths(patch.encode(), repo) == {original, renamed, copied}

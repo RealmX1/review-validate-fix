@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import codecs
 import hashlib
 import json
 import os
@@ -272,34 +271,42 @@ def completed_review_facts(run_dir: Path, handoff_text: str) -> dict[str, Any]:
 
 
 def actual_fix_patch_changed_paths(patch_bytes: bytes, repo: Path) -> set[str]:
-    """只读解析实际补丁；正反向 numstat 合起来包含 rename 的两端。"""
-    forward_paths: set[str] = set()
-    reverse_paths: set[str] = set()
-    for reverse, paths in ((False, forward_paths), (True, reverse_paths)):
-        parsed = subprocess.run(
-            ["git", "apply", "--numstat", "-z", *(["--reverse"] if reverse else [])],
-            input=patch_bytes, cwd=repo, env=clean_git_environment(), capture_output=True, check=False,
+    """逐段消费 Git 解析的实际改动，保留 rename 两端并排除 copy 来源及空操作。"""
+    changed_paths: set[str] = set()
+    for section in re.split(rb"(?m)(?=^diff --git )", patch_bytes):
+        if not section.strip():
+            continue
+        if not section.startswith(b"diff --git "):
+            raise ValueError("canonical issue 主路径的实际补丁缺少 Git diff 头")
+        numstats: list[list[bytes]] = []
+        for reverse in (False, True):
+            parsed = subprocess.run(
+                ["git", "apply", "--numstat", "-z", *(["--reverse"] if reverse else [])],
+                input=section, cwd=repo, env=clean_git_environment(), capture_output=True, check=False,
+            )
+            entries = [entry.split(b"\t", 2) for entry in parsed.stdout.split(b"\0") if entry]
+            if parsed.returncode or len(entries) != 1 or len(entries[0]) != 3:
+                raise ValueError("canonical issue 主路径的实际补丁无法解析为单文件改动")
+            numstats.append(entries[0])
+        summary = subprocess.run(
+            ["git", "apply", "--summary"], input=section, cwd=repo,
+            env=clean_git_environment(), capture_output=True, check=False,
         )
-        if parsed.returncode:
-            raise ValueError("canonical issue 主路径的实际补丁无法解析")
-        for entry in parsed.stdout.split(b"\0"):
-            if entry:
-                fields = entry.split(b"\t", 2)
-                if len(fields) != 3:
-                    raise ValueError("实际补丁的 numstat 路径不合法")
-                paths.add(os.fsdecode(fields[2]))
-    copy_sources: set[str] = set()
-    rename_sources: set[str] = set()
-    for line in patch_bytes.splitlines():
-        for prefix, sources in ((b"copy from ", copy_sources), (b"rename from ", rename_sources)):
-            if line.startswith(prefix):
-                encoded = line[len(prefix):]
-                if encoded.startswith(b'"'):
-                    if not encoded.endswith(b'"'):
-                        raise ValueError("实际补丁的来源路径引号未闭合")
-                    encoded = codecs.escape_decode(encoded[1:-1])[0]
-                sources.add(os.fsdecode(encoded))
-    return safe_relative_paths(sorted(forward_paths | (reverse_paths - copy_sources) | rename_sources))
+        if summary.returncode:
+            raise ValueError("canonical issue 主路径的实际补丁摘要无法解析")
+        forward, reverse = numstats
+        # 0/0 仍可表示空文件增删或真实 mode 变化；同路径自重命名自身不是改动。
+        file_created_or_deleted = re.search(rb"(?m)^ (?:create|delete) mode [0-7]{6} ", summary.stdout)
+        mode_change = re.search(rb"(?m)^ mode change ([0-7]{6}) => ([0-7]{6}) ", summary.stdout)
+        mode_changed = mode_change is not None and mode_change[1] != mode_change[2]
+        if (forward[:2] == [b"0", b"0"] and forward[2] == reverse[2]
+            and not file_created_or_deleted and not mode_changed):
+            continue
+        changed_paths.add(os.fsdecode(forward[2]))
+        # 来源必须由同一有效 diff 的反向解析证明，不能从任意 rename/copy 文本行提取。
+        if not re.search(rb"(?m)^ copy ", summary.stdout):
+            changed_paths.add(os.fsdecode(reverse[2]))
+    return safe_relative_paths(sorted(changed_paths))
 
 
 def applied_scope_expansion_facts(applied_attempts: list[dict[str, Any]], scope_paths: set[str], run_dir: Path,
