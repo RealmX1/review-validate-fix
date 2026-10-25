@@ -37,6 +37,7 @@ from validation_result_cache import (  # noqa: E402
 SCHEMA_NAME = "rvf-reviewed-task-candidate-evidence"
 SCHEMA_VERSION = 1
 APPLIED_SCOPE_EXPANSION_EVIDENCE_SCHEMA_VERSION = 2
+USER_DELEGATED_ELEVATED_ISSUE_EVIDENCE_SCHEMA_VERSION = 3
 APPLIED_SCOPE_EXPANSION_RECEIPT_SCHEMA = "rvf-applied-scope-expansion-qualification-receipt"
 EVIDENCE_RELATIVE_PATH = Path("rvf/evidence/reviewed-task-candidate-evidence.json")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
@@ -581,7 +582,8 @@ def validated_reviewed_task_candidate_evidence(
     receipts = payload.get("receipts")
     if (
         payload.get("schema") != SCHEMA_NAME
-        or payload.get("schema_version") not in {SCHEMA_VERSION, APPLIED_SCOPE_EXPANSION_EVIDENCE_SCHEMA_VERSION}
+        or type(payload.get("schema_version")) is not int
+        or payload.get("schema_version") not in {SCHEMA_VERSION, APPLIED_SCOPE_EXPANSION_EVIDENCE_SCHEMA_VERSION, USER_DELEGATED_ELEVATED_ISSUE_EVIDENCE_SCHEMA_VERSION}
         or not isinstance(subject, dict)
         or not isinstance(review, dict)
         or not isinstance(scope, dict)
@@ -645,7 +647,7 @@ def validated_reviewed_task_candidate_evidence(
     canonical_issue_count = review.get("canonical_issue_count")
     if (
         review_kind not in REVIEW_KINDS
-        or conclusion not in REVIEW_CONCLUSIONS
+        or conclusion not in REVIEW_CONCLUSIONS | {"review_completed_with_user_delegated_issues"}
         or not isinstance(canonical_issue_count, int)
         or isinstance(canonical_issue_count, bool)
         or canonical_issue_count < 0
@@ -656,6 +658,9 @@ def validated_reviewed_task_candidate_evidence(
     validate_iso8601_timestamp(review.get("completed_at"), "review.completed_at")
     validate_iso8601_timestamp(payload.get("created_at"), "created_at")
     evidence_contract = validate_scope_identity(scope, review, subject)
+    from rvf_elevated_issue_delegation import validate_evidence_delegations
+
+    validate_evidence_delegations(payload, evidence_contract)
     expansion_paths = validated_applied_scope_expansion_receipt(payload, evidence_contract)
     if reviewed_task_tip is not None:
         assert_landed_from_reviewed_tip(repo, reviewed_tip=reviewed_task_tip, landed_tip=head_oid,
@@ -698,6 +703,8 @@ def validated_applied_scope_expansion_receipt(payload: Mapping[str, Any], contra
     if payload["schema_version"] == SCHEMA_VERSION:
         if path_value is not None or digest_value is not None:
             raise ValueError("scope expansion requires evidence schema version 2")
+        return set()
+    if payload["schema_version"] == USER_DELEGATED_ELEVATED_ISSUE_EVIDENCE_SCHEMA_VERSION and path_value is None and digest_value is None:
         return set()
     if not isinstance(path_value, str) or not isinstance(digest_value, str) or not SHA256_PATTERN.fullmatch(digest_value):
         raise ValueError("scope expansion receipt path/digest is missing")
@@ -858,6 +865,13 @@ def prepare_candidate_evidence(
             "scope": scope, "validation_records": validation_records, "receipts": receipts,
             "created_at": existing["created_at"] if existing else now,
         }
+        if facts["user_delegated_elevated_issues"]:
+            from rvf_elevated_issue_delegation import DELEGATION_CAPABILITY
+
+            payload["schema_version"] = USER_DELEGATED_ELEVATED_ISSUE_EVIDENCE_SCHEMA_VERSION
+            payload["required_capabilities"] = [DELEGATION_CAPABILITY]
+            payload["review"].update({"outcome_counts": facts["outcome_counts"],
+                                      "user_delegated_elevated_issues": facts["user_delegated_elevated_issues"]})
         if existing and expected_parent_digest is not None and not existing_is_expected_parent and semantic_payload(existing) != semantic_payload(payload):
             raise ValueError("current candidate evidence differs from the contracted integration result")
         if candidate_qualification_artifact_hashes(run_dir) != artifact_hashes:
@@ -885,6 +899,8 @@ def candidate_qualification_artifact_hashes(run_dir: Path) -> dict[str, str]:
                     "artifacts/merge/fix-issue-source-refs-recorded-at-upsert/*.json",
                     "artifacts/fix-attempts/*/attempt.json", "artifacts/fix-attempts/*/result.json", "artifacts/fix-attempts/*/fix.patch"):
         paths.update(run_dir.glob(pattern))
+    paths.update((run_dir / "artifacts/elevated-issue-delegation").glob("**/*.json"))
+    paths.update((run_dir / "artifacts/elevated-issue-delegation").glob("**/*.sha256"))
     return {str(path): ("symlink:" + os.readlink(path) if path.is_symlink() else hashlib.sha256(path.read_bytes()).hexdigest())
             for path in sorted(paths) if path.exists() or path.is_symlink()}
 
@@ -914,9 +930,11 @@ def candidate_evidence_qualification(repo: Path, run_dir: Path, *, pending_stage
         return {"status": "eligible", "reason_code": "candidate_evidence_eligible",
                 "canonical_issue_count": prepared["facts"]["canonical_issue_count"],
                 "outcome_counts": prepared["facts"]["outcome_counts"],
+                "user_delegated_elevated_issues": prepared["facts"]["user_delegated_elevated_issues"],
+                "issues_remain_unresolved": bool(prepared["facts"]["user_delegated_elevated_issues"]),
                 "candidate_content_manifest_sha256": prepared["payload"]["subject"]["candidate_content_manifest_sha256"],
                 "evidence_schema_version": prepared["payload"]["schema_version"],
-                "consumer_contract_update_required": prepared["expansion_receipt"] is not None}
+                "consumer_contract_update_required": prepared["payload"]["schema_version"] != SCHEMA_VERSION}
     except CandidateEvidenceNotApplicable as exc:
         return {"status": "skipped_not_applicable", "reason_code": "candidate_evidence_not_opted_in", "reason": str(exc)}
     except CandidateQualificationRefused as exc:

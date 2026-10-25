@@ -172,6 +172,8 @@ commit 的退出码（prepare 的 0 / 10 / 11 / 12 / 13 见上表，commit 按�
 
 ## Evidence 资格检查与已有提交恢复
 
+用户已把 elevated 问题明确交给其他 Task 时，按 [用户委派处置](../review-validate-fix/references/user-delegated-elevated-issue-disposition.md) 记录并核验回执，再继续原有资格检查；不用等待目标 Task 完成。冻结 handoff 的升级计数保持原值，结果列出仍未解决的问题与跟进归属。含委派 evidence 为 v3，消费者须声明支持；委派不替代本次 Land/base 同步授权，也不能放行 failed、未应用修复、部分委派或撤销后的处置。
+
 `rvf land check-evidence --repo <worktree> --run-dir <run>` 是完整只读 dry-run：不执行验证、不 stage、不写 run、contract 或 evidence。JSON 的 `status` 为 `eligible`、`refused_fail_closed` 或明确的 skip 状态，`reason_code` 稳定；拒绝时 exit 28。prepare 展示同一资格结果；commit 完成必要验证重放后、staging 前重新检查，缺失/过期处置仍为 exit 27，其余资格拒绝为 exit 28。只有真正需等 commit 才能证明的 HEAD/tree、hook 改写和并发变化留在提交后复核。
 
 完成计数以 reviewer results、merge dispositions、canonical fix-issue 和最新 attempt/result 为准。handoff 的统计句与实际结果条目只核对一致性，正文提及结果标签不会计数。R3 仅在明确兜底路由且两份 canonical mimic 结果完整有效时通过。用户全局 ignore 仅影响判脏，不会隐藏 tracked 修改。

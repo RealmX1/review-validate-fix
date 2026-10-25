@@ -1732,7 +1732,7 @@ def run_land(rest: list[str]) -> int:
 # ---------------------------------------------------------------------------
 
 DECISION_PASSTHROUGH_SUBCOMMANDS = ("request-review-start-boundary", "start", "scope", "dispatch", "decline", "decline-dispatched-review")
-RAW_PASSTHROUGH_SUBCOMMANDS = ("validate", "land")
+RAW_PASSTHROUGH_SUBCOMMANDS = ("validate", "land", "elevated-issue-delegation")
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -1814,12 +1814,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "land", add_help=False,
         help="rvf_land.py prepare|commit 透传（commit 缺 --run-dir 时取本仓最近一次 prepare 的 run）",
     )
+    sub.add_parser("elevated-issue-delegation", add_help=False, help="用户委派处置：inspect|record|verify|resume（显式 repo/run）")
     return parser
 
 
 RAW_PASSTHROUGH_SUBCOMMAND_RUNNERS: dict[str, Callable[[list[str]], int]] = {
     "validate": run_validate,
     "land": run_land,
+    "elevated-issue-delegation": lambda rest: subprocess.run(
+        [sys.executable, str(SCRIPTS_DIRECTORY / "rvf_elevated_issue_delegation.py"), *rest], check=False
+    ).returncode,
 }
 
 

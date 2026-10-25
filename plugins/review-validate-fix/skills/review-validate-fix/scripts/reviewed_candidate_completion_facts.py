@@ -92,7 +92,7 @@ def completed_reviewer_legs(run_dir: Path) -> list[rvf_merge_dispositions.Canoni
     return legs
 
 
-def canonical_fix_attempt_facts(run_dir: Path, issue_ids: set[str]) -> tuple[dict[str, int], list[dict[str, Any]]]:
+def canonical_fix_attempt_facts(run_dir: Path, issue_ids: set[str], *, user_delegated_issue_ids: set[str] | None = None) -> tuple[dict[str, int], list[dict[str, Any]]]:
     run_id = rvf_merge_dispositions.run_id_for_run_directory(run_dir)
     contract = read_regular_json_object(run_dir / "artifacts/inputs/scope.contract.json")
     attempts_by_issue: dict[str, list[tuple[datetime, dict[str, Any], dict[str, Any] | None]]] = {}
@@ -136,6 +136,8 @@ def canonical_fix_attempt_facts(run_dir: Path, issue_ids: set[str]) -> tuple[dic
         elif status == "validated_and_submitted_to_kanban_backlog" and latest.get("status") == status:
             require_durable_backlog_submission(result, run_dir)
             counts["submitted_to_kanban_backlog"] += 1
+        elif status == "elevated" and latest.get("status") == status and issue_id in (user_delegated_issue_ids or set()):
+            counts["elevated"] += 1
         else:
             raise ValueError(f"latest fix attempt is unresolved or not applied: {issue_id} ({latest.get('status')}/{status})")
         for _stamp, attempt, attempt_result in attempts:
@@ -143,7 +145,10 @@ def canonical_fix_attempt_facts(run_dir: Path, issue_ids: set[str]) -> tuple[dic
                 if attempt_result is None or attempt_result.get("status") != "fixed":
                     raise ValueError(f"applied attempt has no fixed result: {attempt['attempt_id']}")
                 applied.append({"issue": mirror, "attempt": attempt, "result": attempt_result})
-    return {name: counts[name] for name in ("fixed", "false_positive", "submitted_to_kanban_backlog")}, applied
+    outcomes = {name: counts[name] for name in ("fixed", "false_positive", "submitted_to_kanban_backlog")}
+    if user_delegated_issue_ids:
+        outcomes.update({"elevated": counts["elevated"], "user_delegated": counts["elevated"], "blocking_elevated": 0})
+    return outcomes, applied
 
 
 def require_durable_backlog_submission(result: dict[str, Any], run_dir: Path) -> None:
@@ -209,7 +214,8 @@ def durable_backlog_ledger_entry(entry: Any) -> bool:
 
 def handoff_display_consistency_errors(handoff_text: str, counts: dict[str, int]) -> list[str]:
     errors: list[str] = []
-    expected = {"total": sum(counts.values()), **counts, "elevated": 0}
+    expected = {"elevated": 0, **counts}
+    expected["total"] = sum(counts.get(name, 0) for name in ("fixed", "false_positive", "submitted_to_kanban_backlog", "elevated"))
     patterns = {
         "total": r"(?:共|合计)\s*(\d+)\s*条",
         "fixed": r"(\d+)\s*(?:条\s*)?真实修复|真实修复\s*(\d+)",
@@ -233,14 +239,14 @@ def handoff_display_consistency_errors(handoff_text: str, counts: dict[str, int]
         marker = re.match(r"^\s*(?:[-*]\s+|\d+[.)]\s+)\*{0,2}\[(fixed|false_positive|submitted_to_kanban_backlog|elevated|failed)\]\*{0,2}(?:\s|$)", line, re.IGNORECASE)
         if marker:
             markers[marker.group(1).lower()] += 1
-    if markers["elevated"] or markers["failed"]:
+    if markers["elevated"] > counts.get("user_delegated", 0) or markers["failed"]:
         errors.append("handoff contains unresolved elevated or failed outcomes")
-    if markers and any(markers[name] != counts[name] for name in counts):
+    if markers and any(markers[name] != counts.get(name, 0) for name in ("fixed", "false_positive", "submitted_to_kanban_backlog", "elevated")):
         errors.append("handoff canonical issue summary does not match completed outcomes")
     return errors
 
 
-def completed_review_facts(run_dir: Path, handoff_text: str) -> dict[str, Any]:
+def completed_review_facts(run_dir: Path, handoff_text: str, *, candidate_digest: str | None = None) -> dict[str, Any]:
     try:
         legs = completed_reviewer_legs(run_dir)
     except ValueError as exc:
@@ -255,14 +261,22 @@ def completed_review_facts(run_dir: Path, handoff_text: str) -> dict[str, Any]:
             raise CandidateQualificationRefused("merge_dispositions_check_failed", str(exc)) from exc
         issue_ids = set(dispositions.accounted_fix_issue_ids)
     try:
-        counts, applied = canonical_fix_attempt_facts(run_dir, issue_ids)
+        from rvf_elevated_issue_delegation import accepted_delegations, DELEGATION_CONCLUSION
+
+        contract = read_regular_json_object(run_dir / "artifacts/inputs/scope.contract.json")
+        delegations = accepted_delegations(Path(contract["repo"]), run_dir, candidate_digest=candidate_digest)
+        delegated_ids = {entry["issue_id"] for entry in delegations}
+        if not delegated_ids <= issue_ids:
+            raise ValueError("委派包含未被 canonical merge 计入的问题")
+        counts, applied = canonical_fix_attempt_facts(run_dir, issue_ids, user_delegated_issue_ids=delegated_ids)
     except (ValueError, TypeError, KeyError) as exc:
         raise CandidateQualificationRefused("canonical_fix_completion_invalid", str(exc)) from exc
     errors = handoff_display_consistency_errors(handoff_text, counts)
     if errors:
         raise CandidateQualificationRefused("handoff_display_contradicts_machine_facts", "; ".join(errors))
     return {"canonical_issue_count": len(issue_ids), "outcome_counts": counts, "applied_attempts": applied,
-            "conclusion": "fixes_applied_and_validated" if issue_ids else "no_issues"}
+            "user_delegated_elevated_issues": delegations,
+            "conclusion": DELEGATION_CONCLUSION if delegations else "fixes_applied_and_validated" if issue_ids else "no_issues"}
 
 
 def applied_scope_expansion_facts(applied_attempts: list[dict[str, Any]], scope_paths: set[str], run_dir: Path,
