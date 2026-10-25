@@ -326,7 +326,6 @@ def launch_detached(
                     observe_dispatcher_writer_execution_prelaunch_recovery_inputs,
                     recover_unattempted_dispatcher_preparations_with_admission_lock_held,
                     assert_dispatcher_launch_not_prohibited_by_terminal_archive_intent,
-                    bind_dispatcher_prelaunch_input_generation_with_admission_lock_held,
                 )
                 from core.run_ledger.review_run_lifecycle import read_json_object
 
@@ -362,7 +361,6 @@ def launch_detached(
                 assert_dispatcher_launch_not_prohibited_by_terminal_archive_intent(status_path, payload)
                 current_dispatcher_prelaunch_inputs = observe_dispatcher_writer_execution_prelaunch_recovery_inputs(argv, total_timeout_seconds,
                     dispatcher_tmux_executable_argv0, payload["dispatcher_writer_execution_tmux_executable_search_path"])
-                current_dispatcher_prelaunch_inputs = bind_dispatcher_prelaunch_input_generation_with_admission_lock_held(status_path, payload, current_dispatcher_prelaunch_inputs, previous_dispatcher_execution_receipts)
                 generation_receipt_count = sum(receipt["dispatcher_writer_execution_prelaunch_recovery_generation_sha256"]
                     == current_dispatcher_prelaunch_inputs["dispatcher_writer_execution_prelaunch_recovery_generation_sha256"] for receipt in previous_dispatcher_execution_receipts)
                 if generation_receipt_count >= DISPATCHER_WRITER_EXECUTION_PRELAUNCH_RECOVERY_ATTEMPTS_PER_INPUT_GENERATION:

@@ -168,7 +168,7 @@ def test_unknown_spawn_does_not_report_complete_zero_subagent_work(tmp_path, spa
     assert payload["unattributed_subagent_patch_observations"][0]["call_id"] == "actual-child-patch"
 
 
-@pytest.mark.parametrize("changed_evidence", ["artifact", "identity"])
+@pytest.mark.parametrize("changed_evidence", ["artifact", "identity", "unknown_completed_stage"])
 def test_changed_checkpoint_evidence_waits_and_recovers_without_live_snapshot(tmp_path, changed_evidence):
     scripts, repo, run = crash_fixture(tmp_path)
     finalizer = load_script_module("rvf_run_finalize")
@@ -183,8 +183,10 @@ def test_changed_checkpoint_evidence_waits_and_recovers_without_live_snapshot(tm
     changed = json.loads(original_proof)
     if changed_evidence == "artifact":
         changed["repo"] = str(tmp_path / "foreign-repository")
-    else:
+    elif changed_evidence == "identity":
         changed["identity"]["run_id"] = "foreign-run"
+    else:
+        changed["artifact_sha256_by_stage"]["unknown_completed_stage"] = {}
     write_json(proof_path, changed)
     (repo / "feature.txt").write_text("later-unrelated-workspace\n")
     blocked = subprocess.run([*command, "resume", "after_workspace_stage"], env=environment, capture_output=True, text=True)

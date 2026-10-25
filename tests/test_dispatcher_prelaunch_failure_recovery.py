@@ -394,9 +394,8 @@ def test_exhausted_prelaunch_budget_ignores_touch_and_identical_rewrite_but_trac
     assert unreadable["dispatcher_writer_execution_prelaunch_recovery_generation_sha256"] != meaningful_generations[-1]
     meaningful_generations.append(unreadable["dispatcher_writer_execution_prelaunch_recovery_generation_sha256"])
     tmux_executable.chmod(0o600)
-    readable_again = exhaust_current_dispatcher_prelaunch_input_generation()
-    assert readable_again["dispatcher_writer_execution_prelaunch_recovery_generation_sha256"] != meaningful_generations[-1]
-    meaningful_generations.append(readable_again["dispatcher_writer_execution_prelaunch_recovery_generation_sha256"])
+    # 恢复到先前已经耗尽的内容/权限组合，继续复用原预算，不因往返刷新三次额度。
+    assert detached.launch_detached(**parameters)["recovery_state"] == "waiting_for_dispatcher_prelaunch_input_change"
     helper_source = observed_source_directory / "dispatcher_writer_execution_evidence.py"
     helper_source.write_bytes(helper_source.read_bytes() + "\n# 恢复实现内容发生有意义变化\n".encode())
     changed_recovery_version = exhaust_current_dispatcher_prelaunch_input_generation()
@@ -486,3 +485,26 @@ def test_native_preexisting_session_waits_without_creating_execution(dispatcher_
         (fixture_root / "stop-preexisting-writer").write_text("stop\n")
         subprocess.run([tmux, "-S", str(socket), "kill-server"], capture_output=True, timeout=5)
         short_socket_alias.unlink(missing_ok=True)
+
+
+def test_returning_to_exhausted_input_content_does_not_refresh_attempt_budget(dispatcher_prelaunch_recovery_fixture, monkeypatch):
+    evidence, detached, _, status, script, source, parameters = dispatcher_prelaunch_recovery_fixture
+    assume_absent_tmux_resource_for_preparation_only_fixture(detached, monkeypatch)
+
+    def fail_before_tmux_attempt(*args):
+        raise FileNotFoundError("合成准备故障；未创建tmux或实际writer")
+
+    monkeypatch.setattr(evidence, "complete_dispatcher_writer_execution_entrypoint_content_binding", fail_before_tmux_attempt)
+    for entrypoint_exists in (False, True):
+        if entrypoint_exists:
+            script.write_text(source)
+        for _ in range(3):
+            assert detached.launch_detached(**parameters)["launch_status"] == "launch_failed"
+        assert detached.launch_detached(**parameters)["recovery_state"] == "waiting_for_dispatcher_prelaunch_input_change"
+    receipt_paths = list((status.parent / "dispatcher-writer-executions").glob("*/dispatcher-writer-execution-evidence.json"))
+    assert len(receipt_paths) == 6
+    original_status = status.read_bytes()
+    script.unlink()
+    assert detached.launch_detached(**parameters)["recovery_state"] == "waiting_for_dispatcher_prelaunch_input_change"
+    assert status.read_bytes() == original_status
+    assert len(list((status.parent / "dispatcher-writer-executions").glob("*/dispatcher-writer-execution-evidence.json"))) == 6

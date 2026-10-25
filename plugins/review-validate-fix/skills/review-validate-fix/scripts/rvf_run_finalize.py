@@ -20,6 +20,7 @@ import json
 import os
 import sys
 import traceback
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -715,18 +716,16 @@ def _read_terminal_archive_finalization_progress(
     progress = json.loads(path.read_text())
     if not isinstance(progress, dict) or progress.get("identity") != identity:
         raise ValueError("finalize 持久阶段记录与 run、scope 或首次终态不符")
-    record, completed = progress.get("record"), progress.get("completed_stages")
-    if (not isinstance(record, dict) or not isinstance(completed, list)
-            or any(stage not in FINALIZATION_STAGE_RESULT_KEYS for stage in completed)):
+    record = progress.get("record")
+    digests = progress.get("artifact_sha256_by_stage")
+    if (not isinstance(record, dict) or not isinstance(digests, dict)
+            or any(stage not in FINALIZATION_STAGE_RESULT_KEYS for stage in digests)):
         raise ValueError("finalize 持久阶段记录缺少明确完成事实")
     if any(record.get(key) != identity.get(key) for key in (
         "run_id", "run_dir", "repo", "decision_kind", "review_run_terminal_status", "review_run_terminal_at",
     )):
         raise ValueError("finalize 阶段结果与其身份回执不符")
-    digests = progress.get("artifact_sha256_by_stage")
-    if not isinstance(digests, dict):
-        raise ValueError("finalize 持久阶段记录缺少产物摘要")
-    for stage in completed:
+    for stage in digests:
         if not isinstance(digests.get(stage), dict):
             raise ValueError("finalize 已确认阶段缺少产物摘要")
         for relative, digest in digests[stage].items():
@@ -738,7 +737,7 @@ def _read_terminal_archive_finalization_progress(
 
 
 def terminal_archive_finalization_progress_recovery_evidence_status(request: dict[str, Any]) -> str:
-    """只以阶段证据可核验性的变化刷新预算，不使用每次 checkpoint 的内容变化。"""
+    """仅在阶段证据的可核验性变化时刷新预算，不以检查点的常规更新刷新。"""
     run_dir = Path(request["run_dir"])
     cache = run_dir / "artifacts/.finalize.lock"
     path = run_dir / "artifacts" / TERMINAL_ARCHIVE_FINALIZATION_PROGRESS_FILENAME
@@ -826,8 +825,7 @@ def _finalize_run_owned(
     progress_enabled = decision_kind in NON_REVIEW_COMPLETION_KINDS
     progress_identity = _terminal_archive_finalization_progress_identity(run_dir, finalize_record) if progress_enabled else None
     progress = _read_terminal_archive_finalization_progress(run_dir, progress_identity) if progress_enabled else None
-    completed_stages = set(progress["completed_stages"]) if progress else set()
-    artifact_digests = dict(progress["artifact_sha256_by_stage"]) if progress else {}
+    completed_artifact_digests_by_stage = dict(progress["artifact_sha256_by_stage"]) if progress else {}
     if progress is not None and resume_record is None:
         resume_record = progress["record"]
     if (progress_enabled and resume_record is None
@@ -836,7 +834,7 @@ def _finalize_run_owned(
         resume_record = dict(finalize_record)
     failed_stages = {error.get("stage") for error in (resume_record or {}).get("errors", [])}
     if progress_enabled and resume_record is not None and (progress is not None or not resuming_failed_cache):
-        failed_stages.update(set(FINALIZATION_STAGE_RESULT_KEYS) - completed_stages)
+        failed_stages.update(set(FINALIZATION_STAGE_RESULT_KEYS) - completed_artifact_digests_by_stage.keys())
     if resume_record:
         for key in ("trajectory", "usage", "workspace_diff", "tracker_lease_release", "review_highwater", "analysis"):
             finalize_record[key] = resume_record.get(key)
@@ -845,28 +843,38 @@ def _finalize_run_owned(
         if progress is not None:
             finalize_record["resumed_from_persistent_stage_progress"] = True
 
-    def checkpoint(stage: str | None = None) -> None:
+    def persist_terminal_archive_finalization_progress(stage: str | None = None) -> None:
         if not progress_enabled:
             return
         if stage is not None:
             if any(error.get("stage") == stage for error in finalize_record["errors"]):
-                completed_stages.discard(stage)
-                artifact_digests.pop(stage, None)
+                completed_artifact_digests_by_stage.pop(stage, None)
             else:
-                completed_stages.add(stage)
-                artifact_digests[stage] = _terminal_archive_stage_artifact_digests(run_dir, stage, finalize_record)
+                completed_artifact_digests_by_stage[stage] = _terminal_archive_stage_artifact_digests(run_dir, stage, finalize_record)
         atomic_write_json(artifacts_dir / TERMINAL_ARCHIVE_FINALIZATION_PROGRESS_FILENAME, {
             "schema_version": 1, "identity": progress_identity, "record": finalize_record,
-            "completed_stages": sorted(completed_stages), "artifact_sha256_by_stage": artifact_digests,
+            "artifact_sha256_by_stage": completed_artifact_digests_by_stage,
         })
 
-    checkpoint()
+    persist_terminal_archive_finalization_progress()
 
-    def perform_stage(stage: str) -> bool:
+    def should_execute_finalization_stage(stage: str) -> bool:
         return not resume_record or stage in failed_stages
 
-    try:
-        if perform_stage("trajectory_capture"):
+    @contextmanager
+    def record_finalization_stage_outcome(stage: str):
+        """阶段共用错误记录与检查点；摘要映射中存在该阶段即表示完成。"""
+        try:
+            yield
+        except Exception as exc:
+            finalize_record["errors"].append({
+                "stage": stage, "error": f"{type(exc).__name__}: {exc}",
+                "trace": traceback.format_exc(),
+            })
+        persist_terminal_archive_finalization_progress(stage)
+
+    with record_finalization_stage_outcome("trajectory_capture"):
+        if should_execute_finalization_stage("trajectory_capture"):
             traj_summary = capture_run(run_dir=run_dir, event=event or {}, repo=repo)
             finalize_record["trajectory"] = {
                 "host": traj_summary.get("host"),
@@ -877,39 +885,21 @@ def _finalize_run_owned(
                 "distill_index": traj_summary.get("distill_index"),
                 "reviewers": [item.get("reviewer_id") for item in traj_summary.get("reviewers", [])],
             }
-    except Exception as exc:
-        finalize_record["errors"].append(
-            {
-                "stage": "trajectory_capture",
-                "error": f"{type(exc).__name__}: {exc}",
-                "trace": traceback.format_exc(),
-            }
-        )
 
-    checkpoint("trajectory_capture")
-    try:
-        if perform_stage("usage_summary") or "trajectory_capture" in failed_stages:
+    with record_finalization_stage_outcome("usage_summary"):
+        if should_execute_finalization_stage("usage_summary") or "trajectory_capture" in failed_stages:
             finalize_record["usage"] = _write_usage_summary(run_dir)
-    except Exception as exc:
-        finalize_record["errors"].append(
-            {
-                "stage": "usage_summary",
-                "error": f"{type(exc).__name__}: {exc}",
-                "trace": traceback.format_exc(),
-            }
-        )
 
-    checkpoint("usage_summary")
     before_path = artifacts_dir / "before-workspace-snapshot.json"
     after_path = artifacts_dir / "after-workspace-snapshot.json"
-    if not perform_stage("workspace_diff"):
-        pass
-    elif resume_record or (event or {}).get("review_run_skip_live_workspace_snapshot"):
-        finalize_record["workspace_diff"] = {
-            "status": "unavailable", "reason": "delayed_terminal_archive_recovery" if resume_record else "writers_were_active_at_terminal_observation",
-        }
-    elif repo is not None and before_path.exists():
-        try:
+    with record_finalization_stage_outcome("workspace_diff"):
+        if not should_execute_finalization_stage("workspace_diff"):
+            pass
+        elif resume_record or (event or {}).get("review_run_skip_live_workspace_snapshot"):
+            finalize_record["workspace_diff"] = {
+                "status": "unavailable", "reason": "delayed_terminal_archive_recovery" if resume_record else "writers_were_active_at_terminal_observation",
+            }
+        elif repo is not None and before_path.exists():
             capture_after(repo, after_path)
             diff_payload = compute_workspace_diff(
                 run_dir=run_dir,
@@ -924,59 +914,30 @@ def _finalize_run_owned(
                 "changed_path_count": len(diff_payload.get("changed_paths", [])),
                 "git_diff_path": diff_payload.get("git_diff_path"),
             }
-        except Exception as exc:
-            finalize_record["errors"].append(
-                {
-                    "stage": "workspace_diff",
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "trace": traceback.format_exc(),
-                }
-            )
-    else:
-        finalize_record["workspace_diff"] = {
-            "status": "skipped",
-            "reason": (
-                "missing_before_snapshot" if not before_path.exists() else "missing_repo"
-            ),
-        }
+        else:
+            finalize_record["workspace_diff"] = {
+                "status": "skipped",
+                "reason": (
+                    "missing_before_snapshot" if not before_path.exists() else "missing_repo"
+                ),
+            }
 
-    checkpoint("workspace_diff")
-    try:
-        if perform_stage("tracker_lease_release"):
+    with record_finalization_stage_outcome("tracker_lease_release"):
+        if should_execute_finalization_stage("tracker_lease_release"):
             finalize_record["tracker_lease_release"] = _release_tracker_lease(
                 run_dir, repo, decision_kind=decision_kind,
             )
-    except Exception as exc:
-        finalize_record["errors"].append(
-            {
-                "stage": "tracker_lease_release",
-                "error": f"{type(exc).__name__}: {exc}",
-                "trace": traceback.format_exc(),
-            }
-        )
 
-    checkpoint("tracker_lease_release")
-    try:
-        if perform_stage("review_highwater"):
+    with record_finalization_stage_outcome("review_highwater"):
+        if should_execute_finalization_stage("review_highwater"):
             finalize_record["review_highwater"] = _advance_review_highwater(
                 run_dir, repo, event, summary, finalize_record
             )
-    except Exception as exc:
-        finalize_record["errors"].append(
-            {
-                "stage": "review_highwater",
-                "error": f"{type(exc).__name__}: {exc}",
-                "trace": traceback.format_exc(),
-            }
-        )
 
-    checkpoint("review_highwater")
     finalize_record["completed_at"] = _utc_now()
 
     summary_path = run_dir / "summary.json"
     if summary_path.exists():
-        merged = _read_summary(summary_path)
-        merged["finalize"] = finalize_record
         try:
             merge_review_run_summary(run_dir, {"run_id": summary.get("run_id") or run_dir.name, "finalize": finalize_record})
         except OSError as exc:
@@ -984,22 +945,13 @@ def _finalize_run_owned(
                 {"stage": "summary_merge", "error": f"{type(exc).__name__}: {exc}"}
             )
 
-    try:
-        if perform_stage("analysis_scaffold") or {"trajectory_capture", "usage_summary", "workspace_diff"} & failed_stages:
+    with record_finalization_stage_outcome("analysis_scaffold"):
+        if should_execute_finalization_stage("analysis_scaffold") or {"trajectory_capture", "usage_summary", "workspace_diff"} & failed_stages:
             # 正式分析已经完成时保持其原始事实；更正信息留在独立恢复记录中。
             analysis_status = _read_summary(artifacts_dir / "analysis/.analyze-thread.status.json")
             if analysis_status.get("formal_analysis_completion_status") != "completed":
                 finalize_record["analysis"] = _scaffold_analysis(run_dir)
-    except Exception as exc:
-        finalize_record["errors"].append(
-            {
-                "stage": "analysis_scaffold",
-                "error": f"{type(exc).__name__}: {exc}",
-                "trace": traceback.format_exc(),
-            }
-        )
 
-    checkpoint("analysis_scaffold")
     if decision_kind not in NON_REVIEW_COMPLETION_KINDS:
         try:
             freeze_completion_notification(run_dir, finalize_record)
@@ -1009,9 +961,6 @@ def _finalize_run_owned(
             )
 
     if summary_path.exists():
-        merged = _read_summary(summary_path)
-        merged["finalize"] = finalize_record
-        merged["finalize_completed_at"] = finalize_record["completed_at"]
         try:
             merge_review_run_summary(run_dir, {
                 "run_id": summary.get("run_id") or run_dir.name, "finalize": finalize_record,

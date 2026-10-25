@@ -189,52 +189,6 @@ def observe_dispatcher_writer_execution_prelaunch_recovery_inputs(dispatcher_com
             "dispatcher_writer_execution_prelaunch_recovery_input_observation": observed_dispatcher_prelaunch_inputs}
 
 
-def bind_dispatcher_prelaunch_input_generation_with_admission_lock_held(dispatcher_status_path: Path,
-    dispatcher_status_payload: dict[str, Any], observed_dispatcher_inputs: dict[str, Any], prior_dispatcher_execution_receipts: list[dict[str, Any]]) -> dict[str, Any]:
-    """持久语义代次：A→B→A是新条件恢复，touch/同内容重写不是；不依赖status指针。"""
-    generation_path = dispatcher_status_path.parent / "dispatcher-writer-prelaunch-recovery-input-generation.json"
-    if generation_path.is_symlink():
-        raise ValueError("dispatcher恢复代次记录不能是符号链接")
-    generation_identity = {"run_id": dispatcher_status_payload["run_id"], "run_dir": str(Path(dispatcher_status_payload["run_dir"]).resolve()),
-        "repo_realpath": str(Path(dispatcher_status_payload["repo"]).resolve()), "session_id": dispatcher_status_payload.get("session_id"),
-        "command_sha256": _dispatcher_writer_execution_command_sha256(dispatcher_status_payload["command"])}
-    summary = read_json_object(Path(generation_identity["run_dir"]) / "summary.json")
-    if (summary.get("run_id") != generation_identity["run_id"] or not isinstance(summary.get("repo"), str)
-            or str(Path(summary["repo"]).resolve()) != generation_identity["repo_realpath"]
-            or summary.get("session_id") is not None and summary["session_id"] != generation_identity["session_id"]):
-        raise ValueError("dispatcher恢复代次与正式run归属不符")
-    previous_generation = read_json_object(generation_path)
-    if not previous_generation:
-        recorded_generations = {receipt["dispatcher_writer_execution_prelaunch_recovery_generation_sha256"]: receipt
-            for receipt in prior_dispatcher_execution_receipts if isinstance(receipt.get("dispatcher_writer_execution_prelaunch_recovery_input_fingerprint_sha256"), str)}
-        if recorded_generations:
-            recorded_parent_generations = {receipt.get("dispatcher_writer_execution_prelaunch_recovery_previous_generation_sha256") for receipt in recorded_generations.values()}
-            generation_leaves = set(recorded_generations) - recorded_parent_generations
-            if len(generation_leaves) != 1:
-                raise ValueError("dispatcher恢复代次索引缺失且精确回执存在分叉，禁止刷新预算")
-            latest_generation = recorded_generations[generation_leaves.pop()]
-            previous_generation = {**generation_identity,
-                "semantic_input_sha256": latest_generation["dispatcher_writer_execution_prelaunch_recovery_input_fingerprint_sha256"],
-                "generation_sha256": latest_generation["dispatcher_writer_execution_prelaunch_recovery_generation_sha256"],
-                "previous_generation_sha256": latest_generation.get("dispatcher_writer_execution_prelaunch_recovery_previous_generation_sha256")}
-    if previous_generation and any(previous_generation.get(field) != value for field, value in generation_identity.items()):
-        raise ValueError("dispatcher恢复代次的关键归属不符")
-    semantic_input_sha256 = observed_dispatcher_inputs["dispatcher_writer_execution_prelaunch_recovery_generation_sha256"]
-    if previous_generation.get("semantic_input_sha256") == semantic_input_sha256:
-        generation_sha256 = previous_generation["generation_sha256"]
-        prior_generation_sha256 = previous_generation.get("previous_generation_sha256")
-    else:
-        prior_generation_sha256 = previous_generation.get("generation_sha256")
-        generation_sha256 = hashlib.sha256((prior_generation_sha256 + ":" + semantic_input_sha256).encode()).hexdigest() if prior_generation_sha256 else semantic_input_sha256
-    if not generation_path.exists() or previous_generation.get("semantic_input_sha256") != semantic_input_sha256:
-        atomic_write_json(generation_path, {"schema_version": 1, **generation_identity, "semantic_input_sha256": semantic_input_sha256,
-            "generation_sha256": generation_sha256, "previous_generation_sha256": prior_generation_sha256,
-            "input_observation": observed_dispatcher_inputs["dispatcher_writer_execution_prelaunch_recovery_input_observation"]})
-    return {**observed_dispatcher_inputs, "dispatcher_writer_execution_prelaunch_recovery_generation_sha256": generation_sha256,
-        "dispatcher_writer_execution_prelaunch_recovery_previous_generation_sha256": prior_generation_sha256,
-        "dispatcher_writer_execution_prelaunch_recovery_input_fingerprint_sha256": semantic_input_sha256}
-
-
 def initialize_dispatcher_writer_execution_binding_before_entrypoint_read(dispatcher_status_path: Path, dispatcher_status_payload: dict[str, Any]) -> dict[str, Any]:
     """在可能失败的入口读取前持久绑定；准备身份不包含实际出生或退出事实。"""
     import secrets
@@ -286,7 +240,6 @@ def prepare_dispatcher_writer_execution_evidence_binding(dispatcher_status_path:
         assert_dispatcher_launch_not_prohibited_by_terminal_archive_intent(dispatcher_status_path, dispatcher_status_payload)
         observed_inputs = observe_dispatcher_writer_execution_prelaunch_recovery_inputs(dispatcher_status_payload["command"], dispatcher_status_payload.get("total_timeout_seconds"),
             dispatcher_status_payload.get("dispatcher_writer_execution_tmux_executable_argv0"), dispatcher_status_payload.get("dispatcher_writer_execution_tmux_executable_search_path"))
-        observed_inputs = bind_dispatcher_prelaunch_input_generation_with_admission_lock_held(dispatcher_status_path, dispatcher_status_payload, observed_inputs, prior_receipts)
         consumed_attempts = sum(receipt["dispatcher_writer_execution_prelaunch_recovery_generation_sha256"] == observed_inputs["dispatcher_writer_execution_prelaunch_recovery_generation_sha256"] for receipt in prior_receipts)
         if consumed_attempts >= DISPATCHER_WRITER_EXECUTION_PRELAUNCH_RECOVERY_ATTEMPTS_PER_INPUT_GENERATION:
             raise ValueError("dispatcher同一输入代的三次准备预算已耗尽")
