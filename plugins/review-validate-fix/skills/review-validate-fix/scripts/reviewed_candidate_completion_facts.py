@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import subprocess
 from collections import Counter
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -12,8 +14,11 @@ from typing import Any, Callable, Mapping
 
 import rvf_merge_dispositions
 import check_review_result
+from fix_attempt_scope_expansion_classification import (
+    canonical_issue_authorized_fix_paths, classify_fix_attempt_scope_expansion, scope_contract_paths,
+)
 from review_scope_excluded_path_prefixes import BUILTIN_DEVELOPER_TOOL_MANAGED_PATH_PREFIXES_EXCLUDED_FROM_REVIEW_SCOPE
-from validation_result_cache import canonical_json_bytes
+from validation_result_cache import canonical_json_bytes, clean_git_environment
 
 
 class CandidateQualificationRefused(ValueError):
@@ -306,6 +311,45 @@ def completed_review_facts(run_dir: Path, handoff_text: str, *, allow_missing_co
             "conclusion": "fixes_applied_and_validated" if issue_ids else "no_issues"}
 
 
+def actual_fix_patch_changed_paths(patch_bytes: bytes, repo: Path) -> set[str]:
+    """逐段消费 Git 解析的实际改动，保留 rename 两端并排除 copy 来源及空操作。"""
+    changed_paths: set[str] = set()
+    for section in re.split(rb"(?m)(?=^diff --git )", patch_bytes):
+        if not section.strip():
+            continue
+        if not section.startswith(b"diff --git "):
+            raise ValueError("canonical issue 主路径的实际补丁缺少 Git diff 头")
+        numstats: list[list[bytes]] = []
+        for reverse in (False, True):
+            parsed = subprocess.run(
+                ["git", "apply", "--numstat", "-z", *(["--reverse"] if reverse else [])],
+                input=section, cwd=repo, env=clean_git_environment(), capture_output=True, check=False,
+            )
+            entries = [entry.split(b"\t", 2) for entry in parsed.stdout.split(b"\0") if entry]
+            if parsed.returncode or len(entries) != 1 or len(entries[0]) != 3:
+                raise ValueError("canonical issue 主路径的实际补丁无法解析为单文件改动")
+            numstats.append(entries[0])
+        summary = subprocess.run(
+            ["git", "apply", "--summary"], input=section, cwd=repo,
+            env=clean_git_environment(), capture_output=True, check=False,
+        )
+        if summary.returncode:
+            raise ValueError("canonical issue 主路径的实际补丁摘要无法解析")
+        forward, reverse = numstats
+        # 0/0 仍可表示空文件增删或真实 mode 变化；同路径自重命名自身不是改动。
+        file_created_or_deleted = re.search(rb"(?m)^ (?:create|delete) mode [0-7]{6} ", summary.stdout)
+        mode_change = re.search(rb"(?m)^ mode change ([0-7]{6}) => ([0-7]{6}) ", summary.stdout)
+        mode_changed = mode_change is not None and mode_change[1] != mode_change[2]
+        if (forward[:2] == [b"0", b"0"] and forward[2] == reverse[2]
+            and not file_created_or_deleted and not mode_changed):
+            continue
+        changed_paths.add(os.fsdecode(forward[2]))
+        # 来源必须由同一有效 diff 的反向解析证明，不能从任意 rename/copy 文本行提取。
+        if not re.search(rb"(?m)^ copy ", summary.stdout):
+            changed_paths.add(os.fsdecode(reverse[2]))
+    return safe_relative_paths(sorted(changed_paths))
+
+
 def applied_scope_expansion_facts(applied_attempts: list[dict[str, Any]], scope_paths: set[str], run_dir: Path,
                                 *, contract: Mapping[str, Any], original_run_directory: Path | None = None) -> list[dict[str, Any]]:
     expansions: list[dict[str, Any]] = []
@@ -319,6 +363,11 @@ def applied_scope_expansion_facts(applied_attempts: list[dict[str, Any]], scope_
             raise ValueError("scope expansion requires a fixed and applied attempt")
         if any(attempt.get(key) != result.get(key) for key in ("run_id", "issue_id", "attempt_id")):
             raise ValueError("scope expansion attempt/result identity mismatch")
+        if any(facts[name].get("run_id") != contract.get("run_id") for name in ("issue", "attempt", "result")):
+            raise ValueError("scope expansion facts belong to a different run")
+        if any(facts[name].get("fix_issue_handling_mode", "validate_then_fix") != "validate_then_fix"
+               for name in ("issue", "attempt", "result")):
+            raise ValueError("validate-only issue 不能生成已应用修复的范围扩展凭据")
         changed_paths = safe_relative_paths(result.get("changed_paths", []))
         metadata = result.get("scope_expansion") or {}
         if not isinstance(metadata, dict):
@@ -329,23 +378,38 @@ def applied_scope_expansion_facts(applied_attempts: list[dict[str, Any]], scope_
         acknowledged = safe_relative_paths(metadata.get("acknowledged_protected_or_background_paths", []))
         declared = safe_relative_paths(metadata.get("declared_paths", []))
         confirmed = safe_relative_paths(attempt.get("confirmed_acknowledged_protected_or_background_paths", []))
-        guarded_patterns = [*contract.get("protected_files", []), *contract.get("background_files", []),
-                            *contract.get("excluded_path_prefixes", [])]
-        guarded_changes = {path for path in changed_paths for pattern in guarded_patterns
-                           if isinstance(pattern, str) and pattern and
-                           (path == pattern.rstrip("/") or path.startswith(pattern.rstrip("/") + "/"))}
+        classification = classify_fix_attempt_scope_expansion(
+            changed_paths=sorted(changed_paths),
+            boundary_paths=[*safe_relative_paths(attempt.get("issue_paths", [])), *scope_contract_paths(contract, "fix_allowlist")],
+            declared_paths=sorted(declared), acknowledged_protected_or_background_paths=sorted(acknowledged),
+            reason=metadata.get("reason"), scope_contract=contract, canonical_issue=facts["issue"],
+        )
+        canonical_declared = set(classification["canonical_issue_declared_paths"])
+        if canonical_declared and safe_relative_paths(attempt.get("issue_paths", [])) != set(
+            canonical_issue_authorized_fix_paths(facts["issue"])
+        ):
+            raise ValueError("canonical issue 主路径与 prepare 时登记的路径不一致")
+        if "canonical_issue_declared_paths" in metadata and safe_relative_paths(
+            metadata["canonical_issue_declared_paths"]
+        ) != canonical_declared:
+            raise ValueError("canonical issue 主路径的声明来源不一致")
+        guarded_changes = set(classification["acknowledged_protected_or_background_paths"]) | set(
+            classification["unacknowledged_protected_or_background_paths"])
         if not guarded_changes <= acknowledged & confirmed:
             raise ValueError("protected/background changes lack main-agent confirmation")
         if any(metadata.get(name) for name in ("blocked_paths", "undeclared_paths", "unacknowledged_protected_or_background_paths")):
             raise ValueError("applied attempt has undeclared or blocked scope expansion")
-        if not expanded <= declared or not acknowledged <= confirmed or not (expanded | acknowledged) <= changed_paths:
+        if not expanded <= declared | canonical_declared or not acknowledged <= confirmed or not (expanded | acknowledged) <= changed_paths:
             raise ValueError("scope expansion lacks declaration, applied patch, or main-agent confirmation")
-        if (expanded or acknowledged) and not str(metadata.get("reason") or "").strip():
+        if (expanded or acknowledged or classification["requires_explicit_scope_expansion_reason"]) and not classification["reason"]:
             raise ValueError("scope expansion has no reason")
         outside = changed_paths - scope_paths
         # 确认通道只覆盖冻结 guarded 路径；普通外扩仍须声明。
-        if not outside <= expanded | (acknowledged & guarded_changes):
+        if (not outside <= expanded | canonical_declared | (acknowledged & guarded_changes)
+            or classification["undeclared_paths"]):
             raise ValueError("applied patch has an undeclared path outside the reviewed scope")
+        if classification["blocked_paths"]:
+            raise ValueError("developer-tool-managed scope expansion is forbidden")
         qualified = outside | acknowledged
         if qualified:
             if any(path.startswith(prefix) for path in qualified for prefix in BUILTIN_DEVELOPER_TOOL_MANAGED_PATH_PREFIXES_EXCLUDED_FROM_REVIEW_SCOPE):
@@ -361,8 +425,11 @@ def applied_scope_expansion_facts(applied_attempts: list[dict[str, Any]], scope_
             if (patch.is_symlink() or expected_patch.is_symlink() or not patch.is_file()
                 or patch.resolve() != expected_patch.resolve()):
                 raise ValueError("scope expansion requires its actual applied patch")
+            patch_bytes = patch.read_bytes()
+            if canonical_declared and not canonical_declared <= actual_fix_patch_changed_paths(patch_bytes, Path(contract["repo"])):
+                raise ValueError("实际补丁未包含 canonical issue 声明的主路径")
             snapshots = {name: facts[name] for name in ("issue", "attempt", "result")}
             expansions.append({"paths": sorted(qualified), "issue_id": attempt["issue_id"], "attempt_id": attempt["attempt_id"],
-                               "fix_patch_sha256": hashlib.sha256(patch.read_bytes()).hexdigest(),
+                               "fix_patch_sha256": hashlib.sha256(patch_bytes).hexdigest(),
                                "facts": snapshots, "facts_sha256": hashlib.sha256(canonical_json_bytes(snapshots)).hexdigest()})
     return expansions
