@@ -28,3 +28,23 @@ Land 分开核算真实修复和委派。示例保持共 2、fixed 1、elevated 
 本次未加入生产兼容旁路或临时全绿伪装，无需遗留兼容 shim。合法 v1/v2 是明确要求保留的协议，不是临时绕过。未安装、部署或执行真实来源 base 同步；双仓验收使用隔离 Git、HOME、原生会话夹具和本地响应。
 
 协议与用法见 [委派契约](../architecture/user-delegated-elevated-issue-disposition-contract.md) 及 [公开命令说明](../../plugins/review-validate-fix/skills/review-validate-fix/references/user-delegated-elevated-issue-disposition.md)。
+
+## 最终授权与资格写入补强
+
+最终生产者实现提交为 `7d0f3e2ae2c74e1164e1488905eb1f426c8afb12`，包含 `eefb015` 的共享资格锁及动作级授权修复；消费者固定为 `6e3c6c22a917e22e1b79ae65edd3e5fa03fa81bb`。消费者 Task `7f94e` 已接续到该提交；其后续本地 main 同步由该 Task 按用户另行授权独立完成，本 Task 未执行真实 base 同步、push 或部署。
+
+撤销按对应动作及完整 issue 标识符分句核验：否定撤销拒绝，肯定撤销不会被另一条款的委派否定误伤。每条历史事件都核验真实授权，后续合法 delegate 不会洗白较早的非法 revoke。run、issue 与目标 task 的后缀近似身份拒绝；英文句末句号按标点处理。
+
+canonical writer 与消费者 CAS 共用 `artifacts/elevated-issue-delegation/mutation.lock`。实际覆盖 prepare/start/stop/apply、awaiting marker、issue upsert、merge、reviewer 结果及其轮转/plan、scope 创建/定稿、validation index、handoff、summary/finalize 与 evidence 共 19 类入口。Land 在锁外完成验证重放，持锁后重新核验到提交和证据发布结束；锁忙不夺锁，释放后继续，恢复预算也会按锁可用性变化重开。
+
+最终固定版本已实际通过：
+
+- 完整 `scripts/check_plugin_contracts.py --verbose`：66 个步骤全部通过，退出码 0。
+- 双仓 v1/v2/v3 联合回归：235 项通过，无 skip，包含三条真实完整生产者/消费者生命周期及幂等 handback。
+- 固定完整生产者源码的 writer 锁与恢复：22 项通过，逐项保存 19 类真实 writer 的精确 argv、stdout/stderr、持锁阻断与释放后接续结果。
+- 双仓独立协议 9 场景，以及两种真实生产者 prepare/消费者 Git CAS 竞态全部通过。复验前出现新 attempt 时 base 不推进；实际 Git 落地期间 prepare 等待，落地后接续并使旧 v3 失效。
+- `7494b` 的第 5 次独立重演通过；18 份原件摘要未变。Land 为 `nothing_to_commit`，消费者为 `VERIFIED`，仍显示共 2、fixed 1、elevated 1、已委派 1、阻断 0，跟进 `0030c`。
+
+完整检查曾暴露独立 `rvf_run_finalize` 进程未先初始化 pyroot 的回归；`7d0f3e2` 修复后，35 项 bridge 和 44 项 finalize/bridge 组合通过，最终完整契约也覆盖并通过原失败场景。另一处 stop 参数报错顺序回归与测试准备阶段误解析空 stdout 均已修正；原失败日志保留。既有 SQLite 迁移用例缺少 `leases` 表的问题已在未改动的 `0671383` 独立复现，本次沿用正式 gate 的既有排除，不添加无关兼容实现。
+
+原生交接消息未确认接收时，保留失败及 Review 列 start 拒绝回执，改用正常 mutation reservation 覆盖的受控 fast-forward 接续已验证消费者提交。只推进该 Task 的干净 detached HEAD，接续当时 main 不变；没有伪造原生接收或把旧 RVF 结果提升为覆盖新候选。最终 manifest、完整源码 archive、原件摘要、失败快照及对等报告均持久保存在本 Task 交接目录。没有遗留临时生产兼容旁路。
