@@ -1245,6 +1245,18 @@ def default_prepare_pipeline(
     artifacts_dir = ledger.artifacts_dir
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
+    from core.run_ledger.review_run_lifecycle import record_review_run_phase  # noqa: PLC0415
+
+    record_review_run_phase(
+        ledger.run_dir, run_id=ledger.run_id, phase="prepare",
+        observed_at=token_record.payload.get("acknowledged_at") or now.isoformat().replace("+00:00", "Z"),
+        starts_review_run=True, start_evidence_source="decision_acknowledged",
+    )
+    from core.run_ledger.review_run_lifecycle import merge_review_run_summary
+
+    merge_review_run_summary(ledger.run_dir, {"run_id": ledger.run_id, "repo": worktree,
+                            "session_id": session_id, "origin_transcript_path": transcript_path})
+
     # tracker review scope 分配：必须排在写 prep payload **之前**——三个 tracker 字段是 prep 的
     # 输入，prepare 只是把它们透传给 scope contract。见本文件上方「发起侧 tracker review scope
     # 分配」整节的动机说明。永不抛：拿不到就是一条显式记录在案的降级，start 照常走完。
@@ -1395,6 +1407,9 @@ def default_prepare_pipeline(
             prepare_status=str(state.get("status")),
             ledger=ledger,
         )
+    if record.path.is_file():
+        # 正式 run 的清理与交接证据熬过重启，不依赖临时目录或额外延长 TTL。
+        ledger.artifact("prepared-review-inputs-snapshot.json", record.path.read_bytes())
     return {
         "status": state.get("status"),
         "run_id": state.get("run_id"),
@@ -1471,6 +1486,8 @@ def build_execution_handoff(
         "kanban_task_id": kanban_task_id,
         "run_id": run_id,
         "run_dir": run_dir,
+        # EXPERIMENT_NODE: 多阶段 base 吸收及活动量阈值待 REA-34 对照实验，当前仅最终整合。
+        "base_absorption_policy": "final_integration_only",
         "prep_file": prep_file_path,
         # prepare 产出的全套输入工件（缺失的键保持 None，不静默丢字段）。
         "review_env": artifacts.get("review_env"),
@@ -1494,6 +1511,8 @@ def build_execution_handoff(
             "就地执行：在**当前会话、当前 worktree** 里调用 `$review-validate-fix` skill，按 "
             "SKILL.md 走 review → merge → validate/fix → handoff。不要新建 Kanban task、"
             "不要 fork 新会话；上面这些路径就是本轮 run 的全部输入，不需要重新 prepare。"
+            "保持本轮候选、HEAD 与比较 OID 固定；计划后、实现后与 RVF 前均不自动吸收 base，"
+            "base 的吸收与冲突解决由最终 base-branch-sync 或未来 PR 合并阶段负责。"
         ),
     }
 
@@ -1928,6 +1947,19 @@ def run_start(
         ),
         kanban_task_id=_current_kanban_task_id_from_env(),
     )
+    source_token = record.payload.get("boundary_request_source_token")
+    if isinstance(source_token, str) and isinstance(run_dir, str):
+        try:
+            source_record = token_store.read_decision_token(source_token, root=roots.token_root, now=now_dt)
+            source_run_dir = (source_record.payload or {}).get("run_anchor_dir")
+            if isinstance(source_run_dir, str):
+                from review_run_terminal_archive import record_review_run_successor
+
+                execution_handoff["predecessor_review_run_link"] = record_review_run_successor(
+                    source_run_dir=Path(source_run_dir), successor_run_dir=Path(run_dir), session_id=tok_session_id or "",
+                )
+        except Exception as exc:
+            execution_handoff["predecessor_review_run_link"] = {"status": "unavailable", "error": f"{type(exc).__name__}: {exc}"}
 
     scope_mode_note = (
         f"审查准备就绪（候选 {len(auto_scope_paths)} 路径；tracker scope 已分配，"
@@ -3052,6 +3084,20 @@ def run_decline(
         )
 
     fingerprint = str(declined.payload.get("candidate_fingerprint") or "")
+    terminal_archive_result = None
+    prepared_run_directory = (lookup.payload or {}).get("run_anchor_dir")
+    if isinstance(prepared_run_directory, str) and (Path(prepared_run_directory) / "summary.json").is_file():
+        try:
+            from review_run_terminal_archive import request_review_run_terminal_archive
+
+            source_summary = (lookup.payload or {}).get("candidate_summary") or {}
+            terminal_archive_result = request_review_run_terminal_archive(
+                run_dir=Path(prepared_run_directory), decision_kind="declined", reason=reason,
+                event={"cwd": worktree, "session_id": session_id,
+                       "transcript_path": source_summary.get("origin_transcript_path")},
+            )
+        except Exception as exc:
+            terminal_archive_result = {"status": "waiting_for_evidence", "error": f"{type(exc).__name__}: {exc}"}
     # INTEGRATION-POINT(R7/R12 rewind-on-decline)：理由落 append-only 磁盘 ledger，rewind
     # 不可抹；未来 rewind-on-decline 编排（不在本 repo 实现，Linear 跟踪)会读本 ledger
     # 决定「decline 后回退到决策点前的上下文」——本切片只落盘 + 标注。
@@ -3106,6 +3152,7 @@ def run_decline(
                 "candidate_fingerprint": fingerprint,
                 "decline_kind": decline_kind,
                 "deferred_until_condition_decline_recorded": deferred_until_condition_decline_recorded,
+                "terminal_archive": terminal_archive_result,
             },
         )
     declined_session_scope_snooze_recorded = (
@@ -3143,6 +3190,7 @@ def run_decline(
             "decline_kind": decline_kind,
             "session_scoped_declined_candidate_fingerprint_recorded": session_scoped_declined_candidate_fingerprint_recorded,
             "declined_session_scope_snooze_recorded": declined_session_scope_snooze_recorded,
+            "terminal_archive": terminal_archive_result,
         },
     )
 
@@ -3540,6 +3588,19 @@ def run_decline_dispatched_review(
             token=token, token_state=lookup.status, message=message,
             next_steps=next_steps, detail=detail,
         )
+
+    run_directory = rvf_run.get("run_dir")
+    if isinstance(run_directory, str) and (Path(run_directory) / "summary.json").is_file():
+        try:
+            from review_run_terminal_archive import request_review_run_terminal_archive
+
+            detail["terminal_archive"] = request_review_run_terminal_archive(
+                run_dir=Path(run_directory), decision_kind="declined", reason=reason,
+                event={"cwd": repo, "session_id": session_id,
+                       "transcript_path": payload.get("origin_transcript_path")},
+            )
+        except Exception as exc:
+            detail["terminal_archive"] = {"status": "waiting_for_evidence", "error": f"{type(exc).__name__}: {exc}"}
 
     if review_not_required_declared:
         message = (

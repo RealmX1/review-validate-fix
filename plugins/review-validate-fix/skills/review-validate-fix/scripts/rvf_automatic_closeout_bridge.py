@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+from independent_backup_route import guard_normal_mutation, repository_for_normal_metadata_mutation
+
 import hashlib
 import json
 import os
@@ -213,6 +215,11 @@ def _completion_notification_identity(run_dir: Path, finalized: Mapping[str, Any
     }
 
 
+def _backup_route_completion_notification_repository(arguments):
+    return repository_for_normal_metadata_mutation(arguments["finalized"].get("repo"))
+
+
+@guard_normal_mutation(_backup_route_completion_notification_repository, "freeze_completion_notification", "run_dir")
 def freeze_completion_notification(run_dir: Path, finalized: Mapping[str, Any]) -> None:
     """仅在首次 finalize 落完成锁前冻结；通知故障后也不能重读 handoff 重新背书。"""
     run_dir = run_dir.resolve()
@@ -230,6 +237,7 @@ def freeze_completion_notification(run_dir: Path, finalized: Mapping[str, Any]) 
     })
 
 
+@guard_normal_mutation(_backup_route_completion_notification_repository, "publish_completion", "run_dir")
 def publish_completion(run_dir: Path, finalized: Mapping[str, Any]) -> None:
     run_dir = run_dir.resolve()
     identity = _completion_notification_identity(run_dir, finalized)

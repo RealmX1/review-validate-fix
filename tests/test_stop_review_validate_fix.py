@@ -264,6 +264,7 @@ def invoke(
     if state_dir is None:
         state_dir = Path(tempfile.mkdtemp(prefix="rvf-test-stop-hook-state-"))
     env["RVF_HOME"] = str(state_dir / "rvf-home")
+    env["RVF_USER_LOCAL_DATA_ROOT"] = str(state_dir / "user-local-data")
     env["CODEX_RVF_STATE_DIR"] = str(state_dir)
     env["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(state_dir / "kanban-followup-in-progress")
     if extra_env is not None:
@@ -515,6 +516,7 @@ def seed_finalize_run_dir(
     state: Path,
     repo: Path,
     run_id: str = "rvf-child",
+    session_id: str | None = None,
 ) -> tuple[Path, Path]:
     run_dir = state / "runs" / run_id
     artifacts = run_dir / "artifacts"
@@ -525,6 +527,7 @@ def seed_finalize_run_dir(
         json.dumps(
             {
                 "run_id": run_id,
+                "session_id": session_id,
                 "status": "started",
                 "reason_code": "test",
                 "repo": str(repo),
@@ -4796,7 +4799,7 @@ def test_handoff_advisory_surfaces_finalize_record_errors(tmp_path: Path) -> Non
 def test_handoff_advisory_launches_detached_analyze_thread(tmp_path: Path) -> None:
     state = tmp_path / "state"
     repo = init_repo_with_head(tmp_path / "repo")
-    run_dir, handoff = seed_finalize_run_dir(state=state, repo=repo)
+    run_dir, handoff = seed_finalize_run_dir(state=state, repo=repo, session_id="child-session")
     transcript = write_same_session_transcript_with_marker(
         tmp_path / "rollout.jsonl",
         repo,
@@ -4852,7 +4855,7 @@ def test_handoff_advisory_launches_detached_analyze_thread(tmp_path: Path) -> No
 def test_analyze_thread_env_sets_suppress_stop_hook(tmp_path: Path) -> None:
     state = tmp_path / "state"
     repo = init_repo_with_head(tmp_path / "repo")
-    run_dir, handoff = seed_finalize_run_dir(state=state, repo=repo)
+    run_dir, handoff = seed_finalize_run_dir(state=state, repo=repo, session_id="child-session")
     transcript = write_same_session_transcript_with_marker(
         tmp_path / "rollout.jsonl",
         repo,
@@ -4919,7 +4922,7 @@ def test_analyze_thread_self_stop_is_suppressed(tmp_path: Path) -> None:
 def test_analyze_thread_idempotent_when_session_exists(tmp_path: Path) -> None:
     state = tmp_path / "state"
     repo = init_repo_with_head(tmp_path / "repo")
-    run_dir, handoff = seed_finalize_run_dir(state=state, repo=repo)
+    run_dir, handoff = seed_finalize_run_dir(state=state, repo=repo, session_id="child-session")
     transcript = write_same_session_transcript_with_marker(
         tmp_path / "rollout.jsonl",
         repo,
@@ -4959,7 +4962,7 @@ def test_analyze_thread_idempotent_when_session_exists(tmp_path: Path) -> None:
 def test_analyze_thread_launch_failure_does_not_break_handoff(tmp_path: Path) -> None:
     state = tmp_path / "state"
     repo = init_repo_with_head(tmp_path / "repo")
-    run_dir, handoff = seed_finalize_run_dir(state=state, repo=repo)
+    run_dir, handoff = seed_finalize_run_dir(state=state, repo=repo, session_id="child-session")
     transcript = write_same_session_transcript_with_marker(
         tmp_path / "rollout.jsonl",
         repo,
@@ -5894,7 +5897,10 @@ def test_guardian_liveness_alarm_merges_into_stop_payload(tmp_path: Path) -> Non
         assert module._apply_guardian_liveness_alarm(None) is None
 
         # seed 历史活跃证据(analyze 完成计数;fake 派发器避免真拉 tmux)→ 三条件命中 → 告警。
+        completed_analysis_run_directory = tmp_path / "synthetic-completed-analysis-run"
+        completed_analysis_run_directory.mkdir()
         guardian.record_analyze_completion(
+            run_dir=str(completed_analysis_run_directory),
             guardian_analysis_dispatcher=lambda **_kw: {"launch_status": "faked"}
         )
         alarm = guardian.evaluate_initiation_layer_liveness()

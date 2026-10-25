@@ -258,6 +258,8 @@ def test_initialize_rvf_user_local_data_merges_into_an_existing_registry(
 
     installer.initialize_rvf_user_local_data(
         source_repository=ROOT,
+        # 夹具播种在默认 home，隔离外层显式数据根覆盖。
+        environment={},
         home_directory=home_directory,
     )
 
@@ -453,6 +455,8 @@ def test_initialize_rvf_user_local_data_backfills_fields_on_a_deployed_machine(
 
     installer.initialize_rvf_user_local_data(
         source_repository=ROOT,
+        # 夹具播种在默认 home，隔离外层显式数据根覆盖。
+        environment={},
         home_directory=home_directory,
     )
 

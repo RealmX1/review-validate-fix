@@ -12087,6 +12087,14 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
     cwd_value = event.get("cwd")
     cwd = cwd_value if isinstance(cwd_value, str) and cwd_value else None
 
+    if cwd:
+        from independent_backup_route import should_suppress_normal_stop
+        if should_suppress_normal_stop(Path(cwd)):
+            return skip_decision(
+                "存在备用路线控制记录；读取持久接续状态并保留原失败，不重入普通自动路径。",
+                ledger, "independent_backup_route_owns_or_completed_candidate", cwd=cwd,
+            )
+
     if is_truthy(os.environ.get(RVF_ANALYZE_THREAD)):
         return skip_decision(
             "检测到 RVF_ANALYZE_THREAD：当前 Stop event 来自 detached "
@@ -12209,14 +12217,6 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
     if session_control is not None:
         return session_control
 
-    manual_marker_payload = manual_rvf_session_marker_payload(event, ledger)
-    if manual_marker_payload is not None:
-        return payload_decision(
-            manual_marker_payload,
-            reason_code="manual_rvf_already_ran",
-            cwd=cwd,
-        )
-
     session_id = session_hook_id_from_event(event)
     if session_id and session_hook_disabled(session_id):
         return skip_decision(
@@ -12231,6 +12231,27 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
 
     if should_suppress(event, latest_user):
         return skip_decision("检测到 suppress 标记或环境变量。", ledger, "suppressed", cwd=cwd)
+
+    if cwd and session_id:
+        # 恢复精确仓库/会话的旧归档，不重开 review，也不产生 agent_directive。
+        try:
+            from review_run_terminal_archive import resume_pending_review_run_terminal_archives
+
+            restored_archives = resume_pending_review_run_terminal_archives(repo=Path(cwd), session_id=session_id)
+            if restored_archives:
+                ledger.event(phase="analysis", event="terminal_archive_recovery_observed", status="completed",
+                             terminal_archive_recovery_results=restored_archives)
+        except Exception as exc:
+            ledger.event(phase="analysis", event="terminal_archive_recovery_waiting", status="warning",
+                         error=f"{type(exc).__name__}: {exc}")
+
+    manual_marker_payload = manual_rvf_session_marker_payload(event, ledger)
+    if manual_marker_payload is not None:
+        return payload_decision(
+            manual_marker_payload,
+            reason_code="manual_rvf_already_ran",
+            cwd=cwd,
+        )
 
     cwd_result: GateResult | None = None
     if cwd:

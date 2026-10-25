@@ -18,9 +18,13 @@ candidate_content_manifest_sha256``）。没有补修正、且没有无关脏文
 有补修正时内容摘要变了，才按 ``artifacts/handoff-validation-commands.json`` 的 argv 重跑。
 
 base-branch-sync 不并入本脚本，仍由 agent 在之后按 skill 调用。
+历史实际提交的追加验收另由 ``supplemental-completion inspect|record|verify`` 处理，
+其独立 schema、补审及隔离验证实现位于 ``supplemental_land_completion.py``。
 """
 
 from __future__ import annotations
+
+from independent_backup_route import normal_worktree_mutation, tracked_subprocess_run
 
 import argparse
 import json
@@ -138,7 +142,7 @@ class RvfLandHardGateFailure(Exception):
 
 
 def run_git(repo_root: Path, *arguments: str, check: bool = False) -> subprocess.CompletedProcess[str]:
-    completed = subprocess.run(
+    completed = tracked_subprocess_run(
         ["git", "-C", str(repo_root), *arguments],
         capture_output=True,
         text=True,
@@ -569,6 +573,8 @@ def command_check_evidence(args: argparse.Namespace) -> int:
     handoff = run_dir / "artifacts/handoff.md"
     handoff_text = handoff.read_text(encoding="utf-8") if handoff.is_file() and not handoff.is_symlink() else ""
     intake = build_payload(handoff_text, repo, handoff)
+    if intake.get("run_identity_status") == "invalid":
+        raise ValueError("交接 run 身份不符：" + "；".join(intake.get("run_identity_errors", [])))
     stageable = set(land_stageable_path_universe(intake, contract, applied_fix_attempt_dispositions(run_dir)))
     stageable.update(repo_relative_path(repo, path) for path in args.extra_path)
     entries = repo_snapshot(repo).get("dirty_paths") or []
@@ -598,6 +604,18 @@ def build_prepare_report(args: argparse.Namespace) -> tuple[dict[str, Any], int]
     text, handoff_path = read_handoff_text(args)
     repo_argument = Path(args.repo).expanduser().resolve()
     intake = build_payload(text, repo_argument, handoff_path)
+    if intake.get("run_identity_status") == "invalid":
+        raise ValueError("交接 run 身份不符：" + "；".join(intake.get("run_identity_errors", [])))
+    if args.run_dir:
+        selected_run_directory = Path(args.run_dir).expanduser().resolve()
+        handoff_run_directory = intake.get("run_dir")
+        if handoff_run_directory and Path(handoff_run_directory).resolve() != selected_run_directory:
+            raise ValueError("显式 run 目录与交接绑定的 run 目录不符")
+        if (selected_run_directory / "artifacts").is_dir():
+            # 粘贴摘要可由显式目录补证，但其声明仍必须与该目录的正式身份一致。
+            intake = build_payload(text, repo_argument, selected_run_directory / "artifacts/handoff.md")
+            if intake.get("run_identity_status") == "invalid":
+                raise ValueError("交接 run 身份不符：" + "；".join(intake.get("run_identity_errors", [])))
     current_snapshot = intake["current_repo_snapshot"]
     if not current_snapshot.get("is_git_repo"):
         raise ValueError(f"--repo 不是 git worktree：{repo_argument}")
@@ -658,10 +676,16 @@ def build_prepare_report(args: argparse.Namespace) -> tuple[dict[str, Any], int]
         unrelated,
         leave_unrelated_dirty_paths_uncommitted=args.commit_staged_scope_only_and_leave_unrelated_dirty_paths,
     )
+    if run_dir is not None and (run_dir / "artifacts").is_dir() and intake.get("run_identity_status") != "verified":
+        gate_failures.append(RvfLandHardGateFailure(
+            RVF_LAND_EXIT_REVIEWED_SCOPE_CONTRADICTS_DIRTY_PATHS,
+            "run_identity_unavailable",
+            "精确 run 的 summary 或 scope contract 身份恢复可核验后重验；当前不生成正式计划。",
+        ))
 
     validation = (
         validation_reuse_assessment(repo_root, run_dir)
-        if run_dir is not None and (run_dir / "artifacts").is_dir()
+        if run_dir is not None and (run_dir / "artifacts").is_dir() and intake.get("run_identity_status") == "verified"
         else None
     )
     sections = parse_sections(text)
@@ -711,7 +735,8 @@ def build_prepare_report(args: argparse.Namespace) -> tuple[dict[str, Any], int]
         failure.reason_code in {"handoff_target_repository_unknown", "handoff_targets_another_repository"}
         for failure in gate_failures
     )
-    if run_dir is not None and (run_dir / "artifacts").is_dir() and not cross_repository:
+    if (run_dir is not None and (run_dir / "artifacts").is_dir() and not cross_repository
+            and intake.get("run_identity_status") == "verified"):
         # 11/12 在 commit 时按当时的工作树重新判定（补修正可能改变它们），所以只要仓库身份与
         # run 目录成立就落 plan；10 与 13 不会因补修正而改变，commit 直接信 plan。
         plan = {
@@ -894,7 +919,7 @@ def replay_structured_validation_commands(repo_root: Path, run_dir: Path) -> lis
             invocation += ["--environment-key", key]
         if entry["requires_base_worktree_context"]:
             invocation.append("--requires-base-worktree-context")
-        completed = subprocess.run(
+        completed = tracked_subprocess_run(
             [*invocation, "--", *entry["argv"]],
             capture_output=True,
             text=True,
@@ -990,9 +1015,42 @@ def command_commit(args: argparse.Namespace) -> int:
     # 只认显式 --run-dir：reviewer 子进程与 Codex task shell 都带着 RVF_RUN_DIR（指向活 run），
     # 环境变量回退会把别处 shell 的 land 引到那个 run 上。
     run_dir = Path(args.run_dir).expanduser().resolve()
+    repo_root = Path(repository_identity(Path(args.repo).expanduser().resolve())[0]).resolve()
+    result: dict[str, Any] | None = None
+    failure_output = None
+    result_persistence_started = False
+    result_persistence_completed = False
+    try:
+        with normal_worktree_mutation(repo_root, "rvf-land-commit", run_dir):
+            try:
+                result = land_commit_result_from_prepare_plan(args, run_dir, repo_root)
+            except RvfLandHardGateFailure as failure:
+                result = {"status": "refused", **failure.as_payload()}
+                failure_output = failure.details.get("failure_output")
+            plan = read_json_object_or_none(prepare_plan_artifact_path(run_dir)) or {}
+            if result["status"] != "refused" or plan.get("repo_root") == str(repo_root):
+                result_persistence_started = True
+                persist_land_commit_result(run_dir, repo_root, result)
+                result_persistence_completed = True
+    except (OSError, RuntimeError, ValueError) as exc:
+        if result is None or not result_persistence_started or result_persistence_completed:
+            raise
+        # 异常先退出保护区间以保留 unknown reservation，再回显已发生的提交或拒绝。
+        result["land_commit_result_persistence_error"] = str(exc)
+        if result["status"] != "refused":
+            result.update({"exit_code": RVF_LAND_EXIT_USAGE_ERROR,
+                           "reason_code": "land_commit_result_persistence_failed"})
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if failure_output:
+        print(failure_output, file=sys.stderr)
+    return result["exit_code"]
+
+
+def land_commit_result_from_prepare_plan(
+    args: argparse.Namespace, run_dir: Path, repo_root: Path,
+) -> dict[str, Any]:
     message = read_commit_message(args.message_file)
     plan = load_prepare_plan(run_dir)
-    repo_root = Path(repository_identity(Path(args.repo).expanduser().resolve())[0]).resolve()
     if plan.get("cross_worktree_gate_failed"):
         raise RvfLandHardGateFailure(
             RVF_LAND_EXIT_CROSS_WORKTREE_HANDOFF,
@@ -1017,13 +1075,7 @@ def command_commit(args: argparse.Namespace) -> int:
         failure.details.setdefault("dirty_paths_changed_since_prepare", dirty_paths_changed_since_prepare)
         raise
     result["dirty_paths_changed_since_prepare"] = dirty_paths_changed_since_prepare
-    try:
-        persist_land_commit_result(run_dir, repo_root, result)
-    except (OSError, RuntimeError, ValueError) as exc:
-        result.update({"exit_code": RVF_LAND_EXIT_USAGE_ERROR, "reason_code": "land_commit_result_persistence_failed",
-                       "land_commit_result_persistence_error": str(exc)})
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-    return result["exit_code"]
+    return result
 
 
 def land_commit_after_prepare_plan_checks(
@@ -1262,7 +1314,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     source.add_argument("--handoff-text-file", help="包含粘贴 handoff 正文的临时文件。")
     source.add_argument("--stdin", action="store_true", help="从 stdin 读 handoff 正文（用单引号 heredoc）。")
     prepare.add_argument("--repo", default=".")
-    prepare.add_argument("--run-dir", help="覆盖从 handoff 推断的 run 目录。")
+    prepare.add_argument("--run-dir", help="显式指定本轮 run 目录，须与 handoff 身份一致。")
     prepare.add_argument("--extra-path", action="append", default=[], help="reviewed scope 之外、确属本次工作的路径。")
     prepare.add_argument(
         "--cross-worktree",
@@ -1293,11 +1345,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
     qualification.add_argument("--run-dir", required=True)
     qualification.add_argument("--extra-path", action="append", default=[])
     qualification.add_argument(LEAVE_UNRELATED_DIRTY_PATHS_FLAG, action="store_true")
+    from supplemental_land_completion import add_argument_parser
+    add_argument_parser(subparsers)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_argument_parser().parse_args(argv)
+    if args.subcommand == "supplemental-completion":
+        from supplemental_land_completion import command
+        return command(args)
     try:
         if args.subcommand == "prepare":
             return command_prepare(args)
@@ -1306,15 +1363,6 @@ def main(argv: list[str] | None = None) -> int:
         return command_commit(args)
     except RvfLandHardGateFailure as failure:
         result = {"status": "refused", **failure.as_payload()}
-        if args.subcommand == "commit":
-            run_dir = Path(args.run_dir).expanduser().resolve()
-            plan = read_json_object_or_none(prepare_plan_artifact_path(run_dir)) or {}
-            try:
-                repo = Path(repository_identity(Path(args.repo).expanduser().resolve())[0]).resolve()
-                if plan.get("repo_root") == str(repo):
-                    persist_land_commit_result(run_dir, repo, result)
-            except (OSError, RuntimeError, ValueError) as exc:
-                result["land_commit_result_persistence_error"] = str(exc)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         failure_output = failure.details.get("failure_output")
         if failure_output:

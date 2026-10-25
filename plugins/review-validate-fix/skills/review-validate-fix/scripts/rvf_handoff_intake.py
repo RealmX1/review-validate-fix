@@ -19,7 +19,7 @@ from write_reviewed_task_candidate_evidence import (
 )
 
 
-RVF_RUN_RE = re.compile(r"\b(rvf-\d{8}T\d{6}Z-[A-Za-z0-9_.:-]+)")
+RVF_RUN_RE = re.compile(r"\b(rvf-(?:review-start-[a-f0-9]{16}|\d{8}T\d{6}Z-[A-Za-z0-9_.:-]+))\b")
 PATH_VALUE_RE = re.compile(r"^\s*-\s*([^:\n]+):\s*`?([^`\n]+?)`?\s*$")
 HEADING_RE = re.compile(r"^##+\s+(.+?)\s*$")
 VALIDATION_SECTION_HEADINGS = {
@@ -213,6 +213,8 @@ def parse_key_values(text: str) -> dict[str, str]:
         "rvf worktree / target repo": "target_repo",
         "rvf task worktree": "target_repo",
         "run dir": "run_dir",
+        "run id": "run_id",
+        "run_id": "run_id",
         "transcript path": "transcript_path",
         "transcript": "transcript_path",
         "original transcript": "transcript_path",
@@ -330,11 +332,15 @@ def load_candidate_evidence(
         return "invalid", evidence_path, None, []
     review = payload.get("review")
     scope = payload.get("scope")
+    # 当前候选证据只能证明它自己的归属，不能替缺少身份的交接自行选择一轮。
+    if not expected_run_id:
+        return "unbound_run", evidence_path, digest, []
     if (
-        expected_run_id is not None
-        and (not isinstance(review, dict) or review.get("run_id") != expected_run_id)
+        not isinstance(review, dict) or review.get("run_id") != expected_run_id
     ):
         return "foreign_run", evidence_path, digest, []
+    if expected_scope_contract_path is None:
+        return "unbound_scope", evidence_path, digest, []
     if expected_scope_contract_path is not None:
         evidence_scope_path = scope.get("contract_path") if isinstance(scope, dict) else None
         if (
@@ -436,15 +442,39 @@ def build_payload(text: str, repo: Path, handoff_path: Path | None) -> dict[str,
     values = parse_key_values(text)
     sections = parse_sections(text)
     run_id_match = RVF_RUN_RE.search(text)
-    run_id = run_id_match.group(1) if run_id_match else None
+    run_id = values.get("run_id") or (run_id_match.group(1) if run_id_match else None)
     intake_hints = parse_intake_hints(sections)
     run_dir = infer_run_dir(values, run_id)
-    if run_dir is None and handoff_path is not None and handoff_path.parent.name == "artifacts":
-        run_dir = handoff_path.parent.parent
+    formal_handoff_run_dir = handoff_path.parent.parent if handoff_path is not None and handoff_path.parent.name == "artifacts" else None
+    if formal_handoff_run_dir is not None:
+        # 正式文件的目录绑定优先于正文中最先出现的历史 run；显式矛盾另行拒绝。
+        inferred_run_dir = run_dir
+        run_dir = formal_handoff_run_dir
     artifacts = artifact_paths(run_dir, values)
     summary = read_json(run_dir / "summary.json") if run_dir is not None else None
     if not isinstance(summary, dict):
         summary = None
+    run_identity_errors: list[str] = []
+    if formal_handoff_run_dir is not None:
+        if value_is_available(values.get("run_dir")) and inferred_run_dir is not None and run_dir.resolve() != inferred_run_dir.resolve():
+            run_identity_errors.append("交接声明的 run 目录与正式交接路径不符")
+    identity_sources = {}
+    if value_is_available(values.get("run_id")):
+        identity_sources["declared_run_id"] = values["run_id"]
+    if isinstance(summary, dict) and value_is_available(summary.get("run_id")):
+        identity_sources["summary_run_id"] = summary["run_id"]
+    scope_path = artifacts.get("scope_contract")
+    scope_contract = read_json(Path(scope_path)) if scope_path else None
+    if isinstance(scope_contract, dict) and value_is_available(scope_contract.get("run_id")):
+        identity_sources["scope_contract_run_id"] = scope_contract["run_id"]
+    if len(set(identity_sources.values())) > 1:
+        run_identity_errors.append("交接、summary 与 scope contract 的 run 身份不一致")
+    run_id = identity_sources.get("summary_run_id") or identity_sources.get("scope_contract_run_id") or run_id
+    run_identity_status = (
+        "invalid" if run_identity_errors else "verified"
+        if identity_sources.get("summary_run_id") or identity_sources.get("scope_contract_run_id")
+        else "unavailable"
+    )
     manifest = load_manifest(artifacts.get("session_manifest") or values.get("session_manifest"))
     scoped_paths = parse_scoped_paths(text, sections)
     if not scoped_paths and intake_hints["reviewed_scope_paths"]:
@@ -500,10 +530,12 @@ def build_payload(text: str, repo: Path, handoff_path: Path | None) -> dict[str,
         expected_run_id=run_id,
         expected_scope_contract_path=expected_scope_contract_path,
     )
+    if run_identity_errors:
+        evidence_status, validation_records = "foreign_run", []
     if evidence_status == "valid":
         validation_evidence_source = "candidate_evidence"
         validation_commands: list[str] = []
-    elif evidence_status in {"invalid", "stale", "foreign_run", "foreign_scope"}:
+    elif evidence_status in {"invalid", "stale", "foreign_run", "foreign_scope", "unbound_run", "unbound_scope"}:
         validation_evidence_source = f"{evidence_status}_candidate_evidence"
         validation_commands = parse_validation_commands(sections)
     else:
@@ -512,6 +544,9 @@ def build_payload(text: str, repo: Path, handoff_path: Path | None) -> dict[str,
     return {
         "handoff_path": str(handoff_path.expanduser()) if handoff_path else None,
         "run_id": run_id,
+        "run_identity_status": run_identity_status,
+        "run_identity_errors": run_identity_errors,
+        "run_identity_sources": identity_sources,
         "run_dir": str(run_dir) if run_dir is not None else None,
         "origin": {
             "codex_url": values.get("codex_url"),
@@ -534,6 +569,10 @@ def build_payload(text: str, repo: Path, handoff_path: Path | None) -> dict[str,
         "candidate_evidence_path": str(evidence_path) if evidence_path is not None else None,
         "candidate_evidence_digest": evidence_digest,
         "candidate_evidence_status": evidence_status,
+        "candidate_evidence_identity_recovery_condition": (
+            "本次交接的精确 run 身份和 scope contract 恢复可核验后自动重验；不借用其他轮次的记录"
+            if evidence_status in {"unbound_run", "unbound_scope"} else None
+        ),
         "validation_evidence_source": validation_evidence_source,
         "validation_records": validation_records,
         "validation_commands": validation_commands,
@@ -607,7 +646,7 @@ def main() -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         print(render_text(payload))
-    return 0
+    return 12 if payload["run_identity_status"] == "invalid" else 0
 
 
 if __name__ == "__main__":

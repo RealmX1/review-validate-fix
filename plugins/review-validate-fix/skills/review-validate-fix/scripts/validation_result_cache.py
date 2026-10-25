@@ -596,6 +596,16 @@ def run_validation(args: argparse.Namespace) -> int:
         )
 
     rvf_run_dir = Path(args.rvf_run_dir).expanduser() if args.rvf_run_dir else None
+    if rvf_run_dir is not None:
+        from core.run_ledger.review_run_lifecycle import observe_bound_review_run_component_phase, read_json_object
+
+        try:
+            bound_repo = read_json_object(rvf_run_dir / "summary.json").get("repo")
+        except (OSError, ValueError):
+            bound_repo = None
+        # 子代理在独立 attempt 中做验证，不提前结束主会话仍在进行的修复阶段。
+        if isinstance(bound_repo, str) and Path(bound_repo).resolve() == repo_root.resolve():
+            observe_bound_review_run_component_phase(rvf_run_dir, phase="verify")
 
     content_digest = candidate_content_manifest_sha256(repo_root)
     environment_digest, public_environment = environment_fingerprint(command, args.environment_key)

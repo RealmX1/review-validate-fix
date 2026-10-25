@@ -10,6 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from core.rvf_user_local_data_paths import resolved_rvf_runtime_log_root
+from core.run_ledger.review_run_lifecycle import (
+    is_review_run_prepare_started_event,
+    merge_review_run_summary,
+    record_review_run_phase,
+)
 
 
 INSTALLED_PLUGIN_SKILL_REL = Path("plugins") / "review-validate-fix" / "skills" / "review-validate-fix"
@@ -49,6 +54,8 @@ COMPONENTS = {
 }
 PRESERVED_SUMMARY_KEYS = {
     "log_prefix",
+    "session_id",
+    "origin_transcript_path",
     "mode",
     "issue_title",
     "parent_thread_id",
@@ -133,6 +140,7 @@ RVF_STATE_BACKEND_ALIASES = {
     "kanban-task": "kanban-task",
 }
 PHASES = {
+    "analysis",
     "dev-sync",
     "gate",
     "fork",
@@ -467,7 +475,12 @@ class RunLedger:
             }
         try:
             _append_jsonl(self.events_path, record)
-        except OSError as exc:
+            record_review_run_phase(
+                self.run_dir, run_id=self.run_id, phase=phase,
+                observed_at=record["timestamp"],
+                starts_review_run=is_review_run_prepare_started_event(record),
+            )
+        except (OSError, ValueError) as exc:
             self._diagnose(f"event:{event}", exc)
         return record
 
@@ -507,14 +520,13 @@ class RunLedger:
         if self.diagnostics:
             payload["diagnostics"] = self.diagnostics
             payload["log_unavailable"] = True
-        self.last_summary = payload
         try:
-            _atomic_write_text(
-                self.summary_path,
-                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            payload = merge_review_run_summary(
+                self.run_dir, payload, preserved_keys=PRESERVED_SUMMARY_KEYS,
             )
+            self.last_summary = payload
             self.latest_pointer(status=status, reason_code=reason_code)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             self._diagnose("summary", exc)
             payload["diagnostics"] = self.diagnostics
             payload["log_unavailable"] = True

@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from independent_backup_route import guard_normal_mutation, tracked_subprocess_run
+
 import argparse
 import hashlib
 import json
@@ -71,7 +73,7 @@ def candidate_dirty_paths(repo: Path) -> set[str]:
 
 
 def git(repo: Path, *arguments: str) -> str:
-    completed = subprocess.run(
+    completed = tracked_subprocess_run(
         ["git", *arguments],
         cwd=repo,
         env=clean_git_environment(),
@@ -90,7 +92,7 @@ def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
     **不能用上面的 ``git()``**：``--is-ancestor`` 正是靠**非零退出码**表达「不是祖先」这个合法
     答案，而 ``git()`` 见非零就 raise，会把「不是祖先」变成异常、拿不到布尔值。
     """
-    completed = subprocess.run(
+    completed = tracked_subprocess_run(
         ["git", "merge-base", "--is-ancestor", ancestor, descendant],
         cwd=repo,
         env=clean_git_environment(),
@@ -302,7 +304,7 @@ def landed_delta_paths(repo: Path, reviewed_tip: str, landed_tip: str) -> list[s
     本仓已有同向先例：``tests/test_rvf_handoff_intake.py`` 的
     ``test_handoff_intake_treats_rename_old_and_new_paths_as_scoped``。
     """
-    completed = subprocess.run(
+    completed = tracked_subprocess_run(
         ["git", "diff", "--name-only", "--no-renames", "-z", reviewed_tip, landed_tip, "--"],
         cwd=repo,
         env=clean_git_environment(),
@@ -914,6 +916,7 @@ def candidate_evidence_qualification(repo: Path, run_dir: Path, *, pending_stage
         return {"status": "refused_fail_closed", "reason_code": exc.reason_code, "reason": str(exc)}
 
 
+@guard_normal_mutation("repo_argument", "write-candidate-evidence", "run_dir")
 def write_evidence(repo_argument: Path, run_dir: Path) -> dict[str, Any]:
     prepared = prepare_candidate_evidence(repo_argument, run_dir)
     repo, payload = prepared["repo"], prepared["payload"]

@@ -66,10 +66,10 @@ def prep_root(root: str | Path | None = None) -> Path:
     configured = os.environ.get(ENV_PREP_ROOT)
     if configured:
         return Path(configured).expanduser()
-    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
-    if runtime_dir:
-        return Path(runtime_dir).expanduser() / "rvf-prep"
-    return Path("/tmp") / "rvf-prep"
+    import _rvf_pyroot  # noqa: F401,PLC0415
+    from core.rvf_user_local_data_paths import resolved_rvf_user_local_data_paths
+
+    return resolved_rvf_user_local_data_paths().runtime_state_root / "prepared-review-run-inputs"
 
 
 def generate_token() -> str:
@@ -316,12 +316,34 @@ def sweep_stale(
         lookup = read_prep_file(token, root=base, now=now)
         if lookup.status == "valid":
             continue
+        if lookup.status == "expired" and _prepared_run_still_needs_cleanup_inputs(lookup.payload):
+            # 保留审计/清理输入不延长 token 的执行资格；read 仍如实返回 expired。
+            continue
         try:
             path.unlink()
         except OSError:
             continue
         removed.append(path)
     return removed
+
+
+def _prepared_run_still_needs_cleanup_inputs(payload: dict[str, Any] | None) -> bool:
+    if not isinstance(payload, dict) or not isinstance(payload.get("rvf_run"), dict):
+        return False
+    run = payload["rvf_run"]
+    if not isinstance(run.get("run_dir"), str) or not isinstance(run.get("run_id"), str):
+        return False
+    directory = Path(run["run_dir"]).expanduser()
+    if not directory.is_dir():
+        return False
+    try:
+        summary = json.loads((directory / "summary.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True
+    if not isinstance(summary, dict) or summary.get("run_id") != run["run_id"]:
+        return True
+    finalization = summary.get("finalize")
+    return not (isinstance(finalization, dict) and finalization.get("completed_at") and not finalization.get("errors"))
 
 
 def append_diagnostic(

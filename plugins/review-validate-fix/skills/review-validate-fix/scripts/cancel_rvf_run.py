@@ -284,12 +284,13 @@ def cancel_run(args: argparse.Namespace) -> dict[str, Any]:
             still_running_pids=still_running,
         )
         try:
-            from rvf_run_finalize import finalize_run
+            from review_run_terminal_archive import request_review_run_terminal_archive
 
-            finalize_run(
+            request_review_run_terminal_archive(
                 run_dir=run_dir,
                 event=None,
                 decision_kind="cancelled",
+                reason="用户取消本轮 RVF，保留真实终态和未审范围",
             )
         except Exception as exc:
             ledger.event(

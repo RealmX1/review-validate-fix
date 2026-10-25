@@ -540,6 +540,7 @@ required_files=(
   "scripts/rvf_user_prompt_submit.py"
   "scripts/rvf_handoff_intake.py"
   "scripts/rvf_land.py"
+  "scripts/supplemental_land_completion.py"
   "scripts/validation_result_cache.py"
   "scripts/write_reviewed_task_candidate_evidence.py"
   "scripts/reviewed_candidate_completion_facts.py"
@@ -635,6 +636,7 @@ repo_required_files=(
   "tests/test_review_reopen_marker.py"
   "tests/test_rvf_handoff_intake.py"
   "tests/test_rvf_land_single_step_prepare_and_commit.py"
+  "tests/test_supplemental_land_completion.py"
   "tests/test_validation_result_cache_v2.py"
   "tests/test_reviewed_task_candidate_evidence.py"
   "tests/test_reviewed_candidate_completion_qualification.py"
@@ -748,6 +750,7 @@ run_step "python compile" "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m py_compile \
   "$skill_dir/scripts/rvf_withdrawn_dispatch_tombstone.py" \
   "$skill_dir/scripts/rvf_handoff_intake.py" \
   "$skill_dir/scripts/rvf_land.py" \
+  "$skill_dir/scripts/supplemental_land_completion.py" \
   "$skill_dir/scripts/validation_result_cache.py" \
   "$skill_dir/scripts/write_reviewed_task_candidate_evidence.py" \
   "$skill_dir/scripts/reviewed_candidate_completion_facts.py" \
@@ -796,6 +799,7 @@ run_step "python compile" "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m py_compile \
   "$tests_dir/test_review_reopen_marker.py" \
   "$tests_dir/test_rvf_handoff_intake.py" \
   "$tests_dir/test_rvf_land_single_step_prepare_and_commit.py" \
+  "$tests_dir/test_supplemental_land_completion.py" \
   "$tests_dir/test_review_initiation_decision_point_is_sole_self_injection.py" \
   "$tests_dir/test_reviewer_prompt_delivery_contract.py" \
   "$tests_dir/test_reviewer_structured_output_extraction.py" \
@@ -807,6 +811,18 @@ run_step "python compile" "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m py_compile \
 run_parallel_test_steps
 run_step "tests: rvf_analyze_formal_archive_completion" \
   "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
+    "$tests_dir/test_review_run_lifecycle_analysis_recovery.py" \
+    "$tests_dir/test_review_run_timestamp_resource_boundaries.py" \
+    "$tests_dir/test_finalization_progress_and_subagent_capture_coverage.py" \
+    "$tests_dir/test_prepared_review_run_terminal_archive.py" \
+    "$tests_dir/test_terminal_archive_recovery_control_plane.py" \
+    "$tests_dir/test_dispatcher_writer_execution_evidence.py" \
+    "$tests_dir/test_dispatcher_prelaunch_failure_recovery.py" \
+    "$tests_dir/test_dispatcher_terminal_archive_launch_serialization.py" \
+    "$tests_dir/test_terminal_archive_intent_index_recovery.py" \
+    "$tests_dir/test_analysis_automatic_attempt_recovery.py" \
+    "$tests_dir/test_analysis_input_recovery_and_completion_accounting.py" \
+    "$tests_dir/test_codex_native_edit_completion_deduplication.py" \
     "$tests_dir/test_rvf_analyze_formal_archive_completion.py" \
     "$tests_dir/test_invoke_subagent.py" \
     "$tests_dir/test_rvf_analyze.py" \
@@ -868,6 +884,7 @@ run_step "tests: rvf_land_validation_cache_and_candidate_evidence" \
     "$tests_dir/test_reviewed_task_candidate_evidence.py" \
     "$tests_dir/test_reviewed_candidate_completion_qualification.py" \
     "$tests_dir/test_canonical_issue_path_scope_expansion_recovery.py" \
+    "$tests_dir/test_supplemental_land_completion.py" \
     "$tests_dir/test_rvf_land_single_step_prepare_and_commit.py" \
     "$tests_dir/test_rvf_merge_dispositions_structured_merge_phase.py"
 # reviewer 结果工件生命周期：三态互转对称且换 kind 必归档（旧规则 request→issues 是死结、

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+from independent_backup_route import guard_normal_mutation, tracked_subprocess_run
+
 import argparse
 import hashlib
 import json
@@ -61,7 +63,7 @@ def _run(
     check: bool = True,
     text: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    completed = subprocess.run(
+    completed = tracked_subprocess_run(
         ["git", *args],
         cwd=str(repo),
         capture_output=True,
@@ -371,6 +373,9 @@ def prepare_fix_attempt(
     if worktree.exists():
         raise ValueError(f"attempt worktree already exists: {worktree}")
     attempt_dir.mkdir(parents=True, exist_ok=True)
+    from core.run_ledger.review_run_lifecycle import observe_bound_review_run_component_phase
+
+    observe_bound_review_run_component_phase(run_dir, phase="validate_fix")
     _run(repo, ["worktree", "add", "--detach", str(worktree), base_head])
     # 观察面 = 真实工作区：全部 dirty / untracked 都物化进 attempt（不再只叠 boundary 内的），
     # 修改权仍由 stop 时的 boundary / 声明 / 确认三档控制。baseline 提交含全部 WIP，
@@ -985,6 +990,13 @@ def _ownership_classification_for_acknowledged_path(path: str, scope_contract: d
         return "用户声明的排除区（excluded_path_prefixes）"
     return "合同未登记"
 
+
+def _backup_route_fix_attempt_target(arguments):
+    attempt = _load_attempt(arguments["run_dir"], arguments["attempt_id"])
+    return _optional_repo(arguments.get("target_repo_override"), attempt)
+
+
+@guard_normal_mutation(_backup_route_fix_attempt_target, "apply-fix-attempt", "run_dir")
 
 def apply_fix_attempt(
     *,

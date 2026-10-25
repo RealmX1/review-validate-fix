@@ -70,10 +70,14 @@ def run_request_review_start_boundary(
     roots = roots or cli.AgentDecisionRoots()
     now = now or datetime.now(timezone.utc)
     source = deferred_decision_token or decision_token
+    superseded_archive_result = None
     def result(status, message, token=source, detail=None):
         return cli.CommandResult(command="request-review-start-boundary", status=status,
                                  exit_code=cli.EXIT_REVIEW_START_BOUNDARY_NOT_VERIFIED,
-                                 token=token, message=message, detail=detail or {})
+                                 token=token, message=message, detail={
+                                     **({"source_run_terminal_archive": superseded_archive_result} if superseded_archive_result else {}),
+                                     **(detail or {}),
+                                 })
     if not source or bool(decision_token) == bool(deferred_decision_token) or not reason.strip():
         return result("error", "须提供唯一来源 token 与自主判断理由")
     lookup = tokens.read_decision_token(source, root=roots.token_root, now=now)
@@ -119,8 +123,22 @@ def run_request_review_start_boundary(
     changed = summary.get("candidate_fingerprint") != payload.get("candidate_fingerprint")
     if ordinary_source_was_superseded_by_boundary_request and changed:
         return result("review_start_boundary_invalidated", "候选已变化，不能用已撤回来源恢复旧请求")
-    if payload.get("state") == "acknowledged" and payload.get("run_anchor_dir") and not payload.get("last_start_failure"):
-        return result("review_start_boundary_invalidated", "此 token 已有准备中的 run；须先结束该准备尝试并释放范围，不能把旧准备转给新候选")
+    if not reusing_requested_boundary and payload.get("state") == "acknowledged" and payload.get("run_anchor_dir"):
+        from core.run_ledger.review_run_lifecycle import read_review_run_lifecycle
+        from review_run_terminal_archive import request_review_run_terminal_archive, UNSUCCESSFUL_TERMINAL_KINDS
+
+        previous_run = Path(payload["run_anchor_dir"])
+        try:
+            terminal = read_review_run_lifecycle(previous_run).get("review_run_terminal_status")
+            if not payload.get("last_start_failure") and terminal not in UNSUCCESSFUL_TERMINAL_KINDS:
+                return result("review_start_boundary_invalidated", "此 token 已有准备中的 run；须先结束该准备尝试并释放范围，不能把旧准备转给新候选")
+            superseded_archive_result = request_review_run_terminal_archive(
+                run_dir=previous_run, decision_kind="superseded", reason=f"自主请求新独立分界替代失败准备：{reason}", event=event,
+            )
+        except Exception as exc:
+            return result("review_start_boundary_pending", f"旧准备仍待终态补证：{type(exc).__name__}: {exc}")
+        if superseded_archive_result.get("status") != "archived":
+            return result("review_start_boundary_pending", "旧准备的依赖证据仍待恢复；归档请求已保留，未审范围不豁免")
     if not reusing_requested_boundary or changed:
         if payload.get("state") in ("minted", "injected", "acknowledged"):
             tokens.mark_withdrawn(payload["token"], root=roots.token_root, now=now,

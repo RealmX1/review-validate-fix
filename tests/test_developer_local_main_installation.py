@@ -677,12 +677,15 @@ def _seed_local_main_with_deploy_entrypoints(tmp_path: Path) -> tuple[Path, Path
 
 def test_dirty_local_main_deploys_from_head_without_touching_worktree(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """带 WIP 的 local main 能部署，且它的工作树一个字节都没被动过。
 
     这是本方案取代自动 stash 的核心断言：stash 方案在部署窗口内会把开发者/其它 agent 的
     未提交文件从磁盘上抽走；这里则是 local main 全程只读 ref。
     """
+    # 本例验证显式 home 的默认数据根，不能继承外层完整契约的路径覆盖。
+    monkeypatch.delenv("RVF_USER_LOCAL_DATA_ROOT", raising=False)
     runner = _load_runner()
     local_main_worktree, local_main_runner = _seed_local_main_with_deploy_entrypoints(
         tmp_path
