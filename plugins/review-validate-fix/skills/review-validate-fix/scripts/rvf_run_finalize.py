@@ -13,7 +13,6 @@ stop hook 检测到 RVF run 终结（典型路径：handoff_completion_payload �
 from __future__ import annotations
 
 from independent_backup_route import guard_normal_mutation, repository_for_normal_metadata_mutation, tracked_subprocess_run
-from core.review_run_qualification_mutation_lock import guard_review_run_qualification_mutation, run_directory_for_qualification_artifact
 
 import argparse
 import json
@@ -25,6 +24,8 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _rvf_pyroot  # noqa: E402,F401
+from core.review_run_qualification_mutation_lock import guard_review_run_qualification_mutation, run_directory_for_qualification_artifact
 
 from rvf_automatic_closeout_bridge import freeze_completion_notification, publish_completion  # noqa: E402
 from trajectory_capture import capture_run  # noqa: E402
