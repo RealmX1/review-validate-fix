@@ -6,6 +6,7 @@ import os
 import re
 import shlex  # 决策点横幅里渲染 --transcript-path 命令样例（路径可能含空格）
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -4278,6 +4279,22 @@ def git_toplevel_or_none(path: Path) -> Path | None:
     return Path(value).expanduser().resolve() if value else None
 
 
+def git_worktree_root_and_common_directory_or_none(path: Path) -> tuple[Path, Path] | None:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        values = completed.stdout.strip().splitlines()
+        if completed.returncode != 0 or len(values) != 2 or not all(values):
+            return None
+        return Path(values[0]).resolve(strict=True), Path(values[1]).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
 def _task_workspace_from_mapping(value: dict[str, Any]) -> str | None:
     for key in ("workspace_path", "workspacePath"):
         candidate = value.get(key)
@@ -4309,21 +4326,63 @@ def lookup_kanban_task_workspace_from_state(
     task_id: str,
     project_path: str | None,
 ) -> dict[str, Any]:
+    scan_started = time.monotonic()
     workspaces_dir = cline_kanban_state_dir() / "workspaces"
     checked: list[str] = []
     matches: list[dict[str, str]] = []
     errors: list[str] = []
-    if not workspaces_dir.is_dir():
-        return {"workspace_path": None, "source": "kanban_state_missing", "checked": checked}
-    for sessions_path in sorted(workspaces_dir.glob("*/sessions.json")):
-        checked.append(str(sessions_path))
+    state_scan_metrics = {"files_read": 0, "bytes_read": 0, "duration_ms": 0.0}
+    result: dict[str, Any] = {
+        "workspace_path": None,
+        "source": "kanban_state_missing_task_workspace",
+        "checked": checked,
+        "matches": matches,
+        "errors": errors,
+        "project_path": project_path,
+        "state_scan_metrics": state_scan_metrics,
+    }
+    try:
+        workspace_directories = sorted(workspaces_dir.iterdir())
+    except FileNotFoundError:
+        result["source"] = "kanban_state_missing"
+        workspace_directories = []
+    except OSError as exc:
+        errors.append(f"{workspaces_dir}: {type(exc).__name__}: {exc}")
+        workspace_directories = []
+    for workspace_directory in workspace_directories:
+        sessions_path = workspace_directory / "sessions.json"
         try:
-            payload = json.loads(sessions_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+            if not stat.S_ISDIR(workspace_directory.stat().st_mode):
+                continue
+        except OSError as exc:
+            checked.append(str(sessions_path))
+            errors.append(f"{workspace_directory}: {type(exc).__name__}: {exc}")
+            continue
+        try:
+            sessions_path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            checked.append(str(sessions_path))
             errors.append(f"{sessions_path}: {type(exc).__name__}: {exc}")
             continue
-        sessions = payload.values() if isinstance(payload, dict) else []
-        for session in sessions:
+        checked.append(str(sessions_path))
+        try:
+            contents = sessions_path.read_bytes()
+        except OSError as exc:
+            errors.append(f"{sessions_path}: {type(exc).__name__}: {exc}")
+            continue
+        state_scan_metrics["files_read"] += 1
+        state_scan_metrics["bytes_read"] += len(contents)
+        try:
+            payload = json.loads(contents.decode("utf-8"))
+        except (ValueError, RecursionError) as exc:
+            errors.append(f"{sessions_path}: {type(exc).__name__}: {exc}")
+            continue
+        if not isinstance(payload, dict):
+            errors.append(f"{sessions_path}: sessions JSON 必须是对象")
+            continue
+        for session in payload.values():
             if not isinstance(session, dict):
                 continue
             session_task_id = session.get("taskId") or session.get("task_id") or session.get("id")
@@ -4336,27 +4395,22 @@ def lookup_kanban_task_workspace_from_state(
     unique = []
     seen: set[str] = set()
     for match in matches:
-        resolved = str(Path(match["workspace_path"]).expanduser().resolve())
+        try:
+            resolved = str(Path(match["workspace_path"]).expanduser().resolve())
+        except (OSError, RuntimeError, ValueError) as exc:
+            errors.append(f"{match['sessions_path']}: {type(exc).__name__}: {exc}")
+            continue
         if resolved in seen:
             continue
         seen.add(resolved)
         unique.append({**match, "workspace_path": resolved})
+    result["matches"] = unique
     if len(unique) == 1:
-        return {
-            "workspace_path": unique[0]["workspace_path"],
-            "source": "kanban_state_session_workspace",
-            "checked": checked,
-            "matches": unique,
-            "errors": errors,
-        }
-    return {
-        "workspace_path": None,
-        "source": "kanban_state_ambiguous" if unique else "kanban_state_missing_task_workspace",
-        "checked": checked,
-        "matches": unique,
-        "errors": errors,
-        "project_path": project_path,
-    }
+        result.update(workspace_path=unique[0]["workspace_path"], source="kanban_state_session_workspace")
+    elif unique:
+        result["source"] = "kanban_state_ambiguous"
+    state_scan_metrics["duration_ms"] = (time.monotonic() - scan_started) * 1000
+    return result
 
 
 def lookup_cline_kanban_task_workspace(
@@ -4364,10 +4418,81 @@ def lookup_cline_kanban_task_workspace(
     project_path: str,
     task_id: str,
     ledger: RunLedger,
+    cwd_git_root: Path,
+    cwd_git_common_directory: Path | None = None,
 ) -> dict[str, Any]:
     direct = current_kanban_workspace_path({})
     if direct:
         return {"workspace_path": direct, "source": "kanban_workspace_env"}
+    lookup_started = time.monotonic()
+    state_lookup = lookup_kanban_task_workspace_from_state(task_id=task_id, project_path=project_path)
+    lookup = state_lookup
+    fallback_reason = state_lookup["source"]
+    state_workspace = state_lookup.get("workspace_path")
+    if state_lookup["errors"]:
+        fallback_reason = "kanban_state_read_failed"
+    elif state_workspace:
+        try:
+            cwd_git_identity = (
+                (cwd_git_root, cwd_git_common_directory)
+                if cwd_git_common_directory is not None
+                else git_worktree_root_and_common_directory_or_none(cwd_git_root)
+            )
+            state_git_identity = (
+                cwd_git_identity
+                if cwd_git_identity and _same_existing_path(Path(state_workspace), cwd_git_identity[0])
+                else git_worktree_root_and_common_directory_or_none(Path(state_workspace))
+            )
+            if cwd_git_identity is None or state_git_identity is None:
+                fallback_reason = "kanban_state_workspace_git_root_unavailable"
+            elif not _same_existing_path(cwd_git_root, state_git_identity[0]):
+                fallback_reason = "kanban_state_workspace_git_root_mismatch"
+            else:
+                project_git_identity = (
+                    cwd_git_identity
+                    if _same_existing_path(Path(project_path).expanduser(), cwd_git_identity[0])
+                    else git_worktree_root_and_common_directory_or_none(Path(project_path).expanduser())
+                )
+                if project_git_identity is None:
+                    fallback_reason = "kanban_state_workspace_project_git_repository_unavailable"
+                elif not _same_existing_path(state_git_identity[1], project_git_identity[1]):
+                    fallback_reason = "kanban_state_workspace_project_git_repository_mismatch"
+                else:
+                    fallback_reason = None
+        except (OSError, RuntimeError, ValueError) as exc:
+            fallback_reason = "kanban_state_workspace_git_root_unavailable"
+            state_lookup["errors"].append(f"{type(exc).__name__}: {exc}")
+    task_list_lookup: dict[str, Any] = {
+        "invoked": False, "returncode": None, "duration_ms": 0.0,
+        "stdout_bytes": 0, "stdout_sha256": None, "error": None,
+    }
+    stdout = b""
+    if fallback_reason is not None:
+        lookup, task_list_lookup, stdout = lookup_cline_kanban_task_workspace_from_list(
+            project_path=project_path, task_id=task_id, ledger=ledger
+        )
+    artifact_payload = {
+        "task_id": task_id,
+        "workspace_path": lookup.get("workspace_path"),
+        "source": lookup["source"],
+        "fallback_reason": fallback_reason,
+        "error": lookup.get("error") or task_list_lookup.get("error"),
+        "duration_ms": (time.monotonic() - lookup_started) * 1000,
+        "state_lookup": state_lookup,
+        "task_list_lookup": task_list_lookup,
+    }
+    if lookup is not state_lookup and "state_scan_metrics" in lookup:
+        artifact_payload["fallback_state_scan_metrics"] = lookup["state_scan_metrics"]
+    if task_list_lookup["invoked"] and os.environ.get("CODEX_RVF_CLINE_KANBAN_WORKSPACE_LOOKUP_DEBUG_FULL_STDOUT") == "1":
+        artifact_payload["stdout"] = stdout.decode("utf-8", errors="replace")
+    artifact = ledger.artifact("kanban-followup-workspace-lookup.json", artifact_payload)
+    return {**lookup, "artifact": artifact, "fallback_reason": fallback_reason, "task_list_lookup": task_list_lookup}
+
+
+def lookup_cline_kanban_task_workspace_from_list(
+    *, project_path: str, task_id: str, ledger: RunLedger,
+) -> tuple[dict[str, Any], dict[str, Any], bytes]:
+    """保留 list-first 的查询与 state 回退；正文只在显式 debug artifact 中保存。"""
     client = cline_kanban_script_path("CODEX_RVF_CLINE_KANBAN_CLIENT", DEFAULT_CLINE_KANBAN_CLIENT)
     task_cmd = os.environ.get("CODEX_RVF_CLINE_KANBAN_TASK_CMD", DEFAULT_CLINE_KANBAN_TASK_CMD)
     command = [
@@ -4379,47 +4504,48 @@ def lookup_cline_kanban_task_workspace(
         "--task-cmd",
         task_cmd,
     ]
-    completed = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        env={**os.environ, **ledger.env()},
-        check=False,
-    )
-    artifact = ledger.artifact(
-        "kanban-followup-workspace-lookup.json",
-        {
-            "command": command,
-            "returncode": completed.returncode,
-            "stdout": completed.stdout,
-            "stderr": completed.stderr,
-        },
-    )
-    if completed.returncode == 0:
+    list_started = time.monotonic()
+    stdout = stderr = b""
+    returncode = None
+    error = None
+    try:
+        completed = subprocess.run(command, capture_output=True, env={**os.environ, **ledger.env()}, check=False)
+        stdout, stderr, returncode = completed.stdout, completed.stderr, completed.returncode
+    except OSError as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    stderr_excerpt = stderr[:4096].decode("utf-8", errors="replace")
+    if returncode:
+        error = stderr_excerpt.strip() or f"task list 返回退出码 {returncode}"
+    metadata = {
+        "invoked": True,
+        "command": command,
+        "returncode": returncode,
+        "duration_ms": (time.monotonic() - list_started) * 1000,
+        "stdout_bytes": len(stdout),
+        "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
+        "stderr_bytes": len(stderr),
+        "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+        "stderr_excerpt": stderr_excerpt,
+        "error": error,
+    }
+    if returncode == 0:
         try:
-            payload = json.loads(completed.stdout)
-        except json.JSONDecodeError as exc:
-            return {
+            payload = json.loads(stdout.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            return ({
                 "workspace_path": None,
                 "source": "cline_kanban_workspace_lookup_invalid_json",
-                "artifact": artifact,
                 "error": f"{type(exc).__name__}: {exc}",
-            }
+            }, metadata, stdout)
         if isinstance(payload, dict):
             workspace = kanban_task_workspace_from_payload(payload, task_id)
             if workspace:
-                return {
+                return ({
                     "workspace_path": workspace,
                     "source": "cline_kanban_task_list_workspace",
-                    "artifact": artifact,
-                }
+                }, metadata, stdout)
     state_lookup = lookup_kanban_task_workspace_from_state(task_id=task_id, project_path=project_path)
-    state_lookup["task_list_lookup"] = {
-        "artifact": artifact,
-        "returncode": completed.returncode,
-        "error": completed.stderr.strip() or completed.stdout.strip(),
-    }
-    return state_lookup
+    return state_lookup, metadata, stdout
 
 
 def kanban_task_workspace_guard_payload(
@@ -4431,7 +4557,8 @@ def kanban_task_workspace_guard_payload(
     task_id = current_kanban_task_id(event)
     if not (task_id and cwd):
         return None
-    cwd_root = git_toplevel_or_none(Path(cwd).expanduser())
+    cwd_git_identity = git_worktree_root_and_common_directory_or_none(Path(cwd).expanduser())
+    cwd_root = cwd_git_identity[0] if cwd_git_identity else git_toplevel_or_none(Path(cwd).expanduser())
     if cwd_root is None:
         return None
     direct_workspace = current_kanban_workspace_path(event)
@@ -4444,6 +4571,8 @@ def kanban_task_workspace_guard_payload(
             project_path=project_path,
             task_id=task_id,
             ledger=ledger,
+            cwd_git_root=cwd_root,
+            cwd_git_common_directory=cwd_git_identity[1] if cwd_git_identity else None,
         )
     raw_workspace = lookup.get("workspace_path")
     if not isinstance(raw_workspace, str) or not raw_workspace.strip():
