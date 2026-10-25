@@ -53,6 +53,10 @@ CLI 始终输出一个 JSON object：
 
 原验证仅在 manifest、结构化命令摘要、环境指纹和执行上下文匹配时复用。否则按原 argv 在指定目标的隔离 checkout 验证；不重新执行 Land、commit、seal 或 base 整合。要求真实 base worktree 上下文的义务不能由隔离 task 上下文冒充；缺少匹配记录时保持机器等待，允许通过 `--validation-run-dir` 提供可独立核验的等价材料。
 
+`base_worktree` 的合法执行路径来自同仓原生验证记录与 Git worktree 注册，不使用原 scope 的 task 路径作为 base 路径。生产器先核验原生 record、reference、sidecar 与同仓 cache namespace，再用 `git worktree list --porcelain -z` 的路径字节匹配 record 中的 `validation_context_worktree_realpath_sha256`。只固定唯一匹配的原生注册条目及其 Git common directory，不接受额外声明的任意 base 路径。记录中的 manifest、argv 摘要、环境、`requires_base_worktree_context`、context kind、路径摘要及 cache identity 继续逐项核验；原生 record/reference 保持原样。
+
+该匹配注册以 `validation_snapshots[].base_worktree_context` 保存，含 `repository_git_common_directory` 与 `git_worktree_registration_base64`。离线 `verify` 重算原生路径摘要并核对注册、cache key 路径和消费者预期的同仓 namespace，不追读旧 base 目录、实时注册或 cache。`prunable` 注册仍可证明历史归属，旧目录后来回收不推翻已接受的执行事实；注册已经清理且没有可核对材料时返回机器等待，恢复与原生路径摘要绑定的同仓注册后自动重验，不伪造成功，也不要求人工授权。对于显式要求路径绑定的 `task_worktree` 验证，仍要求原 scope 的 task 路径摘要。
+
 Node 验证先按目标提交中的 npm lockfile 执行隔离 `npm ci --ignore-scripts`，复用可核验的依赖准备回执，并保留每次失败输出。缺运行时、网络或依赖且未产生真实验证记录时返回机器等待；已产生的真实 failed 记录继续拒绝。依赖恢复与验证均计入同输入的有界恢复预算。
 
 ## 持久布局与恢复
@@ -92,11 +96,13 @@ Node 验证先按目标提交中的 npm lockfile 执行隔离 `npm ci --ignore-s
 
 补审输入位于 `artifacts/inputs/supplemental-review-binding.json`，schema 为 `rvf-supplemental-review-binding` version 1，含 `subject_sha256`、`packet_sha256`。`scope.contract.json` 的 `primary_files` 必须覆盖完整固定差异，run 身份为 `supplemental-<subject-sha256>`。scope 和执行回执均须绑定 `target_commit` / `target_tree`；生产时还读取补审实际仓库的 HEAD 与 clean 状态。执行回执单独记录开始、完成时间及 subject 摘要；重启对账后的完成时间注明 `observed_after_reconciliation`。各腿 stdout/stderr 追加保存于 `artifacts/reviewer-command-outputs/`，不混入公共 CLI 的 JSON。
 
+补审 binding、scope 和固定 packet 保持字节不可变；`summary.json` 是 runner 的可变运行摘要，恢复时只核对固定的 `run_id`、`repo`，允许真实 `RunLedger.summary` 更新状态、诊断及其他运行字段，不重写已有摘要。身份不符仍拒绝。
+
 整轮 plan 在实际派发前持久化。各腿结束后另写 `rvf-reviewer-command-execution-result` version 1 回执，绑定 run、repo、reviewer、packet SHA256 和真实 returncode，并保留内容寻址历史。整轮登记中断后可先从这些原生回执恢复健康腿，只执行缺失腿；不推断或伪造退出码。旧补证子进程未确认退出时先等待精确进程组停止，再接续，避免新旧进程同时执行。
 
 正常写入与备用接管共用 `normal_worktree_mutation` reservation；同 run 再用文件锁串行化。原子写入、fsync 和内容寻址保证发布后可复用。发布前以 bundle 和快照独立重放全部判据；提交后登记回执中断时，下次优先核验已有证明，不重复业务动作。JSON 已落盘但缺 sidecar 时，`record` 先独立重验，再补齐 sidecar；只读 `inspect` 不修复文件。
 
-恢复记录含输入指纹、每阶段 attempt count、boot identity、状态、恢复条件和原始输出位置。同输入每阶段最多三次自动尝试；进程重启不清零。先核对已有双审/验证工件，再决定是否执行缺失步骤；原始材料或执行环境改变后重算输入指纹。预算耗尽保留机器等待，不转成人工授权，也不无限空转。
+恢复记录含输入指纹、每阶段 attempt count、boot identity、状态、恢复条件和原始输出位置。同输入每阶段最多三次自动尝试；进程重启不清零。先核对已有双审/验证工件，再决定是否执行缺失步骤；原始材料或执行环境改变后重算输入指纹。双审阶段的预算仅约束新的 reviewer/probe 执行。预算检查前，先只读核对已有 plan、逐腿原生退出回执和 canonical 完成事实；两腿已完成而整轮登记中断时，只恢复 plan / 执行时间登记，不调用 reviewer 或 probe，也不增加 attempt count。原有 attempt history 条目保持不变，另追加 reconciliation history。缺腿或真实未完成仍受三次预算限制；旧进程组未退出仍须等待。预算耗尽保留机器等待，不转成人工授权，也不无限空转。
 
 等待结果中的 `recovery.rvf_argv` 是精确重试命令；`triggers` 列出输入/环境变化、机器材料变化和重启后对账条件。正常等待及拒绝结果在 reservation 内持久化后释放 reservation；真实进程中断或结果持久化失败保留原协议的未知记录，供接管对账。
 

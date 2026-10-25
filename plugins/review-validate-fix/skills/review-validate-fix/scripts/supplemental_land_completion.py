@@ -311,6 +311,12 @@ def reconstruct_reviewed_tree(repository: Path, source_run: Path, snapshot: dict
                        if sum(path in other["paths"] for other in ready) > 1}
         if overlapping:
             uncertain.update(path for item in ready if item["paths"] & overlapping for path in item["paths"])
+            # 过滤前传播完整依赖路径闭包，保留被过滤补丁涉及的其他整路径补审义务。
+            while True:
+                dependent_patch_paths = {path for item in pending if item["paths"] & uncertain for path in item["paths"]}
+                if dependent_patch_paths <= uncertain:
+                    break
+                uncertain.update(dependent_patch_paths)
             pending = [item for item in pending if not item["paths"] & uncertain]
             continue
         for item in sorted(ready, key=lambda entry: entry["attempt_id"]):
@@ -367,17 +373,60 @@ def collect_validation_snapshots(source_run: Path, common_directory: Path) -> li
         return []
     index = read_regular_json_object(path)
     snapshots = []
+    worktree_registrations = None
     for reference in index.get("validation_records", []):
         try:
             record, digest = validated_validation_record_reference(reference, expected_git_common_directory=common_directory)
-            snapshots.append({"reference": reference, "record": record, "record_sha256": digest})
+            snapshot = {"reference": reference, "record": record, "record_sha256": digest}
+            if record.get("requires_base_worktree_context") and record.get("validation_context_kind") == "base_worktree":
+                if worktree_registrations is None:
+                    # 由同仓 Git 的原生注册反查执行时路径摘要，不接受调用者声明的扩大路径。
+                    # prunable 注册仍是历史归属材料；旧目录当前是否存在不改变过去的执行事实。
+                    worktree_registrations = git_bytes(common_directory, "worktree", "list", "--porcelain", "-z").split(b"\0\0")
+                matching = [entry for entry in worktree_registrations if entry.startswith(b"worktree ")
+                            and digest_bytes(entry.split(b"\0", 1)[0][len(b"worktree "):])
+                            == record["validation_context_worktree_realpath_sha256"]]
+                if len(matching) == 1:
+                    snapshot["base_worktree_context"] = {
+                        "repository_git_common_directory": str(common_directory.resolve()),
+                        "git_worktree_registration_base64": base64.b64encode(matching[0]).decode(),
+                    }
+            snapshots.append(snapshot)
         except (OSError, ValueError):
             # 缓存被清理或路径漂移时自动重验，不把缺失缓存升级成人工必答。
             continue
     return snapshots
 
 
-def validate_validation_snapshots(subject: dict, commands: list[dict], snapshots: list[dict], *, check_current_environment: bool) -> list[dict]:
+def validate_base_worktree_context(snapshot: dict, expected_git_common_directory: Path) -> None:
+    """用已核验原生缓存及 Git 注册固定历史上下文，离线核验不追读旧目录。"""
+    record = snapshot["record"]
+    context = snapshot.get("base_worktree_context")
+    if not isinstance(context, dict):
+        raise MachineEvidencePending("缺少与原生 base 路径摘要匹配的同仓 Git worktree 注册；恢复绑定注册材料后重新对账")
+    common_directory = str(expected_git_common_directory.resolve())
+    if context.get("repository_git_common_directory") != common_directory:
+        raise ValueError("base 验证上下文属于另一 Git 仓库")
+    registration = base64.b64decode(context["git_worktree_registration_base64"], validate=True)
+    fields = registration.split(b"\0")
+    if (not fields[0].startswith(b"worktree ") or any(not field for field in fields)
+            or len([field for field in fields if field.startswith(b"worktree ")]) != 1
+            or len([field for field in fields if field.startswith(b"HEAD ") and GIT_COMMIT.fullmatch(os.fsdecode(field[5:]))]) != 1):
+        raise ValueError("base 验证的原生 worktree 注册无效")
+    worktree_path = fields[0][len(b"worktree "):]
+    if (not Path(os.fsdecode(worktree_path)).is_absolute()
+            or digest_bytes(worktree_path) != record.get("validation_context_worktree_realpath_sha256")):
+        raise ValueError("base 验证的原生路径摘要与 worktree 注册不匹配")
+    record_path = Path(str(record.get("cache_record_path", "")))
+    if (not record_path.is_absolute() or record_path.name != "record.json" or record_path.parent.name != record["cache_key"]
+            or record_path.parent.parent.name != "entries"
+            or record_path.parent.parent.parent.name != digest_bytes(os.fsencode(common_directory))
+            or record_path.parent.parent.parent.parent.name != "validation-result-cache-v2"):
+        raise ValueError("base 验证的原生缓存路径没有绑定同仓上下文身份")
+
+
+def validate_validation_snapshots(subject: dict, commands: list[dict], snapshots: list[dict], *, check_current_environment: bool,
+                                  expected_git_common_directory: Path) -> list[dict]:
     accepted = []
     for command in commands:
         command_digest = payload_digest({"argv": command["argv"], "working_directory_relative_to_worktree": command["working_directory_relative_to_worktree"]})
@@ -399,8 +448,9 @@ def validate_validation_snapshots(subject: dict, commands: list[dict], snapshots
                     or record.get("requires_base_worktree_context") != command["requires_base_worktree_context"]):
                 continue
             if command["requires_base_worktree_context"]:
-                expected_path = subject["historical_worktree"]
-                if record.get("validation_context_worktree_realpath_sha256") != digest_bytes(os.fsencode(expected_path)):
+                if command["validation_context_kind"] == "base_worktree":
+                    validate_base_worktree_context(snapshot, expected_git_common_directory)
+                elif record.get("validation_context_worktree_realpath_sha256") != digest_bytes(os.fsencode(subject["historical_worktree"])):
                     continue
             elif record.get("validation_context_worktree_realpath_sha256") is not None:
                 raise ValueError("验证上下文绑定无效")
@@ -534,13 +584,21 @@ def ensure_supplemental_review_inputs(subject: dict, directory: Path, workspace:
                 "supplemental_review_subject_sha256": subject["supplemental_review_subject_sha256"]}
     for relative, encoded in (("artifacts/inputs/supplemental-review-binding.json", canonical_json_bytes(binding)),
                               ("artifacts/inputs/scope.contract.json", canonical_json_bytes(contract)),
-                              ("artifacts/inputs/review-packet.md", review_packet(subject)),
-                              ("summary.json", canonical_json_bytes({"run_id": contract["run_id"], "repo": str(workspace)}))):
+                              ("artifacts/inputs/review-packet.md", review_packet(subject))):
         path = directory / relative
         if path.exists() and path.read_bytes() != encoded:
             raise ValueError(f"持久补审输入变化：{relative}")
         if not path.exists():
             atomic_write(path, encoded)
+    # runner 会追加或更新状态；摘要只固定身份，保留原始状态及诊断字节。
+    summary_path = directory / "summary.json"
+    expected_summary_identity = {"run_id": contract["run_id"], "repo": str(workspace)}
+    if summary_path.exists():
+        summary = read_regular_json_object(summary_path)
+        if any(summary.get(key) != value for key, value in expected_summary_identity.items()):
+            raise ValueError("持久补审摘要的 run 或仓库身份变化")
+    else:
+        atomic_write(summary_path, canonical_json_bytes(expected_summary_identity))
 
 
 def prepare_supplemental_review_dispatch_qualification(subject: dict, directory: Path, sources: dict, backlog_sources: dict) -> None:
@@ -588,45 +646,69 @@ def require_supplemental_review_dispatch_qualification(path: Path, *, repo: str,
         raise ValueError("补审派发未绑定干净的固定目标及同一 packet")
 
 
+def load_supplemental_reviewer_plan_with_native_receipts(subject: dict, directory: Path, workspace: Path) -> dict | None:
+    """只读对账逐腿原生退出事实，不加载路由、不 probe、不派发命令。"""
+    plan_path = directory / "artifacts/reviewers/reviewer-plan.json"
+    if not plan_path.exists():
+        return None
+    plan = read_regular_json_object(plan_path)
+    for leg in plan.get("reviewers", []):
+        receipt_path = directory / "artifacts/reviewer-command-outputs" / (leg["reviewer_id"] + ".execution-result.json")
+        if not receipt_path.exists():
+            continue
+        receipt = read_regular_json_object(receipt_path)
+        if (receipt.get("schema") != "rvf-reviewer-command-execution-result" or receipt.get("schema_version") != 1
+                or receipt.get("run_id") != "supplemental-" + subject["supplemental_review_subject_sha256"]
+                or receipt.get("repo") != str(workspace) or receipt.get("reviewer_id") != leg["reviewer_id"]
+                or receipt.get("packet_sha256") != digest_bytes(review_packet(subject)) or type(receipt.get("returncode")) is not int):
+            raise ValueError("重启后的 reviewer 原生执行回执身份不匹配")
+        leg["returncode"] = receipt["returncode"]
+        leg["returncode_source"] = "durable_reviewer_command_execution_result"
+    return plan
+
+
+def reconcile_completed_supplemental_review_without_new_execution(subject: dict, directory: Path, workspace: Path) -> bool:
+    """先核对已有事实；两腿完整时仅恢复登记，不消耗新执行预算。"""
+    import dispatch_reviewers
+    plan = load_supplemental_reviewer_plan_with_native_receipts(subject, directory, workspace)
+    if plan is None:
+        return False
+    reviewers = plan.get("reviewers", [])
+    if len(reviewers) != 2 or not all(dispatch_reviewers._leg_is_effective(leg, directory / "artifacts") for leg in reviewers):
+        return False
+    ensure_supplemental_review_inputs(subject, directory, workspace)
+    if plan.get("status") != "completed":
+        plan.update(status="completed", effective_reviewer_count=2,
+                    completion_source="durable_reviewer_command_execution_result_reconciliation")
+        atomic_write(directory / "artifacts/reviewers/reviewer-plan.json", canonical_json_bytes(plan))
+    try:
+        validated_supplemental_review(subject, directory)
+    except MachineEvidencePending:
+        validated_supplemental_review(subject, directory, require_execution_receipt=False)
+        execution_path = directory / "artifacts/supplemental-review-execution.json"
+        execution = read_regular_json_object(execution_path)
+        if (execution.get("subject_sha256") != subject["supplemental_review_subject_sha256"]
+                or any(execution.get(key) != subject[key] for key in ("target_commit", "target_tree"))):
+            raise ValueError("补审启动记录身份不匹配")
+        execution.update(status="completed", completed_at=datetime.now(timezone.utc).isoformat(),
+                         completion_time_kind="observed_after_reconciliation")
+        atomic_write(execution_path, canonical_json_bytes(execution))
+        validated_supplemental_review(subject, directory)
+    return True
+
+
 def recover_double_review(subject: dict, directory: Path, workspace: Path) -> None:
     """复用现有路由与双腿执行器；有结果的健康腿跨进程保留。"""
     import dispatch_reviewers
     ensure_supplemental_review_inputs(subject, directory, workspace)
+    if reconcile_completed_supplemental_review_without_new_execution(subject, directory, workspace):
+        return
     plan_path = directory / "artifacts/reviewers/reviewer-plan.json"
+    plan = load_supplemental_reviewer_plan_with_native_receipts(subject, directory, workspace)
     registry = dispatch_reviewers.load_registry(dispatch_reviewers.DEFAULT_REGISTRY)
     available = dispatch_reviewers.probe_available(registry)
-    if plan_path.exists():
-        plan = read_regular_json_object(plan_path)
-        if plan.get("status") == "completed":
-            try:
-                validated_supplemental_review(subject, directory)
-                return
-            except MachineEvidencePending:
-                validated_supplemental_review(subject, directory, require_execution_receipt=False)
-                execution_path = directory / "artifacts/supplemental-review-execution.json"
-                execution = read_regular_json_object(execution_path)
-                if execution.get("subject_sha256") != subject["supplemental_review_subject_sha256"]:
-                    raise ValueError("补审启动记录身份不匹配")
-                execution.update(status="completed", completed_at=datetime.now(timezone.utc).isoformat(),
-                                 completion_time_kind="observed_after_reconciliation")
-                atomic_write(execution_path, canonical_json_bytes(execution))
-                validated_supplemental_review(subject, directory)
-                return
+    if plan is not None:
         reviewers = plan.get("reviewers", [])
-        for leg in reviewers:
-            if leg.get("returncode") is not None:
-                continue
-            receipt_path = directory / "artifacts/reviewer-command-outputs" / (leg["reviewer_id"] + ".execution-result.json")
-            if not receipt_path.exists():
-                continue
-            receipt = read_regular_json_object(receipt_path)
-            if (receipt.get("schema") != "rvf-reviewer-command-execution-result" or receipt.get("schema_version") != 1
-                    or receipt.get("run_id") != "supplemental-" + subject["supplemental_review_subject_sha256"]
-                    or receipt.get("repo") != str(workspace) or receipt.get("reviewer_id") != leg["reviewer_id"]
-                    or receipt.get("packet_sha256") != digest_bytes(review_packet(subject)) or type(receipt.get("returncode")) is not int):
-                raise ValueError("重启后的 reviewer 原生执行回执身份不匹配")
-            leg["returncode"] = receipt["returncode"]
-            leg["returncode_source"] = "durable_reviewer_command_execution_result"
         indices = [index for index, leg in enumerate(reviewers) if not dispatch_reviewers._leg_is_effective(leg, directory / "artifacts")]
         if not reviewers:
             plan = dispatch_reviewers.route("codex", available, registry, require_external_only=True)
@@ -758,7 +840,8 @@ def verify_evidence(repository: Path, run_directory: Path, expected: dict, path:
         commands = load_handoff_validation_commands(source_run)
         if commands != payload["validation_commands"]:
             raise ValueError("验证义务与原 run 不匹配")
-        validate_validation_snapshots(subject, commands or [], payload["validation_snapshots"], check_current_environment=False)
+        validate_validation_snapshots(subject, commands or [], payload["validation_snapshots"], check_current_environment=False,
+                                      expected_git_common_directory=repository_identity(repository)[1])
         if subject["supplemental_review_paths"]:
             review_directory = root / "supplemental-review"
             restore_run_sources(review_directory, payload["supplemental_review_snapshots"])
@@ -825,7 +908,8 @@ def inspect_or_record(arguments: argparse.Namespace, repository: Path, run_direc
         obligations = []
         accepted_validations = []
         try:
-            accepted_validations = validate_validation_snapshots(subject, commands, old_validations, check_current_environment=True)
+            accepted_validations = validate_validation_snapshots(subject, commands, old_validations, check_current_environment=True,
+                                                                 expected_git_common_directory=common_directory)
         except MachineEvidencePending as exc:
             obligations.append({"phase": "validation", "reason": str(exc), "recovery_condition": "匹配目标的真实通过记录或隔离重验完成"})
         if subject["supplemental_review_paths"]:
@@ -836,7 +920,8 @@ def inspect_or_record(arguments: argparse.Namespace, repository: Path, run_direc
         if arguments.validation_run_dir:
             supplied_run = Path(arguments.validation_run_dir).absolute()
             supplied = collect_validation_snapshots(supplied_run, common_directory)
-            accepted_validations = validate_validation_snapshots(subject, commands, supplied, check_current_environment=True)
+            accepted_validations = validate_validation_snapshots(subject, commands, supplied, check_current_environment=True,
+                                                                 expected_git_common_directory=common_directory)
             obligations = [item for item in obligations if item["phase"] != "validation"]
         result = {"status": "awaiting_machine_evidence" if obligations else "acceptable", "binding": expected,
                   "input_fingerprint": fingerprint, "subject": subject, "missing_obligations": obligations,
@@ -874,9 +959,21 @@ def inspect_or_record(arguments: argparse.Namespace, repository: Path, run_direc
             try:
                 review_facts = validated_supplemental_review(subject, review_directory)
             except (FileNotFoundError, MachineEvidencePending):
-                with recovery_phase(state_path, fingerprint, "double_review"):
-                    prepare_supplemental_review_dispatch_qualification(subject, review_directory, sources, backlog_sources)
-                    recover_double_review(subject, review_directory, workspace)
+                prepare_supplemental_review_dispatch_qualification(subject, review_directory, sources, backlog_sources)
+                if reconcile_completed_supplemental_review_without_new_execution(subject, review_directory, workspace):
+                    if state_path.exists():
+                        state = read_regular_json_object(state_path)
+                        if state.get("input_fingerprint") != fingerprint:
+                            raise ValueError("恢复状态输入指纹不匹配")
+                        phase_state = state["phases"].get("double_review")
+                        if phase_state is not None:
+                            phase_state.update(status="completed", reason="已有原生双腿完成事实已纯对账登记",
+                                               reconciled_at=datetime.now(timezone.utc).isoformat(), completion_source="existing_native_receipts_without_new_execution")
+                            state.setdefault("reconciliation_history", []).append({"phase": "double_review", **phase_state})
+                            durable_json(state_path, state)
+                else:
+                    with recovery_phase(state_path, fingerprint, "double_review"):
+                        recover_double_review(subject, review_directory, workspace)
                 review_facts = validated_supplemental_review(subject, review_directory)
         if not accepted_validations:
             if not commands:
@@ -885,7 +982,8 @@ def inspect_or_record(arguments: argparse.Namespace, repository: Path, run_direc
             workspace_common_directory = repository_identity(workspace)[1]
             recovered = collect_validation_snapshots(validation_run, workspace_common_directory)
             try:
-                accepted_validations = validate_validation_snapshots(subject, commands, recovered, check_current_environment=True)
+                accepted_validations = validate_validation_snapshots(subject, commands, recovered, check_current_environment=True,
+                                                                     expected_git_common_directory=common_directory)
             except MachineEvidencePending:
                 if any(command["requires_base_worktree_context"] for command in commands):
                     raise MachineEvidencePending("隔离目标无法冒充原 base worktree 上下文；恢复相同内容与原执行上下文的记录后接续")
@@ -908,7 +1006,8 @@ def inspect_or_record(arguments: argparse.Namespace, repository: Path, run_direc
                                 raise MachineEvidencePending(f"验证运行时未产生真实执行记录；恢复命令依赖后接续：{output_path}")
                             raise ValueError(f"隔离目标验证失败：{command['name']}（exit {completed.returncode}），原始输出：{output_path}")
                     recovered = collect_validation_snapshots(validation_run, workspace_common_directory)
-                    accepted_validations = validate_validation_snapshots(subject, commands, recovered, check_current_environment=True)
+                    accepted_validations = validate_validation_snapshots(subject, commands, recovered, check_current_environment=True,
+                                                                     expected_git_common_directory=common_directory)
         if git_text(workspace, "status", "--porcelain") or git_text(workspace, "rev-parse", "HEAD") != expected["target_commit"]:
             raise ValueError("reviewer 或验证改变了隔离目标，拒绝验收")
         if capture_run_sources(run_directory) != sources or capture_backlog_sources(run_directory) != backlog_sources:

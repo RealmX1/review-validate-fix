@@ -189,6 +189,149 @@ def test_full_supplemental_proof_is_independently_accepted_and_retry_reuses_it(t
     assert len(list((run_dir / supplemental.ARTIFACT_DIRECTORY).glob("*.json"))) == 1
 
 
+def independent_base_validation_case(tmp_path, *, context_kind="base_worktree", requires_base=True, foreign_repository=False,
+                                     execution_mismatch=None):
+    """真实执行原 argv，只有原始历史义务夹具声明 base 上下文。"""
+    from validation_result_cache import write_json_with_digest
+    repo, run_dir, expected, _snapshot = historical_case(tmp_path, residual="none")
+    commands_path = run_dir / "artifacts/handoff-validation-commands.json"
+    commands = json.loads(commands_path.read_text())
+    command = commands["validation_commands"][0]
+    command.update(validation_context_kind="base_worktree", requires_base_worktree_context=True)
+    command["environment_keys"] = ["RVF_TEST_BASE_VALIDATION_FLAVOR"]
+    write_json_with_digest(commands_path, commands)
+    base_worktree = tmp_path / "independent-base-validation-worktree"
+    if foreign_repository:
+        git(tmp_path, "clone", "--quiet", "--no-hardlinks", str(repo), str(base_worktree))
+    else:
+        git(repo, "worktree", "add", "--quiet", "--detach", str(base_worktree), expected["target_commit"])
+    validation_run = tmp_path / "independent-base-validation-run"
+    invocation = [sys.executable, str(SCRIPT_DIRECTORY / "validation_result_cache.py"), "run", "--repo", str(base_worktree),
+                  "--name", command["name"], "--working-directory", command["working_directory_relative_to_worktree"],
+                  "--validation-context-kind", context_kind, "--rvf-run-dir", str(validation_run)]
+    for key in command["environment_keys"]:
+        invocation += ["--environment-key", key]
+    if requires_base:
+        invocation.append("--requires-base-worktree-context")
+    environment = dict(os.environ)
+    executed_argv = command["argv"]
+    if execution_mismatch == "environment":
+        environment["RVF_TEST_BASE_VALIDATION_FLAVOR"] = "不同执行环境"
+    elif execution_mismatch == "command":
+        executed_argv = [sys.executable, "-c", "print('另一条通过命令')"]
+    elif execution_mismatch == "content":
+        (base_worktree / "tracked.txt").write_text("不同的验证目标内容\n")
+    completed = subprocess.run([*invocation, "--", *executed_argv], env=environment, capture_output=True, text=True, check=True)
+    native_record = json.loads(completed.stdout)
+    assert native_record["status"] == "passed" and native_record["cache_status"] == "executed"
+    return repo, run_dir, expected, base_worktree, validation_run, native_record
+
+
+@pytest.mark.parametrize("reclaim_before_record", [False, True])
+def test_independent_base_validation_records_are_accepted_and_verified_offline(tmp_path, capsys, reclaim_before_record):
+    import shutil
+    repo, run_dir, expected, base_worktree, validation_run, native = independent_base_validation_case(tmp_path)
+    native_path = Path(native["cache_record_path"])
+    native_before = native_path.read_bytes()
+    if reclaim_before_record:
+        # Git 保留的 prunable 注册仍可与执行时的原生路径摘要核对。
+        shutil.rmtree(base_worktree)
+    for action in ("inspect", "record"):
+        code, proof = invoke(capsys, action, repo, run_dir, expected, "--validation-run-dir", str(validation_run))
+        assert code == 0, proof
+    assert native_path.read_bytes() == native_before
+    evidence = json.loads(Path(proof["evidence_path"]).read_text())
+    accepted = evidence["validation_snapshots"][0]
+    assert accepted["record"] == json.loads(native_before)
+    assert accepted["reference"]["cache_record_path"] == str(native_path)
+    assert base_worktree != repo
+    if base_worktree.exists():
+        git(repo, "worktree", "remove", "--force", str(base_worktree))
+    else:
+        git(repo, "worktree", "prune", "--expire", "now")
+    shutil.rmtree(validation_run)
+    shutil.rmtree(tmp_path / "user-data")
+    # 离线验收只重放已固定的原生材料，不追读旧 base 路径、注册或 cache。
+    code, verified = invoke(capsys, "verify", repo, run_dir, expected,
+                            "--evidence", proof["evidence_path"], "--evidence-sha256", proof["evidence_sha256"])
+    assert code == 0, verified
+
+
+@pytest.mark.parametrize("context_kind,requires_base,foreign_repository", [
+    ("task_worktree", False, False), ("task_worktree", True, False), ("base_worktree", True, True),
+])
+def test_supplied_base_validation_rejects_wrong_context_or_repository(tmp_path, capsys, context_kind, requires_base, foreign_repository):
+    repo, run_dir, expected, _base, validation_run, _native = independent_base_validation_case(
+        tmp_path, context_kind=context_kind, requires_base=requires_base, foreign_repository=foreign_repository)
+    code, refused = invoke(capsys, "record", repo, run_dir, expected, "--validation-run-dir", str(validation_run))
+    assert code == 3, refused
+    assert not list((run_dir / supplemental.ARTIFACT_DIRECTORY).glob("*.json"))
+
+
+@pytest.mark.parametrize("execution_mismatch", ["environment", "command", "content"])
+def test_supplied_base_validation_still_requires_matching_execution(tmp_path, capsys, execution_mismatch):
+    repo, run_dir, expected, _base, validation_run, _native = independent_base_validation_case(
+        tmp_path, execution_mismatch=execution_mismatch)
+    code, refused = invoke(capsys, "record", repo, run_dir, expected, "--validation-run-dir", str(validation_run))
+    assert code == 3, refused
+    assert not list((run_dir / supplemental.ARTIFACT_DIRECTORY).glob("*.json"))
+
+
+def test_base_registration_gap_recovers_from_same_native_record_without_reexecution(tmp_path, capsys):
+    repo, run_dir, expected, base_worktree, validation_run, native = independent_base_validation_case(tmp_path)
+    native_path = Path(native["cache_record_path"])
+    native_before = native_path.read_bytes()
+    git(repo, "worktree", "remove", "--force", str(base_worktree))
+    code, waiting = invoke(capsys, "inspect", repo, run_dir, expected, "--validation-run-dir", str(validation_run))
+    assert code == 3 and "恢复绑定注册材料" in waiting["reason"], waiting
+    git(repo, "worktree", "add", "--quiet", "--detach", str(base_worktree), expected["target_commit"])
+    code, proof = invoke(capsys, "record", repo, run_dir, expected, "--validation-run-dir", str(validation_run))
+    assert code == 0, proof
+    assert native_path.read_bytes() == native_before
+
+
+@pytest.mark.parametrize("mutation", ["registration_path", "registration_bytes", "repository", "context_digest",
+                                      "cache_namespace", "context_kind", "requires_base", "environment"])
+def test_base_context_proof_rejects_tampering_with_recomputed_outer_digest(tmp_path, capsys, mutation):
+    from validation_result_cache import validation_record_reference
+    repo, run_dir, expected, _base, validation_run, _native = independent_base_validation_case(tmp_path)
+    code, proof = invoke(capsys, "record", repo, run_dir, expected, "--validation-run-dir", str(validation_run))
+    assert code == 0, proof
+    path = Path(proof["evidence_path"])
+    payload = json.loads(path.read_text())
+    snapshot = payload["validation_snapshots"][0]
+    context, record = snapshot["base_worktree_context"], snapshot["record"]
+    if mutation == "registration_path":
+        raw = base64.b64decode(context["git_worktree_registration_base64"])
+        context["git_worktree_registration_base64"] = base64.b64encode(
+            b"worktree " + os.fsencode(str(repo)) + b"\0" + raw.split(b"\0", 1)[1]).decode()
+    elif mutation == "registration_bytes":
+        context["git_worktree_registration_base64"] = base64.b64encode("非 Git 注册原件".encode()).decode()
+    elif mutation == "repository":
+        context["repository_git_common_directory"] = str(tmp_path / "another-repository/.git")
+    else:
+        if mutation == "context_digest":
+            record["validation_context_worktree_realpath_sha256"] = "0" * 64
+        elif mutation == "cache_namespace":
+            record_path = Path(record["cache_record_path"])
+            record["cache_record_path"] = str(record_path.parent.parent.parent.parent / ("f" * 64) / "entries" / record["cache_key"] / "record.json")
+        elif mutation == "context_kind":
+            record["validation_context_kind"] = "task_worktree"
+        elif mutation == "requires_base":
+            record["requires_base_worktree_context"] = False
+        elif mutation == "environment":
+            record["environment_fingerprint_sha256"] = "0" * 64
+        # 内层记录引用也重算，仍须由 cache identity、注册及同仓门禁拒绝。
+        snapshot["record_sha256"] = supplemental.payload_digest(record)
+        snapshot["reference"] = validation_record_reference(record, snapshot["record_sha256"])
+    encoded = canonical_bytes(payload)
+    digest = hashlib.sha256(encoded).hexdigest()
+    mutated_path = path.parent / (digest + ".json")
+    supplemental.durable_publish(mutated_path, encoded)
+    code, refused = invoke(capsys, "verify", repo, run_dir, expected, "--evidence", str(mutated_path), "--evidence-sha256", digest)
+    assert code == 4, refused
+
+
 @pytest.mark.parametrize("mutation", ["missing_leg", "request", "explicit_incomplete", "unapplied", "newer_failed", "stale_dispositions", "handoff_hash", "task", "token"])
 def test_historical_obligations_and_identity_cannot_be_bypassed(tmp_path, capsys, mutation):
     repo, run_dir, expected, _snapshot = historical_case(tmp_path, machine_issue=True)
@@ -245,6 +388,89 @@ def test_replay_checks_complete_preimages_and_includes_unreconstructable_whole_p
     assert code == 3, payload
     assert payload["subject"]["whole_path_review_required"] == ["tracked.txt"]
     assert payload["subject"]["whole_path_context"]
+
+
+@pytest.mark.parametrize("ambiguous_preimages", [False, True])
+@pytest.mark.parametrize("dependent_patch_count", [1, 2])
+def test_patch_dependency_closure_preserves_reverted_whole_paths(tmp_path, monkeypatch, ambiguous_preimages, dependent_patch_count):
+    repo = repository(tmp_path / "synthetic-patch-repository")
+    shared_candidate = "".join(f"候选第 {number} 行\n" for number in range(40))
+    candidate_contents = {"shared.txt": shared_candidate, "separate.txt": "独立候选正文\n",
+                          "chained.txt": "后续依赖候选正文\n", "independent.txt": "无依赖候选正文\n"}
+    for path, contents in candidate_contents.items():
+        (repo / path).write_text(contents)
+    git(repo, "add", "--all");git(repo, "commit", "-qm", "test: 合成补丁候选")
+    checkpoint_commit = git(repo, "rev-parse", "HEAD")
+    snapshot = {"checkpoint_commit": checkpoint_commit, "checkpoint_tree": git(repo, "rev-parse", "HEAD^{tree}")}
+    run_dir = tmp_path / "synthetic-patch-review-run"
+    facts = {"applied_attempts": []}
+    patch_paths = {}
+
+    def record_applied_patch(attempt_id, baseline_commit, updated_contents):
+        git(repo, "reset", "--hard", baseline_commit)
+        for path, contents in updated_contents.items():
+            (repo / path).write_text(contents)
+        patch = subprocess.run(["git", "diff", "--binary", "--full-index"], cwd=repo, capture_output=True, check=True).stdout
+        patch_path = run_dir / "artifacts/fix-attempts" / attempt_id / "fix.patch"
+        patch_path.parent.mkdir(parents=True);patch_path.write_bytes(patch)
+        patch_paths[attempt_id] = patch_path
+        # 每份补丁都实际检查并应用；不以合成 metadata 冒充合法的补丁链。
+        git(repo, "reset", "--hard", baseline_commit)
+        git(repo, "apply", "--check", str(patch_path));git(repo, "apply", str(patch_path))
+        git(repo, "add", "--all");git(repo, "commit", "-qm", "test: 应用合成补丁 " + attempt_id)
+        facts["applied_attempts"].append({"attempt": {"attempt_id": attempt_id, "baseline_commit": baseline_commit},
+                                         "result": {"changed_paths": list(updated_contents)}})
+        return git(repo, "rev-parse", "HEAD")
+
+    shared_after_a = shared_candidate.replace("候选第 1 行", "补丁 A 第一处修改")
+    combined_commit = record_applied_patch("patch-a", checkpoint_commit, {"shared.txt": shared_after_a})
+    if ambiguous_preimages:
+        shared_after_b = shared_candidate.replace("候选第 38 行", "补丁 B 另一处修改")
+        record_applied_patch("patch-b", checkpoint_commit, {"shared.txt": shared_after_b})
+        git(repo, "reset", "--hard", combined_commit)
+        # A/B 的完整前像相同、hunk 不同；B 在 A 之后仍可真实应用。
+        git(repo, "apply", "--check", str(patch_paths["patch-b"]));git(repo, "apply", str(patch_paths["patch-b"]))
+        git(repo, "add", "--all");git(repo, "commit", "-qm", "test: 合并合法的分离 hunk")
+        combined_commit = git(repo, "rev-parse", "HEAD")
+    shared_after_c = (repo / "shared.txt").read_text().replace("候选第 20 行", "补丁 C 依赖修改")
+    after_c = record_applied_patch("dependent-patch-c", combined_commit,
+                                   {"shared.txt": shared_after_c, "separate.txt": "补丁 C 的跨路径修复\n"})
+    after_dependencies = after_c
+    reverted_paths = ["separate.txt"]
+    if dependent_patch_count == 2:
+        after_dependencies = record_applied_patch("dependent-patch-d", after_c,
+                                                  {"separate.txt": "补丁 D 的后续修复\n", "chained.txt": "补丁 D 的跨路径修复\n"})
+        reverted_paths.append("chained.txt")
+    record_applied_patch("independent-patch", checkpoint_commit, {"independent.txt": "独立补丁修复\n"})
+    git(repo, "reset", "--hard", after_dependencies)
+    git(repo, "apply", "--check", str(patch_paths["independent-patch"]));git(repo, "apply", str(patch_paths["independent-patch"]))
+    if ambiguous_preimages:
+        for path in reverted_paths:
+            (repo / path).write_text(candidate_contents[path])
+    git(repo, "add", "--all");git(repo, "commit", "-qm", "test: 固定实际目标")
+    target_commit = git(repo, "rev-parse", "HEAD")
+    # 若有 D，则 D 先于 C 进入扫描，覆盖逆序的多跳整路径义务。
+    facts["applied_attempts"].reverse()
+    (run_dir / "artifacts/handoff.md").write_text("- handoff_status: COMPLETED\n- review_status: COMPLETED\n")
+    monkeypatch.setattr(supplemental, "validate_original_binding", lambda *args: ({"scope_hash": "a" * 64}, snapshot, facts))
+    subject = supplemental.build_supplemental_review_subject(repo, run_dir, {"target_commit": target_commit}, {})
+    if ambiguous_preimages:
+        required_paths = sorted(["shared.txt", *reverted_paths])
+        assert subject["whole_path_review_required"] == required_paths
+        assert subject["supplemental_review_paths"] == required_paths
+        assert subject["replayed_attempt_ids"] == ["independent-patch"]
+        for path in reverted_paths:
+            # 回退路径没有 tree delta，仍须出现在补审范围与完整正文上下文。
+            entry = next(item for item in subject["path_entries"] if item["path"] == path)
+            assert entry["before"] == entry["after"]
+            contexts = [item for item in subject["whole_path_context"] if item["path"] == path]
+            assert len(contexts) == 2
+            assert all(base64.b64decode(item["content_base64"]).decode() == candidate_contents[path] for item in contexts)
+    else:
+        assert subject["whole_path_review_required"] == []
+        assert subject["supplemental_review_paths"] == []
+        assert set(subject["replayed_attempt_ids"]) == set(patch_paths)
+        assert subject["reconstructed_tree"] == subject["target_tree"]
 
 
 def test_proof_survives_original_worktree_sources_cache_and_installation_path_drift(tmp_path, capsys, monkeypatch):
@@ -559,3 +785,182 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="导出历史 Land 补证的合成消费契约夹具。")
     parser.add_argument("--export-contract-fixtures", type=Path, required=True)
     export_consumer_contract_fixtures(parser.parse_args().export_contract_fixtures.absolute())
+
+
+@pytest.mark.parametrize("interruption", ["machine_wait", "missing_leg", "plan_registration"])
+def test_real_runner_summary_updates_allow_bound_recovery(tmp_path, capsys, monkeypatch, interruption):
+    import dispatch_reviewers
+    repo, run_dir, expected, _snapshot = historical_case(tmp_path)
+    monkeypatch.setattr(dispatch_reviewers, "load_registry", lambda path: {})
+    monkeypatch.setattr(dispatch_reviewers, "probe_available", lambda registry: ["synthetic"])
+    monkeypatch.setattr(dispatch_reviewers, "route", lambda *args, **kwargs: {
+        "schema_version": 1, "status": "planned", "routing_rule": "R1", "warnings": [],
+        "reviewers": [{"reviewer_id": name, "harness_id": "synthetic"} for name in ("synthetic-a", "synthetic-b")]})
+    commands = []
+    invocation_counts = {}
+    def real_runner_command(reviewer, **kwargs):
+        reviewer_id = reviewer["reviewer_id"]
+        invocation_counts[reviewer_id] = invocation_counts.get(reviewer_id, 0) + 1
+        commands.append(reviewer_id)
+        fail_first = invocation_counts[reviewer_id] == 1 and (
+            interruption == "machine_wait" or (interruption == "missing_leg" and reviewer_id == "synthetic-b"))
+        result = {"schema_version": 1, "kind": "no_issues", "issues": [], "requests": [],
+                  "audit_summary": "合成 harness 独立核对固定差异；真实 runner 校验 canonical 结果。"}
+        program = ("import json,os;from pathlib import Path;"
+                   "p=Path(os.environ['RVF_REVIEW_RESULT']);p.parent.mkdir(parents=True,exist_ok=True);"
+                   f"p.write_text({json.dumps(result,ensure_ascii=False)!r});print('合成 harness 已执行');")
+        if fail_first:
+            program = "import sys;print('合成 harness 暂时不可用',file=sys.stderr);raise SystemExit(7)"
+        config_path = tmp_path / (reviewer_id + ".json")
+        config_path.write_text(json.dumps({"enabled": True, "label": "alternative-reviewer:" + reviewer_id,
+            "command": [sys.executable, "-c", program], "allow_repo_cwd": True, "output_format": "text"}))
+        return [sys.executable, str(SCRIPT_DIRECTORY / "run_alternative_reviewer.py"),
+                "--config", str(config_path), "--repo", kwargs["repo"], "--review-packet", kwargs["review_packet"],
+                "--scope-contract", kwargs["scope_contract"], "--rvf-run-id", kwargs["run_id"],
+                "--rvf-run-dir", kwargs["run_dir"], "--reviewer-id", reviewer_id]
+    monkeypatch.setattr(dispatch_reviewers, "_build_reviewer_command", real_runner_command)
+    original_execute = dispatch_reviewers.execute_plan
+    interrupted = []
+    def execute_without_fallback(*args, **kwargs):
+        result = original_execute(*args, **kwargs, max_fallback_rounds=0)
+        if interruption == "plan_registration" and not interrupted:
+            interrupted.append(True)
+            raise OSError("合成中断：原生逐腿回执已落盘，整轮 plan 尚未登记")
+        return result
+    monkeypatch.setattr(dispatch_reviewers, "execute_plan", execute_without_fallback)
+    code, first = invoke(capsys, "record", repo, run_dir, expected, "--recover-machine-evidence")
+    assert code == (4 if interruption == "plan_registration" else 3), first
+    operation = next((run_dir / supplemental.ARTIFACT_DIRECTORY / "recovery-operations").iterdir())
+    review_directory = operation / "supplemental-review-run"
+    summary_path = review_directory / "summary.json"
+    summary_bytes = summary_path.read_bytes()
+    summary = json.loads(summary_bytes)
+    assert summary["reason_code"] in {"reviewer_completed", "reviewer_failed"}
+    assert summary["run_id"].startswith("supplemental-")
+    subject = supplemental.read_regular_json_object(
+        review_directory / "artifacts/inputs/supplemental-review-dispatch-qualification.json")["subject"]
+    supplemental.ensure_supplemental_review_inputs(subject, review_directory, operation / "target-validation-and-review-workspace")
+    assert summary_path.read_bytes() == summary_bytes
+    code, proof = invoke(capsys, "record", repo, run_dir, expected, "--recover-machine-evidence")
+    assert code == 0, proof
+    assert len(commands) == {"machine_wait": 4, "missing_leg": 3, "plan_registration": 2}[interruption]
+    code, verified = invoke(capsys, "verify", repo, run_dir, expected,
+        "--evidence", proof["evidence_path"], "--evidence-sha256", proof["evidence_sha256"])
+    assert code == 0, verified
+
+
+@pytest.mark.parametrize("identity_field", ["run_id", "repo"])
+def test_supplemental_summary_rejects_foreign_identity_without_rewriting_it(tmp_path, capsys, identity_field):
+    from core.run_ledger.run_ledger import start_run
+    repo, run_dir, expected, _snapshot = historical_case(tmp_path)
+    _code, inspected = invoke(capsys, "inspect", repo, run_dir, expected)
+    subject = inspected["subject"]
+    review_directory = tmp_path / "identity-review-run"
+    supplemental.ensure_supplemental_review_inputs(subject, review_directory, repo)
+    ledger = start_run("reviewer", repo=repo, cwd=repo, run_id="supplemental-" + subject["supplemental_review_subject_sha256"],
+                       run_dir=review_directory)
+    ledger.summary(status="failed", reason_code="reviewer_failed", message="合成身份负例，保留真实摘要结构")
+    path = review_directory / "summary.json"
+    summary = json.loads(path.read_text())
+    summary[identity_field] = "foreign-identity"
+    path.write_text(json.dumps(summary))
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match="身份|仓库"):
+        supplemental.ensure_supplemental_review_inputs(subject, review_directory, repo)
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("recovery_kind", ["native_receipts", "completed_plan", "missing_leg", "foreign_receipt"])
+def test_exhausted_review_budget_reconciles_native_receipts_before_new_execution(tmp_path, capsys, monkeypatch, recovery_kind):
+    import dispatch_reviewers
+    repo, run_dir, expected, _snapshot = historical_case(tmp_path)
+    probe_calls = []
+    reviewer_calls = []
+    monkeypatch.setattr(dispatch_reviewers, "load_registry", lambda path: {})
+    def probe_with_two_waits(registry):
+        probe_calls.append(True)
+        if len(probe_calls) <= 2:
+            raise supplemental.MachineEvidencePending("合成环境：前两次 harness 证据尚未恢复")
+        return ["synthetic"]
+    monkeypatch.setattr(dispatch_reviewers, "probe_available", probe_with_two_waits)
+    monkeypatch.setattr(dispatch_reviewers, "route", lambda *args, **kwargs: {
+        "schema_version": 1, "status": "planned", "routing_rule": "R1", "warnings": [],
+        "reviewers": [{"reviewer_id": name, "harness_id": "synthetic"} for name in ("synthetic-a", "synthetic-b")]})
+    def real_runner_command(reviewer, **kwargs):
+        reviewer_calls.append(reviewer["reviewer_id"])
+        result = {"schema_version": 1, "kind": "no_issues", "issues": [], "requests": [],
+                  "audit_summary": "预算恢复合成 harness 已核对固定差异，真实 runner 校验结果。"}
+        program = ("import os;from pathlib import Path;"
+                   "p=Path(os.environ['RVF_REVIEW_RESULT']);p.parent.mkdir(parents=True,exist_ok=True);"
+                   f"p.write_text({json.dumps(result,ensure_ascii=False)!r});print('合成 harness 完成');")
+        if recovery_kind == "missing_leg" and reviewer["reviewer_id"] == "synthetic-b":
+            program = "raise SystemExit(7)"
+        config = tmp_path / (reviewer["reviewer_id"] + ".json")
+        config.write_text(json.dumps({"enabled": True, "label": "alternative-reviewer:" + reviewer["reviewer_id"],
+            "command": [sys.executable, "-c", program], "output_format": "text", "allow_repo_cwd": True}))
+        return [sys.executable, str(SCRIPT_DIRECTORY / "run_alternative_reviewer.py"), "--config", str(config),
+            "--repo", kwargs["repo"], "--review-packet", kwargs["review_packet"], "--scope-contract", kwargs["scope_contract"],
+            "--rvf-run-id", kwargs["run_id"], "--rvf-run-dir", kwargs["run_dir"], "--reviewer-id", reviewer["reviewer_id"]]
+    monkeypatch.setattr(dispatch_reviewers, "_build_reviewer_command", real_runner_command)
+    original_execute = dispatch_reviewers.execute_plan
+    def execute_with_registration_interruption(*args, **kwargs):
+        plan = original_execute(*args, **kwargs, max_fallback_rounds=0)
+        if recovery_kind != "completed_plan":
+            raise OSError("合成中断：原生逐腿回执已落盘，尚未登记整轮 plan")
+        return plan
+    monkeypatch.setattr(dispatch_reviewers, "execute_plan", execute_with_registration_interruption)
+    original_write = supplemental.atomic_write
+    def interrupt_completed_execution_receipt(path, encoded):
+        if recovery_kind == "completed_plan" and path.name == "supplemental-review-execution.json" and json.loads(encoded).get("status") == "completed":
+            raise OSError("合成中断：整轮 plan 已完成，执行时间回执尚未登记")
+        return original_write(path, encoded)
+    monkeypatch.setattr(supplemental, "atomic_write", interrupt_completed_execution_receipt)
+    for _ in range(2):
+        code, pending = invoke(capsys, "record", repo, run_dir, expected, "--recover-machine-evidence")
+        assert code == 3, pending
+    code, interrupted = invoke(capsys, "record", repo, run_dir, expected, "--recover-machine-evidence")
+    assert code == 4, interrupted
+    operation = next((run_dir / supplemental.ARTIFACT_DIRECTORY / "recovery-operations").iterdir())
+    state_path = operation / "machine-evidence-recovery-state.json"
+    state_before = json.loads(state_path.read_text())
+    assert state_before["phases"]["double_review"]["attempt_count"] == 3
+    review_directory = operation / "supplemental-review-run"
+    receipts = list((review_directory / "artifacts/reviewer-command-outputs").glob("*.execution-result.json"))
+    assert len(receipts) == 2
+    assert sorted(json.loads(path.read_text())["returncode"] for path in receipts) == ([0, 7] if recovery_kind == "missing_leg" else [0, 0])
+    assert json.loads((review_directory / "summary.json").read_text())["reason_code"] in {"reviewer_completed", "reviewer_failed"}
+    monkeypatch.setattr(supplemental, "atomic_write", original_write)
+    if recovery_kind == "foreign_receipt":
+        receipt = json.loads(receipts[0].read_text());receipt["packet_sha256"] = "0" * 64
+        receipts[0].write_text(json.dumps(receipt))
+    calls_before = (len(probe_calls), len(reviewer_calls))
+    if recovery_kind == "native_receipts":
+        # 原生进程组仍活着时，纯登记也必须先等待旧执行真正退出。
+        from independent_backup_route import control_directory, capture_process_identity
+        process = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(60)"], start_new_session=True)
+        reservation = control_directory(repo) / "normal-mutations" / "synthetic-prior-supplemental-process.json"
+        supplemental.durable_json(reservation, {"operation": "supplemental-land-completion-record",
+            "original_run_directory": str(run_dir.resolve()), "child_process_group_ids": [process.pid],
+            "child_process_group_identities": {str(process.pid): capture_process_identity(process.pid)}})
+        try:
+            code, pending = invoke(capsys, "record", repo, run_dir, expected, "--recover-machine-evidence")
+            assert code == 3 and "旧补证子进程" in pending["reason"], pending
+            assert (len(probe_calls), len(reviewer_calls)) == calls_before
+        finally:
+            process.terminate();process.wait(timeout=10)
+    code, recovered = invoke(capsys, "record", repo, run_dir, expected, "--recover-machine-evidence")
+    assert (len(probe_calls), len(reviewer_calls)) == calls_before
+    state_after = json.loads(state_path.read_text())
+    assert state_after["phases"]["double_review"]["attempt_count"] == 3
+    assert state_after["attempt_history"][:len(state_before["attempt_history"])] == state_before["attempt_history"]
+    assert [entry for entry in state_after["attempt_history"] if entry["phase"] == "double_review"] == state_before["attempt_history"]
+    if recovery_kind == "missing_leg":
+        assert code == 3 and "三次" in recovered["reason"], recovered
+        assert not list((run_dir / supplemental.ARTIFACT_DIRECTORY).glob("*.json"))
+    elif recovery_kind == "foreign_receipt":
+        assert code == 4 and "回执身份" in recovered["reason"], recovered
+    else:
+        assert code == 0, recovered
+        code, verified = invoke(capsys, "verify", repo, run_dir, expected,
+            "--evidence", recovered["evidence_path"], "--evidence-sha256", recovered["evidence_sha256"])
+        assert code == 0, verified
