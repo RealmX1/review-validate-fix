@@ -73,6 +73,26 @@ def run_delegation(tmp_path: Path, repo: Path, run_dir: Path, action: str, reque
                                          "CODEX_RVF_CLINE_KANBAN_TASK_CMD": shlex.join([sys.executable, str(unavailable_control_plane)])}, text=True, capture_output=True)
 
 
+def append_native_issue_action_request(tmp_path: Path, original_request_file: Path, *, action: str, message_text: str, decision_id: str) -> Path:
+    request = json.loads(original_request_file.read_bytes())
+    authorization = request["authorization"]
+    authorization.update({"native_turn_id": decision_id, "native_user_message_id": decision_id + "-message",
+                          "message_text": message_text, "mode": "direct_delegation"})
+    request["action"] = action
+    with Path(authorization["transcript_path"]).open("a") as native:
+        for record in [
+            {"type": "event_msg", "payload": {"type": "task_started", "turn_id": decision_id, "turn_attribution": {"turn_trigger": "user"}}},
+            {"type": "response_item", "payload": {"role": "user", "content": [{"type": "input_text", "text": message_text}],
+                "internal_chat_message_metadata_passthrough": {"turn_id": decision_id, "content_item_metadata": [{"provenance": {"type": "user"}}]}}},
+            {"type": "event_msg", "payload": {"type": "item_completed", "turn_id": decision_id, "item": {
+                "type": "UserMessage", "id": decision_id + "-message", "content": [{"type": "text", "text": message_text}]}}},
+        ]:
+            native.write(json.dumps(record, ensure_ascii=False) + "\n")
+    path = tmp_path / (decision_id + "-request.json")
+    path.write_bytes(canonical_bytes(request))
+    return path
+
+
 @pytest.mark.parametrize("mode", ["approve_proposed_delegation", "direct_delegation"])
 def test_real_user_delegation_preserves_counts_and_allows_land_without_waiting_for_followup(tmp_path: Path, mode: str) -> None:
     repo, run_dir, request_file = delegated_issue_fixture(tmp_path, mode=mode)
@@ -417,3 +437,76 @@ def test_native_authorization_rejects_a_different_run_that_contains_the_expected
     native.write_text(native.read_text().replace("rvf-candidate-evidence-test", "rvf-candidate-evidence-test-other"))
     result = run_delegation(tmp_path, repo, run_dir, "record", request_file)
     assert result.returncode == 11 and "没有绑定该 run" in result.stdout
+
+
+@pytest.mark.parametrize("message_text", ["不要撤销 RVF-002 的委派。", "请勿取消 RVF-002 的委派。", "Do not revoke the delegation of RVF-002.", "Don't cancel the delegation of RVF-002."])
+def test_negated_revocation_does_not_remove_an_accepted_delegation(tmp_path: Path, message_text: str) -> None:
+    repo, run_dir, original = delegated_issue_fixture(tmp_path)
+    assert run_delegation(tmp_path, repo, run_dir, "record", original).returncode == 0
+    revoke = append_native_issue_action_request(tmp_path, original, action="revoke", message_text=message_text, decision_id="negative-revocation")
+    result = run_delegation(tmp_path, repo, run_dir, "record", revoke)
+    assert result.returncode == 11 and "否定撤销" in result.stdout
+    assert len(delegation.read_ledger(run_dir)[1]) == 1
+    assert len(delegation.accepted_delegations(repo, run_dir)) == 1
+    assert run_writer(repo, run_dir).returncode == 0
+
+
+@pytest.mark.parametrize("message_text", ["不要继续委派，撤销 RVF-002。", "Do not delegate further; revoke the delegation of RVF-002."])
+def test_refusing_further_delegation_does_not_forbid_an_explicit_revocation(tmp_path: Path, message_text: str) -> None:
+    repo, run_dir, original = delegated_issue_fixture(tmp_path)
+    assert run_delegation(tmp_path, repo, run_dir, "record", original).returncode == 0
+    revoke = append_native_issue_action_request(tmp_path, original, action="revoke", message_text=message_text, decision_id="affirmative-revocation")
+    result = run_delegation(tmp_path, repo, run_dir, "record", revoke)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert len(delegation.read_ledger(run_dir)[1]) == 2
+    assert delegation.accepted_delegations(repo, run_dir) == []
+
+
+def test_redelegation_cannot_hide_an_unauthorized_negative_revocation_in_history(tmp_path: Path) -> None:
+    repo, run_dir, original = delegated_issue_fixture(tmp_path)
+    assert run_delegation(tmp_path, repo, run_dir, "record", original).returncode == 0
+    revoke = append_native_issue_action_request(tmp_path, original, action="revoke", message_text="撤销 RVF-002 的委派。", decision_id="historical-revocation")
+    assert run_delegation(tmp_path, repo, run_dir, "record", revoke).returncode == 0
+    redelegate = append_native_issue_action_request(tmp_path, original, action="delegate", message_text="将 RVF-002 委派给 target-task 解决。", decision_id="later-delegation")
+    assert run_delegation(tmp_path, repo, run_dir, "record", redelegate).returncode == 0
+    assert run_writer(repo, run_dir).returncode == 0
+    payload, evidence_path, _sha = evidence.validated_reviewed_task_candidate_evidence(repo)
+    ledger, events = delegation.read_ledger(run_dir)
+    revoked = copy.deepcopy(events[1][0])
+    snapshot = json.loads(Path(revoked["authorization"]["native_snapshot"]["path"]).read_bytes())
+    negative_text = "不要撤销 RVF-002 的委派。"
+    revoked["authorization"]["message_text"] = negative_text
+    for record in snapshot["records"]:
+        native_payload = record.get("payload") or {}
+        if record.get("type") == "response_item" and (native_payload.get("internal_chat_message_metadata_passthrough") or {}).get("turn_id") == "historical-revocation":
+            native_payload["content"] = [{"type": "input_text", "text": negative_text}]
+        if (native_payload.get("item") or {}).get("id") == "historical-revocation-message":
+            native_payload["item"]["content"] = [{"type": "text", "text": negative_text}]
+    root = run_dir / delegation.DELEGATION_DIRECTORY
+    revoked["authorization"]["native_snapshot"] = delegation.immutable_artifact(root, "native-evidence-snapshots", snapshot)
+    ledger["events"][1] = delegation.immutable_artifact(root, "receipts", revoked)
+    later = copy.deepcopy(events[2][0]); later["previous_receipt_sha256"] = ledger["events"][1]["sha256"]
+    ledger["events"][2] = delegation.immutable_artifact(root, "receipts", later)
+    delegation.atomic_bytes(root / "ledger.json", canonical_bytes(ledger))
+    reference = payload["review"]["user_delegated_elevated_issues"][0]
+    reference.update({"receipt_path": ledger["events"][2]["path"], "receipt_sha256": ledger["events"][2]["sha256"]})
+    delegation.atomic_bytes(evidence_path, canonical_bytes(payload))
+    delegation.atomic_bytes(Path(f"{evidence_path}.sha256"), (delegation.digest(payload) + "\n").encode())
+    with pytest.raises(ValueError, match="否定撤销"):
+        evidence.validated_reviewed_task_candidate_evidence(repo)
+
+
+@pytest.mark.parametrize("identifier", ["RVF-002", "target-task"])
+def test_direct_delegation_cannot_target_a_different_issue_or_task_with_the_same_prefix(tmp_path: Path, identifier: str) -> None:
+    repo, run_dir, request_file = delegated_issue_fixture(tmp_path, mode="direct_delegation")
+    request = json.loads(request_file.read_bytes())
+    replacement_text = request["authorization"]["message_text"].replace(identifier, identifier + "-other")
+    native = Path(request["authorization"]["transcript_path"])
+    records = [json.loads(line) for line in native.read_text().splitlines()]
+    records[3]["payload"]["content"][0]["text"] = replacement_text
+    records[4]["payload"]["item"]["content"][0]["text"] = replacement_text
+    native.write_text("\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n")
+    request["authorization"]["message_text"] = replacement_text
+    request_file.write_bytes(canonical_bytes(request))
+    result = run_delegation(tmp_path, repo, run_dir, "record", request_file)
+    assert result.returncode == 11 and "直接委派须" in result.stdout

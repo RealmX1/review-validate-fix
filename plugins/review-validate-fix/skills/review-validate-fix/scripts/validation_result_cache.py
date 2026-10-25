@@ -21,6 +21,7 @@ from typing import Any, Mapping
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401
+from core.review_run_qualification_mutation_lock import guard_review_run_qualification_mutation, run_directory_for_qualification_artifact  # noqa: E402
 from core.rvf_user_local_data_paths import resolved_rvf_user_local_data_paths  # noqa: E402
 
 
@@ -225,6 +226,7 @@ def atomic_write(path: Path, data: bytes) -> None:
             pass
 
 
+@guard_review_run_qualification_mutation(lambda arguments: run_directory_for_qualification_artifact(arguments["path"]))
 def write_json_with_digest(path: Path, payload: Mapping[str, Any]) -> str:
     encoded = canonical_json_bytes(payload)
     digest = sha256_hex(encoded)
@@ -327,6 +329,7 @@ def validated_validation_record_reference(
     return record, record_digest
 
 
+@guard_review_run_qualification_mutation("run_dir")
 def append_run_validation_record(
     run_dir: Path | None,
     record: Mapping[str, Any],

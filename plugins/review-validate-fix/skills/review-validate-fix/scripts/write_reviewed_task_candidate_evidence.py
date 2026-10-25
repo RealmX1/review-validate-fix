@@ -18,6 +18,7 @@ from typing import Any, Mapping
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import rvf_merge_dispositions  # noqa: E402
+from core.review_run_qualification_mutation_lock import guard_review_run_qualification_mutation  # noqa: E402
 from reviewed_candidate_completion_facts import (  # noqa: E402
     CandidateQualificationRefused,
     applied_scope_expansion_facts,
@@ -942,6 +943,7 @@ def candidate_evidence_qualification(repo: Path, run_dir: Path, *, pending_stage
 
 
 @guard_normal_mutation("repo_argument", "write-candidate-evidence", "run_dir")
+@guard_review_run_qualification_mutation("run_dir")
 def write_evidence(repo_argument: Path, run_dir: Path) -> dict[str, Any]:
     prepared = prepare_candidate_evidence(repo_argument, run_dir)
     repo, payload = prepared["repo"], prepared["payload"]

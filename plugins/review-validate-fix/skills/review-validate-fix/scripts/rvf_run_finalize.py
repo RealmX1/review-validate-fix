@@ -13,6 +13,7 @@ stop hook 检测到 RVF run 终结（典型路径：handoff_completion_payload �
 from __future__ import annotations
 
 from independent_backup_route import guard_normal_mutation, repository_for_normal_metadata_mutation, tracked_subprocess_run
+from core.review_run_qualification_mutation_lock import guard_review_run_qualification_mutation, run_directory_for_qualification_artifact
 
 import argparse
 import json
@@ -74,6 +75,7 @@ def _read_summary(path: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+@guard_review_run_qualification_mutation(lambda arguments: run_directory_for_qualification_artifact(arguments["path"]))
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp")

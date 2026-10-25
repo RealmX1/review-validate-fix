@@ -43,6 +43,10 @@ rvf elevated-issue-delegation resume --repo <worktree> --run-dir <精确run> --r
 
 撤销使用 `action=revoke`，绑定原生用户明确撤销该 issue 的新消息；无需 target 回执。重新委派仍使用 delegate。所有事件追加保存，原 handoff、attempt/result 和旧失败记录保持不变。
 
+撤销按对应动作核验：`不要撤销 RVF-002 的委派。` 会拒绝；`不要继续委派，撤销 RVF-002 的委派。` 可以授权撤销。每条历史事件都必须有真实用户授权，较新的合法委派不能使先前的否定撤销变成合法。
+
 退出码 0 表示处置已核验；10 为等待机器证据，11 为证据无效，12 为明确禁止（包含唯一执行者已被其他路线接管）。record/resume 首次持久绑定候选、attempt、scope 与 handoff，等待期间变化不得自动重绑旧决定；也保存输入指纹、失败历史和恢复条件。同输入最多三次自动补证，原生记录、回执、查询实现或其他绑定输入变化后重新核验。后续已授权的 `rvf land commit` 自动尝试恢复待补证委派；`land check-evidence` 始终只读。已提交结果先对账，再执行缺失阶段。
+
+canonical issue、attempt/result、reviewer 结果与轮转、scope、validation、handoff/summary 和 evidence 的正式写入口共用 `artifacts/elevated-issue-delegation/mutation.lock`，与消费者 CAS 互斥。锁忙时最多等待 30 秒，释放后自动继续；超时保留等待及失败记录，锁变为可用后恢复预算自动重开。Land 在锁外完成验证重放，再持锁复核、提交和发布证据。更新冻结工件必须经过正式 writer，不能直接覆盖文件。
 
 含委派 evidence 必须是 v3，声明 `user_delegated_elevated_issue_disposition_v1`。例如总数 2、fixed 1、elevated 1、user_delegated 1、blocking_elevated 0；结果不得写成全部已修。旧消费者拒绝 v3，应使用支持该能力的消费者；不得删除证据或降级成全绿 v1。v3 的范围扩展继续执行完整扩展校验。公开结果分别报告审查完成、问题未解决及跟进归属、Land 实际结果、base 同步实际结果。

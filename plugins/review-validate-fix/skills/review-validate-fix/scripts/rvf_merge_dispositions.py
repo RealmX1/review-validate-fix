@@ -45,6 +45,7 @@ from typing import Any, Iterable, Mapping
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
+from core.review_run_qualification_mutation_lock import guard_review_run_qualification_mutation  # noqa: E402
 from core.run_ledger.run_ledger import safe_token  # noqa: E402
 from validation_result_cache import canonical_json_bytes, write_json_with_digest  # noqa: E402
 
@@ -799,6 +800,7 @@ def build_merge_dispositions_payload(run_dir: Path, decisions: Mapping[str, Any]
     return payload
 
 
+@guard_review_run_qualification_mutation("run_dir")
 def write_merge_dispositions(run_dir: Path, decisions: Mapping[str, Any]) -> tuple[Path, str, dict[str, Any]]:
     payload = build_merge_dispositions_payload(run_dir, decisions)
     path = merge_dispositions_path(run_dir)

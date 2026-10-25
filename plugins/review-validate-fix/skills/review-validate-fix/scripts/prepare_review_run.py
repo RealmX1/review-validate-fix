@@ -20,6 +20,7 @@ from typing import Any, Mapping
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 core.* import
+from core.review_run_qualification_mutation_lock import guard_review_run_qualification_mutation, run_directory_for_qualification_artifact
 from core.session_scope_allocation.committed_round_detection import (  # noqa: E402
     frozen_committed_round_base_exclusion_ref,
     resolve_local_review_base_branch_ref,
@@ -788,6 +789,7 @@ def validated_integration_candidate_receipt(
     return receipt
 
 
+@guard_review_run_qualification_mutation(lambda arguments: run_directory_for_qualification_artifact(arguments["path"]))
 def write_scope_contract(
     *,
     path: Path,

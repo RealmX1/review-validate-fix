@@ -1067,6 +1067,7 @@ def land_commit_after_prepare_plan_checks(
     repo_root: Path,
     message: str,
     dirty_entries: list[dict[str, str]],
+    *, validation_with_completed_replay: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     extra_paths = sorted(
         set(plan.get("extra_paths") or []) | {repo_relative_path(repo_root, path) for path in args.extra_path}
@@ -1106,7 +1107,18 @@ def land_commit_after_prepare_plan_checks(
             merge_dispositions_errors=list(merge_dispositions_errors),
         )
 
-    validation = ensure_validation_satisfies_evidence_gate(repo_root, run_dir)
+    if validation_with_completed_replay is None:
+        validation = ensure_validation_satisfies_evidence_gate(repo_root, run_dir)
+        from core.review_run_qualification_mutation_lock import review_run_qualification_mutation_lock
+
+        # 验证子进程发布 validation index 也持同锁；先完成重放，再锁内复核全部资格和提交。
+        with review_run_qualification_mutation_lock(run_dir):
+            if plan.get("head_oid_at_prepare") != head_oid(repo_root):
+                raise RvfLandHardGateFailure(RVF_LAND_EXIT_PREPARE_PLAN_MISSING_OR_STALE, "prepare_plan_stale", "等待资格锁期间 HEAD 已变化；重跑 prepare。")
+            return land_commit_after_prepare_plan_checks(args, plan, run_dir, repo_root, message,
+                [entry for entry in repo_snapshot(repo_root).get("dirty_paths") or [] if isinstance(entry, dict)],
+                validation_with_completed_replay=validation)
+    validation = validation_with_completed_replay
 
     qualification = land_candidate_evidence_qualification(
         repo_root, run_dir, in_scope, unrelated, leave_unrelated=leave_unrelated_dirty_paths_uncommitted,

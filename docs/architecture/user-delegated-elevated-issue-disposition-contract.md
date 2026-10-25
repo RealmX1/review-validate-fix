@@ -12,7 +12,15 @@
 
 `authorization` 保留 `transcript_path` 来源声明；原生快照的 `original_transcript_path` 必须与其一致，后续核验只读归档。Codex 的 `AgentMessage` 可能用 `Text`（大写 T），`UserMessage` 可以包含分段文本和图片；正文抽取保留全部文本。用户简短批准可以绑定紧邻的明确委派提案；否定原话不能因包含“同意”或“委派”子串而被接受。
 
+撤销单独核对撤销动作的肯定授权。`不要撤销 RVF-002 的委派。` 不能登记为 revoke；`不要继续委派，撤销 RVF-002 的委派。` 可以。按动作条款及完整 issue 标识符归属判断否定，不能让前一条款的委派否定误伤后面的肯定撤销。固定历史链的每个事件仍执行同一授权校验，后续合法 delegate 不会洗掉较早的非法 revoke。run、issue 与目标 task 均匹配完整机器标识符；句末英文句号是标点，标识符后接 `.other` 或 `-other` 则是另一身份。
+
 首次 record/resume 将原请求映射到不可变 `pending-requests` 快照，并持久绑定候选、attempt、scope 和 handoff；自动恢复只对原绑定补证，不能在等待中切换候选。输入指纹包括原生记录、回执、最新 attempt、候选和核验实现；同输入补证最多三次。缺失目标回执可只读查询同一稳定 task，已接受事件不依赖后续查询成功。
+
+所有受支持的 canonical 资格写入口与消费者 CAS 共用原 run 的 `artifacts/elevated-issue-delegation/mutation.lock`，以同 inode 的 `flock` 串行化。覆盖 issue upsert、prepare/start/stop/apply、awaiting marker 对 attempt 的更新、merge/source refs、reviewer 结果追加/换 kind/归档轮转、reviewer plan、scope 创建/定稿/扩展落盘、validation index、handoff、summary/finalize 及 candidate evidence 发布。生产者通过可重入的 `core/review_run_qualification_mutation_lock.py` 统一加锁；直接绕过正式 writer 修改冻结工件不属于受支持的发布方式，读者仍须核对摘要与最新事实。
+
+Land 先在资格锁外完成可能启动子进程的验证重放，再持锁重读 HEAD、Git/WIP、canonical 资格和委派账本，直到提交、封窗与 evidence 发布结束。验证 index 发布也取同锁，因而不能在持锁时等待该验证子进程。消费者必须在同锁下最后复验到实际 CAS 落地，不能只锁账本。取得资格锁不替代原有唯一执行者及 Git 门禁。
+
+锁忙时不改资格输入、不抢占原持有者，生产者最多等待 30 秒并在 stderr 报告机器等待。委派恢复把锁可用性纳入输入指纹：同一锁忙输入最多三次自动补证，释放后自动开启新预算；只读检查不创建锁或恢复记录。所有失败、等待与恢复历史保留。进程结束由内核释放 flock；重启后的执行先对账已有结果。
 
 含委派的 candidate evidence 为 version 3，顶层 `required_capabilities` 精确包含 `user_delegated_elevated_issue_disposition_v1`；`review.conclusion` 为 `review_completed_with_user_delegated_issues`。`review.outcome_counts` 保留 `fixed`、`false_positive`、`submitted_to_kanban_backlog`、`elevated`，另加 `user_delegated` 和 `blocking_elevated`。canonical_issue_count 只求前四项之和，user_delegated 为 elevated 的子集，blocking_elevated 必须为零。
 

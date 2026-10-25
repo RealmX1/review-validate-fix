@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from core.rvf_user_local_data_paths import resolved_rvf_runtime_log_root
+from core.review_run_qualification_mutation_lock import review_run_qualification_mutation_lock
 
 
 INSTALLED_PLUGIN_SKILL_REL = Path("plugins") / "review-validate-fix" / "skills" / "review-validate-fix"
@@ -399,16 +400,17 @@ class RunLedger:
         del max_inline_bytes
         path = self.unique_artifact_path(name) if unique else self.artifact_path(name)
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            if isinstance(content_or_bytes, bytes):
-                path.write_bytes(content_or_bytes)
-            elif isinstance(content_or_bytes, str):
-                path.write_text(content_or_bytes, encoding="utf-8")
-            else:
-                path.write_text(
-                    json.dumps(content_or_bytes, ensure_ascii=False, indent=2) + "\n",
-                    encoding="utf-8",
-                )
+            with review_run_qualification_mutation_lock(self.run_dir):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if isinstance(content_or_bytes, bytes):
+                    path.write_bytes(content_or_bytes)
+                elif isinstance(content_or_bytes, str):
+                    path.write_text(content_or_bytes, encoding="utf-8")
+                else:
+                    path.write_text(
+                        json.dumps(content_or_bytes, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
             return str(path)
         except OSError as exc:
             self._diagnose(f"artifact:{name}", exc)
@@ -509,10 +511,11 @@ class RunLedger:
             payload["log_unavailable"] = True
         self.last_summary = payload
         try:
-            _atomic_write_text(
-                self.summary_path,
-                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            )
+            with review_run_qualification_mutation_lock(self.run_dir):
+                _atomic_write_text(
+                    self.summary_path,
+                    json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                )
             self.latest_pointer(status=status, reason_code=reason_code)
         except OSError as exc:
             self._diagnose("summary", exc)

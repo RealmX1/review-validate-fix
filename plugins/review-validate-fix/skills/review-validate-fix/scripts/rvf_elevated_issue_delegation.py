@@ -19,6 +19,8 @@ from typing import Any
 
 from independent_backup_route import BackupRouteOwned, guard_normal_mutation
 from validation_result_cache import candidate_content_manifest_sha256, canonical_json_bytes, clean_git_environment
+from core.review_run_qualification_mutation_lock import review_run_qualification_mutation_lock
+from core import review_run_qualification_mutation_lock as qualification_lock_protocol
 
 
 DELEGATION_CAPABILITY = "user_delegated_elevated_issue_disposition_v1"
@@ -184,6 +186,35 @@ def content_text(parts: Any) -> str:
     return "".join(texts)
 
 
+def native_text_contains_exact_machine_identifier(message_text: str, identifier: str) -> bool:
+    pattern = r"(?<![A-Za-z0-9._-])" + re.escape(identifier) + r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9._-])"
+    return re.search(pattern, message_text) is not None
+
+
+def require_user_authorized_issue_revocation(message_text: str, issue_id: str) -> None:
+    if not native_text_contains_exact_machine_identifier(message_text, issue_id):
+        raise DelegationEvidenceError("缺少针对 issue 的用户撤销原话")
+    action_pattern = r"撤销|取消.*委派|\brevoke\b|\bcancel\b.*\bdelegat"
+    negation_pattern = (r"(?:不要|不必|不能|不应|不得|不许|不准|不想|不愿|不会|不再|不|请勿|勿|别|禁止|拒绝|不同意|不批准|"
+                        r"do\s+not|don't|never|not\s+to|no\s+need\s+to).{0,32}(?:撤销|取消|\brevoke\b|\bcancel\b)")
+    issue_identifier_pattern = r"(?<![A-Za-z0-9._-])RVF-\d+(?![A-Za-z0-9_-]|\.[A-Za-z0-9._-])"
+    all_issue_ids = set(re.findall(issue_identifier_pattern, message_text))
+    affirmative_revocation = False
+    for clause in re.split(r"[，,。;；!?！？\n]+|\.(?=\s|$)", message_text):
+        if not re.search(action_pattern, clause, re.I):
+            continue
+        clause_issue_ids = set(re.findall(issue_identifier_pattern, clause))
+        if clause_issue_ids and issue_id not in clause_issue_ids:
+            continue
+        if not clause_issue_ids and len(all_issue_ids) > 1:
+            continue
+        if re.search(negation_pattern, clause, re.I):
+            raise DelegationEvidenceError("用户明确否定撤销该 issue 的委派")
+        affirmative_revocation = True
+    if not affirmative_revocation:
+        raise DelegationEvidenceError("缺少针对 issue 的肯定撤销授权")
+
+
 def validate_native_authorization(snapshot: dict[str, Any], authorization: dict[str, Any], issue_id: str,
                                   follow_up: dict[str, Any] | None, target_receipt: dict[str, Any] | None, action: str, *, run_id: str) -> None:
     if snapshot.get("schema") != "rvf-historical-native-user-authorization-snapshot" or type(snapshot.get("schema_version")) is not int or snapshot.get("schema_version") != 1:
@@ -195,7 +226,7 @@ def validate_native_authorization(snapshot: dict[str, Any], authorization: dict[
     records = snapshot.get("records")
     if not isinstance(records, list) or not records:
         raise DelegationEvidenceError("缺少原生授权快照")
-    if not re.search(r"(?<![A-Za-z0-9._-])" + re.escape(run_id) + r"(?![A-Za-z0-9._-])", canonical_json_bytes(records).decode("utf-8")):
+    if not native_text_contains_exact_machine_identifier(canonical_json_bytes(records).decode("utf-8"), run_id):
         raise DelegationEvidenceError("原生授权上下文没有绑定该 run，不能复用其他审查的同名 issue 决定")
     session = None
     current_turn = None
@@ -251,22 +282,25 @@ def validate_native_authorization(snapshot: dict[str, Any], authorization: dict[
     if received_text.lstrip().startswith(("<hook_prompt", "<task-notification", "<environment_context>", "<task-initial-prompt")):
         raise DelegationEvidenceError("自动投递和 handoff 不能作为用户委派授权")
     if action == "revoke":
-        if issue_id not in received_text or not re.search(r"撤销|取消.*委派|revoke|cancel.*delegat", received_text, re.I):
-            raise DelegationEvidenceError("缺少针对 issue 的用户撤销原话")
+        require_user_authorized_issue_revocation(received_text, issue_id)
         return
     if re.search(r"(?:^|[\n。；])\s*(?:Stop\b|停止|暂停|禁止|不得|不要(?:提交|同步|推送|执行|继续))", received_text, re.I):
         raise DelegationEvidenceError("用户请求包含执行禁止；委派不能解除它", status="execution_prohibited")
     if (re.search(r"不同意|不批准|不可以|拒绝|\bdisagree\b|\breject\b", received_text, re.I)
-        or re.search(r"(?:不要|不能|不应|不得|禁止|do not|don't).{0,16}(?:委派|转交|交给|派到|创建|新建|delegat|assign|creat)", received_text, re.I)):
+        or re.search(r"(?:不要|不能|不应|不得|禁止|别|勿|do not|don't).{0,16}"
+                     r"(?:委派|转交|交给|派到|创建|新建|建.{0,12}(?:task|任务)|delegat|assign|creat)"
+                     r"|不(?:委派|转交|交给|派到|创建|新建|建.{0,12}(?:task|任务))", received_text, re.I)):
         raise DelegationEvidenceError("用户原话明确拒绝该委派")
     mode = authorization.get("mode")
     if mode == "direct_delegation":
-        if (follow_up is None or issue_id not in received_text or follow_up["task_id"] not in received_text
+        if (follow_up is None or not native_text_contains_exact_machine_identifier(received_text, issue_id)
+            or not native_text_contains_exact_machine_identifier(received_text, follow_up["task_id"])
             or not re.search(r"委派|转交|交给|派到|delegat|assign", received_text, re.I)):
             raise DelegationEvidenceError("直接委派须由用户原话绑定 issue 和目标 task")
     elif mode == "approve_proposed_delegation":
         quote = authorization.get("proposal_context_quote")
-        if (not isinstance(quote, str) or issue_id not in quote or not assistant_context or quote not in assistant_context[-1]
+        if (not isinstance(quote, str) or not native_text_contains_exact_machine_identifier(quote, issue_id)
+            or not assistant_context or quote not in assistant_context[-1]
             or not re.search(r"^\s*(?:可以|同意|批准|好的?|yes\b|I agree\b|approve\b)", received_text, re.I)
             or not (re.search(r"(?:创建|新建|开|建).{0,12}(?:task|任务)|delegat|assign", received_text, re.I)
                     or re.search(r"(?:委派|交给|转交|delegat|assign).{0,80}(?:task|任务)|(?:创建|新建|开|建).{0,12}(?:task|任务)", quote, re.I))):
@@ -503,8 +537,7 @@ def record_delegation(repo: Path, run_dir: Path, request: dict[str, Any]) -> dic
     root.mkdir(parents=True, exist_ok=True)
     lock_path = root / "mutation.lock"
     assert_safe_artifact_path(lock_path, run_dir)
-    with lock_path.open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with review_run_qualification_mutation_lock(run_dir):
         ledger, events = read_ledger(run_dir)
         facts = latest_issue_facts(run_dir, request["issue_id"])
         if request.get("candidate_binding") is not None and request["candidate_binding"] != current_request_candidate_binding(repo, run_dir, request["issue_id"]):
@@ -558,6 +591,8 @@ def recovery_input_fingerprint(repo: Path, run_dir: Path, request_file: Path) ->
     paths.extend(Path(argument) for argument in shlex.split(task_query_command)[1:] if Path(argument).is_file())
     return digest({"files": {str(path): hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() and not path.is_symlink() else "missing_or_unsafe" for path in paths},
                    "candidate": candidate_content_manifest_sha256(repo), "verifier_source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                   "qualification_lock_implementation_sha256": hashlib.sha256(Path(qualification_lock_protocol.__file__).read_bytes()).hexdigest(),
+                   "qualification_lock_availability": qualification_lock_protocol.review_run_qualification_mutation_lock_availability(run_dir),
                    "target_query_command": task_query_command,
                    "runtime_port": os.environ.get("KANBAN_RUNTIME_PORT")})
 
