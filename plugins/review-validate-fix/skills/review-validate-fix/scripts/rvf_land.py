@@ -18,6 +18,8 @@ candidate_content_manifest_sha256``）。没有补修正、且没有无关脏文
 有补修正时内容摘要变了，才按 ``artifacts/handoff-validation-commands.json`` 的 argv 重跑。
 
 base-branch-sync 不并入本脚本，仍由 agent 在之后按 skill 调用。
+历史实际提交的追加验收另由 ``supplemental-completion inspect|record|verify`` 处理，
+其独立 schema、补审及隔离验证实现位于 ``supplemental_land_completion.py``。
 """
 
 from __future__ import annotations
@@ -1322,11 +1324,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
     qualification.add_argument("--run-dir", required=True)
     qualification.add_argument("--extra-path", action="append", default=[])
     qualification.add_argument(LEAVE_UNRELATED_DIRTY_PATHS_FLAG, action="store_true")
+    from supplemental_land_completion import add_argument_parser
+    add_argument_parser(subparsers)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_argument_parser().parse_args(argv)
+    if args.subcommand == "supplemental-completion":
+        from supplemental_land_completion import command
+        return command(args)
     try:
         if args.subcommand == "prepare":
             return command_prepare(args)

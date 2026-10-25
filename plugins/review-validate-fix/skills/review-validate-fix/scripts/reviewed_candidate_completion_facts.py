@@ -8,7 +8,7 @@ import re
 from collections import Counter
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import rvf_merge_dispositions
 import check_review_result
@@ -92,7 +92,9 @@ def completed_reviewer_legs(run_dir: Path) -> list[rvf_merge_dispositions.Canoni
     return legs
 
 
-def canonical_fix_attempt_facts(run_dir: Path, issue_ids: set[str]) -> tuple[dict[str, int], list[dict[str, Any]]]:
+def canonical_fix_attempt_facts(run_dir: Path, issue_ids: set[str], *,
+                                backlog_artifact_reader: Callable[[Path], dict[str, Any]] = read_regular_json_object,
+                                original_run_directory: Path | None = None) -> tuple[dict[str, int], list[dict[str, Any]]]:
     run_id = rvf_merge_dispositions.run_id_for_run_directory(run_dir)
     contract = read_regular_json_object(run_dir / "artifacts/inputs/scope.contract.json")
     attempts_by_issue: dict[str, list[tuple[datetime, dict[str, Any], dict[str, Any] | None]]] = {}
@@ -134,7 +136,7 @@ def canonical_fix_attempt_facts(run_dir: Path, issue_ids: set[str]) -> tuple[dic
         elif status == "false_positive" and latest.get("status") == status:
             counts["false_positive"] += 1
         elif status == "validated_and_submitted_to_kanban_backlog" and latest.get("status") == status:
-            require_durable_backlog_submission(result, run_dir)
+            require_durable_backlog_submission(result, original_run_directory or run_dir, artifact_reader=backlog_artifact_reader)
             counts["submitted_to_kanban_backlog"] += 1
         else:
             raise ValueError(f"latest fix attempt is unresolved or not applied: {issue_id} ({latest.get('status')}/{status})")
@@ -146,7 +148,15 @@ def canonical_fix_attempt_facts(run_dir: Path, issue_ids: set[str]) -> tuple[dic
     return {name: counts[name] for name in ("fixed", "false_positive", "submitted_to_kanban_backlog")}, applied
 
 
-def require_durable_backlog_submission(result: dict[str, Any], run_dir: Path) -> None:
+def optional_backlog_artifact(path: Path, artifact_reader: Callable[[Path], dict[str, Any]]) -> dict[str, Any] | None:
+    try:
+        return artifact_reader(path)
+    except (OSError, ValueError):
+        return None
+
+
+def require_durable_backlog_submission(result: dict[str, Any], run_dir: Path, *,
+                                       artifact_reader: Callable[[Path], dict[str, Any]] = read_regular_json_object) -> None:
     receipt = result.get("kanban_backlog_submission")
     if not isinstance(receipt, dict) or any(receipt.get(key) != result[key] for key in ("issue_id", "attempt_id")):
         raise ValueError("backlog terminal outcome has no identity-bound submission receipt")
@@ -162,15 +172,15 @@ def require_durable_backlog_submission(result: dict[str, Any], run_dir: Path) ->
         if outcome == "pending_kanban_runtime_unavailable":
             pending_path = Path(str(group.get("pending_prompt_path", "")))
             fingerprints = {entry.get("finding_fingerprint") for entry in group.get("findings", []) if isinstance(entry, dict)}
-            if pending_path.is_file() and not pending_path.is_symlink():
-                pending = read_regular_json_object(pending_path)
+            pending = optional_backlog_artifact(pending_path, artifact_reader)
+            if pending is not None:
                 if (pending.get("run_dir") == str(run_dir) and fingerprints and None not in fingerprints
                     and fingerprints <= set(pending.get("finding_fingerprints", []))):
                     continue
             # 正式重试成功会删除旧 pending；用同一 finding 的持久建卡账本证明已完成，不改旧回执。
-            entries = backlog_latest_submission_by_finding_fingerprint(receipt)
+            entries = backlog_latest_submission_by_finding_fingerprint(receipt, artifact_reader=artifact_reader)
             if fingerprints and None not in fingerprints and all(
-                durable_backlog_ledger_entry(entries.get(fingerprint)) for fingerprint in fingerprints
+                durable_backlog_ledger_entry(entries.get(fingerprint), artifact_reader=artifact_reader) for fingerprint in fingerprints
             ):
                 continue
         if outcome == "nothing_new_to_submit":
@@ -180,30 +190,35 @@ def require_durable_backlog_submission(result: dict[str, Any], run_dir: Path) ->
                 and finding.get("previous_kanban_task_id") for finding in findings
             ):
                 continue
-            latest_by_fingerprint = backlog_latest_submission_by_finding_fingerprint(receipt)
+            latest_by_fingerprint = backlog_latest_submission_by_finding_fingerprint(receipt, artifact_reader=artifact_reader)
             if findings and all(isinstance(finding, dict) and finding.get("outcome") == "skipped_already_submitted_identical_finding"
-                                and durable_backlog_ledger_entry(latest_by_fingerprint.get(finding.get("finding_fingerprint")))
+                                and durable_backlog_ledger_entry(latest_by_fingerprint.get(finding.get("finding_fingerprint")), artifact_reader=artifact_reader)
                                 for finding in findings):
                 continue
         raise ValueError("backlog terminal outcome lacks a created task or durable pending intent")
 
 
-def backlog_latest_submission_by_finding_fingerprint(receipt: dict[str, Any]) -> dict[str, Any]:
+def backlog_latest_submission_by_finding_fingerprint(receipt: dict[str, Any], *,
+        artifact_reader: Callable[[Path], dict[str, Any]] = read_regular_json_object) -> dict[str, Any]:
     ledger_path = Path(str(receipt.get("ledger_path", "")))
+    if artifact_reader is not read_regular_json_object:
+        # 补充证明的 reader 从已固定的原始 JSONL 字节逐行解析，不追读旧路径。
+        return artifact_reader(ledger_path)
     if ledger_path.is_symlink() or not ledger_path.is_file():
         raise ValueError("backlog finding has no durable ledger")
     return {entry.get("finding_fingerprint"): entry for line in ledger_path.read_text().splitlines()
             if line.strip() for entry in [json.loads(line)] if isinstance(entry, dict)}
 
 
-def durable_backlog_ledger_entry(entry: Any) -> bool:
+def durable_backlog_ledger_entry(entry: Any, *,
+        artifact_reader: Callable[[Path], dict[str, Any]] = read_regular_json_object) -> bool:
     if not isinstance(entry, dict):
         return False
     if entry.get("outcome") == "created_kanban_backlog_task":
         return bool(entry.get("kanban_task_id"))
     if entry.get("outcome") == "pending_kanban_runtime_unavailable":
         pending = Path(str(entry.get("pending_prompt_path", "")))
-        return pending.is_file() and not pending.is_symlink()
+        return optional_backlog_artifact(pending, artifact_reader) is not None
     return False
 
 
@@ -240,13 +255,38 @@ def handoff_display_consistency_errors(handoff_text: str, counts: dict[str, int]
     return errors
 
 
-def completed_review_facts(run_dir: Path, handoff_text: str) -> dict[str, Any]:
+def handoff_completion_marker_facts(handoff_text: str, *, allow_missing: bool = False) -> dict[str, Any]:
+    """缺失标记仅可由补充入口补证；明确未完成及相互冲突的标记永远拒绝。"""
+    marker_values: dict[str, list[str]] = {"handoff_status": [], "review_status": []}
+    in_code_block = False
+    for line in handoff_text.splitlines():
+        if line.lstrip().startswith(("```", "~~~")):
+            in_code_block = not in_code_block
+            continue
+        if not in_code_block:
+            marker = re.match(r"^\s*(?:-\s*)?(handoff_status|review_status):[ \t]*(.*)$", line, re.IGNORECASE)
+            if marker:
+                marker_values[marker.group(1).lower()].append(marker.group(2).strip().upper())
+    missing = []
+    for name in ("handoff_status", "review_status"):
+        values = marker_values[name]
+        if any(value != "COMPLETED" for value in values):
+            raise CandidateQualificationRefused("handoff_completion_invalid", f"{name} 明确未完成或标记冲突")
+        if not values:
+            missing.append(name)
+    if missing and not allow_missing:
+        raise CandidateQualificationRefused("handoff_completion_invalid", "handoff 与 review 均须完成")
+    return {"missing_markers": missing, "completion_source": "structured_review_facts" if missing else "handoff_markers_and_structured_review_facts"}
+
+
+def completed_review_facts(run_dir: Path, handoff_text: str, *, allow_missing_completion_markers: bool = False,
+                           backlog_artifact_reader: Callable[[Path], dict[str, Any]] = read_regular_json_object,
+                           original_run_directory: Path | None = None) -> dict[str, Any]:
     try:
         legs = completed_reviewer_legs(run_dir)
     except ValueError as exc:
         raise CandidateQualificationRefused("reviewer_completion_invalid", str(exc)) from exc
-    if not all(re.search(rf"(?im)^\s*(?:-\s*)?{name}:\s*COMPLETED\s*$", handoff_text) for name in ("handoff_status", "review_status")):
-        raise CandidateQualificationRefused("handoff_completion_invalid", "handoff and review must both be completed")
+    handoff_completion_marker_facts(handoff_text, allow_missing=allow_missing_completion_markers)
     issue_ids: set[str] = set()
     if any(leg.issues for leg in legs) or rvf_merge_dispositions.merge_dispositions_path(run_dir).exists() or any((run_dir / "artifacts/fix-issues").glob("*.json")):
         try:
@@ -255,7 +295,8 @@ def completed_review_facts(run_dir: Path, handoff_text: str) -> dict[str, Any]:
             raise CandidateQualificationRefused("merge_dispositions_check_failed", str(exc)) from exc
         issue_ids = set(dispositions.accounted_fix_issue_ids)
     try:
-        counts, applied = canonical_fix_attempt_facts(run_dir, issue_ids)
+        counts, applied = canonical_fix_attempt_facts(run_dir, issue_ids, backlog_artifact_reader=backlog_artifact_reader,
+                                                     original_run_directory=original_run_directory)
     except (ValueError, TypeError, KeyError) as exc:
         raise CandidateQualificationRefused("canonical_fix_completion_invalid", str(exc)) from exc
     errors = handoff_display_consistency_errors(handoff_text, counts)
@@ -266,7 +307,7 @@ def completed_review_facts(run_dir: Path, handoff_text: str) -> dict[str, Any]:
 
 
 def applied_scope_expansion_facts(applied_attempts: list[dict[str, Any]], scope_paths: set[str], run_dir: Path,
-                                *, contract: Mapping[str, Any]) -> list[dict[str, Any]]:
+                                *, contract: Mapping[str, Any], original_run_directory: Path | None = None) -> list[dict[str, Any]]:
     expansions: list[dict[str, Any]] = []
     for facts in applied_attempts:
         attempt, result = facts["attempt"], facts["result"]
@@ -311,6 +352,11 @@ def applied_scope_expansion_facts(applied_attempts: list[dict[str, Any]], scope_
                 raise ValueError("developer-tool-managed scope expansion is forbidden")
             patch = Path(str(result.get("fix_patch_path", "")))
             expected_patch = run_dir / "artifacts/fix-attempts" / attempt["attempt_id"] / "fix.patch"
+            if original_run_directory is not None:
+                original_patch = original_run_directory / "artifacts/fix-attempts" / attempt["attempt_id"] / "fix.patch"
+                if patch != original_patch:
+                    raise ValueError("范围扩展的原补丁身份不匹配")
+                patch = expected_patch
             # 祖先路径可以使用别名；补丁本身仍须是绑定 attempt 的普通文件。
             if (patch.is_symlink() or expected_patch.is_symlink() or not patch.is_file()
                 or patch.resolve() != expected_patch.resolve()):
