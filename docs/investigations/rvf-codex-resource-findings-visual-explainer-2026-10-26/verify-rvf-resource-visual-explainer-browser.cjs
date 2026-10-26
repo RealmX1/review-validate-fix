@@ -42,6 +42,7 @@ const historicalResourceSummary = JSON.parse(fs.readFileSync(path.join(investiga
       const analysisTimeWidth = await explainer.locator('.rvf-time-bar span').last().evaluate(element => parseFloat(element.style.width));
       assertObserved(`${pageName}：时长比例直接来自历史统计`, Math.abs(analysisTimeWidth-historicalResourceSummary.primary_7_days.analyze_elapsed_share*100)<0.00001);
       assertObserved(`${pageName}：标注了新版修复与历史窗口`, (await explainer.textContent()).includes('新版已补这道检查') && (await explainer.textContent()).includes('截止 2026-10-18'));
+      assertObserved(`${pageName}：区分旧缓存和实际声明的 Hook 入口`, (await explainer.textContent()).includes('旧缓存插件的三个 Hook 入口在配置中已禁用'));
       for (const viewportWidth of [1360, 390]) {
         await page.setViewportSize({ width: viewportWidth, height: 1050 });
         const overflow = await explainer.evaluate(element => ({ clientWidth: element.clientWidth, scrollWidth: element.scrollWidth, rectWidth: element.getBoundingClientRect().width }));

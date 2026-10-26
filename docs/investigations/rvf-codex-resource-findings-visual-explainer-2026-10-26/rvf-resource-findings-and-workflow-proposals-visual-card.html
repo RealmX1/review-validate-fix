@@ -51,7 +51,7 @@
   <h2 id="rvf-archive-title">说“写完了”，还要查档案柜。</h2>
   <div class="rvf-archive-layout"><div class="rvf-document-grid" id="rvf-formal-archive-documents" aria-label="历史 18 次复盘中，仅 1 份通过正式归档检查。"></div><div><div class="rvf-one-of-eighteen">1 / 18</div><p class="rvf-caption">历史样本中，通过正式归档检查。</p><p class="rvf-small" style="margin-top:12px">18 次进程都退出成功；17 份正式文件仍有 TODO。<br>部分复盘内容可能保存在别处，不能把这些 Token 全算作白费。</p></div></div>
   <div class="rvf-current-status"><span class="rvf-large-icon">🛡️</span><div><strong>10 月 26 日核对：新版已补这道检查。</strong><p>正式目录授权 → 文件与快照校验 → 有限重试／恢复。<br>当前部署代码具备这些能力；实际改善率尚未重新测量。</p></div></div>
-  <details><summary>哪些能力已经存在，直接复用？</summary><ul><li>仅给当前 run 的正式 analysis 目录追加写入授权。</li><li>进程退出、正式输出完成、完成计数分别记录；校验 summary 无 TODO、causality 与原事实快照一致。</li><li>每证据代次最多三次自动尝试，预算和历史跨重启保留。</li><li>已有成功产物恢复可读后只重验和幂等补记，不重新花 Token 跑模型。</li></ul><p>源码核对基于本地 main 与已部署 <code>fa7e2c6c8ccf</code>，四个相关部署文件 SHA256 一致。旧比例保持历史口径；没有把源码已更新写成新版端到端效果已验收。</p></details>
+  <details><summary>哪些能力已经存在，直接复用？</summary><ul><li>仅给当前 run 的正式 analysis 目录追加写入授权。</li><li>进程退出、正式输出完成、完成计数分别记录；校验 summary 无 TODO、causality 与原事实快照一致。</li><li>每证据代次最多三次自动尝试，预算和历史跨重启保留。</li><li>已有成功产物恢复可读后只重验和幂等补记，不重新花 Token 跑模型。</li></ul><p>源码核对基于本地 main 与已部署 <code>fa7e2c6c8ccf</code>，四个相关部署文件 SHA256 一致。旧缓存插件的三个 Hook 入口在配置中已禁用；全局与本会话的直接 Hook 配置指向新版发行包。目录中仍有旧缓存，不能据此断言当前 Hook 仍跑旧代码。</p><p>旧比例保持历史口径；这里核对了源码和声明的执行入口，没有把它写成新版端到端效果已验收。</p></details>
  </section>
  <section class="rvf-panel" id="rvf-proposed-workflow-panel" aria-labelledby="rvf-proposal-title">
   <div class="rvf-step-number">④ 流程改进提案 · 尚未实施</div>

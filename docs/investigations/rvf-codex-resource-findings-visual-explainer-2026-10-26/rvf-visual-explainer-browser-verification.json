@@ -1,5 +1,5 @@
 {
-  "verifiedAtUtc": "2026-10-26T20:22:44.807Z",
+  "verifiedAtUtc": "2026-10-26T20:25:59.419Z",
   "browser": "隔离 Chrome / Playwright",
   "offline": true,
   "initialCliNavigationFailure": "CLI 默认禁止 file://；使用本地 Playwright API 验证相同离线文件，未修改 CLI 或生产配置。",
@@ -39,6 +39,10 @@
     },
     {
       "description": "独立离线图解：标注了新版修复与历史窗口",
+      "passed": true
+    },
+    {
+      "description": "独立离线图解：区分旧缓存和实际声明的 Hook 入口",
       "passed": true
     },
     {
@@ -83,6 +87,10 @@
     },
     {
       "description": "会话可视化页：标注了新版修复与历史窗口",
+      "passed": true
+    },
+    {
+      "description": "会话可视化页：区分旧缓存和实际声明的 Hook 入口",
       "passed": true
     },
     {

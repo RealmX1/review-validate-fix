@@ -22,8 +22,9 @@
       "source_sha256": "df110cc846e91a251ab067690a9396ff6f030567540efabd99784bc23a334a00",
       "deployed_path": "/Users/bominzhang/.rvf/developer-plugin-marketplaces/review-validate-fix-local-main/plugins/review-validate-fix/adapters/codex/subagent.py",
       "deployed_file_matches_main": true,
-      "loaded_skill_cache_path": "/Users/bominzhang/.codex/plugins/cache/review-validate-fix-local-main/review-validate-fix/0.1.0/adapters/codex/subagent.py",
-      "loaded_skill_cache_matches_main": false
+      "catalogued_skill_cache_path": "/Users/bominzhang/.codex/plugins/cache/review-validate-fix-local-main/review-validate-fix/0.1.0/adapters/codex/subagent.py",
+      "catalogued_skill_cache_matches_main": false,
+      "catalogued_skill_cache_file_exists": false
     },
     {
       "repository_path": "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_analyze_thread.py",
@@ -31,8 +32,9 @@
       "source_sha256": "accdb58f2473f4665a62504644e9b45b570a60963d51c359e842b1c59e585b2c",
       "deployed_path": "/Users/bominzhang/.rvf/developer-plugin-marketplaces/review-validate-fix-local-main/plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_analyze_thread.py",
       "deployed_file_matches_main": true,
-      "loaded_skill_cache_path": "/Users/bominzhang/.codex/plugins/cache/review-validate-fix-local-main/review-validate-fix/0.1.0/skills/review-validate-fix/scripts/rvf_analyze_thread.py",
-      "loaded_skill_cache_matches_main": false
+      "catalogued_skill_cache_path": "/Users/bominzhang/.codex/plugins/cache/review-validate-fix-local-main/review-validate-fix/0.1.0/skills/review-validate-fix/scripts/rvf_analyze_thread.py",
+      "catalogued_skill_cache_matches_main": false,
+      "catalogued_skill_cache_file_exists": true
     },
     {
       "repository_path": "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_analyze_formal_archive_verified_execution.py",
@@ -40,8 +42,9 @@
       "source_sha256": "c0afbf4c58a3b9a461869344c224c36294c81138fcb3f6412171d93ad54bd02f",
       "deployed_path": "/Users/bominzhang/.rvf/developer-plugin-marketplaces/review-validate-fix-local-main/plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_analyze_formal_archive_verified_execution.py",
       "deployed_file_matches_main": true,
-      "loaded_skill_cache_path": "/Users/bominzhang/.codex/plugins/cache/review-validate-fix-local-main/review-validate-fix/0.1.0/skills/review-validate-fix/scripts/rvf_analyze_formal_archive_verified_execution.py",
-      "loaded_skill_cache_matches_main": false
+      "catalogued_skill_cache_path": "/Users/bominzhang/.codex/plugins/cache/review-validate-fix-local-main/review-validate-fix/0.1.0/skills/review-validate-fix/scripts/rvf_analyze_formal_archive_verified_execution.py",
+      "catalogued_skill_cache_matches_main": false,
+      "catalogued_skill_cache_file_exists": false
     },
     {
       "repository_path": "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_run_finalize.py",
@@ -49,8 +52,9 @@
       "source_sha256": "9c015fb742b885995d52f4e048ace0f5db9d99a7991a0e35eb2d63093bf604df",
       "deployed_path": "/Users/bominzhang/.rvf/developer-plugin-marketplaces/review-validate-fix-local-main/plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_run_finalize.py",
       "deployed_file_matches_main": true,
-      "loaded_skill_cache_path": "/Users/bominzhang/.codex/plugins/cache/review-validate-fix-local-main/review-validate-fix/0.1.0/skills/review-validate-fix/scripts/rvf_run_finalize.py",
-      "loaded_skill_cache_matches_main": false
+      "catalogued_skill_cache_path": "/Users/bominzhang/.codex/plugins/cache/review-validate-fix-local-main/review-validate-fix/0.1.0/skills/review-validate-fix/scripts/rvf_run_finalize.py",
+      "catalogued_skill_cache_matches_main": false,
+      "catalogued_skill_cache_file_exists": true
     }
   ],
   "existing_capabilities_confirmed_in_deployed_code": [
@@ -111,5 +115,39 @@
       "hit_count": 11,
       "interpretation": "命中主要是产出、校验、归因等路径；不能据此把已有 reviewer backlog 投递误当成 Analyze 建议消费。"
     }
-  ]
+  ],
+  "hook_route_verification": {
+    "checked_routes": [
+      {
+        "configuration_home": "/Users/bominzhang/.codex",
+        "config_sha256": "31d57559ec230f23bfe1e58e8bbfdd37279b706af3ed4d0c09451e52f31790f6",
+        "hooks_sha256": "738c4e8fe812a47172ca6eebc927f297348a1e60740066c1f722e7fc75c9d673",
+        "cached_plugin_hook_enabled_states": {
+          "review-validate-fix@review-validate-fix-local-main:hooks/hooks.json:post_tool_use:0:0": false,
+          "review-validate-fix@review-validate-fix-local-main:hooks/hooks.json:stop:0:0": false,
+          "review-validate-fix@review-validate-fix-local-main:hooks/hooks.json:user_prompt_submit:0:0": false
+        },
+        "declared_hook_target_scripts": [
+          "/Users/bominzhang/.rvf/developer-plugin-marketplaces/review-validate-fix-local-main/plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_user_prompt_submit.py",
+          "/Users/bominzhang/.rvf/developer-plugin-marketplaces/review-validate-fix-local-main/plugins/review-validate-fix/skills/review-validate-fix/scripts/stop_hook_router.py"
+        ]
+      },
+      {
+        "configuration_home": "/Users/bominzhang/.cline/kanban/codex-configuration-writer-bindings-and-sync/writers/c3ae79b9-4dd6-47e8-8b0f-f5ac9ec9e857/configuration-home",
+        "config_sha256": "35629b22d972d4204fba39cbccc81d6c06b7641c29ed2f961083f39931ce7712",
+        "hooks_sha256": "738c4e8fe812a47172ca6eebc927f297348a1e60740066c1f722e7fc75c9d673",
+        "cached_plugin_hook_enabled_states": {
+          "review-validate-fix@review-validate-fix-local-main:hooks/hooks.json:post_tool_use:0:0": false,
+          "review-validate-fix@review-validate-fix-local-main:hooks/hooks.json:stop:0:0": false,
+          "review-validate-fix@review-validate-fix-local-main:hooks/hooks.json:user_prompt_submit:0:0": false
+        },
+        "declared_hook_target_scripts": [
+          "/Users/bominzhang/.rvf/developer-plugin-marketplaces/review-validate-fix-local-main/plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_user_prompt_submit.py",
+          "/Users/bominzhang/.rvf/developer-plugin-marketplaces/review-validate-fix-local-main/plugins/review-validate-fix/skills/review-validate-fix/scripts/stop_hook_router.py"
+        ]
+      }
+    ],
+    "conclusion": "全局与本会话配置 writer 的旧插件 Hook 均禁用，直接 Hook 指向新版 marketplace；目录缓存残留不能反证当前 Hook 版本。",
+    "remaining_limit": "此处证明源码与声明的执行入口，不把它写成新版真实 Analyze 成功率已经实测。"
+  }
 }
