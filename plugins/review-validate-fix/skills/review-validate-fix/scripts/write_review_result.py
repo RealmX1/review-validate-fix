@@ -9,6 +9,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import _rvf_pyroot  # noqa: F401
+from core.review_run_qualification_mutation_lock import guard_review_run_qualification_mutation, run_directory_for_qualification_artifact
+
 
 SCHEMA_VERSION = 1
 REQUEST_TYPES = {
@@ -121,6 +124,7 @@ def base_payload(kind: str) -> dict[str, Any]:
     }
 
 
+@guard_review_run_qualification_mutation(lambda arguments: run_directory_for_qualification_artifact(arguments["out"]))
 def supersede_existing_result(out: Path, existing: dict[str, Any], new_kind: str) -> dict[str, Any]:
     """把当前这份**另一 kind** 的结果工件归档，并返回新 payload（带指向归档的溯源链）。
 
@@ -169,6 +173,7 @@ def supersede_existing_result(out: Path, existing: dict[str, Any], new_kind: str
     return payload
 
 
+@guard_review_run_qualification_mutation(lambda arguments: run_directory_for_qualification_artifact(arguments["path"]))
 def write_payload(path: Path, payload: dict[str, Any]) -> None:
     ensure_out_allowed(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -184,6 +189,7 @@ def optional_fields(args: argparse.Namespace, names: tuple[str, ...]) -> dict[st
     return fields
 
 
+@guard_review_run_qualification_mutation(lambda arguments: run_directory_for_qualification_artifact(Path(arguments["args"].out)))
 def command_no_issues(args: argparse.Namespace) -> int:
     out = Path(args.out)
     existing = read_existing(out)
@@ -204,6 +210,7 @@ def command_no_issues(args: argparse.Namespace) -> int:
     return 0
 
 
+@guard_review_run_qualification_mutation(lambda arguments: run_directory_for_qualification_artifact(Path(arguments["args"].out)))
 def command_issue(args: argparse.Namespace) -> int:
     if not is_relative_repo_path(args.path):
         return fail("--path must be a relative repo path without '..'")
@@ -244,6 +251,7 @@ def command_issue(args: argparse.Namespace) -> int:
     return 0
 
 
+@guard_review_run_qualification_mutation(lambda arguments: run_directory_for_qualification_artifact(Path(arguments["args"].out)))
 def append_request(args: argparse.Namespace, request: dict[str, Any]) -> int:
     out = Path(args.out)
     existing = read_existing(out)

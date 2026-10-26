@@ -1022,11 +1022,16 @@ def command_commit(args: argparse.Namespace) -> int:
     result_persistence_completed = False
     try:
         with normal_worktree_mutation(repo_root, "rvf-land-commit", run_dir):
+            from rvf_elevated_issue_delegation import resume_pending_delegations_for_authorized_land
+
+            delegation_recovery = resume_pending_delegations_for_authorized_land(repo_root, run_dir)
             try:
                 result = land_commit_result_from_prepare_plan(args, run_dir, repo_root)
             except RvfLandHardGateFailure as failure:
                 result = {"status": "refused", **failure.as_payload()}
                 failure_output = failure.details.get("failure_output")
+            if delegation_recovery:
+                result["elevated_issue_delegation_recovery"] = delegation_recovery
             plan = read_json_object_or_none(prepare_plan_artifact_path(run_dir)) or {}
             if result["status"] != "refused" or plan.get("repo_root") == str(repo_root):
                 result_persistence_started = True
@@ -1085,6 +1090,7 @@ def land_commit_after_prepare_plan_checks(
     repo_root: Path,
     message: str,
     dirty_entries: list[dict[str, str]],
+    *, validation_with_completed_replay: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     extra_paths = sorted(
         set(plan.get("extra_paths") or []) | {repo_relative_path(repo_root, path) for path in args.extra_path}
@@ -1124,7 +1130,18 @@ def land_commit_after_prepare_plan_checks(
             merge_dispositions_errors=list(merge_dispositions_errors),
         )
 
-    validation = ensure_validation_satisfies_evidence_gate(repo_root, run_dir)
+    if validation_with_completed_replay is None:
+        validation = ensure_validation_satisfies_evidence_gate(repo_root, run_dir)
+        from core.review_run_qualification_mutation_lock import review_run_qualification_mutation_lock
+
+        # 验证子进程发布 validation index 也持同锁；先完成重放，再锁内复核全部资格和提交。
+        with review_run_qualification_mutation_lock(run_dir):
+            if plan.get("head_oid_at_prepare") != head_oid(repo_root):
+                raise RvfLandHardGateFailure(RVF_LAND_EXIT_PREPARE_PLAN_MISSING_OR_STALE, "prepare_plan_stale", "等待资格锁期间 HEAD 已变化；重跑 prepare。")
+            return land_commit_after_prepare_plan_checks(args, plan, run_dir, repo_root, message,
+                [entry for entry in repo_snapshot(repo_root).get("dirty_paths") or [] if isinstance(entry, dict)],
+                validation_with_completed_replay=validation)
+    validation = validation_with_completed_replay
 
     qualification = land_candidate_evidence_qualification(
         repo_root, run_dir, in_scope, unrelated, leave_unrelated=leave_unrelated_dirty_paths_uncommitted,
@@ -1296,6 +1313,11 @@ def land_commit_after_prepare_plan_checks(
         "round_baseline_seal": round_baseline_seal,
         "candidate_evidence": candidate_evidence,
         "candidate_evidence_qualification": qualification,
+        "review_completed": qualification["status"] == "eligible",
+        "land_completed": exit_code == RVF_LAND_EXIT_OK,
+        "issues_remain_unresolved": qualification.get("issues_remain_unresolved", False),
+        "user_delegated_elevated_issues": qualification.get("user_delegated_elevated_issues", []),
+        "base_sync_completed": False,
     }
     if committed_paths_outside_stage_set:
         result["reason_code"] = "committed_paths_outside_stage_set"

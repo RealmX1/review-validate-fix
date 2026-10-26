@@ -19,6 +19,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
+from core.review_run_qualification_mutation_lock import guard_review_run_qualification_mutation  # noqa: E402
 import rvf_fix_issue  # noqa: E402
 from fix_attempt_scope_expansion_classification import (  # noqa: E402
     canonical_issue_authorized_fix_paths, classify_fix_attempt_scope_expansion,
@@ -349,6 +350,7 @@ def _commit_all(repo: Path, message: str) -> str:
     return _run(repo, ["rev-parse", "HEAD"], check=True).stdout.strip()
 
 
+@guard_review_run_qualification_mutation("run_dir")
 def prepare_fix_attempt(
     *,
     run_dir: Path,
@@ -442,6 +444,7 @@ def command_prepare(args: argparse.Namespace) -> int:
     return 0
 
 
+@guard_review_run_qualification_mutation("run_dir")
 def mark_fix_attempt_started(
     *,
     run_dir: Path,
@@ -478,6 +481,7 @@ FIX_ATTEMPT_SUBAGENT_AWAITING_MARKER_DISPATCHER = "rvf fix prepare（validate/fi
 ATTEMPT_FIELD_MAIN_AGENT_SESSION_ID_AWAITING_FIX_SUBAGENT = "main_agent_session_id_awaiting_fix_subagent"
 
 
+@guard_review_run_qualification_mutation("run_dir")
 def arm_fix_attempt_subagent_awaiting_marker(
     *, run_dir: Path, attempt_id: str, main_agent_session_id: str
 ) -> Path | None:
@@ -704,6 +708,18 @@ def _load_kanban_backlog_findings_before_any_write(args: argparse.Namespace) -> 
     return backlog_submission.load_out_of_scope_findings_file(Path(raw).expanduser().resolve())
 
 
+def _qualification_run_directory_for_stop(arguments):
+    args = arguments["args"]
+    inferred = infer_run_dir_and_attempt_id_from_attempt_worktree_path(Path.cwd())
+    if args.attempt_id is None and inferred is None:
+        # 参数不足时交回原命令报告缺失 attempt ID；此前不会产生资格写入。
+        return None
+    if args.run_dir or os.environ.get("RVF_RUN_DIR"):
+        return _required_path(args.run_dir, "RVF_RUN_DIR", "--run-dir")
+    return inferred[0] if inferred is not None else _required_path(None, "RVF_RUN_DIR", "--run-dir")
+
+
+@guard_review_run_qualification_mutation(_qualification_run_directory_for_stop)
 def command_stop(args: argparse.Namespace) -> int:
     inferred = infer_run_dir_and_attempt_id_from_attempt_worktree_path(Path.cwd())
     if args.attempt_id is None:
@@ -997,6 +1013,7 @@ def _backup_route_fix_attempt_target(arguments):
 
 
 @guard_normal_mutation(_backup_route_fix_attempt_target, "apply-fix-attempt", "run_dir")
+@guard_review_run_qualification_mutation("run_dir")
 
 def apply_fix_attempt(
     *,

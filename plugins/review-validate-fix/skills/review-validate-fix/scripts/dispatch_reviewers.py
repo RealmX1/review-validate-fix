@@ -53,6 +53,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 core.* import
+from core.review_run_qualification_mutation_lock import guard_review_run_qualification_mutation, run_directory_for_qualification_artifact
 from review_start_boundary_gate import require_prepared_run_review_start_boundary
 from core.review_start_boundary.review_start_boundary_verification import ReviewStartBoundaryNotVerified
 import harness_limit_cooldown
@@ -839,6 +840,7 @@ def _resume_plan_for_review_request_legs(
     return plan, indices
 
 
+@guard_review_run_qualification_mutation(lambda arguments: run_directory_for_qualification_artifact(arguments["artifacts_dir"] / "reviewers/reviewer-plan.json"))
 def _rotate_review_request_leg_artifacts(
     plan: dict[str, Any], indices: list[int], artifacts_dir: Path
 ) -> list[str]:
@@ -866,6 +868,12 @@ def _rotate_review_request_leg_artifacts(
         os.replace(result_path, archive_path)
         rotated.append(str(archive_path))
     return rotated
+
+
+@guard_review_run_qualification_mutation(lambda arguments: run_directory_for_qualification_artifact(arguments["path"]))
+def write_canonical_reviewer_plan(path: Path, plan: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def _backup_route_dispatch_repository(arguments):
@@ -1815,7 +1823,7 @@ def main() -> int:
 
     reviewers_dir.mkdir(parents=True, exist_ok=True)
     plan_path = reviewers_dir / "reviewer-plan.json"
-    plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    write_canonical_reviewer_plan(plan_path, plan)
     print(str(plan_path))
 
     if plan["status"] == "failed":

@@ -249,6 +249,7 @@ token 与 run 目录都可省——`rvf` 按「显式参数 > `RVF_RUN_DIR` > �
   2. 子代理在 attempt worktree 内改完后，照抄参数块里的整行收尾命令 `cd <attempt worktree> && rvf fix stop --attempt-id … --run-dir … --status …`。不能靠 cwd 反推：Claude 子代理每次 Bash 调用都会重置 cwd。
   3. 全部子代理结束后 `rvf apply --all-stopped`：按 attempt 创建顺序合回所有已 stop 的 fixed attempt，逐条报告 `applied` / `merge_conflict` / `scope_expansion_conflict`，**遇到冲突就停下交给你判断**（merge_conflict 记为该 attempt 未合并，不得手工搬运后伪装成已归因 patch）。
 - `--status elevated` 必须通过 `--result-file <elevation-detail.json>` 写入升级详情；自然语言 final 只作日志。
+- 用户明确把 elevated 问题交给其他 Task 后，可用 `rvf elevated-issue-delegation record|verify|resume` 留下可审计处置，详见 [用户委派与收尾](references/user-delegated-elevated-issue-disposition.md)。问题仍为 elevated，已核验委派只改变原候选的阻断性；不等待目标完成，不增加 Land、同步或 push 权限。
 - **elevated 不即时交开发者，先自解析、再延迟到末端。** 收到 reviewer / fixer 标记的 elevated concern 后，主会话先尝试自行决断：① 以自身 context 判断；② 依据不足则派 subagent 在代码库中找分辨/决策依据。只有 context + 代码库都不足以决断时，才真正记为 `elevated`（能决断的就地转 `fixed` / `false_positive`）。即便确属 elevated，也不当场打断流程去问，而是先把所有非 elevated issue 验证/修复完，到 workflow 末端再处理（见 Handoff）。
 
 ## 最终验证证据

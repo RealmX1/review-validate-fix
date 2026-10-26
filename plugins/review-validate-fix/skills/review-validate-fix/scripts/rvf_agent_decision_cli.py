@@ -57,6 +57,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401 — 把 pyroot 上 sys.path，供 core.* / 兄弟脚本 import
+from core.review_run_qualification_mutation_lock import guard_review_run_qualification_mutation, run_directory_for_qualification_artifact
 from core.session_scope_allocation.committed_round_detection import (  # noqa: E402
     frozen_committed_round_base_exclusion_ref,
 )
@@ -255,6 +256,7 @@ def _ensure_parent_dir(path: Path) -> None:
         pass
 
 
+@guard_review_run_qualification_mutation(lambda arguments: run_directory_for_qualification_artifact(arguments["path"]))
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     _ensure_parent_dir(path)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
