@@ -191,28 +191,120 @@ def native_text_contains_exact_machine_identifier(message_text: str, identifier:
     return re.search(pattern, message_text) is not None
 
 
+NATIVE_DELEGATION_ACTION_PATTERN = r"委派|转交|交给|派到|\bdelegat(?:e|ed|es|ing)\b|\bassign(?:ed|ing|s)?\b"
+NATIVE_REVOCATION_ACTION_PATTERN = r"撤销|取消|\brevoke\b|\bcancel\b"
+NATIVE_TASK_CREATION_ACTION_PATTERN = (r"(?:创建|新建|建立|开设|(?:开|建)(?=\s*(?:一|另|新|独立|专门|task|任务)))"
+                                       r"\s*(?:(?:一|另)个?|新的?|独立的?|专门的?|后续|跟进|\s)*(?:task\b|任务)"
+                                       r"|\bcreat(?:e|ing)\s+(?:(?:a|an|new|separate|independent|follow-up)\s+)*task\b")
+NATIVE_ACTION_NEGATION_PATTERN = (r"不要|不必|不能|不应|不得|不许|不准|不想|不愿|不会|不再|不予|不打算|请勿|勿|别|禁止|拒绝|不同意|不批准|不可以"
+                                r"|不是要|没有(?:同意|批准|授权)|尚未(?:同意|批准|授权)|停止|暂停"
+                                r"|不(?=将|把|再|继续|直接|在|向|给)|\b(?:do|does|did|must|should|will|would|can|could)\s+not\b"
+                                r"|\b(?:don't|doesn't|didn't|mustn't|shouldn't|won't|wouldn't|can't|couldn't|cannot|never)\b"
+                                r"|\bno\s+need\s+to\b|\bnot\s+to\b|(?:不|\bnot)\s*$")
+NATIVE_ACTION_UNCERTAINTY_PATTERN = r"好像|似乎|不确定|还不行|先观察|考虑一下|再考虑|能否|可否|是否|要不要|\b(?:maybe|perhaps|whether)\b"
+NATIVE_FOLLOW_UP_TASK_TARGET_PATTERN = (r"(?:独立|新(?:建)?|其他|另一个|后续|跟进)(?:的)?\s*(?:task\b|任务)"
+                                      r"|\b(?:(?:a|an|new|another|separate|independent|follow-up)\s+)+task\b")
+
+
+def native_issue_action_clauses(message_text: str) -> list[str]:
+    # 每个动作自己携带 issue 与目标；不能从其他句子或并列动作借用标识符。
+    action_boundary_pattern = (NATIVE_DELEGATION_ACTION_PATTERN + "|" + NATIVE_REVOCATION_ACTION_PATTERN
+                               + r"|创建|新建|保留|维持|留在|处理|\bkeep\b|\bretain\b")
+    clauses: list[str] = []
+    for sentence in re.split(r"[，,。;；!！\n]+|\.(?=\s|$)", message_text):
+        start = 0
+        for conjunction in re.finditer(r"并且?|而且|以及|且|和|与|但是|不过|然后|同时|以(?=保留|维持)|\b(?:and|but|then|however|while)\b", sentence, re.I):
+            before = sentence[start:conjunction.start()]
+            after = sentence[conjunction.end():]
+            if re.search(action_boundary_pattern, before, re.I) and re.search(action_boundary_pattern, after, re.I):
+                clauses.append(before.strip())
+                start = conjunction.end()
+        if sentence[start:].strip():
+            clauses.append(sentence[start:].strip())
+    return clauses
+
+
+def native_revocation_action_targets_issue_delegation(clause: str, action_match: re.Match[str], issue_id: str) -> bool:
+    identifier_pattern = r"(?<![A-Za-z0-9._-])" + re.escape(issue_id) + r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9._-])"
+    delegation_object_pattern = (
+        rf"(?:针对\s*|对\s*)?{identifier_pattern}(?:\s*(?:的\s*)?(?:委派|转交)(?:授权|决定)?)?"
+        rf"|(?:the\s+)?(?:delegation|assignment)\s+(?:of|for)\s+{identifier_pattern}"
+        rf"|{identifier_pattern}['’]s\s+(?:delegation|assignment)"
+    )
+    trailing_modifier_pattern = r"\s*(?:(?:吧|即可|就好|please|now|immediately)\s*)?"
+    after_action = clause[action_match.end():]
+    # 完整宾语只能是该 issue 的委派，或裸 issue 简写；验证、备份等所属对象不能借用其身份。
+    if re.fullmatch(rf"\s*(?:{delegation_object_pattern}){trailing_modifier_pattern}", after_action, re.I):
+        return True
+    return bool(re.fullmatch(trailing_modifier_pattern, after_action, re.I)
+                and re.search(rf"(?:^|(?:将|把)\s*)(?:{delegation_object_pattern})\s*(?:请|please)?\s*$",
+                              clause[:action_match.start()], re.I))
+
+
+def native_issue_action_authorization(message_text: str, issue_id: str, action: str, *, target_task_id: str | None = None,
+                                     allow_task_creation: bool = False, allow_implicit_issue: bool = False) -> tuple[bool, bool]:
+    affirmative = False
+    negated = False
+    action_pattern = NATIVE_REVOCATION_ACTION_PATTERN if action == "revoke" else NATIVE_DELEGATION_ACTION_PATTERN
+    if allow_task_creation:
+        action_pattern += "|" + NATIVE_TASK_CREATION_ACTION_PATTERN
+    for clause in native_issue_action_clauses(message_text):
+        if not native_text_contains_exact_machine_identifier(clause, issue_id):
+            if not allow_implicit_issue or re.search(r"\bRVF-\d+\b", clause):
+                continue
+        for action_match in re.finditer(action_pattern, clause, re.I):
+            if action == "revoke" and not native_revocation_action_targets_issue_delegation(clause, action_match, issue_id):
+                continue
+            creation = re.fullmatch(NATIVE_TASK_CREATION_ACTION_PATTERN, action_match.group(), re.I) is not None
+            prefix = clause[:action_match.start()]
+            action_negated = re.search(NATIVE_ACTION_NEGATION_PATTERN, prefix, re.I) is not None
+            if action == "delegate" and not creation:
+                if re.search(r"撤销|取消|保留|维持|\brevoke\b|\bcancel\b|\bkeep\b", prefix, re.I):
+                    # “保留／撤销某委派”中的委派是宾语，不是新的委派动作。
+                    continue
+                if target_task_id is not None and native_text_contains_exact_machine_identifier(clause, target_task_id):
+                    pass
+                elif allow_task_creation and re.search(NATIVE_FOLLOW_UP_TASK_TARGET_PATTERN, clause, re.I):
+                    pass
+                else:
+                    if (allow_task_creation and not action_negated
+                        and re.search(r"(?:给|到|\bto)\s+[A-Za-z0-9][A-Za-z0-9._-]*", clause, re.I)):
+                        negated = True
+                    continue
+            if action_negated:
+                negated = True
+            elif re.search(NATIVE_ACTION_UNCERTAINTY_PATTERN, clause, re.I) or "？" in clause or "?" in clause:
+                continue
+            else:
+                affirmative = True
+    return affirmative, negated
+
+
 def require_user_authorized_issue_revocation(message_text: str, issue_id: str) -> None:
-    if not native_text_contains_exact_machine_identifier(message_text, issue_id):
-        raise DelegationEvidenceError("缺少针对 issue 的用户撤销原话")
-    action_pattern = r"撤销|取消.*委派|\brevoke\b|\bcancel\b.*\bdelegat"
-    negation_pattern = (r"(?:不要|不必|不能|不应|不得|不许|不准|不想|不愿|不会|不再|不|请勿|勿|别|禁止|拒绝|不同意|不批准|"
-                        r"do\s+not|don't|never|not\s+to|no\s+need\s+to).{0,32}(?:撤销|取消|\brevoke\b|\bcancel\b)")
-    issue_identifier_pattern = r"(?<![A-Za-z0-9._-])RVF-\d+(?![A-Za-z0-9_-]|\.[A-Za-z0-9._-])"
-    all_issue_ids = set(re.findall(issue_identifier_pattern, message_text))
-    affirmative_revocation = False
-    for clause in re.split(r"[，,。;；!?！？\n]+|\.(?=\s|$)", message_text):
-        if not re.search(action_pattern, clause, re.I):
-            continue
-        clause_issue_ids = set(re.findall(issue_identifier_pattern, clause))
-        if clause_issue_ids and issue_id not in clause_issue_ids:
-            continue
-        if not clause_issue_ids and len(all_issue_ids) > 1:
-            continue
-        if re.search(negation_pattern, clause, re.I):
-            raise DelegationEvidenceError("用户明确否定撤销该 issue 的委派")
-        affirmative_revocation = True
-    if not affirmative_revocation:
+    affirmative, negated = native_issue_action_authorization(message_text, issue_id, "revoke")
+    if negated:
+        raise DelegationEvidenceError("用户明确否定撤销该 issue 的委派")
+    if not affirmative:
         raise DelegationEvidenceError("缺少针对 issue 的肯定撤销授权")
+
+
+def native_user_explicitly_approves_proposal(message_text: str) -> bool:
+    clauses = native_issue_action_clauses(message_text)
+    approval_pattern = (r"可以|好的?|(?:我)?(?:同意|批准)(?:(?:这个|这项|该|此|上述)?(?:方案|提案|建议|委派|建卡))?"
+                        r"|yes|I\s+agree(?:\s+with\s+(?:this|the)\s+(?:plan|proposal))?|(?:I\s+)?approve(?:\s+(?:this|the)\s+(?:plan|proposal))?")
+    rejection_or_deferral_pattern = (r"(?:但是|但|不过)?\s*(?:好像还不行|还不行|先观察(?:一下)?|考虑一下|再考虑(?:一下)?"
+                                     r"|(?:maybe|perhaps)(?:\s+later)?|not\s+yet"
+                                     r"|(?:我)?(?:不同意|不批准|不可以|拒绝)(?:(?:这个|这项|该|此|上述)?(?:方案|提案|建议|委派|建卡))?"
+                                     r"|(?:I\s+)?(?:disagree|reject)(?:\s+(?:this|the)\s+(?:plan|proposal))?)")
+    return bool(clauses and re.fullmatch(approval_pattern, clauses[0], re.I)
+                and not any(re.fullmatch(rejection_or_deferral_pattern, clause, re.I) for clause in clauses[1:])
+                and not re.match(r"[^，,。;；\n]*[?？]", message_text))
+
+
+def native_issue_remains_in_current_task(message_text: str, issue_id: str) -> bool:
+    return any(native_text_contains_exact_machine_identifier(clause, issue_id)
+               and re.search(r"(?:继续|保留|留在|维持).*?(?:本任务|当前任务|本\s*task)", clause, re.I)
+               for clause in native_issue_action_clauses(message_text))
 
 
 def validate_native_authorization(snapshot: dict[str, Any], authorization: dict[str, Any], issue_id: str,
@@ -284,26 +376,29 @@ def validate_native_authorization(snapshot: dict[str, Any], authorization: dict[
     if action == "revoke":
         require_user_authorized_issue_revocation(received_text, issue_id)
         return
-    if re.search(r"(?:^|[\n。；])\s*(?:Stop\b|停止|暂停|禁止|不得|不要(?:提交|同步|推送|执行|继续))", received_text, re.I):
+    if any(re.match(r"(?:Stop\b|停止|暂停|禁止|不得|不要(?:提交|同步|推送|执行|继续))", clause, re.I)
+           and not (re.search(r"\bRVF-\d+\b", clause) and re.search(NATIVE_DELEGATION_ACTION_PATTERN, clause, re.I)
+                    and not re.match(r"(?:禁止|不得|不要)(?:提交|同步|推送|执行)", clause))
+           for clause in native_issue_action_clauses(received_text)):
         raise DelegationEvidenceError("用户请求包含执行禁止；委派不能解除它", status="execution_prohibited")
-    if (re.search(r"不同意|不批准|不可以|拒绝|\bdisagree\b|\breject\b", received_text, re.I)
-        or re.search(r"(?:不要|不能|不应|不得|禁止|别|勿|do not|don't).{0,16}"
-                     r"(?:委派|转交|交给|派到|创建|新建|建.{0,12}(?:task|任务)|delegat|assign|creat)"
-                     r"|不(?:委派|转交|交给|派到|创建|新建|建.{0,12}(?:task|任务))", received_text, re.I)):
-        raise DelegationEvidenceError("用户原话明确拒绝该委派")
     mode = authorization.get("mode")
     if mode == "direct_delegation":
-        if (follow_up is None or not native_text_contains_exact_machine_identifier(received_text, issue_id)
-            or not native_text_contains_exact_machine_identifier(received_text, follow_up["task_id"])
-            or not re.search(r"委派|转交|交给|派到|delegat|assign", received_text, re.I)):
+        affirmative, negated = native_issue_action_authorization(received_text, issue_id, "delegate", target_task_id=(follow_up or {}).get("task_id"))
+        if negated:
+            raise DelegationEvidenceError("用户原话明确拒绝该委派")
+        if follow_up is None or not affirmative:
             raise DelegationEvidenceError("直接委派须由用户原话绑定 issue 和目标 task")
     elif mode == "approve_proposed_delegation":
         quote = authorization.get("proposal_context_quote")
         if (not isinstance(quote, str) or not native_text_contains_exact_machine_identifier(quote, issue_id)
             or not assistant_context or quote not in assistant_context[-1]
-            or not re.search(r"^\s*(?:可以|同意|批准|好的?|yes\b|I agree\b|approve\b)", received_text, re.I)
-            or not (re.search(r"(?:创建|新建|开|建).{0,12}(?:task|任务)|delegat|assign", received_text, re.I)
-                    or re.search(r"(?:委派|交给|转交|delegat|assign).{0,80}(?:task|任务)|(?:创建|新建|开|建).{0,12}(?:task|任务)", quote, re.I))):
+            or not native_user_explicitly_approves_proposal(received_text)):
+            raise DelegationEvidenceError("用户批准链缺少原生提案、issue 或建卡授权")
+        target_task_id = (follow_up or {}).get("task_id")
+        proposed, proposal_negated = native_issue_action_authorization(quote, issue_id, "delegate", target_task_id=target_task_id, allow_task_creation=True)
+        user_requested, user_negated = native_issue_action_authorization(received_text, issue_id, "delegate", target_task_id=target_task_id, allow_task_creation=True, allow_implicit_issue=True)
+        if (proposal_negated or user_negated or native_issue_remains_in_current_task(quote, issue_id)
+            or native_issue_remains_in_current_task(received_text, issue_id) or not (proposed or user_requested)):
             raise DelegationEvidenceError("用户批准链缺少原生提案、issue 或建卡授权")
         binding = authorization.get("target_binding_quote")
         task = (target_receipt or {}).get("task") or {}
@@ -445,20 +540,86 @@ def validate_receipt(receipt: dict[str, Any], run_dir: Path, repo_identity: dict
     validate_native_authorization(snapshot, authorization, receipt["issue_id"], follow_up, target_receipt, receipt["action"], run_id=receipt["run_id"])
 
 
+def native_user_decision_identity(authorization: dict[str, Any]) -> tuple[str, str]:
+    identity = (authorization.get("session_id"), authorization.get("native_user_message_id"))
+    if any(not isinstance(value, str) or not value for value in identity):
+        raise DelegationEvidenceError("原生用户决定缺少稳定 session/message 身份")
+    return identity
+
+
+def native_user_decision_prefix(snapshot: dict[str, Any], authorization: dict[str, Any]) -> list[dict[str, Any]]:
+    records = snapshot.get("records")
+    if not isinstance(records, list):
+        raise DelegationEvidenceError("原生用户决定缺少记录前缀")
+    for index, record in enumerate(records):
+        payload = record.get("payload") or {}
+        item = payload.get("item") or {}
+        if (record.get("type") == "event_msg" and payload.get("type") == "item_completed"
+            and payload.get("turn_id") == authorization.get("native_turn_id") and item.get("type") == "UserMessage"
+            and item.get("id") == authorization.get("native_user_message_id")):
+            return records[:index + 1]
+    raise DelegationEvidenceError("原生用户决定的稳定事件未出现在快照中")
+
+
+def native_user_decision_order(
+    authorization: dict[str, Any], prefix: list[dict[str, Any]],
+    previous_authorization: dict[str, Any], previous_prefix: list[dict[str, Any]],
+) -> str:
+    if authorization.get("session_id") != previous_authorization.get("session_id"):
+        return "unproven"
+    if prefix == previous_prefix:
+        return "same"
+    if prefix[:len(previous_prefix)] == previous_prefix:
+        return "newer"
+    if previous_prefix[:len(prefix)] == prefix:
+        return "older"
+    return "unproven"
+
+
+def native_user_decision_semantics(receipt: dict[str, Any]) -> dict[str, Any]:
+    authorization = receipt["authorization"]
+    return {"action": receipt["action"], "follow_up": receipt.get("follow_up"),
+            "native_turn_id": authorization.get("native_turn_id"), "message_text": authorization.get("message_text")}
+
+
+def effective_native_user_decisions(
+    run_dir: Path, events: list[tuple[dict[str, Any], dict[str, str]]],
+) -> dict[str, tuple[dict[str, Any], dict[str, str], list[dict[str, Any]]]]:
+    effective = {}
+    seen = {}
+    for receipt, reference in events:
+        authorization = receipt["authorization"]
+        identity = (receipt["issue_id"], *native_user_decision_identity(authorization))
+        prefix = native_user_decision_prefix(capture_native_snapshot(authorization, run_dir), authorization)
+        if identity in seen:
+            prior, prior_prefix = seen[identity]
+            if native_user_decision_semantics(receipt) != native_user_decision_semantics(prior) or prefix != prior_prefix:
+                raise DelegationEvidenceError("同一原生用户事件被重复用于不同的决定")
+            # 已接受的历史重放仍是真实事件，但追加顺序不能把它变成新的用户授权。
+            continue
+        seen[identity] = (receipt, prefix)
+        previous = effective.get(receipt["issue_id"])
+        if previous is not None:
+            order = native_user_decision_order(authorization, prefix, previous[0]["authorization"], previous[2])
+            if order == "older":
+                continue
+            if order != "newer":
+                raise DelegationEvidenceError("无法证明原生用户决定的先后；等待同一会话的不可变记录前缀补齐", status="waiting_for_machine_evidence")
+        effective[receipt["issue_id"]] = (receipt, reference, prefix)
+    return effective
+
+
 def accepted_delegations(repo: Path, run_dir: Path, *, candidate_digest: str | None = None) -> list[dict[str, Any]]:
     identity = git_identity(repo)
     candidate = candidate_digest or candidate_content_manifest_sha256(repo)
     ledger, events = read_ledger(run_dir)
-    active = {}
     for receipt, reference in events:
         # 历史事件按当时快照核验；当前候选及最新 attempt 仅约束仍生效的委派。
         validate_receipt(receipt, run_dir, identity, receipt.get("candidate_content_manifest_sha256"), require_latest=False)
-        if receipt["action"] == "revoke":
-            active.pop(receipt["issue_id"], None)
-        else:
-            active[receipt["issue_id"]] = (receipt, reference)
     accepted = []
-    for receipt, reference in active.values():
+    for receipt, reference, _prefix in effective_native_user_decisions(run_dir, events).values():
+        if receipt["action"] == "revoke":
+            continue
         validate_receipt(receipt, run_dir, identity, candidate)
         accepted.append({"issue_id": receipt["issue_id"], "attempt_id": receipt["attempt_id"],
                          "receipt_path": reference["path"], "receipt_sha256": reference["sha256"], "follow_up": receipt["follow_up"]})
@@ -467,12 +628,49 @@ def accepted_delegations(repo: Path, run_dir: Path, *, candidate_digest: str | N
     return sorted(accepted, key=lambda item: item["issue_id"])
 
 
-def validate_evidence_delegations(payload: dict[str, Any], contract: dict[str, Any]) -> None:
+def historical_evidence_delegations(payload: dict[str, Any], run_dir: Path) -> list[dict[str, Any]]:
+    """按 evidence 冻结的回执位置重放账本前缀，不把后续撤销当作历史失效。"""
+    references = payload["review"].get("user_delegated_elevated_issues")
+    if not isinstance(references, list) or not references or not all(isinstance(reference, dict) for reference in references):
+        raise DelegationEvidenceError("v3 缺少冻结的委派引用")
+    ledger, events = read_ledger(run_dir)
+    referenced_digests = {reference.get("receipt_sha256") for reference in references
+                          if isinstance(reference.get("receipt_sha256"), str)}
+    referenced_sequences = [receipt["sequence"] for receipt, reference in events if reference["sha256"] in referenced_digests]
+    if len(referenced_digests) != len(references) or len(referenced_sequences) != len(references):
+        raise DelegationEvidenceError("历史 evidence 的委派回执不在绑定账本中或重复")
+    identity = git_identity(Path(payload["subject"]["worktree_realpath"]))
+    prefix_events = events[:max(referenced_sequences)]
+    for receipt, reference in prefix_events:
+        validate_receipt(receipt, run_dir, identity, receipt.get("candidate_content_manifest_sha256"), require_latest=False)
+    accepted = []
+    for receipt, reference, _prefix in effective_native_user_decisions(run_dir, prefix_events).values():
+        if receipt["action"] == "revoke":
+            continue
+        validate_receipt(receipt, run_dir, identity, payload["subject"]["candidate_content_manifest_sha256"], require_latest=False)
+        accepted.append({"issue_id": receipt["issue_id"], "attempt_id": receipt["attempt_id"],
+                         "receipt_path": reference["path"], "receipt_sha256": reference["sha256"], "follow_up": receipt["follow_up"]})
+    if read_ledger(run_dir)[0] != ledger:
+        raise DelegationEvidenceError("委派账本在历史核验期间变化", status="waiting_for_machine_evidence")
+    return sorted(accepted, key=lambda item: item["issue_id"])
+
+
+def validate_evidence_delegations(payload: dict[str, Any], contract: dict[str, Any], *, require_current_qualification: bool = True) -> None:
+    from reviewed_candidate_completion_facts import completed_review_facts, handoff_display_consistency_errors
+
     review = payload["review"]
+    run_dir = Path(payload["scope"]["contract_path"]).parent.parent.parent
+    handoff_text = regular_bytes(run_dir / "artifacts/handoff.md").decode()
     if payload["schema_version"] != 3:
         if (review.get("user_delegated_elevated_issues") or payload.get("required_capabilities")
             or review.get("conclusion") == DELEGATION_CONCLUSION):
             raise DelegationEvidenceError("用户委派证据必须使用 version 3，禁止降级")
+        # 版本及声明可被一起删除，必须另查绑定 run 的 canonical 完成事实。
+        completed = completed_review_facts(run_dir, handoff_text,
+                                           candidate_digest=payload["subject"]["candidate_content_manifest_sha256"])
+        if (completed["user_delegated_elevated_issues"] or completed["conclusion"] != review["conclusion"]
+            or completed["canonical_issue_count"] != review["canonical_issue_count"]):
+            raise DelegationEvidenceError("v1/v2 与 canonical 完成事实不符，用户委派证据禁止降级")
         return
     if payload.get("required_capabilities") != [DELEGATION_CAPABILITY] or review.get("conclusion") != DELEGATION_CONCLUSION:
         raise DelegationEvidenceError("v3 缺少委派能力或真实结论")
@@ -482,17 +680,20 @@ def validate_evidence_delegations(payload: dict[str, Any], contract: dict[str, A
         or counts["blocking_elevated"] != 0 or counts["elevated"] != counts["user_delegated"] or counts["user_delegated"] == 0
         or sum(counts[name] for name in ("fixed", "false_positive", "submitted_to_kanban_backlog", "elevated")) != review["canonical_issue_count"]):
         raise DelegationEvidenceError("v3 问题与委派计数不符")
-    run_dir = Path(payload["scope"]["contract_path"]).parent.parent.parent
-    accepted = accepted_delegations(Path(payload["subject"]["worktree_realpath"]), run_dir,
+    accepted = (accepted_delegations(Path(payload["subject"]["worktree_realpath"]), run_dir,
                                     candidate_digest=payload["subject"]["candidate_content_manifest_sha256"])
+                if require_current_qualification else historical_evidence_delegations(payload, run_dir))
     if not accepted or accepted != review.get("user_delegated_elevated_issues") or len(accepted) != counts["user_delegated"]:
         raise DelegationEvidenceError("v3 委派引用与有效账本不符")
-    from reviewed_candidate_completion_facts import completed_review_facts
-
-    completed = completed_review_facts(run_dir, regular_bytes(run_dir / "artifacts/handoff.md").decode(),
-                                       candidate_digest=payload["subject"]["candidate_content_manifest_sha256"])
-    if completed["outcome_counts"] != counts or completed["canonical_issue_count"] != review["canonical_issue_count"]:
-        raise DelegationEvidenceError("v3 计数与 canonical reviewer/merge/最新 attempt 完成事实不符")
+    if require_current_qualification:
+        completed = completed_review_facts(run_dir, handoff_text,
+                                           candidate_digest=payload["subject"]["candidate_content_manifest_sha256"])
+        if completed["outcome_counts"] != counts or completed["canonical_issue_count"] != review["canonical_issue_count"]:
+            raise DelegationEvidenceError("v3 计数与 canonical reviewer/merge/最新 attempt 完成事实不符")
+    elif (not all(re.search(rf"(?im)^\s*(?:-\s*)?{name}:\s*COMPLETED\s*$", handoff_text)
+                  for name in ("handoff_status", "review_status"))
+          or handoff_display_consistency_errors(handoff_text, counts)):
+        raise DelegationEvidenceError("v3 完成状态或计数与回执绑定的历史 handoff 不符")
 
 
 def target_receipt_with_machine_recovery(request: dict[str, Any], run_dir: Path) -> dict[str, Any]:
@@ -539,14 +740,42 @@ def record_delegation(repo: Path, run_dir: Path, request: dict[str, Any]) -> dic
     assert_safe_artifact_path(lock_path, run_dir)
     with review_run_qualification_mutation_lock(run_dir):
         ledger, events = read_ledger(run_dir)
-        facts = latest_issue_facts(run_dir, request["issue_id"])
-        if request.get("candidate_binding") is not None and request["candidate_binding"] != current_request_candidate_binding(repo, run_dir, request["issue_id"]):
-            raise DelegationEvidenceError("委派请求绑定的候选、最新 attempt、scope 或 handoff 已变化，不能自动重绑旧决定")
         identity = git_identity(repo)
         if identity["worktree_realpath"] != str(Path(frozen_contract(run_dir)["repo"]).resolve()):
             raise DelegationEvidenceError("委派请求目标仓库与 run 不符")
         authorization = dict(request["authorization"])
+        issue_events = [(event, reference) for event, reference in events if event["issue_id"] == request["issue_id"]]
+        for event, _reference in issue_events:
+            validate_receipt(event, run_dir, identity, event.get("candidate_content_manifest_sha256"), require_latest=False)
+        effective = effective_native_user_decisions(run_dir, issue_events).get(request["issue_id"])
+        prior = next(((event, reference) for event, reference in issue_events
+                      if native_user_decision_identity(event["authorization"]) == native_user_decision_identity(authorization)), None)
+        if prior is not None:
+            event, reference = prior
+            requested_semantics = {"action": action, "follow_up": request.get("follow_up") if action == "delegate" else None,
+                                   "authorization": authorization}
+            if native_user_decision_semantics(requested_semantics) != native_user_decision_semantics(event):
+                raise DelegationEvidenceError("同一原生用户事件不能重新授权其他动作或目标")
+            target = (read_canonical(Path(event["target_identity_snapshot"]["path"]), event["target_identity_snapshot"]["sha256"])[0]
+                      if action == "delegate" else None)
+            validate_native_authorization(capture_native_snapshot(event["authorization"], run_dir), authorization,
+                                          request["issue_id"], event.get("follow_up"), target, action, run_id=request["run_id"])
+            superseded = native_user_decision_identity(effective[0]["authorization"]) != native_user_decision_identity(authorization)
+            return {"status": "accepted", "reused": True, "action": action, "superseded": superseded,
+                    "receipt_path": reference["path"], "receipt_sha256": reference["sha256"], "follow_up": event.get("follow_up"),
+                    "superseded_by_receipt_sha256": effective[1]["sha256"] if superseded else None}
         snapshot = capture_native_snapshot(authorization, run_dir)
+        prefix = native_user_decision_prefix(snapshot, authorization)
+        if effective is not None:
+            order = native_user_decision_order(authorization, prefix, effective[0]["authorization"], effective[2])
+            if order == "older":
+                return {"status": "superseded", "superseded": True, "reason": "旧原生用户决定已被较新决定取代，不产生新回执或执行资格",
+                        "superseded_by_receipt_path": effective[1]["path"], "superseded_by_receipt_sha256": effective[1]["sha256"]}
+            if order != "newer":
+                raise DelegationEvidenceError("无法证明请求晚于已接受的原生用户决定；等待同一会话的不可变记录前缀补齐", status="waiting_for_machine_evidence")
+        facts = latest_issue_facts(run_dir, request["issue_id"])
+        if request.get("candidate_binding") is not None and request["candidate_binding"] != current_request_candidate_binding(repo, run_dir, request["issue_id"]):
+            raise DelegationEvidenceError("委派请求绑定的候选、最新 attempt、scope 或 handoff 已变化，不能自动重绑旧决定")
         follow_up = request.get("follow_up") if action == "delegate" else None
         target_receipt = target_receipt_with_machine_recovery(request, run_dir) if action == "delegate" else None
         if action == "delegate":
@@ -566,11 +795,6 @@ def record_delegation(repo: Path, run_dir: Path, request: dict[str, Any]) -> dic
                    "facts": facts, "facts_sha256": digest(facts), "authorization": authorization, "follow_up": follow_up,
                    "target_identity_snapshot": immutable_artifact(root, "target-identity-snapshots", target_receipt) if target_receipt else None,
                    "request_fingerprint_sha256": digest(request)}
-        # stdout/索引登记中断后重跑相同请求复用原事件，撤销后的同请求则追加重新委派。
-        prior = next((event for event, reference in reversed(events) if event["issue_id"] == receipt["issue_id"]), None)
-        if prior and all(prior.get(name) == receipt.get(name) for name in receipt if name not in {"sequence", "previous_receipt_sha256"}):
-            reference = next(reference for event, reference in events if event == prior)
-            return {"status": "accepted", "reused": True, "receipt_path": reference["path"], "receipt_sha256": reference["sha256"]}
         validate_receipt(receipt, run_dir, identity, receipt["candidate_content_manifest_sha256"])
         reference = immutable_artifact(root, "receipts", receipt)
         ledger["events"].append(reference)
@@ -580,7 +804,8 @@ def record_delegation(repo: Path, run_dir: Path, request: dict[str, Any]) -> dic
 
 
 def recovery_input_fingerprint(repo: Path, run_dir: Path, request_file: Path) -> str:
-    paths = [request_file, run_dir / "summary.json", run_dir / "artifacts/inputs/scope.contract.json", run_dir / "artifacts/handoff.md"]
+    paths = [request_file, run_dir / "summary.json", run_dir / "artifacts/inputs/scope.contract.json", run_dir / "artifacts/handoff.md",
+             run_dir / DELEGATION_DIRECTORY / "ledger.json"]
     try:
         request = read_object(request_file)
         paths.extend([Path(request.get("target_receipt_path", ".")), Path(request.get("authorization", {}).get("transcript_path", "."))])
@@ -639,20 +864,15 @@ def resume_delegation_with_exclusive_recovery_state_access(repo: Path, run_dir: 
     state_path = root / "recovery-attempts" / f"{fingerprint}.json"
     assert_safe_artifact_path(state_path, run_dir)
     previous = read_object(state_path) if state_path.exists() else {"attempt_count": 0, "history": []}
-    if previous.get("status") == "accepted":
-        request = read_object(request_file)
-        _ledger, events = read_ledger(run_dir)
-        prior = next((event for event, reference in reversed(events) if event["issue_id"] == request.get("issue_id")), None)
-        if prior and prior.get("request_fingerprint_sha256") == digest(request):
-            validate_receipt(prior, run_dir, git_identity(repo), candidate_content_manifest_sha256(repo))
-            return {**previous["result"], "reused": True}
-    if previous.get("status") != "accepted" and previous["attempt_count"] >= 3:
+    if previous.get("status") not in {"accepted", "superseded"} and previous["attempt_count"] >= 3:
         return {"status": previous["status"], "reason": previous["reason"], "automatic_retry_budget_exhausted": True,
                 "recovery_condition": "请求、原生记录、目标回执、attempt 或候选输入变化后自动重验", "input_fingerprint_sha256": fingerprint}
     try:
         result = record_delegation(repo, run_dir, read_object(request_file))
     except (OSError, ValueError, KeyError, TypeError) as exc:
         result = {"status": getattr(exc, "status", "invalid_evidence"), "reason": str(exc)}
+    if previous.get("status") in {"accepted", "superseded"} and previous.get("result") == result:
+        return {**result, "recovery_state_path": str(state_path), "attempt_count": previous["attempt_count"]}
     previous.update({"input_fingerprint_sha256": fingerprint, "attempt_count": previous["attempt_count"] + 1,
                      "request_file": str(request_file), "status": result["status"], "reason": result.get("reason"), "result": result,
                      "recovery_condition": "原生记录、目标回执、attempt、请求或候选输入变化", "updated_at": datetime.now(timezone.utc).isoformat()})
@@ -716,7 +936,7 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
         result = {"status": getattr(exc, "status", "invalid_evidence"), "reason": str(exc)}
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    return {"accepted": 0, "waiting_for_machine_evidence": 10, "invalid_evidence": 11, "execution_prohibited": 12}[result["status"]]
+    return {"accepted": 0, "superseded": 0, "waiting_for_machine_evidence": 10, "invalid_evidence": 11, "execution_prohibited": 12}[result["status"]]
 
 
 if __name__ == "__main__":

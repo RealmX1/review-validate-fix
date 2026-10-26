@@ -2,7 +2,7 @@
 
 本契约归属 `review-validate-fix/1d446`；消费者归属 `my-ai-setup/7f94e`。委派仅改变问题的阻断性，问题仍未解决，不增加 commit、同步或 push 授权。来源 `7494b`、实际 hooks 修复 `0030c`、委派路线 `e05af` 的关系已登记；`abc87` 的历史补证与 `53034` 的整合恢复保持独立，不复制其 WIP。
 
-公开入口为 `rvf elevated-issue-delegation inspect|record|verify|resume`，始终显式传 `--repo`、`--run-dir`。`record`/`resume` 使用 `--request-file` 读取版本 1 的请求；`inspect`/`verify` 只读。成功、机器等待、证据无效、明确禁止分别使用 `accepted`、`waiting_for_machine_evidence`、`invalid_evidence`、`execution_prohibited`，退出码为 0、10、11、12。Land 保留 exit 27/28。
+公开入口为 `rvf elevated-issue-delegation inspect|record|verify|resume`，始终显式传 `--repo`、`--run-dir`。`record`/`resume` 使用 `--request-file` 读取版本 1 的请求；`inspect`/`verify` 只读。成功、机器等待、证据无效、明确禁止分别使用 `accepted`、`waiting_for_machine_evidence`、`invalid_evidence`、`execution_prohibited`，退出码为 0、10、11、12。Land 保留 exit 27/28。未接受过的旧决定已被较新用户事件取代时，record/resume 返回 `superseded`、exit 0；这表示旧请求已经终止，不证明该请求获授权，也不产生回执或收尾资格。已接受旧事件重放可返回 `accepted/reused=true/superseded=true`，仅复用历史回执。
 
 处置存放于原 run 的 `artifacts/elevated-issue-delegation/`。`receipts/<sha256>.json` 为 canonical JSON 和 `.sha256` sidecar；`ledger.json` 是原子更新的追加索引。每个回执绑定 sequence、previous_receipt_sha256、action（delegate/revoke）、run_id、issue_id、attempt_id、repo、候选内容摘要、冻结 scope/handoff 摘要、issue/attempt/result 快照、原生用户请求和稳定目标身份。撤销及重新委派追加新事件；已发布 evidence 中的引用必须仍是该 issue 在账本中的有效处置。
 
@@ -29,3 +29,9 @@ Land 先在资格锁外完成可能启动子进程的验证重放，再持锁重
 无委派继续使用有效 v1/v2。v3 若带 `scope.applied_scope_expansion_receipt_path`，完整执行现有 v2 扩展判据；无扩展时该 path/digest 均缺席。委派不能放宽范围。
 
 冻结 handoff 的 elevated 计数保持原值。公开结果分别说明 review 已完成、问题仍未解决、Land 实际结果与 base 同步实际结果。恢复先对账已有提交及结果；只读 check-evidence 不写恢复状态。机器补证按输入指纹分阶段最多三次，变化后开启新预算，失败历史保留。
+
+用户决定的当前效力按原生 session/UserMessage 稳定身份与不可变记录前缀比较，不按账本追加时刻或请求自报时间排序。同一消息不能重复授予不同动作或目标；较早消息的重放不得覆盖较新撤销，也不得撤销较新重新委派。先后无法证明时保存机器等待，补齐同源前缀后有界恢复。恢复指纹包含账本摘要，已存在的接受或撤销结果优先对账。
+
+当前 evidence 读取独立核对 canonical 完成事实，v1/v2 不能删除全部委派字段来伪装全绿。历史 v3 读取只重放冻结回执所在的账本前缀，逐条核验当时的授权、身份、摘要及原生决定顺序；后续合法撤销或新 attempt 不推翻当时真实性。历史读取不会把旧用户事件的重复追加当成新的有效授权。合法撤销后由新消息重新委派，可归档旧指针并发布新证据。
+
+日志 writer 在资格锁超时后沿既有不可用日志契约降级：不越锁写入，保留 diagnostics，不让 finally 中的附属日志覆盖真实命令退出码。该诊断不驱动 agent 续跑。

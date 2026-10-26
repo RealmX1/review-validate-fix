@@ -661,7 +661,7 @@ def validated_reviewed_task_candidate_evidence(
     evidence_contract = validate_scope_identity(scope, review, subject)
     from rvf_elevated_issue_delegation import validate_evidence_delegations
 
-    validate_evidence_delegations(payload, evidence_contract)
+    validate_evidence_delegations(payload, evidence_contract, require_current_qualification=require_current_subject)
     expansion_paths = validated_applied_scope_expansion_receipt(payload, evidence_contract)
     if reviewed_task_tip is not None:
         assert_landed_from_reviewed_tip(repo, reviewed_tip=reviewed_task_tip, landed_tip=head_oid,

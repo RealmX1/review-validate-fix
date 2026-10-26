@@ -48,3 +48,12 @@ canonical writer 与消费者 CAS 共用 `artifacts/elevated-issue-delegation/mu
 完整检查曾暴露独立 `rvf_run_finalize` 进程未先初始化 pyroot 的回归；`7d0f3e2` 修复后，35 项 bridge 和 44 项 finalize/bridge 组合通过，最终完整契约也覆盖并通过原失败场景。另一处 stop 参数报错顺序回归与测试准备阶段误解析空 stdout 均已修正；原失败日志保留。既有 SQLite 迁移用例缺少 `leases` 表的问题已在未改动的 `0671383` 独立复现，本次沿用正式 gate 的既有排除，不添加无关兼容实现。
 
 原生交接消息未确认接收时，保留失败及 Review 列 start 拒绝回执，改用正常 mutation reservation 覆盖的受控 fast-forward 接续已验证消费者提交。只推进该 Task 的干净 detached HEAD，接续当时 main 不变；没有伪造原生接收或把旧 RVF 结果提升为覆盖新候选。最终 manifest、完整源码 archive、原件摘要、失败快照及对等报告均持久保存在本 Task 交接目录。没有遗留临时生产兼容旁路。
+
+
+## 独立 RVF fe6e0ac4 的修复与验收边界
+
+本轮精确 run 为 `rvf-review-start-fe6e0ac4de3db68e`，开审 HEAD 为 `590385afab2fda84af1468f732145318055c3df3`，正式覆盖 25/25 个候选文件。canonical plan 已完成，两条有效腿的 10 项发现合并为 4 条问题：动作级真实授权、旧请求恢复、历史与当前证据判据、资格锁超时日志降级。全部经独立 validate/fix attempt 处理；历史前缀与原生顺序 helper 的最后接线另走正式 attempt，保留先前成功结果与红测。
+
+新增四份原生链/真实 flock 回归已纳入正式契约检查。最终主工作区验收及固定源码清单写入持久交接根下的 `rvf-fe6e0ac4-*` 产物，本文件不预报这些命令通过。RVF 修复在 handoff 阶段仍待后续已授权 Land 提交；本 Task 不部署、不 push、不真实同步 base。
+
+独立复核固定 `6e3c6c2` 消费者的动作授权函数，10 个边界案例有 9 项不符预期，报告为交接根的 `rvf-fe6e0ac4-consumer-independent-authorization-probe.json`。这是纯原生授权函数核验，不冒充完整 handback 结果。既有双仓成功报告保留当时版本与覆盖；这批新边界修复并复验前，最新端到端交付仍未完成。消费者归属既有 `7f94e`，本轮未发送跨 Task message 或修改其真实 run/main。

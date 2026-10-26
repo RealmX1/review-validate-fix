@@ -640,6 +640,10 @@ repo_required_files=(
   "tests/test_reviewed_task_candidate_evidence.py"
   "tests/test_reviewed_candidate_completion_qualification.py"
   "tests/test_user_delegated_elevated_issue_disposition.py"
+  "tests/test_elevated_issue_action_scoped_user_authorization.py"
+  "tests/test_elevated_issue_superseded_request_recovery.py"
+  "tests/test_reviewed_candidate_delegation_evidence_history.py"
+  "tests/test_run_ledger_qualification_mutation_lock_degradation.py"
   "tests/test_review_run_qualification_mutation_lock.py"
   "core/review_run_qualification_mutation_lock.py"
   "tests/test_rvf_merge_dispositions_structured_merge_phase.py"
@@ -872,6 +876,10 @@ run_step "tests: rvf_land_validation_cache_and_candidate_evidence" \
     "$tests_dir/test_reviewed_task_candidate_evidence.py" \
     "$tests_dir/test_reviewed_candidate_completion_qualification.py" \
     "$tests_dir/test_user_delegated_elevated_issue_disposition.py" \
+    "$tests_dir/test_elevated_issue_action_scoped_user_authorization.py" \
+    "$tests_dir/test_elevated_issue_superseded_request_recovery.py" \
+    "$tests_dir/test_reviewed_candidate_delegation_evidence_history.py" \
+    "$tests_dir/test_run_ledger_qualification_mutation_lock_degradation.py" \
     "$tests_dir/test_review_run_qualification_mutation_lock.py" \
     "$tests_dir/test_rvf_land_single_step_prepare_and_commit.py" \
     "$tests_dir/test_rvf_merge_dispositions_structured_merge_phase.py"

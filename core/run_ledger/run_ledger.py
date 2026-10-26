@@ -10,7 +10,10 @@ from pathlib import Path
 from typing import Any
 
 from core.rvf_user_local_data_paths import resolved_rvf_runtime_log_root
-from core.review_run_qualification_mutation_lock import review_run_qualification_mutation_lock
+from core.review_run_qualification_mutation_lock import (
+    ReviewRunQualificationMutationLockBusy,
+    review_run_qualification_mutation_lock,
+)
 
 
 INSTALLED_PLUGIN_SKILL_REL = Path("plugins") / "review-validate-fix" / "skills" / "review-validate-fix"
@@ -412,7 +415,7 @@ class RunLedger:
                         encoding="utf-8",
                     )
             return str(path)
-        except OSError as exc:
+        except (OSError, ReviewRunQualificationMutationLockBusy) as exc:
             self._diagnose(f"artifact:{name}", exc)
             return None
 
@@ -517,7 +520,7 @@ class RunLedger:
                     json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
                 )
             self.latest_pointer(status=status, reason_code=reason_code)
-        except OSError as exc:
+        except (OSError, ReviewRunQualificationMutationLockBusy) as exc:
             self._diagnose("summary", exc)
             payload["diagnostics"] = self.diagnostics
             payload["log_unavailable"] = True
