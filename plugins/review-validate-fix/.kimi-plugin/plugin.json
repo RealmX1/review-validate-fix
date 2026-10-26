@@ -1,11 +1,8 @@
 {
   "name": "review-validate-fix",
-  "description": "Review-Validate-Fix: 在 Stop 时刻征询是否发起双路外部评审，并在 UserPromptSubmit 时刻承接派发。",
+  "description": "固定任务快照、独立双审与匿名验证修复；主会话直接收尾。",
   "skills": [
     "./skills/"
-  ],
-  "commands": [
-    "./commands/"
   ],
   "hooks": [
     {

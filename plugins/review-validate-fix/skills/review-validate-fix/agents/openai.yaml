@@ -1,7 +1,6 @@
 interface:
-  display_name: "Review Validate Fix"
-  short_description: "Double-review, validate, fix, and hand off changes"
-  default_prompt: "Use $review-validate-fix to run double review on current uncommitted changes or an explicitly provided manual review scope, merge findings, validate/fix real issues, and maintain a handoff.md artifact by default. Add 'skip review' or 'no handoff' to change those defaults."
-
+  display_name: "RVF 任务快照评审"
+  short_description: "独立双审、匿名验证修复与主会话收尾"
+  default_prompt: "按任务授权，用固定基线和显式任务路径运行 RVF；独立双审后合并验证修复，主会话完成最终验证和提交。"
 policy:
   allow_implicit_invocation: false

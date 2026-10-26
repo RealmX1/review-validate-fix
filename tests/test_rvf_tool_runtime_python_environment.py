@@ -150,7 +150,7 @@ def test_public_shell_bootstrap_pins_its_nested_shell_without_running_full_suite
     scripts.mkdir(parents=True)
     shutil.copy2(ROOT / "scripts/rvf_tool_runtime_python_environment.py", scripts)
     original_shell = (ROOT / "scripts/check_skill_contracts.sh").read_text()
-    shell_prefix = original_shell.split("# 测试卫生守卫", 1)[0]
+    shell_prefix = original_shell.split('cd "$repo_root"', 1)[0]
     (scripts / "check_skill_contracts.sh").write_text(shell_prefix + 'printf "%s\\n" "$verbose"\n' + "bash -c \"python3 -c 'import sys; print(sys.executable)'\"\n")
     bad_python = tmp_path / "wrong-python/python3"
     bad_python.parent.mkdir()
@@ -163,38 +163,8 @@ def test_public_shell_bootstrap_pins_its_nested_shell_without_running_full_suite
     assert completed.stdout.splitlines() == ["1" if shell_arguments else "0", sys.executable]
 
 
-def test_python_contract_entry_pins_shell_and_records_selected_runtime(tmp_path):
-    repository = tmp_path / "isolated contract tool"
-    scripts = repository / "scripts"
-    scripts.mkdir(parents=True)
-    (repository / "plugins/review-validate-fix/skills/review-validate-fix").mkdir(parents=True)
-    for filename in ("check_plugin_contracts.py", "rvf_tool_runtime_python_environment.py"):
-        shutil.copy2(ROOT / "scripts" / filename, scripts)
-    (scripts / "check_skill_contracts.sh").write_text("python3 -c 'import sys, tomllib, pytest; print(sys.executable)'\n")
-    bad_python = tmp_path / "wrong-python/python3"
-    bad_python.parent.mkdir()
-    bad_python.write_text("#!/bin/sh\nexit 99\n")
-    bad_python.chmod(0o700)
-    environment = {**os.environ, runtime.PYTHON_EXECUTABLE_ENVIRONMENT_VARIABLE: sys.executable, "PATH": str(bad_python.parent) + os.pathsep + os.defpath}
-    report = tmp_path / "contract-timing.json"
-    # 真实系统解释器仅启动选择器，随即交给已固定的合格环境执行入口与 shell。
-    bootstrap_python = "/usr/bin/python3" if Path("/usr/bin/python3").exists() else sys.executable
-    completed = subprocess.run([bootstrap_python, str(scripts / "check_plugin_contracts.py"), "--verbose", "--timing-report", str(report)], env=environment, capture_output=True, text=True, timeout=30)
-    assert completed.returncode == 0, completed.stderr
-    assert sys.executable in completed.stdout
-    receipt = json.loads(report.read_text())
-    assert receipt["tool_runtime_python"]["python_executable_absolute_path"] == sys.executable
-    assert receipt["tool_runtime_python"]["required_module_preflight_results"]["pytest"] == "available"
 
 
-def test_contract_preflight_failure_writes_failure_report_without_starting_shell(tmp_path):
-    report = tmp_path / "failed-contract-timing.json"
-    completed = subprocess.run([sys.executable, str(ROOT / "scripts/check_plugin_contracts.py"), "--timing-report", str(report)], env={**os.environ, runtime.PYTHON_EXECUTABLE_ENVIRONMENT_VARIABLE: str(tmp_path / "absent-python")}, capture_output=True, text=True, timeout=30)
-    assert completed.returncode == 2
-    receipt = json.loads(report.read_text())
-    assert receipt["phase"] == "python_runtime_preflight"
-    assert receipt["error_code"] == "python_executable_unusable"
-    assert receipt["command"] == []
 
 
 def test_deploy_preflight_failure_precedes_deployment_lock_and_reports_json(tmp_path, monkeypatch, capsys):

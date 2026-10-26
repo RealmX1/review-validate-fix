@@ -44,7 +44,6 @@ INSTALLER = ROOT / "scripts/install_to_codex.py"
 BUNDLED_HOOK_EVENT_SCRIPTS = {
     "Stop": "stop.py",
     "UserPromptSubmit": "user_prompt_submit.py",
-    "PostToolUse": "post_tool_use.py",
 }
 
 
@@ -430,7 +429,7 @@ def _bake_codex_hooks_json(
         tmp_path / "active/plugins/review-validate-fix/skills/review-validate-fix"
     )
     installer.configure_stop_hook(
-        plugin_skill_dir, "auto", user_local_data_paths=user_paths
+        plugin_skill_dir, user_local_data_paths=user_paths
     )
     installer.configure_user_prompt_submit_hook(
         plugin_skill_dir, user_local_data_paths=user_paths
@@ -456,8 +455,8 @@ def test_installer_bakes_guarded_commands_into_codex_hooks_json(
     payload, _ = _bake_codex_hooks_json(tmp_path, monkeypatch)
 
     for event_name, script_name in (
-        ("Stop", "stop_hook_router.py"),
-        ("UserPromptSubmit", "rvf_user_prompt_submit.py"),
+        ("Stop", "task_snapshot_review_hook.py"),
+        ("UserPromptSubmit", "task_snapshot_review_hook.py"),
     ):
         command = _baked_command(payload, event_name, script_name)
         assert command.startswith(f"{HOOK_TARGET_SCRIPT_SHELL_VARIABLE_NAME}=")
@@ -478,8 +477,8 @@ def test_installer_bakes_the_resolved_breadcrumb_root_instead_of_the_ambient_var
     assert user_paths.user_local_data_root == user_local_data_root
 
     for event_name, script_name in (
-        ("Stop", "stop_hook_router.py"),
-        ("UserPromptSubmit", "rvf_user_prompt_submit.py"),
+        ("Stop", "task_snapshot_review_hook.py"),
+        ("UserPromptSubmit", "task_snapshot_review_hook.py"),
     ):
         command = _baked_command(payload, event_name, script_name)
         assert (
@@ -506,7 +505,7 @@ def test_installer_baked_command_leaves_the_breadcrumb_under_the_resolved_root(
     payload, _ = _bake_codex_hooks_json(
         tmp_path, monkeypatch, user_local_data_root=user_local_data_root
     )
-    command = _baked_command(payload, "Stop", "stop_hook_router.py")
+    command = _baked_command(payload, "Stop", "task_snapshot_review_hook.py")
 
     completed = _run_guarded_command(command, rvf_user_local_data_root=ambient_root)
 

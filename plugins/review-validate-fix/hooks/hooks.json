@@ -6,7 +6,7 @@
           {
             "type": "command",
             "command": "rvf_hook_target_script=\"${CLAUDE_PLUGIN_ROOT}/hooks/stop.py\"; if [ -f \"$rvf_hook_target_script\" ]; then python3 \"$rvf_hook_target_script\"; rvf_hook_target_script_exit_status=$?; if [ \"$rvf_hook_target_script_exit_status\" -eq 2 ]; then rvf_hook_target_script_exit_status=0; fi; exit \"$rvf_hook_target_script_exit_status\"; else { rvf_hook_breadcrumb_directory=\"$RVF_USER_LOCAL_DATA_ROOT\"; [ -n \"$rvf_hook_breadcrumb_directory\" ] || rvf_hook_breadcrumb_directory=\"$HOME/.rvf/user-local-data\"; mkdir -p \"$rvf_hook_breadcrumb_directory\" && printf '%s\\t%s\\t%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" 'Stop' \"$rvf_hook_target_script\" >>\"$rvf_hook_breadcrumb_directory/rvf-hook-target-missing.log\"; } >/dev/null 2>&1; exit 0; fi",
-            "timeout": 120
+            "timeout": 10
           }
         ]
       }
@@ -17,19 +17,7 @@
           {
             "type": "command",
             "command": "rvf_hook_target_script=\"${CLAUDE_PLUGIN_ROOT}/hooks/user_prompt_submit.py\"; if [ -f \"$rvf_hook_target_script\" ]; then python3 \"$rvf_hook_target_script\"; rvf_hook_target_script_exit_status=$?; if [ \"$rvf_hook_target_script_exit_status\" -eq 2 ]; then rvf_hook_target_script_exit_status=0; fi; exit \"$rvf_hook_target_script_exit_status\"; else { rvf_hook_breadcrumb_directory=\"$RVF_USER_LOCAL_DATA_ROOT\"; [ -n \"$rvf_hook_breadcrumb_directory\" ] || rvf_hook_breadcrumb_directory=\"$HOME/.rvf/user-local-data\"; mkdir -p \"$rvf_hook_breadcrumb_directory\" && printf '%s\\t%s\\t%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" 'UserPromptSubmit' \"$rvf_hook_target_script\" >>\"$rvf_hook_breadcrumb_directory/rvf-hook-target-missing.log\"; } >/dev/null 2>&1; exit 0; fi",
-            "timeout": 90
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "rvf_hook_target_script=\"${CLAUDE_PLUGIN_ROOT}/hooks/post_tool_use.py\"; if [ -f \"$rvf_hook_target_script\" ]; then python3 \"$rvf_hook_target_script\"; rvf_hook_target_script_exit_status=$?; if [ \"$rvf_hook_target_script_exit_status\" -eq 2 ]; then rvf_hook_target_script_exit_status=0; fi; exit \"$rvf_hook_target_script_exit_status\"; else { rvf_hook_breadcrumb_directory=\"$RVF_USER_LOCAL_DATA_ROOT\"; [ -n \"$rvf_hook_breadcrumb_directory\" ] || rvf_hook_breadcrumb_directory=\"$HOME/.rvf/user-local-data\"; mkdir -p \"$rvf_hook_breadcrumb_directory\" && printf '%s\\t%s\\t%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" 'PostToolUse' \"$rvf_hook_target_script\" >>\"$rvf_hook_breadcrumb_directory/rvf-hook-target-missing.log\"; } >/dev/null 2>&1; exit 0; fi",
-            "timeout": 30
+            "timeout": 10
           }
         ]
       }

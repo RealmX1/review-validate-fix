@@ -52,12 +52,8 @@ DEPLOYMENT_RECEIPT_SCHEMA_VERSION = 2
 DEPLOY_STAMP_RE = re.compile(r"\s+\[deployed [^\]]+\]$")
 STABLE_BASE_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 FULL_GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
-LEGACY_DEFAULT_CLINE_KANBAN_ENV = {
-    "CODEX_RVF_CLINE_KANBAN_START_CMD": "npx -y kanban@0.1.66 --no-open",
-    "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "npx -y kanban@0.1.66 task",
-}
-CLINE_KANBAN_WORKTREE_MODES = {"branch", "inplace"}
 BUNDLE_IGNORED_NAMES = {
+    "state",
     ".DS_Store",
     ".git",
     ".mypy_cache",
@@ -1326,25 +1322,10 @@ def backfill_bundled_fields_missing_from_existing_user_local_harness_entries(
     return backfilled_field_names_by_harness_id
 
 
-def legacy_default_cline_kanban_env_value(name: str, value: str | None) -> str | None:
-    text = (value or "").strip()
-    if not text or LEGACY_DEFAULT_CLINE_KANBAN_ENV.get(name) == text:
-        return None
-    return text
 
 
-def normalized_cline_kanban_worktree_mode(value: str | None) -> str | None:
-    text = (value or "").strip().lower()
-    return text if text in CLINE_KANBAN_WORKTREE_MODES else None
 
 
-def normalize_fork_mode(value: str) -> str:
-    mode = (value or "auto").strip()
-    if mode in {"cline", "kanban", "ck"}:
-        return "cline-kanban"
-    if mode in {"kanban-message", "kanban-inject"}:
-        return "kanban-followup"
-    return mode
 
 
 def _read_hooks_document(hooks_path: Path) -> dict[str, Any]:
@@ -1357,132 +1338,38 @@ def _read_hooks_document(hooks_path: Path) -> dict[str, Any]:
     return payload
 
 
-def configure_stop_hook(
-    plugin_skill_dir: Path,
-    fork_mode: str = "auto",
-    cline_kanban_start_cmd: str | None = None,
-    cline_kanban_task_cmd: str | None = None,
-    cline_kanban_start_timeout: str | None = None,
-    cline_kanban_tmux_session: str | None = None,
-    cline_kanban_base_ref: str | None = None,
-    cline_kanban_worktree_mode: str | None = None,
-    cline_kanban_auto_review_enabled: str | None = None,
-    cline_kanban_auto_review_mode: str | None = None,
-    cline_kanban_start_in_plan_mode: str | None = None,
-    *,
-    user_local_data_paths: RvfUserLocalDataPaths | None = None,
-) -> Path:
-    fork_mode = normalize_fork_mode(fork_mode)
-    cline_kanban_worktree_mode = normalized_cline_kanban_worktree_mode(
-        cline_kanban_worktree_mode
-    )
+def configure_stop_hook(plugin_skill_dir: Path, *, user_local_data_paths: RvfUserLocalDataPaths | None = None) -> Path:
+    """配置轻量 hook；不向插件注入 Kanban 原生编排设置。"""
     paths = user_local_data_paths or resolved_rvf_user_local_data_paths()
     hooks_path = Path.home() / ".codex/hooks.json"
-    hooks_path.parent.mkdir(parents=True, exist_ok=True)
-    data = _read_hooks_document(hooks_path)
-    hooks = data.setdefault("hooks", {})
-    stop_groups = hooks.setdefault("Stop", [])
-    if not isinstance(stop_groups, list):
-        stop_groups = []
-        hooks["Stop"] = stop_groups
-    router = plugin_skill_dir / "scripts/stop_hook_router.py"
-    stable_dispatcher = plugin_skill_dir / "scripts/stop_hook_dispatcher.py"
-    dev_dispatcher = (
-        ROOT
-        / f"plugins/{PLUGIN_NAME}"
-        / PLUGIN_SKILL_RELATIVE_PATH
-        / "scripts/stop_hook_dispatcher.py"
-    )
-    env_parts = [
-        f"RVF_USER_LOCAL_DATA_ROOT={shlex.quote(str(paths.user_local_data_root))}",
-        f"CODEX_RVF_LOG_ROOT={shlex.quote(str(paths.run_logs_root))}",
-        f"CODEX_RVF_STATE_DIR={shlex.quote(str(paths.runtime_state_root))}",
-        f"CODEX_RVF_INSTALLED_SKILL_DIR={shlex.quote(str(plugin_skill_dir))}",
-        "CODEX_RVF_MODE=fork",
-        f"CODEX_RVF_FORK_MODE={shlex.quote(fork_mode)}",
-        f"CODEX_RVF_STABLE_STOP_HOOK={shlex.quote(str(stable_dispatcher))}",
-        f"CODEX_RVF_DEV_STOP_HOOK={shlex.quote(str(dev_dispatcher))}",
-    ]
-    if fork_mode in {"auto", "cline-kanban", "kanban-followup"}:
-        for name, value in (
-            ("CODEX_RVF_CLINE_KANBAN_START_CMD", cline_kanban_start_cmd),
-            ("CODEX_RVF_CLINE_KANBAN_TASK_CMD", cline_kanban_task_cmd),
-            ("CODEX_RVF_CLINE_KANBAN_START_TIMEOUT", cline_kanban_start_timeout),
-            ("CODEX_RVF_CLINE_KANBAN_TMUX_SESSION", cline_kanban_tmux_session),
-            ("CODEX_RVF_CLINE_KANBAN_BASE_REF", cline_kanban_base_ref),
-            ("CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE", cline_kanban_worktree_mode),
-            (
-                "CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_ENABLED",
-                cline_kanban_auto_review_enabled,
-            ),
-            ("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE", cline_kanban_auto_review_mode),
-            (
-                "CODEX_RVF_CLINE_KANBAN_START_IN_PLAN_MODE",
-                cline_kanban_start_in_plan_mode,
-            ),
-        ):
-            text = (value or "").strip()
-            if text:
-                env_parts.append(f"{name}={shlex.quote(text)}")
-    env_parts.extend(
-        [
-            "CODEX_RVF_DEV_SYNC_COMMAND_TIMEOUT=180",
-            "CODEX_RVF_STOP_HOOK_CHAIN_TIMEOUT=60",
-            f"CODEX_RVF_DEV_REPO={shlex.quote(str(ROOT))}",
-        ]
-    )
-    entry = {
-        "type": "command",
-        "command": hook_command_guarded_against_missing_target_script(
-            target_script_shell_literal=shlex.quote(str(router)),
-            hook_event_name="Stop",
-            environment_assignment_prefix=" ".join(env_parts),
-            # env 前缀只作用于 python3 那一条命令，面包屑分支读不到它烘焙的
-            # RVF_USER_LOCAL_DATA_ROOT，故把已解析的根显式传进守卫。
-            hook_target_missing_breadcrumb_directory_shell_literal=shlex.quote(
-                str(paths.user_local_data_root)
-            ),
-        ),
-        "timeout": 300,
-        "statusMessage": "Review-Validate-Fix：选择通道并运行停止检查",
-    }
-    cleaned_groups: list[dict[str, Any]] = []
-    target_group: dict[str, Any] | None = None
-    for raw_group in stop_groups:
-        if not isinstance(raw_group, dict):
+    document = _read_hooks_document(hooks_path)
+    groups = document.setdefault("hooks", {}).setdefault('Stop', [])
+    target = plugin_skill_dir / "scripts/task_snapshot_review_hook.py"
+    entry = {"type":"command","command":hook_command_guarded_against_missing_target_script(
+        target_script_shell_literal=shlex.quote(str(target)),hook_event_name='Stop',
+        environment_assignment_prefix=f"RVF_USER_LOCAL_DATA_ROOT={shlex.quote(str(paths.user_local_data_root))}",
+        hook_target_missing_breadcrumb_directory_shell_literal=shlex.quote(str(paths.user_local_data_root)),
+        script_arguments=("--event",'Stop',"--host","codex")),"timeout":10}
+    cleaned = []
+    for group in groups:
+        if not isinstance(group, dict):
             continue
-        group = raw_group
-        group_hooks = group.get("hooks")
-        if not isinstance(group_hooks, list):
-            group["hooks"] = []
-            cleaned_groups.append(group)
-            continue
-        kept_hooks: list[Any] = []
-        removed_rvf_hook = False
-        for existing in group_hooks:
-            command = existing.get("command") if isinstance(existing, dict) else None
-            if isinstance(command, str) and any(
-                marker in command
-                for marker in (
-                    "stop_review_validate_fix.py",
-                    "stop_hook_dispatcher.py",
-                    "stop_hook_router.py",
-                )
-            ):
-                removed_rvf_hook = True
-                if target_group is None:
-                    target_group = group
-                continue
-            kept_hooks.append(existing)
-        if removed_rvf_hook and target_group is group:
-            kept_hooks.append(entry)
-        group["hooks"] = kept_hooks
-        if kept_hooks:
-            cleaned_groups.append(group)
-    if target_group is None:
-        cleaned_groups.append({"hooks": [entry]})
-    hooks["Stop"] = cleaned_groups
-    write_json_atomic(hooks_path, data)
+        kept = [item for item in group.get("hooks", []) if not (isinstance(item, dict) and "/skills/review-validate-fix/scripts/" in item.get("command", ""))]
+        if kept:
+            cleaned.append({**group,"hooks":kept})
+    cleaned.append({"hooks":[entry]})
+    document["hooks"]['Stop'] = cleaned
+    if "PostToolUse" in document["hooks"]:
+        remaining=[]
+        for group in document["hooks"]["PostToolUse"]:
+            kept=[item for item in group.get("hooks",[]) if not (isinstance(item,dict) and "/skills/review-validate-fix/scripts/" in item.get("command",""))]
+            if kept:
+                remaining.append({**group,"hooks":kept})
+        if remaining:
+            document["hooks"]["PostToolUse"]=remaining
+        else:
+            document["hooks"].pop("PostToolUse",None)
+    write_json_atomic(hooks_path, document)
     return hooks_path
 
 
@@ -1770,70 +1657,38 @@ def kimi_plugin_registration_outcome_for_deployment_receipt(
         return None, failure
 
 
-def configure_user_prompt_submit_hook(
-    plugin_skill_dir: Path,
-    *,
-    user_local_data_paths: RvfUserLocalDataPaths | None = None,
-) -> Path:
+def configure_user_prompt_submit_hook(plugin_skill_dir: Path, *, user_local_data_paths: RvfUserLocalDataPaths | None = None) -> Path:
+    """配置轻量 hook；不向插件注入 Kanban 原生编排设置。"""
     paths = user_local_data_paths or resolved_rvf_user_local_data_paths()
     hooks_path = Path.home() / ".codex/hooks.json"
-    hooks_path.parent.mkdir(parents=True, exist_ok=True)
-    data = _read_hooks_document(hooks_path)
-    hooks = data.setdefault("hooks", {})
-    prompt_groups = hooks.setdefault("UserPromptSubmit", [])
-    if not isinstance(prompt_groups, list):
-        prompt_groups = []
-    detector = plugin_skill_dir / "scripts/rvf_user_prompt_submit.py"
-    entry = {
-        "type": "command",
-        "command": hook_command_guarded_against_missing_target_script(
-            target_script_shell_literal=shlex.quote(str(detector)),
-            hook_event_name="UserPromptSubmit",
-            environment_assignment_prefix=" ".join(
-                [
-                    f"RVF_USER_LOCAL_DATA_ROOT={shlex.quote(str(paths.user_local_data_root))}",
-                    f"CODEX_RVF_LOG_ROOT={shlex.quote(str(paths.run_logs_root))}",
-                    f"CODEX_RVF_STATE_DIR={shlex.quote(str(paths.runtime_state_root))}",
-                    f"CODEX_RVF_INSTALLED_SKILL_DIR={shlex.quote(str(plugin_skill_dir))}",
-                ]
-            ),
-            # 同 configure_stop_hook：面包屑根必须显式传，不能指望 ambient 环境变量。
-            hook_target_missing_breadcrumb_directory_shell_literal=shlex.quote(
-                str(paths.user_local_data_root)
-            ),
-        ),
-        "timeout": 5,
-    }
-    cleaned_groups: list[dict[str, Any]] = []
-    target_group: dict[str, Any] | None = None
-    for raw_group in prompt_groups:
-        if not isinstance(raw_group, dict):
+    document = _read_hooks_document(hooks_path)
+    groups = document.setdefault("hooks", {}).setdefault('UserPromptSubmit', [])
+    target = plugin_skill_dir / "scripts/task_snapshot_review_hook.py"
+    entry = {"type":"command","command":hook_command_guarded_against_missing_target_script(
+        target_script_shell_literal=shlex.quote(str(target)),hook_event_name='UserPromptSubmit',
+        environment_assignment_prefix=f"RVF_USER_LOCAL_DATA_ROOT={shlex.quote(str(paths.user_local_data_root))}",
+        hook_target_missing_breadcrumb_directory_shell_literal=shlex.quote(str(paths.user_local_data_root)),
+        script_arguments=("--event",'UserPromptSubmit',"--host","codex")),"timeout":10}
+    cleaned = []
+    for group in groups:
+        if not isinstance(group, dict):
             continue
-        group = raw_group
-        group_hooks = group.get("hooks")
-        if not isinstance(group_hooks, list):
-            group["hooks"] = []
-            cleaned_groups.append(group)
-            continue
-        kept_hooks: list[Any] = []
-        removed_rvf_hook = False
-        for existing in group_hooks:
-            command = existing.get("command") if isinstance(existing, dict) else None
-            if isinstance(command, str) and "rvf_user_prompt_submit.py" in command:
-                removed_rvf_hook = True
-                if target_group is None:
-                    target_group = group
-                continue
-            kept_hooks.append(existing)
-        if removed_rvf_hook and target_group is group:
-            kept_hooks.append(entry)
-        group["hooks"] = kept_hooks
-        if kept_hooks:
-            cleaned_groups.append(group)
-    if target_group is None:
-        cleaned_groups.append({"hooks": [entry]})
-    hooks["UserPromptSubmit"] = cleaned_groups
-    write_json_atomic(hooks_path, data)
+        kept = [item for item in group.get("hooks", []) if not (isinstance(item, dict) and "/skills/review-validate-fix/scripts/" in item.get("command", ""))]
+        if kept:
+            cleaned.append({**group,"hooks":kept})
+    cleaned.append({"hooks":[entry]})
+    document["hooks"]['UserPromptSubmit'] = cleaned
+    if "PostToolUse" in document["hooks"]:
+        remaining=[]
+        for group in document["hooks"]["PostToolUse"]:
+            kept=[item for item in group.get("hooks",[]) if not (isinstance(item,dict) and "/skills/review-validate-fix/scripts/" in item.get("command",""))]
+            if kept:
+                remaining.append({**group,"hooks":kept})
+        if remaining:
+            document["hooks"]["PostToolUse"]=remaining
+        else:
+            document["hooks"].pop("PostToolUse",None)
+    write_json_atomic(hooks_path, document)
     return hooks_path
 
 
@@ -1877,16 +1732,6 @@ def _parse_arguments(argv: list[str] | None) -> argparse.Namespace:
             "是官方认可路径；写完仍须由 kimi_plugin_manifest_activation_state_check.py 独立复验。"
         ),
     )
-    parser.add_argument("--fork-mode", default="auto")
-    parser.add_argument("--cline-kanban-start-cmd")
-    parser.add_argument("--cline-kanban-task-cmd")
-    parser.add_argument("--cline-kanban-start-timeout")
-    parser.add_argument("--cline-kanban-tmux-session")
-    parser.add_argument("--cline-kanban-base-ref")
-    parser.add_argument("--cline-kanban-worktree-mode", choices=sorted(CLINE_KANBAN_WORKTREE_MODES))
-    parser.add_argument("--cline-kanban-auto-review-enabled")
-    parser.add_argument("--cline-kanban-auto-review-mode")
-    parser.add_argument("--cline-kanban-start-in-plan-mode")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     rollback_requested = bool(
@@ -2000,35 +1845,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         hooks_path: Path | None = None
         if args.configure_stop_hook:
-            hooks_path = configure_stop_hook(
-                plugin_skill_dir,
-                args.fork_mode,
-                args.cline_kanban_start_cmd
-                or legacy_default_cline_kanban_env_value(
-                    "CODEX_RVF_CLINE_KANBAN_START_CMD",
-                    os.environ.get("CODEX_RVF_CLINE_KANBAN_START_CMD"),
-                ),
-                args.cline_kanban_task_cmd
-                or legacy_default_cline_kanban_env_value(
-                    "CODEX_RVF_CLINE_KANBAN_TASK_CMD",
-                    os.environ.get("CODEX_RVF_CLINE_KANBAN_TASK_CMD"),
-                ),
-                args.cline_kanban_start_timeout
-                or os.environ.get("CODEX_RVF_CLINE_KANBAN_START_TIMEOUT"),
-                args.cline_kanban_tmux_session
-                or os.environ.get("CODEX_RVF_CLINE_KANBAN_TMUX_SESSION"),
-                args.cline_kanban_base_ref
-                or os.environ.get("CODEX_RVF_CLINE_KANBAN_BASE_REF"),
-                args.cline_kanban_worktree_mode
-                or os.environ.get("CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE"),
-                args.cline_kanban_auto_review_enabled
-                or os.environ.get("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_ENABLED"),
-                args.cline_kanban_auto_review_mode
-                or os.environ.get("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE"),
-                args.cline_kanban_start_in_plan_mode
-                or os.environ.get("CODEX_RVF_CLINE_KANBAN_START_IN_PLAN_MODE"),
-                user_local_data_paths=user_local_data_paths,
-            )
+            hooks_path = configure_stop_hook(plugin_skill_dir, user_local_data_paths=user_local_data_paths)
         if args.configure_user_prompt_submit_hook:
             hooks_path = configure_user_prompt_submit_hook(
                 plugin_skill_dir,

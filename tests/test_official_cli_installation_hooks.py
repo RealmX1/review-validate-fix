@@ -59,7 +59,7 @@ def test_configure_hooks_deduplicates_rvf_entries_and_injects_user_local_roots(
                     "Stop": [
                         {
                             "hooks": [
-                                {"type": "command", "command": "python3 old/stop_hook_router.py"},
+                                {"type": "command", "command": "python3 old/skills/review-validate-fix/scripts/task_snapshot_review_hook.py"},
                                 {"type": "command", "command": "python3 unrelated.py"},
                             ]
                         }
@@ -67,7 +67,7 @@ def test_configure_hooks_deduplicates_rvf_entries_and_injects_user_local_roots(
                     "UserPromptSubmit": [
                         {
                             "hooks": [
-                                {"type": "command", "command": "python3 old/rvf_user_prompt_submit.py"}
+                                {"type": "command", "command": "python3 old/skills/review-validate-fix/scripts/task_snapshot_review_hook.py"}
                             ]
                         }
                     ],
@@ -82,7 +82,6 @@ def test_configure_hooks_deduplicates_rvf_entries_and_injects_user_local_roots(
 
     installer.configure_stop_hook(
         plugin_skill_dir,
-        "cline-kanban",
         user_local_data_paths=user_paths,
     )
     installer.configure_user_prompt_submit_hook(
@@ -93,16 +92,14 @@ def test_configure_hooks_deduplicates_rvf_entries_and_injects_user_local_roots(
     payload = json.loads(hooks_path.read_text(encoding="utf-8"))
     stop_commands = _commands(payload, "Stop")
     prompt_commands = _commands(payload, "UserPromptSubmit")
-    assert len([command for command in stop_commands if "stop_hook_router.py" in command]) == 1
+    assert len([command for command in stop_commands if "task_snapshot_review_hook.py" in command]) == 1
     assert len(
-        [command for command in prompt_commands if "rvf_user_prompt_submit.py" in command]
+        [command for command in prompt_commands if "task_snapshot_review_hook.py" in command]
     ) == 1
     assert "python3 unrelated.py" in stop_commands
     for command in (stop_commands[-1], prompt_commands[-1]):
         assert f"RVF_USER_LOCAL_DATA_ROOT={user_paths.user_local_data_root}" in command
-        assert f"CODEX_RVF_LOG_ROOT={user_paths.run_logs_root}" in command
-        assert f"CODEX_RVF_STATE_DIR={user_paths.runtime_state_root}" in command
-    assert "CODEX_RVF_FORK_MODE=cline-kanban" in stop_commands[-1]
+    assert "--event Stop --host codex" in stop_commands[-1]
 
 
 def test_installer_has_no_manual_official_cache_or_installed_metadata_writer() -> None:

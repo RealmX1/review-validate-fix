@@ -1111,7 +1111,7 @@ def _run_local_deploy_using_validated_python(
         contract_output: str | None = None
         installer_receipt: dict[str, Any] | None = None
         python_executable = selected_python.python_executable_absolute_path
-        contract_command = [python_executable, str(paths["contract"])]
+        contract_command = [python_executable, str(paths["contract"]), "--full"]
         installer_command = [
             python_executable,
             str(paths["installer"]),

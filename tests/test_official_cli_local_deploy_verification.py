@@ -65,8 +65,8 @@ def _verification_fixture(tmp_path: Path):
     shutil.copytree(plugin_root, codex_cache_root)
     shutil.copytree(plugin_root, claude_cache_root)
     hooks_path = home_directory / ".codex/hooks.json"
-    router = plugin_root / "skills/review-validate-fix/scripts/stop_hook_router.py"
-    prompt_hook = plugin_root / "skills/review-validate-fix/scripts/rvf_user_prompt_submit.py"
+    router = plugin_root / "skills/review-validate-fix/scripts/task_snapshot_review_hook.py"
+    prompt_hook = plugin_root / "skills/review-validate-fix/scripts/task_snapshot_review_hook.py"
     environment_prefix = (
         f"RVF_USER_LOCAL_DATA_ROOT={user_paths.user_local_data_root} "
         f"CODEX_RVF_LOG_ROOT={user_paths.run_logs_root} "
@@ -218,8 +218,8 @@ def test_verifier_accepts_official_cli_installation_and_shared_user_state(
     assert result["official_cli"]["codex"]["installed"] is True
     assert result["official_cli"]["claude"]["installed"] is True
     assert result["cache_payloads_match_active_release"] is True
-    assert result["synthetic_hook_smoke"]["codex_stop_router"]["status"] == "ok"
-    assert result["synthetic_hook_smoke"]["codex_user_prompt_submit"]["status"] == "ok"
+    assert result["synthetic_hook_smoke"]["Stop"]["status"] == "ok"
+    assert result["synthetic_hook_smoke"]["UserPromptSubmit"]["status"] == "ok"
     assert result["official_cli_versions"]["codex"] == "codex-cli test"
 
 
