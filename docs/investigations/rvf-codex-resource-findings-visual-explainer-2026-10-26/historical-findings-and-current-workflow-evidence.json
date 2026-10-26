@@ -1,0 +1,115 @@
+{
+  "checked_at_utc": "2026-10-26T20:17:10.100462+00:00",
+  "task_id": "65528",
+  "historical_measurement_cutoff_utc": "2026-10-18T23:30:59Z",
+  "historical_measurement_source_commit": "dab447306d4fd5f7600e1aca76d5b92433e07c8c",
+  "historical_summary_sha256": "be4bbafe65f179e8588157f2a3deb1db265561d19ba322c29b85987184119684",
+  "historical_summary_repository_path": "docs/investigations/rvf-codex-stage-duration-token-share-2026-10-18/rvf-codex-resource-summary.json",
+  "local_main_commit": "fa7e2c6c8ccfb3c4f5c592a95fdaf89590ea0ebd",
+  "deployed_release": {
+    "base_plugin_version": "0.1.0",
+    "generated_plugin_version": "0.1.0-dev.511+gfa7e2c6c8ccf",
+    "payload_digest": "21cac4b4f6d1773406da0b004068c15cd29a301abbc10f67dbedb95b19dcb59e",
+    "schema_version": 1,
+    "source_commit": "fa7e2c6c8ccfb3c4f5c592a95fdaf89590ea0ebd",
+    "source_commit_count": 511,
+    "source_repository": "/Users/bominzhang/.rvf/deployment-source-worktree-at-local-main-head"
+  },
+  "source_evidence": [
+    {
+      "repository_path": "adapters/codex/subagent.py",
+      "local_main_commit": "fa7e2c6c8ccfb3c4f5c592a95fdaf89590ea0ebd",
+      "source_sha256": "df110cc846e91a251ab067690a9396ff6f030567540efabd99784bc23a334a00",
+      "deployed_path": "/Users/bominzhang/.rvf/developer-plugin-marketplaces/review-validate-fix-local-main/plugins/review-validate-fix/adapters/codex/subagent.py",
+      "deployed_file_matches_main": true,
+      "loaded_skill_cache_path": "/Users/bominzhang/.codex/plugins/cache/review-validate-fix-local-main/review-validate-fix/0.1.0/adapters/codex/subagent.py",
+      "loaded_skill_cache_matches_main": false
+    },
+    {
+      "repository_path": "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_analyze_thread.py",
+      "local_main_commit": "fa7e2c6c8ccfb3c4f5c592a95fdaf89590ea0ebd",
+      "source_sha256": "accdb58f2473f4665a62504644e9b45b570a60963d51c359e842b1c59e585b2c",
+      "deployed_path": "/Users/bominzhang/.rvf/developer-plugin-marketplaces/review-validate-fix-local-main/plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_analyze_thread.py",
+      "deployed_file_matches_main": true,
+      "loaded_skill_cache_path": "/Users/bominzhang/.codex/plugins/cache/review-validate-fix-local-main/review-validate-fix/0.1.0/skills/review-validate-fix/scripts/rvf_analyze_thread.py",
+      "loaded_skill_cache_matches_main": false
+    },
+    {
+      "repository_path": "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_analyze_formal_archive_verified_execution.py",
+      "local_main_commit": "fa7e2c6c8ccfb3c4f5c592a95fdaf89590ea0ebd",
+      "source_sha256": "c0afbf4c58a3b9a461869344c224c36294c81138fcb3f6412171d93ad54bd02f",
+      "deployed_path": "/Users/bominzhang/.rvf/developer-plugin-marketplaces/review-validate-fix-local-main/plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_analyze_formal_archive_verified_execution.py",
+      "deployed_file_matches_main": true,
+      "loaded_skill_cache_path": "/Users/bominzhang/.codex/plugins/cache/review-validate-fix-local-main/review-validate-fix/0.1.0/skills/review-validate-fix/scripts/rvf_analyze_formal_archive_verified_execution.py",
+      "loaded_skill_cache_matches_main": false
+    },
+    {
+      "repository_path": "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_run_finalize.py",
+      "local_main_commit": "fa7e2c6c8ccfb3c4f5c592a95fdaf89590ea0ebd",
+      "source_sha256": "9c015fb742b885995d52f4e048ace0f5db9d99a7991a0e35eb2d63093bf604df",
+      "deployed_path": "/Users/bominzhang/.rvf/developer-plugin-marketplaces/review-validate-fix-local-main/plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_run_finalize.py",
+      "deployed_file_matches_main": true,
+      "loaded_skill_cache_path": "/Users/bominzhang/.codex/plugins/cache/review-validate-fix-local-main/review-validate-fix/0.1.0/skills/review-validate-fix/scripts/rvf_run_finalize.py",
+      "loaded_skill_cache_matches_main": false
+    }
+  ],
+  "existing_capabilities_confirmed_in_deployed_code": [
+    "Codex 对精确 run analysis 目录追加写入授权",
+    "正式输出和原始 causality 快照校验，完成与进程退出分开",
+    "每证据代次最多三次自动尝试，持久预算与历史",
+    "已有成功产物恢复可读后只重验和幂等补计数，不重新执行模型",
+    "RVF 边界计数差分，阶段与原生响应观测，缺失记 unavailable"
+  ],
+  "remaining_gaps_confirmed_in_code": [
+    "外部 reviewer 用量在 component_response_token_usage 中仍为 unavailable",
+    "background_analysis 的 token_usage_coverage_status 仍为 unavailable",
+    "未找到执行路径内的常规批量 Analyze 策略或跨轮建议消费闭环"
+  ],
+  "evidence_limits": [
+    "未重新采集 10 月 26 日的全链 Token 成本",
+    "新部署的归档修复不反证 10 月 18 日历史结果，也不等于运行效果已经复测通过",
+    "默认旧归档目录近期开出的 Codex 状态未找到绑定当前部署的样本，不外推全机无运行"
+  ],
+  "discovery_trace_refs": [
+    {
+      "tool": "rg",
+      "query": "RVF analyze lifecycle|c2c9d|d7741|65528",
+      "scope": "/Users/bominzhang/.codex/memories/MEMORY.md",
+      "relevant_section": "RVF analyze lifecycle and backlog observability"
+    },
+    {
+      "tool": "git show",
+      "query": "formal_analysis_completion_status|reconcile_formal_analysis_completion_without_agent_execution|automatic_analysis_attempt_limit",
+      "scope": "fa7e2c6c8ccfb3c4f5c592a95fdaf89590ea0ebd",
+      "result_paths": [
+        "adapters/codex/subagent.py",
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_analyze_thread.py",
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_analyze_formal_archive_verified_execution.py",
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_run_finalize.py"
+      ]
+    },
+    {
+      "tool": "rg",
+      "query": "rvf.analyze|batch.*analy|批量复盘",
+      "scope": "/Users/bominzhang/.claude/plans",
+      "reviewed_paths": [
+        "rvf-run-finalize-py-reactive-boot.md",
+        "rvf-agent-purrfect-cake.md"
+      ],
+      "reviewed_relevant_line_count": 8
+    },
+    {
+      "tool": "git grep -l",
+      "query": "batch.*analy|analy.*batch|批量.*复盘|复盘.*批量|analysis.*sampling",
+      "scope": "main:core,plugins,docs excluding generated anti-pattern presentation",
+      "hit_count": 0
+    },
+    {
+      "tool": "git grep -l",
+      "query": "causality.json",
+      "scope": "main:core,plugins",
+      "hit_count": 11,
+      "interpretation": "命中主要是产出、校验、归因等路径；不能据此把已有 reviewer backlog 投递误当成 Analyze 建议消费。"
+    }
+  ]
+}

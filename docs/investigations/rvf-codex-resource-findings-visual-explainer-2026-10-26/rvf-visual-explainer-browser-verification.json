@@ -1,0 +1,109 @@
+{
+  "verifiedAtUtc": "2026-10-26T20:22:44.807Z",
+  "browser": "隔离 Chrome / Playwright",
+  "offline": true,
+  "initialCliNavigationFailure": "CLI 默认禁止 file://；使用本地 Playwright API 验证相同离线文件，未修改 CLI 或生产配置。",
+  "status": "passed",
+  "checks": [
+    {
+      "description": "独立离线图解：积木数等于 100",
+      "passed": true
+    },
+    {
+      "description": "独立离线图解：默认比例为 11.88%",
+      "passed": true
+    },
+    {
+      "description": "独立离线图解：全部 Token 切换为 3.47%",
+      "passed": true
+    },
+    {
+      "description": "独立离线图解：切换后积木仍为 100",
+      "passed": true
+    },
+    {
+      "description": "独立离线图解：新读写复盘约 12 份",
+      "passed": true
+    },
+    {
+      "description": "独立离线图解：历史归档为 18 份与 1 份通过",
+      "passed": true
+    },
+    {
+      "description": "独立离线图解：提案卡片三张",
+      "passed": true
+    },
+    {
+      "description": "独立离线图解：时长比例直接来自历史统计",
+      "passed": true
+    },
+    {
+      "description": "独立离线图解：标注了新版修复与历史窗口",
+      "passed": true
+    },
+    {
+      "description": "独立离线图解：1360px 无图解横向溢出",
+      "passed": true
+    },
+    {
+      "description": "独立离线图解：390px 无图解横向溢出",
+      "passed": true
+    },
+    {
+      "description": "会话可视化页：积木数等于 100",
+      "passed": true
+    },
+    {
+      "description": "会话可视化页：默认比例为 11.88%",
+      "passed": true
+    },
+    {
+      "description": "会话可视化页：全部 Token 切换为 3.47%",
+      "passed": true
+    },
+    {
+      "description": "会话可视化页：切换后积木仍为 100",
+      "passed": true
+    },
+    {
+      "description": "会话可视化页：新读写复盘约 12 份",
+      "passed": true
+    },
+    {
+      "description": "会话可视化页：历史归档为 18 份与 1 份通过",
+      "passed": true
+    },
+    {
+      "description": "会话可视化页：提案卡片三张",
+      "passed": true
+    },
+    {
+      "description": "会话可视化页：时长比例直接来自历史统计",
+      "passed": true
+    },
+    {
+      "description": "会话可视化页：标注了新版修复与历史窗口",
+      "passed": true
+    },
+    {
+      "description": "会话可视化页：1360px 无图解横向溢出",
+      "passed": true
+    },
+    {
+      "description": "会话可视化页：390px 无图解横向溢出",
+      "passed": true
+    },
+    {
+      "description": "页面脚本无运行错误",
+      "passed": true
+    },
+    {
+      "description": "独立页面无远程脚本或外部资产依赖",
+      "passed": true
+    }
+  ],
+  "browserErrors": [],
+  "remoteRequests": [],
+  "standalonePagePath": "/Users/bominzhang/.cline/worktrees/65528/review-validate-fix/docs/investigations/rvf-codex-resource-findings-visual-explainer-2026-10-26/rvf-resource-findings-and-workflow-proposals-offline.html",
+  "sessionPagePath": "/Users/bominzhang/.ai-viz/sessions/session-20261026-161355-bd23d5.html"
+}

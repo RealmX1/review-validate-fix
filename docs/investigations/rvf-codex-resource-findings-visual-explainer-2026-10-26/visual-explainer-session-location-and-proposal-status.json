@@ -1,0 +1,16 @@
+{
+  "session_page": "/Users/bominzhang/.ai-viz/sessions/session-20261026-161355-bd23d5.html",
+  "session_file_url": "file:///Users/bominzhang/.ai-viz/sessions/session-20261026-161355-bd23d5.html",
+  "offline_explainer_repository_path": "docs/investigations/rvf-codex-resource-findings-visual-explainer-2026-10-26/rvf-resource-findings-and-workflow-proposals-offline.html",
+  "generator_repository_path": "docs/investigations/rvf-codex-resource-findings-visual-explainer-2026-10-26/build-rvf-resource-findings-visual-explainer.py",
+  "session_card_number": 1,
+  "runtime_workflow_modified": false,
+  "decision_status": "ESCALATE",
+  "proposal_summary": [
+    "补齐 reviewer、Analyze 和健康探测用量，复用已有计量与去重",
+    "先小范围试点普通轮次程序存证与每周或20轮批量分析，需要新推理的异常即时处理",
+    "建议指纹去重，核对是否已修，复用已有任务并回验"
+  ],
+  "next_verification_condition": "自然发生的 Codex RVF 产生与当前部署绑定的正式 Analyze 回执后，复核归档、恢复与成本；当前图解不触发新的 RVF。",
+  "proposed_runtime_workflow_updates_authorized_for_implementation": false
+}
