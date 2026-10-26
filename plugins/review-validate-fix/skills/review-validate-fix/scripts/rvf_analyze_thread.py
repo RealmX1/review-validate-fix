@@ -277,6 +277,7 @@ def launch_detached_analyze_thread(
             "agent_process_returncode": None,
             "formal_analysis_completion_status": "pending",
             "formal_analysis_validation_errors": [],
+            "automatic_analysis_attempt_limit": 3,
             "formal_analysis_causality_snapshot_required": bool(
                 previous_status.get("formal_analysis_causality_snapshot_required")
                 or previous_status.get("agent_process_returncode") is not None

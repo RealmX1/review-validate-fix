@@ -19,6 +19,9 @@ from typing import Any, Mapping
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import rvf_merge_dispositions  # noqa: E402
 from core.review_run_qualification_mutation_lock import guard_review_run_qualification_mutation  # noqa: E402
+from fix_attempt_scope_expansion_classification import (  # noqa: E402
+    REVIEWED_SCOPE_PATH_UNIVERSE_FIELD_NAMES, reviewed_scope_path_universe,
+)
 from reviewed_candidate_completion_facts import (  # noqa: E402
     CandidateQualificationRefused,
     applied_scope_expansion_facts,
@@ -289,26 +292,9 @@ def expected_parent_evidence_receipt(
     return str(immutable_path), actual_digest
 
 
-# 落地 delta 收敛判据的 scope 全集（08-19 处方 §四·步骤 1 第三条：四个集合的并集，不是两个）。
-REVIEWED_SCOPE_PATH_UNIVERSE_FIELD_NAMES = (
-    "primary_files",
-    "fix_allowlist",
-    "task_change_paths",
-    "background_files",
-)
-
 # 跨仓逐字一致的错误标识串（my-ai-setup 侧 message 也包含它们，便于跨仓 grep 同一根线）。
 LANDED_TIP_ANCESTRY_ERROR = "landed tip does not descend from the reviewed tip"
 LANDED_DELTA_ESCAPED_SCOPE_ERROR = "landed delta escaped the reviewed scope"
-
-
-def reviewed_scope_path_universe(contract: Mapping[str, Any]) -> set[str]:
-    universe: set[str] = set()
-    for field_name in REVIEWED_SCOPE_PATH_UNIVERSE_FIELD_NAMES:
-        values = contract.get(field_name)
-        if isinstance(values, list):
-            universe.update(value for value in values if isinstance(value, str) and value)
-    return universe
 
 
 def landed_delta_paths(repo: Path, reviewed_tip: str, landed_tip: str) -> list[str]:
@@ -935,7 +921,14 @@ def candidate_evidence_qualification(repo: Path, run_dir: Path, *, pending_stage
                 "issues_remain_unresolved": bool(prepared["facts"]["user_delegated_elevated_issues"]),
                 "candidate_content_manifest_sha256": prepared["payload"]["subject"]["candidate_content_manifest_sha256"],
                 "evidence_schema_version": prepared["payload"]["schema_version"],
-                "consumer_contract_update_required": prepared["payload"]["schema_version"] != SCHEMA_VERSION}
+                "consumer_contract_update_required": prepared["payload"]["schema_version"] != SCHEMA_VERSION,
+                "recovered_canonical_issue_scope_expansion_paths": sorted({
+                    path for expansion in (prepared["expansion_receipt"] or {}).get("expansions", [])
+                    for path in expansion["paths"]
+                    if path not in (expansion["facts"]["result"].get("scope_expansion") or {}).get("expanded_paths", [])
+                    and path not in (expansion["facts"]["result"].get("scope_expansion") or {}).get(
+                        "acknowledged_protected_or_background_paths", [])
+                })}
     except CandidateEvidenceNotApplicable as exc:
         return {"status": "skipped_not_applicable", "reason_code": "candidate_evidence_not_opted_in", "reason": str(exc)}
     except CandidateQualificationRefused as exc:

@@ -1197,14 +1197,17 @@ def main() -> int:
         emit(disabled_gui_payload)
         return 0
 
+    independent_backup_candidate_requires_in_progress_run_reconciliation = False
     if isinstance(cwd, str):
-        from independent_backup_route import should_suppress_normal_stop
+        from independent_backup_route import control_directory, marker_present, should_suppress_normal_stop
         if should_suppress_normal_stop(Path(cwd)):
-            return emit_terminal_payload(
-                ledger, status="skipped", reason_code="independent_backup_route_owns_or_completed_candidate",
-                message="存在独立备用路线控制记录，普通自动路径保持静默",
-                detail="读取持久接续记录；不重复发起普通 RVF 或自动收尾。",
-            )
+            if marker_present(control_directory(Path(cwd)) / "active-owner"):
+                return emit_terminal_payload(
+                    ledger, status="skipped", reason_code="independent_backup_route_owns_or_completed_candidate",
+                    message="存在独立备用路线控制记录，普通自动路径保持静默",
+                    detail="读取持久接续记录；不重复发起普通 RVF 或自动收尾。",
+                )
+            independent_backup_candidate_requires_in_progress_run_reconciliation = True
     if suppress_requested():
         ledger.event(
             phase="dev-sync",
@@ -1281,6 +1284,9 @@ def main() -> int:
             message="rvf-analyze follow-up trigger turn; skipped dispatcher sync and installed hook",
             detail="检测到 RVF analyze follow-up trigger，已跳过主 RVF 自动触发。",
         )
+    if independent_backup_candidate_requires_in_progress_run_reconciliation:
+        # 候选覆盖不等于没有其他在途 run；先保留宿主守卫，再交 core 按 run 对账。
+        return run_installed_stop_hook(raw_input, ledger)
     sync_needed, reason, repo = should_sync(event)
     if not sync_needed:
         ledger.event(

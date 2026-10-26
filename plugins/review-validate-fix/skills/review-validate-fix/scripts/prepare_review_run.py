@@ -16,7 +16,7 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 core.* import
@@ -30,6 +30,7 @@ import concurrent.futures
 import rvf_prep_file
 from rvf_dispatch_prompts import dispatch_scope_of_work_text
 from core.run_ledger.run_ledger import normalize_rvf_backend, rvf_state_fields, start_run
+from core.run_ledger.review_run_lifecycle import atomic_write_json, read_json_object, merge_review_run_summary
 from core.session_scope_allocation import reviewable_unit_diff_tracker
 from core.host_adapter.host_transcript_format_detection import HOST_CODEX, detect_transcript_format
 from core.rvf_user_local_data_paths import resolved_rvf_reviewer_registry_path
@@ -1022,6 +1023,7 @@ def prepare_run(
     local_base_ref: str | None = None,
     scope_contract_extensions: Mapping[str, Any] | None = None,
     decision_token: str | None = None,
+    preparation_execution_identity_observer: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     root = git_root(repo)
 
@@ -1140,6 +1142,11 @@ def prepare_run(
     rvf_run_id, rvf_run_dir = bind_review_start_boundary_to_one_run(
         receipt=verified_boundary_receipt, run_id=rvf_run_id, run_dir=rvf_run_dir,
     )
+    if preparation_execution_identity_observer is not None:
+        preparation_execution_identity_observer({
+            "repo": root, "run_id": rvf_run_id, "run_dir": rvf_run_dir,
+            "verified_session_id": verified_boundary_receipt.get("session_id"),
+        })
     ledger = start_run(
         "prepare-run",
         repo=str(root),
@@ -1147,6 +1154,12 @@ def prepare_run(
         run_id=rvf_run_id,
         run_dir=rvf_run_dir,
     )
+    if ledger.available:
+        # 首次 prepare 尚未写出 scope 时，也保留已验证的精确身份供中断恢复核验。
+        identity_summary = {"run_id": ledger.run_id, "run_dir": str(ledger.run_dir), "repo": str(root)}
+        if verified_boundary_receipt.get("session_id"):
+            identity_summary["session_id"] = verified_boundary_receipt["session_id"]
+        merge_review_run_summary(ledger.run_dir, identity_summary)
     ledger.event(
         phase="prepare",
         event="started",
@@ -1812,7 +1825,7 @@ def prepare_run_from_prep_file(
         "rvf_backend": rvf_backend,
     }
 
-    def _runner() -> dict[str, Any]:
+    def _prepare_once(identity_observer: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
         return prepare_run(
             repo=target_repo,
             session_context=scope_of_work_path,
@@ -1833,7 +1846,18 @@ def prepare_run_from_prep_file(
             committed_base_ref=committed_base_ref,
             local_base_ref=local_base_ref,
             scope_contract_extensions=contract_extensions,
+            preparation_execution_identity_observer=identity_observer,
         )
+
+    def _runner() -> dict[str, Any]:
+        execution_identity: dict[str, Any] = {}
+        try:
+            return _prepare_once(execution_identity.update)
+        except KeyboardInterrupt:
+            # 只消费实际 preparation 执行抛出的原生中断；future 等待者被中断不证明 worker 结束。
+            if execution_identity:
+                _record_native_preparation_interruption(**execution_identity, transcript=transcript_path, policy_event=payload)
+            raise
 
     completed_state = state
     # Manage executor manually so a TimeoutError can return immediately. Using
@@ -1862,6 +1886,9 @@ def prepare_run_from_prep_file(
             "completed_at": _shared_workflow_now(),
             "error": f"prepare_run exceeded {timeout_seconds:.0f}s timeout",
         }
+    except KeyboardInterrupt:
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
     except ReviewStartBoundaryNotVerified as exc:
         executor.shutdown(wait=False, cancel_futures=True)
         completed_state = {**state, "status": exc.status, "completed_at": _shared_workflow_now(), "error": exc.reason}
@@ -1878,6 +1905,75 @@ def prepare_run_from_prep_file(
     new_rvf_run["shared_workflow_state"] = completed_state
     rvf_prep_file.update_prep_file(prep, {"rvf_run": new_rvf_run})
     return completed_state
+
+
+def _record_native_preparation_interruption(
+    *, repo: Path, run_id: str | None, run_dir: Path | None,
+    verified_session_id: str | None = None, transcript: Path | None = None,
+    policy_event: Mapping[str, Any] | None = None,
+) -> None:
+    """异常清理只登记持久事实和请求，原异常继续抛出；不执行归档或模型。"""
+    if not run_id or run_dir is None or not (run_dir / "summary.json").is_file():
+        return
+    observation_path = run_dir / "artifacts/preparation-native-interruption-observation.json"
+    observation: dict[str, Any] = {
+        "schema_version": 1, "run_id": run_id, "run_dir": str(run_dir.resolve()), "repo": str(repo.resolve()),
+        "native_exception_kind": "KeyboardInterrupt", "observed_at": _shared_workflow_now(),
+    }
+    run_identity_verified = False
+    recovery_index: Path | None = None
+    try:
+        summary = read_json_object(run_dir / "summary.json")
+        if (run_dir.is_symlink() or (run_dir / "summary.json").is_symlink() or summary.get("run_id") != run_id
+                or not isinstance(summary.get("repo"), str) or Path(summary["repo"]).resolve() != repo.resolve()):
+            raise ValueError("原生 preparation 中断的精确 run 或仓库身份不符")
+        run_identity_verified = True
+        from review_run_terminal_archive import (
+            request_review_run_terminal_archive, record_native_preparation_interruption_recovery_index,
+        )
+
+        event: dict[str, Any] = {"cwd": str(repo.resolve())}
+        if transcript is not None:
+            event["transcript_path"] = str(transcript)
+        for name in ("suppress_review_validate_fix", "review_validate_fix_suppressed"):
+            if (policy_event or {}).get(name) is True:
+                event[name] = True
+        observation["event"] = event
+        known_session = verified_session_id or summary.get("session_id")
+        if known_session:
+            observation["session_id"] = known_session
+            atomic_write_json(observation_path, observation)
+            recovery_index = record_native_preparation_interruption_recovery_index(observation_path)
+        contract_path = run_dir / "artifacts/inputs/scope.contract.json"
+        if contract_path.is_symlink():
+            raise ValueError("原生 preparation 中断的固定 scope 不能是符号链接")
+        contract = read_json_object(contract_path)
+        snapshot = contract.get("review_candidate_snapshot") or contract.get("review_start_boundary_receipt") or {}
+        sessions = [value for value in (summary.get("session_id"), snapshot.get("session_id"), verified_session_id) if value]
+        if not sessions or any(value != sessions[0] for value in sessions):
+            raise ValueError("原生 preparation 中断缺少一致的已绑定会话证据")
+        observation["session_id"] = sessions[0]
+        observation["status"] = "native_interruption_recorded"
+        atomic_write_json(observation_path, observation)
+        if recovery_index is None:
+            recovery_index = record_native_preparation_interruption_recovery_index(observation_path)
+        event["session_id"] = sessions[0]
+        outcome = request_review_run_terminal_archive(run_dir=run_dir, decision_kind="interrupted",
+            reason="preparation 实际执行收到 KeyboardInterrupt；保留原中断并延后归档恢复", event=event,
+            defer_resume=True)
+        observation.update({"status": "terminal_archive_request_recorded", "request_status": outcome["status"]})
+        atomic_write_json(observation_path, observation)
+        recovery_index.unlink(missing_ok=True)
+    except Exception as exc:
+        # 保留可核验缺口，不让记账失败替换原 KeyboardInterrupt。
+        if not run_identity_verified:
+            return
+        observation.update({"status": "waiting_for_evidence", "error": f"{type(exc).__name__}: {exc}",
+                            "recovery_condition": "精确 run、仓库及绑定 session/scope 证据恢复可读后重验"})
+        try:
+            atomic_write_json(observation_path, observation)
+        except OSError:
+            pass
 
 
 def main() -> int:
@@ -1917,8 +2013,8 @@ def main() -> int:
     parser.add_argument(
         "--local-base-ref",
         help=(
-            "Local branch whose committed AGENTS.md may opt into the pre-review one-way base sync gate. "
-            "Regular repositories remain unchanged when omitted."
+            "固定候选所使用的本地比较分支；本参数不吸收 base。"
+            "base 的吸收与冲突解决由最终 base-branch-sync 或未来 PR 合并阶段负责。"
         ),
     )
     parser.add_argument(
@@ -1949,6 +2045,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    execution_identity: dict[str, Any] = {}
     try:
         session_context = Path(args.session_context).expanduser().resolve() if args.session_context else None
         if session_context is None and not args.allow_missing_session_context:
@@ -2019,7 +2116,12 @@ def main() -> int:
             local_base_ref=args.local_base_ref,
             scope_contract_extensions=contract_extensions,
             decision_token=args.decision_token,
+            preparation_execution_identity_observer=execution_identity.update,
         )
+    except KeyboardInterrupt:
+        if execution_identity:
+            _record_native_preparation_interruption(**execution_identity, transcript=transcript)
+        raise
     except Exception as exc:
         return fail(str(exc), 2)
 

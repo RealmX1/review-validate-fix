@@ -40,7 +40,23 @@ receipt 的 schema 为 `rvf-applied-scope-expansion-qualification-receipt` versi
 
 消费者必须先校验 receipt 的位置、canonical bytes、sidecar、身份、快照及补丁，再将其 `paths` 加入冻结全集。落地 tip 必须继承最初 reviewed tip；`--no-renames` 的落地 delta 必须落在该并集中，rename 源、目的两端都检查。不得只相信一个扩大后的路径数组，也不得将无法理解的 version 2 按 version 1 接受。
 
-本仓 reader 已实现以上 version 2 校验。本次核对的已安装 `base-branch-sync` 仍仅支持 version 1，必须明确拒绝 version 2。跨仓后续需要采用相同判据，并覆盖合法扩展、缺声明/应用/确认、receipt/patch 篡改、run/内容/原 scope 身份不符及 rename 越界的正负例。两个仓库正式安装并完成对等验收之前，B2 的跨仓快路径仍未交付。
+## Canonical issue 主路径与原事件补证
+
+task `72dbd` 将两种边界明确分开：attempt 的 `issue_paths ∪ fix_allowlist` 控制修改权限，冻结合同的四个路径集合控制 evidence 的范围扩展记账。canonical issue 的普通主路径可以直接修复；当它处于冻结范围外时，即使已处于 attempt boundary 内，stop 仍将其记入 `scope_expansion.expanded_paths`。
+
+`declared_paths` 包含 CLI 的显式声明和 canonical issue 的有效主路径声明；新增 `canonical_issue_declared_paths` 标明后者。仅允许 `validate_then_fix` issue 的真实改动路径，并核对 canonical issue 与 prepare 时的路径身份。仅主路径自动声明时，理由可来自 canonical issue 的问题描述；其他边界外路径仍须通过 CLI 显式声明理由。protected/background/excluded 的双重确认、validate-only 禁修及工具托管路径拒绝不因主路径身份而豁免。冻结范围内但在 attempt 修改边界外的普通路径，也仍须显式声明。
+
+`declared_paths_outside_attempt_boundary` 单独记录修改权限的外扩，参与补丁导出、告警和 apply 前的 baseline blob 漂移检查；它与 `expanded_paths` 不必相同。已审但不在 fixer 修改边界内的依赖，声明后仍须完整合回，也不能覆盖 prepare 后其他会话的修改。
+
+已经 applied 的 attempt 可能保留相对 attempt boundary 生成的旧 `expanded_paths`。正式 `check-evidence`、prepare/commit 与 receipt reader 使用同一分类逻辑重新核对：遗漏路径必须同时属于 canonical issue、prepare 时登记的 issue 路径、result 的 changed paths 和该 attempt 的实际 patch。不能借此补齐其他未声明路径，也不能把尚未应用、validate-only 或身份不符的修复视为完成。
+
+`rvf land check-evidence` 继续完全只读，资格 JSON 的 `recovered_canonical_issue_scope_expansion_paths` 列出实际补出的主路径。prepare/commit 沿用 version 2 evidence 与内容寻址的扩展资格 receipt，保留原始 issue/attempt/result 快照及 patch 摘要；不会改写原 attempt/result、patch、handoff 或冻结路径集合。正常 landing restamp 仍按原契约归档最初 reviewed contract。重复恢复复用相同凭据，干净且内容匹配时不增加实现提交。此规则按相同机器事实计算，不按工具旧版本设置放宽分支。
+
+生产 run 只能在其所属 Task 按精确 run 恢复。本卡的原始 `rvf-review-start-2af6e3d18859ee08` 样本仅作只读核验；完整写入生命周期在隔离仓库中重放。若原候选后来已变化，其他资格门禁仍可能拒绝，不能把主路径判据修复当作对当前所有候选的通过证明。
+
+外部 `base-branch-sync` reader 需要采用相同的 canonical issue 主路径补证判据。旧 reader 仅凭原快照中的 `expanded_paths` 核验，可能拒绝上述历史补证 receipt；不能修改快照来迁就它，也不能宣称本仓 land 成功意味着外部消费者已升级。本卡只交付本仓实现和对等更新契约，不修改或部署外仓。
+
+本仓 reader 已实现以上 version 2 校验。task `5de70` 最初交付时核对的已安装 `base-branch-sync` 仅支持 version 1，当时必须明确拒绝 version 2；这是原交付时的状态，不代表后续消费者未升级。跨仓后续需要采用相同判据，并覆盖合法扩展、缺声明/应用/确认、receipt/patch 篡改、run/内容/原 scope 身份不符及 rename 越界的正负例。两个仓库正式安装并完成对等验收之前，B2 的跨仓快路径仍未交付。
 
 ## Restamp、重复恢复与实际结果
 

@@ -19,6 +19,10 @@
 
 最后核对全部所需阶段与当前内容，再 `finish --repo <worktree> --operation-id <原ID> --evidence-file <最终报告>`。已发生的提交／落地先复用，不重复执行；完成后新内容仍进入正常审查。输出 `RVF_BACKUP_ROUTE_RESULT_FILE: <持久绝对路径>`，分别报告备用结果与原自动化状态；不用普通 handoff marker 冒充正常 finalize。独立结论由原始材料支持，不要求额外 JSON schema。
 
+原 run 已消费与当前候选覆盖分别核验：后续提交改变 HEAD 不复活旧 run，新内容也不因历史消费被当作已审。Stop 先按精确 run、operation 与 worktree Git 目录对账在途／pending 凭证，再考虑续跑或重投；清理失败不得再催原 run，其他 run 保留。索引缺失／损坏时自动查同 operation 的持久完成原件，有界分页进度和缺口落盘供下次 Stop 接续；仍无法核验则记 `unknown` 与重验条件，诊断不驱动新回合。根目录、子目录与符号链接入口统一按真实 worktree 根计算候选指纹。
+
+尚未查尽分页时静默等待机器补证，不提前视为未覆盖；命中记录在候选未变时优先重新核验，候选变化则重置旧游标／缓存资格。无关 run 的已知坏记录不冻结其他 run；同 run 的归档原件缺失仍保留未知。清理前先核验并回收精确 tracker lease，缺 artifact 从原生账本补证，失败保留凭证自动重试；pending 发布和清理使用共同写锁，避免误删另一 run。dispatcher 转交仍遵守宿主既有 plan 等守卫。
+
 `review_only`／`validate_fix` 子代理仍只执行分配角色，不能因本节自行接管、提交或发起完整 RVF。后台完成通知或任务重启后先读接续记录；条件未满足时保留机器可检测的恢复条件并继续独立工作，不做无变化重试。
 
 <!-- entry:review -->

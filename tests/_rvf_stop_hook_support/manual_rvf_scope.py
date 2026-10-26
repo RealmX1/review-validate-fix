@@ -74,8 +74,8 @@ def test_manual_rvf_session_marker_skips_before_fork_gate(tmp_path: Path) -> Non
     try:
         module.set_session_hook_enabled(
             session_id="manual-rvf-session",
-            enabled=False,
-            latest_user="RVF_STOP_HOOK: off",
+            enabled=True,
+            latest_user="RVF_STOP_HOOK: on",
         )
         module.write_manual_rvf_session_marker(
             session_id="manual-rvf-session",
@@ -113,6 +113,27 @@ def test_manual_rvf_session_marker_skips_before_fork_gate(tmp_path: Path) -> Non
     assert summary["manual_rvf_dirty_hash"]
     assert "app_server_requests_path" not in summary
     assert latest_pointer(state)["reason_code"] == "manual_rvf_already_ran"
+
+    # session 已启用时 manual marker 先于 fork；同一 marker 存在时，明确 Off 仍优先。
+    os.environ["CODEX_RVF_STATE_DIR"] = str(state)
+    os.environ.pop("CODEX_RVF_SESSION_HOOK_STATE_DIR", None)
+    try:
+        module.set_session_hook_enabled(
+            session_id="manual-rvf-session", enabled=False, latest_user="RVF_STOP_HOOK: off",
+        )
+    finally:
+        if old_state is None:
+            os.environ.pop("CODEX_RVF_STATE_DIR", None)
+        else:
+            os.environ["CODEX_RVF_STATE_DIR"] = old_state
+        if old_session_state is not None:
+            os.environ["CODEX_RVF_SESSION_HOOK_STATE_DIR"] = old_session_state
+    disabled = parse_json(invoke({"cwd": str(dirty), "session_id": "manual-rvf-session", "stop_hook_active": False},
+        extra_env={"CODEX_RVF_FORK_MODE": "dry-run"}, state_dir=state)[0])
+    assert "decision" not in disabled
+    assert summary_from_payload(disabled)["reason_code"] == "session_hook_disabled"
+    state_payload = json.loads((state / "session-hook/manual-rvf-session.json").read_text(encoding="utf-8"))
+    assert state_payload["manual_rvf_run_id"] == "rvf-manual-run"
 
 
 def test_manual_rvf_session_marker_dirty_change_does_not_suppress(tmp_path: Path) -> None:

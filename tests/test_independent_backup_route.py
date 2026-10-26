@@ -89,6 +89,96 @@ def test_completed_candidate_is_suppressed_only_until_content_changes(route):
         pass
 
 
+def record_candidate_coverage_beyond_first_recovery_page(route):
+    """真实完成候选排在第二页；前页为其他候选的完整历史记录。"""
+    module, repo, *_ = route
+    report = record_complete_delivery_fixture(route, operation_id="operation-zzz-target")
+    result = module.finish_backup_route(repo, "operation-zzz-target", report)
+    for index in range(module.STOP_COMPLETION_RECOVERY_OPERATION_LIMIT):
+        operation_id = f"operation-{index:03}"
+        module.durable_json(module.control_directory(repo) / "completed-operations" / (operation_id + ".json"),
+                            {**result, "operation_id": operation_id, "content_fingerprint": "0" * 64})
+    return result
+
+
+def test_paginated_candidate_coverage_waits_then_reuses_verified_target_across_processes(route, monkeypatch):
+    module, repo, *_ = route
+    record_candidate_coverage_beyond_first_recovery_page(route)
+    reads, read_completion = [], module.read_backup_operation_completion_evidence
+    def record_completion_read(*args, **kwargs):
+        reads.append(args[1])
+        return read_completion(*args, **kwargs)
+    monkeypatch.setattr(module, "read_backup_operation_completion_evidence", record_completion_read)
+    assert module.should_suppress_normal_stop(repo) is True
+    observation_path = module.control_directory(repo) / "stop-content-verification-observation.json"
+    first = json.loads(observation_path.read_text())
+    assert first["status"] == "unknown" and first["recovery_after_operation"]
+    assert len(reads) == module.STOP_COMPLETION_RECOVERY_OPERATION_LIMIT
+    restarted_query = (
+        "import importlib.util,json,sys; from pathlib import Path; "
+        "spec=importlib.util.spec_from_file_location('restarted_backup_route',sys.argv[1]); "
+        "helper=importlib.util.module_from_spec(spec); spec.loader.exec_module(helper); "
+        "print(json.dumps({'suppress':helper.should_suppress_normal_stop(Path(sys.argv[2]))}))"
+    )
+    restarted = json.loads(subprocess.check_output(
+        [__import__("sys").executable, "-c", restarted_query, str(SCRIPT), str(repo)], text=True))
+    assert restarted["suppress"] is True
+    assert json.loads(observation_path.read_text())["status"] == "covered"
+    reads.clear()
+    for _ in range(3):
+        assert module.should_suppress_normal_stop(repo) is True
+        assert json.loads(observation_path.read_text())["status"] == "covered"
+    assert reads == ["operation-zzz-target"] * 3
+
+
+@pytest.mark.parametrize("previous_state", ["pending", "covered"])
+@pytest.mark.parametrize("change", ["head", "content", "index"])
+def test_candidate_changes_invalidate_coverage_cursor_and_verified_target(route, monkeypatch, previous_state, change):
+    module, repo, _, _, git = route
+    monkeypatch.setattr(module, "STOP_COMPLETION_RECOVERY_OPERATION_LIMIT", 2)
+    record_candidate_coverage_beyond_first_recovery_page(route)
+    assert module.should_suppress_normal_stop(repo) is True
+    if previous_state == "covered":
+        assert module.should_suppress_normal_stop(repo) is True
+    observation_path = module.control_directory(repo) / "stop-content-verification-observation.json"
+    previous = json.loads(observation_path.read_text())
+    if change == "head":
+        git("commit", "--allow-empty", "-qm", "fix: 新提交应重新核验覆盖")
+    elif change == "content":
+        (repo / "source.txt").write_text("尚未评审的新候选\n")
+    else:
+        blob = subprocess.check_output(["git", "-C", str(repo), "hash-object", "-w", "--stdin"], input=b"new staged bytes\n").decode().strip()
+        git("update-index", "--cacheinfo", "100644", blob, "source.txt")
+    assert module.should_suppress_normal_stop(repo) is True
+    current = json.loads(observation_path.read_text())
+    assert current["status"] == "unknown" and current["recovery_after_operation"]
+    assert current["candidate_content_fingerprint"] != previous["candidate_content_fingerprint"]
+    assert module.should_suppress_normal_stop(repo) is False
+    assert json.loads(observation_path.read_text())["status"] == "not_covered"
+
+
+def test_cached_candidate_coverage_rechecks_source_and_exhausted_gaps_allow_new_review(route, monkeypatch):
+    module, repo, _, artifacts, _ = route
+    monkeypatch.setattr(module, "STOP_COMPLETION_RECOVERY_OPERATION_LIMIT", 2)
+    record_candidate_coverage_beyond_first_recovery_page(route)
+    assert module.should_suppress_normal_stop(repo) is True
+    assert module.should_suppress_normal_stop(repo) is True
+    completed = module.control_directory(repo) / "completed-operations/operation-zzz-target.json"
+    delivery = artifacts / "operation-zzz-target/backup-route-delivery-result.json"
+    saved_delivery = delivery.read_bytes()
+    completed.write_text("损坏的缓存来源索引\n")
+    delivery.write_text("暂不可读的缓存来源原件\n")
+    assert module.should_suppress_normal_stop(repo) is False
+    observation_path = module.control_directory(repo) / "stop-content-verification-observation.json"
+    observation = json.loads(observation_path.read_text())
+    assert observation["status"] == "unknown"
+    assert not observation["recovery_after_operation"]
+    delivery.write_bytes(saved_delivery)
+    assert module.should_suppress_normal_stop(repo) is True
+    assert module.should_suppress_normal_stop(repo) is True
+    assert json.loads(observation_path.read_text())["status"] == "covered"
+
+
 def test_finish_requires_actual_commit_and_all_required_stages(route):
     module, repo, _, artifacts, _ = route
     claim(route)
@@ -406,14 +496,14 @@ def test_metadata_only_mode_cannot_hide_a_broken_git_identity(route, tmp_path, m
         module.repository_for_normal_metadata_mutation(selected)
 
 
-def record_complete_delivery_fixture(route, delivery_stage="land", original_run=None, base_ref=None):
+def record_complete_delivery_fixture(route, delivery_stage="land", original_run=None, base_ref=None, operation_id="operation-a"):
     """用真实 Git 事实完成指定阶段，供恢复与内容隔离回归复用。"""
     module, repo, authorization, artifacts, git = route
-    module.claim_backup_route(repo, "operation-a", artifacts, authorization, "隔离回归", original_run, delivery_stage)
+    module.claim_backup_route(repo, operation_id, artifacts, authorization, "隔离回归", original_run, delivery_stage)
     report = artifacts / "report.md"
     report.write_text("合成夹具：原始评审、验证与实际提交已经核对。\n")
     for stage in module.STAGES[:module.STAGES.index(delivery_stage) + 1]:
-        module.record_stage_fact(repo, "operation-a", stage, report,
+        module.record_stage_fact(repo, operation_id, stage, report,
                                  git("rev-parse", "HEAD") if stage in {"land", "base_sync"} else None,
                                  base_ref if stage == "base_sync" else None)
     return report
@@ -428,6 +518,272 @@ def test_consumed_original_run_rejects_a_new_backup_operation(route, tmp_path):
     with pytest.raises(module.BackupRouteOwned, match="消费"):
         module.claim_backup_route(repo, "operation-b", artifacts, authorization, "不得重复交付", original_run, "land")
     assert not module.marker_present(module.control_directory(repo) / "active-owner")
+
+
+@pytest.mark.parametrize("entry", ["root", "subdirectory", "symlink"])
+def test_candidate_identity_and_snapshot_use_actual_worktree_root(route, tmp_path, entry):
+    module, repo, authorization, artifacts, git = route
+    nested = repo / "nested-source"
+    nested.mkdir()
+    alias = tmp_path / "repository-entry-alias"
+    alias.symlink_to(nested, target_is_directory=True)
+    selected = {"root": repo, "subdirectory": nested, "symlink": alias}[entry]
+    (repo / "source.txt").write_text("仓库根目录的候选内容\n")
+    assert module.worktree_content_fingerprint(selected) == module.worktree_content_fingerprint(repo)
+    module.claim_backup_route(selected, "operation-a", artifacts, authorization, "仓库入口归一", None, "review")
+    identity = module.operation_identity(selected, "operation-a")
+    assert identity["worktree"] == str(repo.resolve())
+    snapshot = module.freeze_candidate(selected, "operation-a", ["source.txt"], git("rev-parse", "HEAD"))
+    assert git("show", snapshot["candidate_commit"] + ":source.txt") == "仓库根目录的候选内容"
+
+
+def test_readonly_consumption_survives_commit_without_claiming_new_candidate_coverage(route, tmp_path):
+    module, repo, _, _, git = route
+    original_run = tmp_path / "rvf-original-run"
+    report = record_complete_delivery_fixture(route, original_run=original_run)
+    result = module.finish_backup_route(repo, "operation-a", report)
+    assert module.read_current_candidate_backup_coverage_evidence(repo)["status"] == "covered"
+    git("commit", "--allow-empty", "-qm", "fix: 完成后提交改变 HEAD")
+    root = module.control_directory(repo)
+    before = {str(path): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+    consumption = module.read_original_run_backup_consumption_evidence(repo, original_run)
+    assert consumption["status"] == "consumed"
+    assert consumption["result"] == result
+    assert module.read_current_candidate_backup_coverage_evidence(repo)["status"] == "not_covered"
+    assert {str(path): path.read_bytes() for path in root.rglob("*") if path.is_file()} == before
+
+
+@pytest.mark.parametrize("failure", ["missing", "corrupt", "unreadable", "completed_index_corrupt"])
+def test_original_run_consumption_recovers_from_bound_completion_records(route, tmp_path, monkeypatch, failure):
+    module, repo, *_ = route
+    original_run = tmp_path / "rvf-original-run"
+    report = record_complete_delivery_fixture(route, original_run=original_run)
+    module.finish_backup_route(repo, "operation-a", report)
+    consumed = module.consumed_run_record(repo, original_run)
+    if failure == "missing":
+        consumed.unlink()
+    elif failure == "corrupt":
+        consumed.write_text("损坏的消费索引\n")
+    elif failure == "completed_index_corrupt":
+        (module.control_directory(repo) / "completed-operations/operation-a.json").write_text("broken")
+    else:
+        read_text = Path.read_text
+        def deny_consumption_read(path, *args, **kwargs):
+            if path == consumed:
+                raise PermissionError("模拟消费索引读取受限")
+            return read_text(path, *args, **kwargs)
+        monkeypatch.setattr(Path, "read_text", deny_consumption_read)
+    evidence = module.reconcile_original_run_backup_consumption(repo, original_run)
+    assert evidence["status"] == "consumed"
+    assert evidence["result"]["operation_id"] == "operation-a"
+    if failure in {"missing", "corrupt"}:
+        assert json.loads(consumed.read_text())["status"] == "backup_closed"
+    if failure == "corrupt":
+        originals = list((module.control_directory(repo) / "recovered-consumption-record-originals").glob("*"))
+        assert [path.read_text() for path in originals] == ["损坏的消费索引\n"]
+
+
+def test_consumption_is_bound_to_exact_run_and_independent_worktree(route, tmp_path):
+    module, repo, _, _, git = route
+    original_run = tmp_path / "rvf-original-run"
+    report = record_complete_delivery_fixture(route, original_run=original_run)
+    module.finish_backup_route(repo, "operation-a", report)
+    other_worktree = tmp_path / "other-worktree"
+    git("worktree", "add", "--detach", str(other_worktree), "HEAD")
+    assert module.worktree_content_fingerprint(other_worktree) == module.worktree_content_fingerprint(repo)
+    assert module.control_directory(other_worktree) != module.control_directory(repo)
+    assert module.read_original_run_backup_consumption_evidence(other_worktree, original_run)["status"] == "not_consumed"
+    assert module.read_original_run_backup_consumption_evidence(repo, tmp_path / "another-run")["status"] == "not_consumed"
+    borrowed = module.consumed_run_record(other_worktree, original_run)
+    module.durable_json(borrowed, json.loads(module.consumed_run_record(repo, original_run).read_text()))
+    assert module.read_original_run_backup_consumption_evidence(other_worktree, original_run)["status"] == "unknown"
+    assert module.should_suppress_normal_stop(other_worktree) is False
+
+
+@pytest.mark.parametrize("interruption", ["completion_index", "consumption_index", "owner_archive"])
+def test_stop_recovers_interrupted_finish_after_head_and_content_change(route, tmp_path, monkeypatch, interruption):
+    module, repo, _, artifacts, git = route
+    original_run = tmp_path / "rvf-original-run"
+    report = record_complete_delivery_fixture(route, original_run=original_run)
+    write_json, rename = module.durable_json, module.os.rename
+    def interrupted_write(path, value):
+        if ((interruption == "completion_index" and path.parent.name == "completed-operations")
+                or (interruption == "consumption_index" and path.parent.name == "consumed-original-runs")):
+            raise OSError("模拟完成写入中断")
+        return write_json(path, value)
+    def interrupted_archive(source, destination):
+        if interruption == "owner_archive" and Path(source).name == "active-owner":
+            raise OSError("模拟归档中断")
+        return rename(source, destination)
+    monkeypatch.setattr(module, "durable_json", interrupted_write)
+    monkeypatch.setattr(module.os, "rename", interrupted_archive)
+    with pytest.raises(OSError):
+        module.finish_backup_route(repo, "operation-a", report)
+    original_result = (artifacts / "operation-a/backup-route-delivery-result.json").read_bytes()
+    git("commit", "--allow-empty", "-qm", "fix: 中断后 HEAD 改变")
+    (repo / "source.txt").write_text("中断后新增未审内容\n")
+    monkeypatch.setattr(module, "durable_json", write_json)
+    monkeypatch.setattr(module.os, "rename", rename)
+    assert module.should_suppress_normal_stop(repo) is False
+    assert module.reconcile_original_run_backup_consumption(repo, original_run)["status"] == "consumed"
+    assert not module.marker_present(module.control_directory(repo) / "active-owner")
+    assert (artifacts / "operation-a/backup-route-delivery-result.json").read_bytes() == original_result
+
+
+def test_missing_completion_evidence_stays_unknown_then_recovers_on_later_stop(route, tmp_path):
+    module, repo, _, artifacts, _ = route
+    original_run = tmp_path / "rvf-original-run"
+    report = record_complete_delivery_fixture(route, original_run=original_run)
+    module.finish_backup_route(repo, "operation-a", report)
+    completed = module.control_directory(repo) / "completed-operations/operation-a.json"
+    delivery = artifacts / "operation-a/backup-route-delivery-result.json"
+    historical_bytes = delivery.read_bytes()
+    completed.write_text("broken")
+    delivery.write_text("broken")
+    assert module.reconcile_original_run_backup_consumption(repo, original_run)["status"] == "unknown"
+    delivery.write_bytes(historical_bytes)
+    assert module.reconcile_original_run_backup_consumption(repo, original_run)["status"] == "consumed"
+    observations = list(module.control_directory(repo).glob("stop-original-run-verification-*-history/*.json"))
+    assert {json.loads(path.read_text())["status"] for path in observations} == {"unknown", "consumed"}
+
+
+@pytest.mark.parametrize("failure", ["missing", "corrupt", "unreadable"])
+def test_unrelated_run_does_not_inherit_another_operations_completion_gap(route, tmp_path, monkeypatch, failure):
+    module, repo, _, artifacts, _ = route
+    original_run = tmp_path / "rvf-original-run"
+    report = record_complete_delivery_fixture(route, original_run=original_run)
+    module.finish_backup_route(repo, "operation-a", report)
+    completed = module.control_directory(repo) / "completed-operations/operation-a.json"
+    delivery = artifacts / "operation-a/backup-route-delivery-result.json"
+    completed.write_text("损坏的完成索引\n")
+    if failure == "missing":
+        delivery.unlink()
+    elif failure == "corrupt":
+        delivery.write_text("损坏的持久交付原件\n")
+    else:
+        read_text = Path.read_text
+        def deny_delivery_read(path, *args, **kwargs):
+            if path == delivery:
+                raise PermissionError("模拟其他 run 的原件读取受限")
+            return read_text(path, *args, **kwargs)
+        monkeypatch.setattr(Path, "read_text", deny_delivery_read)
+    evidence = module.reconcile_original_run_backup_consumption(repo, tmp_path / "another-run")
+    assert evidence["status"] == "not_consumed"
+    assert evidence["verification_gaps"] == []
+
+
+@pytest.mark.parametrize("failure", ["missing", "corrupt", "unreadable"])
+def test_bound_archived_run_missing_completion_stays_unknown_and_recovers(route, tmp_path, monkeypatch, failure):
+    module, repo, _, artifacts, git = route
+    original_run = tmp_path / "rvf-original-run"
+    report = record_complete_delivery_fixture(route, original_run=original_run)
+    result = module.finish_backup_route(repo, "operation-a", report)
+    module.consumed_run_record(repo, original_run).unlink()
+    (module.control_directory(repo) / "completed-operations/operation-a.json").unlink()
+    delivery = artifacts / "operation-a/backup-route-delivery-result.json"
+    saved_delivery = delivery.read_bytes()
+    if failure == "missing":
+        delivery.unlink()
+    elif failure == "corrupt":
+        delivery.write_text("损坏的持久交付原件\n")
+    else:
+        read_text = Path.read_text
+        def deny_delivery_read(path, *args, **kwargs):
+            if path == delivery:
+                raise PermissionError("模拟目标 run 的原件读取受限")
+            return read_text(path, *args, **kwargs)
+        monkeypatch.setattr(Path, "read_text", deny_delivery_read)
+    git("commit", "--allow-empty", "-qm", "fix: 历史完成后新增候选")
+    (repo / "source.txt").write_text("尚未评审的新内容\n")
+    evidence = module.reconcile_original_run_backup_consumption(repo, original_run)
+    assert evidence["status"] == "unknown"
+    assert evidence["verification_gaps"]
+    assert not module.consumed_run_record(repo, original_run).exists()
+    monkeypatch.undo()
+    delivery.write_bytes(saved_delivery)
+    recovered = module.reconcile_original_run_backup_consumption(repo, original_run)
+    assert recovered["status"] == "consumed"
+    assert recovered["result"] == result
+    assert module.read_current_candidate_backup_coverage_evidence(repo)["status"] == "not_covered"
+
+
+@pytest.mark.parametrize("identity_field", ["operation_id", "worktree_git_directory", "original_run_directory", "artifacts_directory"])
+def test_unrelated_run_exclusion_requires_exact_archived_operation_identity(route, tmp_path, identity_field):
+    module, repo, _, artifacts, _ = route
+    report = record_complete_delivery_fixture(route, original_run=tmp_path / "rvf-original-run")
+    module.finish_backup_route(repo, "operation-a", report)
+    (module.control_directory(repo) / "completed-operations/operation-a.json").unlink()
+    (artifacts / "operation-a/backup-route-delivery-result.json").unlink()
+    archive_identity = module.control_directory(repo) / "closed-ownership-markers/operation-a/identity.json"
+    identity = json.loads(archive_identity.read_text())
+    identity[identity_field] = "不能用于排除目标 run 的身份"
+    module.durable_json(archive_identity, identity)
+    assert module.reconcile_original_run_backup_consumption(repo, tmp_path / "another-run")["status"] == "unknown"
+
+
+def test_completion_recovery_is_bounded_and_resumes_persisted_cursor(route, tmp_path, monkeypatch):
+    module, repo, *_ = route
+    original_run = tmp_path / "rvf-original-run"
+    report = record_complete_delivery_fixture(route, original_run=original_run, operation_id="operation-zzz-target")
+    result = module.finish_backup_route(repo, "operation-zzz-target", report)
+    module.consumed_run_record(repo, original_run).unlink()
+    for index in range(5):
+        operation = f"operation-{index}"
+        module.durable_json(module.control_directory(repo) / "completed-operations" / (operation + ".json"),
+                            {**result, "operation_id": operation, "original_run_directory": str(tmp_path / f"other-run-{index}")})
+    monkeypatch.setattr(module, "STOP_COMPLETION_RECOVERY_OPERATION_LIMIT", 2)
+    first = module.reconcile_original_run_backup_consumption(repo, original_run)
+    assert first["status"] == "unknown"
+    assert first["recovery_after_operation"] == "operation-1"
+    restarted_query = (
+        "import importlib.util,json,sys; from pathlib import Path; "
+        "spec=importlib.util.spec_from_file_location('restarted_backup_route',sys.argv[1]); "
+        "helper=importlib.util.module_from_spec(spec); spec.loader.exec_module(helper); "
+        "helper.STOP_COMPLETION_RECOVERY_OPERATION_LIMIT=2; "
+        "print(json.dumps(helper.reconcile_original_run_backup_consumption(Path(sys.argv[2]),Path(sys.argv[3]))))"
+    )
+    # 新解释器只凭持久游标接续，不共享当前进程内的对象或状态。
+    second = json.loads(subprocess.check_output(
+        [__import__("sys").executable, "-c", restarted_query, str(SCRIPT), str(repo), str(original_run)], text=True))
+    assert second["status"] == "unknown"
+    assert second["recovery_after_operation"] == "operation-3"
+    assert module.reconcile_original_run_backup_consumption(repo, original_run)["status"] == "consumed"
+
+
+def test_completion_recovery_keeps_earlier_page_unknown_until_full_recheck(route, tmp_path, monkeypatch):
+    module, repo, _, artifacts, _ = route
+    original_run = tmp_path / "rvf-original-run"
+    report = record_complete_delivery_fixture(route, original_run=original_run)
+    result = module.finish_backup_route(repo, "operation-a", report)
+    module.consumed_run_record(repo, original_run).unlink()
+    completed = module.control_directory(repo) / "completed-operations/operation-a.json"
+    completed.write_text("broken")
+    delivery = artifacts / "operation-a/backup-route-delivery-result.json"
+    saved_delivery = delivery.read_bytes()
+    delivery.write_text("broken")
+    module.durable_json(module.control_directory(repo) / "completed-operations/operation-z.json",
+                        {**result, "operation_id": "operation-z", "original_run_directory": str(tmp_path / "other-run")})
+    monkeypatch.setattr(module, "STOP_COMPLETION_RECOVERY_OPERATION_LIMIT", 1)
+    first = module.reconcile_original_run_backup_consumption(repo, original_run)
+    assert first["status"] == "unknown" and first["recovery_after_operation"] == "operation-a"
+    second = module.reconcile_original_run_backup_consumption(repo, original_run)
+    assert second["status"] == "unknown" and second["recovery_after_operation"] is None
+    assert second["verification_gaps"] == first["verification_gaps"]
+    delivery.write_bytes(saved_delivery)
+    assert module.reconcile_original_run_backup_consumption(repo, original_run)["status"] == "consumed"
+
+
+def test_completed_artifact_cannot_recover_a_different_operation_identity(route, tmp_path):
+    module, repo, _, artifacts, _ = route
+    original_run = tmp_path / "rvf-original-run"
+    report = record_complete_delivery_fixture(route, original_run=original_run)
+    module.finish_backup_route(repo, "operation-a", report)
+    (module.control_directory(repo) / "completed-operations/operation-a.json").unlink()
+    delivery = artifacts / "operation-a/backup-route-delivery-result.json"
+    result = json.loads(delivery.read_text())
+    result["operation_id"] = "another-operation"
+    module.durable_json(delivery, result)
+    assert module.read_original_run_backup_consumption_evidence(repo, original_run)["status"] == "unknown"
 
 
 def test_base_sync_rejects_unabsorbed_base_changes(route, tmp_path):
@@ -580,6 +936,8 @@ def test_stop_content_verification_failure_preserves_unknown_without_hiding_new_
     (repo / "source.txt").write_text("未审查的新候选\n")
     if failure == "invalid_json":
         (module.control_directory(repo) / "completed-operations/operation-a.json").write_text("broken")
+        # 同 operation 的持久原件也不可读时才仍然未知；单份索引损坏应自动补证。
+        (route[3] / "operation-a/backup-route-delivery-result.json").write_text("broken")
     elif failure == "git_enumeration_failed":
         check_output = module.subprocess.check_output
         def reject_git_file_enumeration(command, *args, **kwargs):

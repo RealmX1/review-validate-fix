@@ -344,6 +344,40 @@ def test_prepare_hard_gate_exit_codes(tmp_path: Path) -> None:
         json.loads(scopeless.stdout)["hard_gate_failures"][0]["reason_code"]
         == "reviewed_scope_unknown_with_dirty_worktree"
     )
+    assert not (scopeless_run / "artifacts/rvf-land-prepare-plan.json").exists()
+
+
+def test_prepare_refuses_explicit_run_directory_conflicting_with_handoff_before_writing_plan(tmp_path: Path) -> None:
+    repo, handoff_run, _counter = reviewed_dirty_run(tmp_path)
+    selected_run = create_completed_run(tmp_path, repo, "another-run")
+    completed = prepare(tmp_path, repo, handoff_run, "--run-dir", str(selected_run))
+    assert completed.returncode == 2, completed.stdout + completed.stderr
+    assert "run" in completed.stderr
+    assert not (selected_run / "artifacts/rvf-land-prepare-plan.json").exists()
+    assert not (handoff_run / "artifacts/rvf-land-prepare-plan.json").exists()
+
+
+def test_prepare_can_bind_pasted_handoff_to_exact_explicit_run_directory(tmp_path: Path) -> None:
+    repo, run_dir, _counter = reviewed_dirty_run(tmp_path)
+    completed = run_land(
+        tmp_path, repo, "prepare", "--stdin", "--repo", str(repo), "--run-dir", str(run_dir),
+        "--format", "json", stdin_text="# 本轮交接\n- handoff_status: COMPLETED\n",
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    report = json.loads(completed.stdout)
+    assert report["run_id"] == json.loads((run_dir / "summary.json").read_text())["run_id"]
+    assert report["run_dir"] == str(run_dir)
+    assert report["prepare_plan_path"]
+
+
+def test_prepare_refuses_pasted_run_id_conflicting_with_selected_run(tmp_path: Path) -> None:
+    repo, run_dir, _counter = reviewed_dirty_run(tmp_path)
+    completed = run_land(
+        tmp_path, repo, "prepare", "--stdin", "--repo", str(repo), "--run-dir", str(run_dir),
+        "--format", "json", stdin_text="- run id: `rvf-foreign-run`\n- handoff_status: COMPLETED\n",
+    )
+    assert completed.returncode == 2, completed.stdout + completed.stderr
+    assert not (run_dir / "artifacts/rvf-land-prepare-plan.json").exists()
 
 
 def test_commit_refuses_stale_prepare_plan_and_unfilled_draft(tmp_path: Path) -> None:

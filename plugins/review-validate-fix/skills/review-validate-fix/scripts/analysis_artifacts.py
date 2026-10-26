@@ -25,6 +25,7 @@ artifact 里：
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import sys
@@ -33,6 +34,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+import _rvf_pyroot  # noqa: F401
+from core.run_ledger.review_run_lifecycle import (
+    parse_timezone_aware_review_run_timestamp_utc,
+    review_run_timestamp_is_within_optional_bounds,
+)
 from compact_path_tree_rendering import render_compact_path_tree_block
 ANALYSIS_SCHEMA_VERSION = 2
 ANALYSIS_DIR_NAME = "analysis"
@@ -84,14 +90,19 @@ class ScaffoldStats:
     trajectory_kind_counts: dict[str, int]
     patch_event_count: int  # 主 rollout 内 write-op 数（apply_patch / Edit / Write / MultiEdit 归一）
     subagent_count: int
-    subagent_patch_event_count: int  # 所有 subagent rollouts 内 write-op 数合计
+    subagent_patch_event_count: int | None  # 捕获轨迹中已证明 spawn 归属的计数；边界未知时为空
     reviewer_count: int
     reviewer_issue_counts: dict[str, int]
-    workspace_changed_path_count: int
+    workspace_changed_path_count: int | None
     workspace_head_before: str | None
     workspace_head_after: str | None
     # same-session-full 自审时 RVF 子区间的 ts 下界；None 表示未窗口化（全量计数）。
     trajectory_window_start: str | None
+    subagent_capture_status: str = "unavailable"
+    trajectory_window_end: str | None = None
+    observed_subagent_write_op_event_count: int = 0
+    subagent_patch_event_count_coverage_status: str = "unavailable"
+    subagent_patch_event_count_diagnostics: list[str] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -326,7 +337,7 @@ def _extract_review_issues(payload: Any) -> list[dict[str, Any]]:
 
 
 def _is_write_op(record: dict[str, Any]) -> bool:
-    """host-无关 write-op 判据：产生 ``artifact_refs`` 的 tool_call。
+    """host 无关的 write-op 判据：带路径证据的调用或原生编辑结果。
 
     覆盖 Codex ``apply_patch`` 与 Claude ``Edit`` / ``Write`` / ``MultiEdit`` /
     ``NotebookEdit``——蒸馏时这些工具都落非空 ``artifact_refs``，而 Read / Grep /
@@ -334,7 +345,7 @@ def _is_write_op(record: dict[str, Any]) -> bool:
     非 Codex host 的 write-op 会被漏算——见 04-anti-patterns ②「core 消费 host
     工具名」）。每条 write-op record 计 1，与 ``artifact_refs`` 文件个数无关。
     """
-    if record.get("kind") != "tool_call":
+    if record.get("kind") not in ("tool_call", "tool_result"):
         return False
     refs = record.get("artifact_refs")
     return isinstance(refs, list) and len(refs) > 0
@@ -355,20 +366,104 @@ def _rvf_window_start(summary_payload: dict[str, Any], run_id: str | None) -> st
     """``same-session-full`` 自审时 RVF 子区间的 ts 下界。
 
     ``flow-1-self-rising`` 下整段会话（含触发前数日/数周的实现工作）被当成 RVF
-    自身轨迹，计数严重失真。这里复用 capture 端 ``find_rvf_start_in_*_jsonl`` 同款
-    信号——``summary.json::timestamp``（RVF prepare 时刻）——作为窗口下界；缺失时
-    退化到 run_id 内嵌时间戳。返回 None 表示无可用下界（不窗口化、退回全量计数）。
+    自身轨迹，计数严重失真。起点使用独立开审记录或绑定 prepare 事件；缺失时
+    可只读参考 run_id 内嵌时间戳。没有可用边界时保留未知，不使用组件最后更新时间。
     """
-    ts = summary_payload.get("timestamp")
+    ts = summary_payload.get("review_run_started_at")
     if isinstance(ts, str) and ts:
         return ts
+    lifecycle_path = summary_payload.get("run_dir")
+    if isinstance(lifecycle_path, str):
+        from core.run_ledger.review_run_lifecycle import review_run_start_evidence
+
+        ts, _source = review_run_start_evidence(Path(lifecycle_path), summary_payload)
+        if ts:
+            return ts
     return _run_id_timestamp(run_id)
+
+
+def _subagent_spawn_boundary_evidence(inputs: AnalysisInputs, subagent: SubagentInput) -> dict[str, Any]:
+    """优先使用绑定 manifest；其边界缺失时只从同身份原生 spawn 补证。"""
+    spawn = subagent.manifest.get("spawn") or {}
+    spawn = spawn if isinstance(spawn, dict) else {}
+    identities = [value for value in (spawn.get("agent_id"), subagent.manifest.get("agent_id"))
+                  if isinstance(value, str) and value]
+    if subagent.trajectory_jsonl is not None:
+        rollout = subagent.trajectory_jsonl.parent / "rollout.jsonl"
+        for index, record in enumerate(_iter_jsonl(rollout)):
+            if index >= 64:
+                break
+            if record.get("type") == "session_meta":
+                payload = record.get("payload")
+                native_id = payload.get("id") if isinstance(payload, dict) else None
+                if isinstance(native_id, str) and native_id:
+                    identities.append(native_id)
+                break
+    if any(value != subagent.agent_id for value in identities):
+        return {"status": "identity_mismatch", "spawned_at": None, "source": "unavailable"}
+    timestamp = spawn.get("spawned_at")
+    if identities and parse_timezone_aware_review_run_timestamp_utc(timestamp) is not None:
+        return {"status": "available", "spawned_at": timestamp, "source": "captured_spawn_manifest"}
+    if inputs.rvf_rollout_jsonl is not None and isinstance(spawn.get("spawn_call_id"), str):
+        from adapters.codex.subagent import discover_spawned_agents
+
+        for native_spawn in discover_spawned_agents(inputs.rvf_rollout_jsonl):
+            if (native_spawn.agent_id == subagent.agent_id and native_spawn.call_id == spawn["spawn_call_id"]
+                    and parse_timezone_aware_review_run_timestamp_utc(native_spawn.ts) is not None):
+                return {"status": "available", "spawned_at": native_spawn.ts, "source": "correlated_native_spawn"}
+    return {"status": "unavailable", "spawned_at": None, "source": "unavailable"}
+
+
+def _subagent_capture_status(inputs: AnalysisInputs, window_start: str | None, window_end: str | None = None) -> str:
+    if any(bound is not None and parse_timezone_aware_review_run_timestamp_utc(bound) is None
+           for bound in (window_start, window_end)):
+        return "unavailable"
+    if (window_start is not None and window_end is not None
+            and parse_timezone_aware_review_run_timestamp_utc(window_start)
+            > parse_timezone_aware_review_run_timestamp_utc(window_end)):
+        return "unavailable"
+    captured_call_ids = set()
+    for subagent in inputs.subagents:
+        if subagent.trajectory_jsonl is None or subagent.manifest.get("distill_status") == "distill_failed":
+            return "partial"
+        if _subagent_spawn_boundary_evidence(inputs, subagent)["status"] != "available":
+            return "partial"
+        spawn = subagent.manifest.get("spawn") or {}
+        if isinstance(spawn, dict) and isinstance(spawn.get("spawn_call_id"), str):
+            captured_call_ids.add(spawn["spawn_call_id"])
+    if inputs.rvf_rollout_jsonl is None:
+        return "partial" if inputs.subagents else "unavailable"
+    for record in _iter_jsonl(inputs.rvf_rollout_jsonl):
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("type") in ("function_call", "custom_tool_call"):
+            if str(payload.get("name", "")).split(".")[-1] == "spawn_agent":
+                if ((window_start is not None or window_end is not None)
+                        and parse_timezone_aware_review_run_timestamp_utc(record.get("timestamp")) is None):
+                    return "partial"
+                if not review_run_timestamp_is_within_optional_bounds(
+                    record.get("timestamp"), window_start=window_start, window_end=window_end,
+                ):
+                    continue
+                if payload.get("call_id") not in captured_call_ids:
+                    return "partial"
+    return "complete" if window_start is not None and window_end is not None else "unavailable"
+
+
+def _subagent_trajectory_window_start(window_start: Any, spawned_at: Any) -> Any:
+    lower_bounds = [value for value in (window_start, spawned_at) if value is not None]
+    for bound in lower_bounds:
+        if parse_timezone_aware_review_run_timestamp_utc(bound) is None:
+            return bound
+    return max(lower_bounds, key=parse_timezone_aware_review_run_timestamp_utc) if lower_bounds else None
 
 
 def _count_trajectory(
     inputs: AnalysisInputs,
     *,
     window_start: str | None = None,
+    window_end: str | None = None,
 ) -> tuple[int, dict[str, int], int]:
     """返回 (record_count, kind_counts, patch_event_count)。
 
@@ -384,7 +479,7 @@ def _count_trajectory(
     kind_counts: dict[str, int] = {}
     patch_event_count = 0
 
-    if window_start is None:
+    if window_start is None and window_end is None:
         index_payload = _safe_load_json(inputs.trajectory_index_json)
         if isinstance(index_payload, dict):
             rc = index_payload.get("record_count")
@@ -405,7 +500,9 @@ def _count_trajectory(
     fallback_record_count = 0
     fallback_kind_counts: dict[str, int] = {}
     for record in _iter_jsonl(traj):
-        if window_start is not None and (record.get("ts") or "") < window_start:
+        if not review_run_timestamp_is_within_optional_bounds(
+            record.get("ts"), window_start=window_start, window_end=window_end,
+        ):
             continue
         fallback_record_count += 1
         kind = record.get("kind")
@@ -431,6 +528,7 @@ def gather_stats(inputs: AnalysisInputs) -> ScaffoldStats:
     summary_payload = _safe_load_json(inputs.summary_json)
     if not isinstance(summary_payload, dict):
         summary_payload = {}
+    summary_payload = {**summary_payload, "run_dir": str(inputs.run_dir)}
     finalize = summary_payload.get("finalize")
     if not isinstance(finalize, dict):
         finalize = {}
@@ -468,15 +566,38 @@ def gather_stats(inputs: AnalysisInputs) -> ScaffoldStats:
         if post_kind == "same-session-full"
         else None
     )
+    window_end = summary_payload.get("review_run_terminal_at") or finalize.get("review_run_terminal_at")
+    if not isinstance(window_end, str):
+        window_end = None
     record_count, kind_counts, patch_event_count = _count_trajectory(
-        inputs, window_start=window_start
+        inputs, window_start=window_start, window_end=window_end,
     )
 
     subagent_patch_event_count = 0
+    observed_subagent_write_op_event_count = 0
+    subagent_patch_event_count_diagnostics = []
+    attributable_subagent_trajectory_count = 0
+    capture_status = _subagent_capture_status(inputs, window_start, window_end)
     for subagent in inputs.subagents:
         if subagent.trajectory_jsonl is None:
+            subagent_patch_event_count_diagnostics.append(f"{subagent.agent_id}: captured_trajectory_unavailable")
             continue
+        boundary = _subagent_spawn_boundary_evidence(inputs, subagent)
+        source_start = _subagent_trajectory_window_start(window_start, boundary["spawned_at"])
+        if boundary["status"] != "available":
+            subagent_patch_event_count_diagnostics.append(f"{subagent.agent_id}: spawn_boundary_{boundary['status']}")
+        else:
+            attributable_subagent_trajectory_count += 1
         for record in _iter_jsonl(subagent.trajectory_jsonl):
+            if (_is_write_op(record) and review_run_timestamp_is_within_optional_bounds(
+                    record.get("ts"), window_start=window_start, window_end=window_end)):
+                observed_subagent_write_op_event_count += 1
+            if boundary["status"] != "available":
+                continue
+            if not review_run_timestamp_is_within_optional_bounds(
+                record.get("ts"), window_start=source_start, window_end=window_end,
+            ):
+                continue
             if _is_write_op(record):
                 subagent_patch_event_count += 1
 
@@ -489,9 +610,9 @@ def gather_stats(inputs: AnalysisInputs) -> ScaffoldStats:
 
     head_before: str | None = None
     head_after: str | None = None
-    changed_path_count = 0
+    changed_path_count = None if workspace_block.get("status") == "unavailable" else 0
 
-    diff_payload = _safe_load_json(inputs.workspace_diff_json)
+    diff_payload = _safe_load_json(inputs.workspace_diff_json) if workspace_block.get("status") != "unavailable" else None
     if isinstance(diff_payload, dict):
         hb = diff_payload.get("head_before")
         ha = diff_payload.get("head_after")
@@ -525,14 +646,71 @@ def gather_stats(inputs: AnalysisInputs) -> ScaffoldStats:
         trajectory_kind_counts=dict(kind_counts),
         patch_event_count=patch_event_count,
         subagent_count=len(inputs.subagents),
-        subagent_patch_event_count=subagent_patch_event_count,
+        subagent_patch_event_count=None if subagent_patch_event_count_diagnostics else subagent_patch_event_count,
         reviewer_count=len(inputs.reviewer_results),
         reviewer_issue_counts=reviewer_issue_counts,
         workspace_changed_path_count=changed_path_count,
         workspace_head_before=head_before,
         workspace_head_after=head_after,
         trajectory_window_start=window_start,
+        subagent_capture_status=capture_status,
+        trajectory_window_end=window_end,
+        observed_subagent_write_op_event_count=observed_subagent_write_op_event_count,
+        subagent_patch_event_count_coverage_status=(("partial" if attributable_subagent_trajectory_count else "unavailable")
+                                                  if subagent_patch_event_count_diagnostics
+                                                  else "complete" if capture_status == "complete" else "partial"),
+        subagent_patch_event_count_diagnostics=subagent_patch_event_count_diagnostics,
     )
+
+
+def _artifact_object(path: Path) -> dict[str, Any]:
+    payload = _safe_load_json(path)
+    return payload if isinstance(payload, dict) else {}
+
+
+def component_state_observations(inputs: AnalysisInputs, stats: ScaffoldStats) -> dict[str, Any]:
+    """独立呈现各组件的已记录状态，不由 RVF 完成推导 land 或 base 已完成。"""
+    summary = _artifact_object(inputs.summary_json)
+    plan_path = inputs.run_dir / "artifacts/reviewers/reviewer-plan.json"
+    reviewers = _artifact_object(plan_path).get("reviewers")
+    planned_count = len(reviewers) if isinstance(reviewers, list) else None
+    valid_results = 0
+    import check_review_result
+    import rvf_merge_dispositions
+
+    try:
+        canonical_results = {leg.review_result_path.resolve() for leg in rvf_merge_dispositions.read_canonical_reviewer_leg_results(inputs.run_dir)
+                             if not leg.read_error}
+        reviewer_count_evidence_status = "available"
+    except (OSError, ValueError):
+        canonical_results = set()
+        reviewer_count_evidence_status = "unavailable"
+    for path in inputs.reviewer_results:
+        if path.resolve() not in canonical_results:
+            continue
+        try:
+            qualification = check_review_result.classify(path, scope_contract=inputs.run_dir / "artifacts/inputs/scope.contract.json")
+            valid_results += int(qualification.get("valid") is True)
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
+    analyze = _artifact_object(inputs.run_dir / "artifacts/analysis/.analyze-thread.status.json")
+    land = _artifact_object(inputs.run_dir / "artifacts/rvf-land-commit-result.json")
+    land_status = "not_observed"
+    if land:
+        if land.get("run_id") == stats.run_id and Path(str(land.get("run_dir", ""))).resolve() == inputs.run_dir.resolve():
+            result = land.get("result")
+            land_status = result.get("status", "recorded") if isinstance(result, dict) else "unknown"
+        else:
+            land_status = "identity_mismatch"
+    return {
+        "rvf_terminal_status": summary.get("review_run_terminal_status") or stats.decision_kind or "unknown",
+        "analyze_completion_status": analyze.get("formal_analysis_completion_status") or summary.get("rvf_analyze_status") or "not_observed",
+        "land_status": land_status, "base_integration_status": "unknown",
+        "base_integration_evidence_source": "base-branch-sync 或 Kanban 的独立整合回执；不由 RVF 推断",
+        "planned_reviewer_count": planned_count, "observed_reviewer_result_count": len(inputs.reviewer_results),
+        "valid_reviewer_result_count": valid_results, "reviewer_plan_path": str(plan_path),
+        "reviewer_count_evidence_status": reviewer_count_evidence_status,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -588,6 +766,14 @@ def scaffold_summary_md(
     )
     lines.append(f"- summary.json: `{_rel_or_abs(inputs.summary_json, run_dir)}`")
     lines.append(f"- handoff.md: `{_rel_or_abs(inputs.handoff_md, run_dir)}`")
+    metadata = _artifact_object(inputs.summary_json)
+    lines.append(f"- 审查开审起点: `{metadata.get('review_run_started_at') or stats.trajectory_window_start or 'unknown'}`")
+    lines.append(f"- 独立终态: `{metadata.get('review_run_terminal_status') or stats.decision_kind or 'unknown'}`")
+    terminal_reason = (metadata.get("finalize") or {}).get("review_run_terminal_reason")
+    if isinstance(terminal_reason, str) and terminal_reason:
+        lines.append(f"- 终止原因: {terminal_reason}")
+    component_states = component_state_observations(inputs, stats)
+    lines.append(f"- 独立状态快照: RVF=`{component_states['rvf_terminal_status']}`；Analyze=`{component_states['analyze_completion_status']}`；land=`{component_states['land_status']}`；base 整合=`{component_states['base_integration_status']}`")
     lines.append("")
     lines.append(_todo("用 1-2 段叙述本次 RVF 的诱因、最终走向（handoff/cancel/...）和最显著的成果或风险"))
     lines.append("")
@@ -609,6 +795,7 @@ def scaffold_summary_md(
         f"- trajectory.index.json: `{_rel_or_abs(inputs.trajectory_index_json, run_dir)}`"
     )
     lines.append(f"- post_rvf_source_kind: `{stats.post_rvf_source_kind or '-'}`")
+    lines.append(f"- 统计截止: `{stats.trajectory_window_end or 'unknown'}`")
     lines.append(f"- 总记录数: `{stats.trajectory_record_count}`")
     if stats.trajectory_window_start:
         lines.append(
@@ -619,10 +806,24 @@ def scaffold_summary_md(
         f"- 各 kind 计数: {_format_kind_counts(stats.trajectory_kind_counts)}"
     )
     lines.append(f"- write-op 事件（主 rollout）: `{stats.patch_event_count}`")
+    coverage = _artifact_object(run_dir / "artifacts/analysis/causality.json")
+    lines.append(f"- subagent_capture_status: `{stats.subagent_capture_status}`")
+    lines.append(f"- patch_call_attribution_status: `{coverage.get('patch_call_attribution_status', 'unavailable')}`；零捕获不等于零执行")
+    resource_usage = _artifact_object(run_dir / "artifacts/usage/usage-summary.json")
+    lines.append(f"- Token 计量覆盖: `{resource_usage.get('token_usage_coverage_status', 'unavailable')}`")
+    if resource_usage.get("phase_wall_seconds"):
+        lines.extend(["", "| 阶段 | 墙钟秒数 |", "| --- | ---: |"])
+        for phase, duration in resource_usage["phase_wall_seconds"].items():
+            lines.append(f"| `{phase}` | {duration if duration is not None else 'unknown'} |")
+        lines.append("后台 Analyze 独立计量；累计并行时长不等于主任务额外等待。")
     lines.append(
         f"- spawn_agent 子代理: `{stats.subagent_count}`；"
-        f"子代理 write-op 合计: `{stats.subagent_patch_event_count}`"
+        f"已归属的捕获 write-op: `{stats.subagent_patch_event_count if stats.subagent_patch_event_count is not None else 'unknown'}`；"
+        f"计数覆盖: `{stats.subagent_patch_event_count_coverage_status}`"
     )
+    lines.append(f"- 子代理在 RVF 窗口内的原始 write-op 观测: `{stats.observed_subagent_write_op_event_count}`；可能包含继承历史，不等于已证明的 spawn 后执行数")
+    lines.extend(f"- 子代理计数缺口: `{diagnostic}`；原生 spawn 身份和边界恢复后自动重验"
+                 for diagnostic in stats.subagent_patch_event_count_diagnostics)
     if inputs.subagents:
         lines.append("- 子代理 trajectory:")
         for subagent in inputs.subagents:
@@ -644,6 +845,7 @@ def scaffold_summary_md(
     lines.append("## Reviewer 发现")
     lines.append("")
     lines.append(f"- reviewer_count: `{stats.reviewer_count}`")
+    lines.append(f"- 正式计划 reviewer 数: `{component_states['planned_reviewer_count']}`；有效结果数: `{component_states['valid_reviewer_result_count']}`")
     lines.append(
         f"- 每位 reviewer 的 issue 数: {_format_reviewer_counts(stats.reviewer_issue_counts)}"
     )
@@ -672,7 +874,7 @@ def scaffold_summary_md(
     )
     lines.append(f"- head_before: `{stats.workspace_head_before or '-'}`")
     lines.append(f"- head_after: `{stats.workspace_head_after or '-'}`")
-    lines.append(f"- changed_paths: `{stats.workspace_changed_path_count}`")
+    lines.append(f"- changed_paths: `{stats.workspace_changed_path_count if stats.workspace_changed_path_count is not None else 'unknown'}`")
 
     classification = _classify_changed_paths(inputs)
     if classification is not None:
@@ -775,6 +977,7 @@ def _patches_from_trajectory(
     *,
     source_agent_id: str | None,
     window_start: str | None = None,
+    window_end: str | None = None,
 ) -> list[dict[str, Any]]:
     """从一份蒸馏 trajectory.jsonl 中抽出 write-op tool_calls。
 
@@ -791,7 +994,9 @@ def _patches_from_trajectory(
     """
     out: list[dict[str, Any]] = []
     for record in _iter_jsonl(traj_path):
-        if window_start is not None and (record.get("ts") or "") < window_start:
+        if not review_run_timestamp_is_within_optional_bounds(
+            record.get("ts"), window_start=window_start, window_end=window_end,
+        ):
             continue
         if not _is_write_op(record):
             continue
@@ -830,6 +1035,7 @@ def _collect_patches(
     inputs: AnalysisInputs,
     *,
     window_start: str | None = None,
+    window_end: str | None = None,
 ) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     if inputs.trajectory_jsonl is not None:
@@ -838,18 +1044,43 @@ def _collect_patches(
                 inputs.trajectory_jsonl,
                 source_agent_id=None,
                 window_start=window_start,
+                window_end=window_end,
             )
         )
     for subagent in inputs.subagents:
         if subagent.trajectory_jsonl is None:
             continue
+        boundary = _subagent_spawn_boundary_evidence(inputs, subagent)
+        if boundary["status"] != "available":
+            continue
+        source_start = _subagent_trajectory_window_start(window_start, boundary["spawned_at"])
         out.extend(
             _patches_from_trajectory(
-                subagent.trajectory_jsonl, source_agent_id=subagent.agent_id
+                subagent.trajectory_jsonl, source_agent_id=subagent.agent_id,
+                window_start=source_start, window_end=window_end,
             )
         )
-    out.sort(key=lambda item: (item.get("ts") or "", item.get("source_agent_id") or ""))
+    def patch_timestamp_sort_key(item: dict[str, Any]) -> tuple:
+        moment = parse_timezone_aware_review_run_timestamp_utc(item.get("ts"))
+        return moment is None, moment, item.get("source_agent_id") or ""
+
+    out.sort(key=patch_timestamp_sort_key)
     return out
+
+
+def _unattributed_subagent_patch_observations(inputs: AnalysisInputs, stats: ScaffoldStats) -> list[dict[str, Any]]:
+    observations = []
+    for subagent in inputs.subagents:
+        if subagent.trajectory_jsonl is None:
+            continue
+        boundary = _subagent_spawn_boundary_evidence(inputs, subagent)
+        if boundary["status"] == "available":
+            continue
+        for patch in _patches_from_trajectory(subagent.trajectory_jsonl, source_agent_id=subagent.agent_id,
+                window_start=stats.trajectory_window_start, window_end=stats.trajectory_window_end):
+            observations.append({**patch, "spawn_boundary_status": boundary["status"],
+                "temporal_attribution_status": "unavailable", "evidence_level": "captured_write_op_observation"})
+    return observations
 
 
 def _enrich_candidate_patch_call_ids(
@@ -970,10 +1201,49 @@ def scaffold_causality_json(
             issue.setdefault("candidate_patch_call_ids", [])
 
     patch_events = ledger.get("patch_events", []) if isinstance(ledger, dict) else []
-    patches = _collect_patches(inputs, window_start=stats.trajectory_window_start)
+    patches = _collect_patches(inputs, window_start=stats.trajectory_window_start, window_end=stats.trajectory_window_end)
+    unattributed_subagent_patch_observations = _unattributed_subagent_patch_observations(inputs, stats)
     # handoff B：用已捕获子代理 trajectory 的 write-op call_id 补全 per-issue
     # candidate_patch_call_ids（DB 侧 call_id 恒 null，故在此只读关联）。
     _enrich_candidate_patch_call_ids(issues, patch_events, patches)
+    attempt_patch_evidence = []
+    attempts = ledger.get("fix_attempts", []) if isinstance(ledger, dict) else []
+    for attempt in attempts:
+        evidence = {
+            "attempt_id": attempt.get("attempt_id"), "issue_id": attempt.get("issue_id"),
+            "evidence_level": "attempt_patch", "native_call_id": None,
+            "fix_patch_path": attempt.get("fix_patch_path"), "fix_patch_sha256": None,
+            "status": "unavailable",
+        }
+        patch_path = attempt.get("fix_patch_path")
+        if isinstance(patch_path, str):
+            path = Path(patch_path)
+            expected_root = inputs.run_dir / "artifacts/fix-attempts"
+            if attempt.get("run_id") != stats.run_id or not path.resolve().is_relative_to(expected_root.resolve()) or path.is_symlink():
+                evidence["status"] = "identity_mismatch"
+            else:
+                try:
+                    patch_hash = hashlib.sha256()
+                    with path.open("rb") as patch_file:
+                        for chunk in iter(lambda: patch_file.read(65536), b""):
+                            patch_hash.update(chunk)
+                    evidence.update({"status": "available", "fix_patch_sha256": patch_hash.hexdigest(),
+                                     "fix_patch_bytes": path.stat().st_size})
+                except OSError:
+                    pass
+        attempt_patch_evidence.append(evidence)
+    attributed_paths = {
+        ref.get("path") for patch in patches if isinstance(patch.get("call_id"), str)
+        for ref in patch.get("artifact_refs", []) if isinstance(ref, dict)
+    }
+    missing_calls = any(event.get("path") not in attributed_paths for event in patch_events)
+    if not patch_events and any(item["status"] == "available" for item in attempt_patch_evidence):
+        missing_calls = True
+    patch_call_attribution_status = (
+        "partial" if missing_calls or stats.subagent_capture_status == "partial"
+        or unattributed_subagent_patch_observations or any(not patch.get("call_id") for patch in patches)
+        else "unavailable" if ledger is None and not patches else "complete"
+    )
 
     try:
         merge_dispositions = _merge_dispositions_section(
@@ -988,10 +1258,15 @@ def scaffold_causality_json(
         "run_id": stats.run_id,
         "generated_at": _utc_now(),
         "diagnostics": diagnostics,
+        "subagent_capture_status": stats.subagent_capture_status,
+        "patch_call_attribution_status": patch_call_attribution_status,
+        "attempt_patch_evidence": attempt_patch_evidence,
+        "component_states": component_state_observations(inputs, stats),
         "issues": issues,
         "fix_attempts": ledger.get("fix_attempts", []) if isinstance(ledger, dict) else [],
         "patch_events": patch_events,
         "patches": patches,
+        "unattributed_subagent_patch_observations": unattributed_subagent_patch_observations,
         "merge_dispositions": merge_dispositions,
     }
     _atomic_write_json(out_path, payload)
@@ -1010,8 +1285,9 @@ def scaffold_run(run_dir: Path) -> dict[str, Any]:
     analysis_dir = inputs.run_dir / "artifacts" / ANALYSIS_DIR_NAME
     summary_md_path = analysis_dir / "summary.md"
     causality_json_path = analysis_dir / "causality.json"
-    scaffold_summary_md(inputs, stats, summary_md_path)
     scaffold_causality_json(inputs, stats, causality_json_path)
+    scaffold_summary_md(inputs, stats, summary_md_path)
+    capture_coverage = _safe_load_json(causality_json_path) or {}
     return {
         "summary_md_path": summary_md_path,
         "causality_json_path": causality_json_path,
@@ -1025,9 +1301,16 @@ def scaffold_run(run_dir: Path) -> dict[str, Any]:
             "trajectory_record_count": stats.trajectory_record_count,
             "trajectory_kind_counts": dict(stats.trajectory_kind_counts),
             "trajectory_window_start": stats.trajectory_window_start,
+            "trajectory_window_end": stats.trajectory_window_end,
             "patch_event_count": stats.patch_event_count,
             "subagent_count": stats.subagent_count,
+            "subagent_capture_status": stats.subagent_capture_status,
+            "patch_call_attribution_status": capture_coverage.get("patch_call_attribution_status"),
+            "component_states": capture_coverage.get("component_states"),
             "subagent_patch_event_count": stats.subagent_patch_event_count,
+            "observed_subagent_write_op_event_count": stats.observed_subagent_write_op_event_count,
+            "subagent_patch_event_count_coverage_status": stats.subagent_patch_event_count_coverage_status,
+            "subagent_patch_event_count_diagnostics": stats.subagent_patch_event_count_diagnostics,
             "reviewer_count": stats.reviewer_count,
             "reviewer_issue_counts": dict(stats.reviewer_issue_counts),
             "workspace_changed_path_count": stats.workspace_changed_path_count,

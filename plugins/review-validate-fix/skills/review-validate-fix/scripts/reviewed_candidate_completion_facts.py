@@ -4,16 +4,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import subprocess
 from collections import Counter
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import rvf_merge_dispositions
 import check_review_result
+from fix_attempt_scope_expansion_classification import (
+    canonical_issue_authorized_fix_paths, classify_fix_attempt_scope_expansion, scope_contract_paths,
+)
 from review_scope_excluded_path_prefixes import BUILTIN_DEVELOPER_TOOL_MANAGED_PATH_PREFIXES_EXCLUDED_FROM_REVIEW_SCOPE
-from validation_result_cache import canonical_json_bytes
+from validation_result_cache import canonical_json_bytes, clean_git_environment
 
 
 class CandidateQualificationRefused(ValueError):
@@ -92,7 +97,10 @@ def completed_reviewer_legs(run_dir: Path) -> list[rvf_merge_dispositions.Canoni
     return legs
 
 
-def canonical_fix_attempt_facts(run_dir: Path, issue_ids: set[str], *, user_delegated_issue_ids: set[str] | None = None) -> tuple[dict[str, int], list[dict[str, Any]]]:
+def canonical_fix_attempt_facts(run_dir: Path, issue_ids: set[str], *,
+                                user_delegated_issue_ids: set[str] | None = None,
+                                backlog_artifact_reader: Callable[[Path], dict[str, Any]] = read_regular_json_object,
+                                original_run_directory: Path | None = None) -> tuple[dict[str, int], list[dict[str, Any]]]:
     run_id = rvf_merge_dispositions.run_id_for_run_directory(run_dir)
     contract = read_regular_json_object(run_dir / "artifacts/inputs/scope.contract.json")
     attempts_by_issue: dict[str, list[tuple[datetime, dict[str, Any], dict[str, Any] | None]]] = {}
@@ -134,7 +142,7 @@ def canonical_fix_attempt_facts(run_dir: Path, issue_ids: set[str], *, user_dele
         elif status == "false_positive" and latest.get("status") == status:
             counts["false_positive"] += 1
         elif status == "validated_and_submitted_to_kanban_backlog" and latest.get("status") == status:
-            require_durable_backlog_submission(result, run_dir)
+            require_durable_backlog_submission(result, original_run_directory or run_dir, artifact_reader=backlog_artifact_reader)
             counts["submitted_to_kanban_backlog"] += 1
         elif status == "elevated" and latest.get("status") == status and issue_id in (user_delegated_issue_ids or set()):
             counts["elevated"] += 1
@@ -151,7 +159,15 @@ def canonical_fix_attempt_facts(run_dir: Path, issue_ids: set[str], *, user_dele
     return outcomes, applied
 
 
-def require_durable_backlog_submission(result: dict[str, Any], run_dir: Path) -> None:
+def optional_backlog_artifact(path: Path, artifact_reader: Callable[[Path], dict[str, Any]]) -> dict[str, Any] | None:
+    try:
+        return artifact_reader(path)
+    except (OSError, ValueError):
+        return None
+
+
+def require_durable_backlog_submission(result: dict[str, Any], run_dir: Path, *,
+                                       artifact_reader: Callable[[Path], dict[str, Any]] = read_regular_json_object) -> None:
     receipt = result.get("kanban_backlog_submission")
     if not isinstance(receipt, dict) or any(receipt.get(key) != result[key] for key in ("issue_id", "attempt_id")):
         raise ValueError("backlog terminal outcome has no identity-bound submission receipt")
@@ -167,15 +183,15 @@ def require_durable_backlog_submission(result: dict[str, Any], run_dir: Path) ->
         if outcome == "pending_kanban_runtime_unavailable":
             pending_path = Path(str(group.get("pending_prompt_path", "")))
             fingerprints = {entry.get("finding_fingerprint") for entry in group.get("findings", []) if isinstance(entry, dict)}
-            if pending_path.is_file() and not pending_path.is_symlink():
-                pending = read_regular_json_object(pending_path)
+            pending = optional_backlog_artifact(pending_path, artifact_reader)
+            if pending is not None:
                 if (pending.get("run_dir") == str(run_dir) and fingerprints and None not in fingerprints
                     and fingerprints <= set(pending.get("finding_fingerprints", []))):
                     continue
             # 正式重试成功会删除旧 pending；用同一 finding 的持久建卡账本证明已完成，不改旧回执。
-            entries = backlog_latest_submission_by_finding_fingerprint(receipt)
+            entries = backlog_latest_submission_by_finding_fingerprint(receipt, artifact_reader=artifact_reader)
             if fingerprints and None not in fingerprints and all(
-                durable_backlog_ledger_entry(entries.get(fingerprint)) for fingerprint in fingerprints
+                durable_backlog_ledger_entry(entries.get(fingerprint), artifact_reader=artifact_reader) for fingerprint in fingerprints
             ):
                 continue
         if outcome == "nothing_new_to_submit":
@@ -185,30 +201,35 @@ def require_durable_backlog_submission(result: dict[str, Any], run_dir: Path) ->
                 and finding.get("previous_kanban_task_id") for finding in findings
             ):
                 continue
-            latest_by_fingerprint = backlog_latest_submission_by_finding_fingerprint(receipt)
+            latest_by_fingerprint = backlog_latest_submission_by_finding_fingerprint(receipt, artifact_reader=artifact_reader)
             if findings and all(isinstance(finding, dict) and finding.get("outcome") == "skipped_already_submitted_identical_finding"
-                                and durable_backlog_ledger_entry(latest_by_fingerprint.get(finding.get("finding_fingerprint")))
+                                and durable_backlog_ledger_entry(latest_by_fingerprint.get(finding.get("finding_fingerprint")), artifact_reader=artifact_reader)
                                 for finding in findings):
                 continue
         raise ValueError("backlog terminal outcome lacks a created task or durable pending intent")
 
 
-def backlog_latest_submission_by_finding_fingerprint(receipt: dict[str, Any]) -> dict[str, Any]:
+def backlog_latest_submission_by_finding_fingerprint(receipt: dict[str, Any], *,
+        artifact_reader: Callable[[Path], dict[str, Any]] = read_regular_json_object) -> dict[str, Any]:
     ledger_path = Path(str(receipt.get("ledger_path", "")))
+    if artifact_reader is not read_regular_json_object:
+        # 补充证明的 reader 从已固定的原始 JSONL 字节逐行解析，不追读旧路径。
+        return artifact_reader(ledger_path)
     if ledger_path.is_symlink() or not ledger_path.is_file():
         raise ValueError("backlog finding has no durable ledger")
     return {entry.get("finding_fingerprint"): entry for line in ledger_path.read_text().splitlines()
             if line.strip() for entry in [json.loads(line)] if isinstance(entry, dict)}
 
 
-def durable_backlog_ledger_entry(entry: Any) -> bool:
+def durable_backlog_ledger_entry(entry: Any, *,
+        artifact_reader: Callable[[Path], dict[str, Any]] = read_regular_json_object) -> bool:
     if not isinstance(entry, dict):
         return False
     if entry.get("outcome") == "created_kanban_backlog_task":
         return bool(entry.get("kanban_task_id"))
     if entry.get("outcome") == "pending_kanban_runtime_unavailable":
         pending = Path(str(entry.get("pending_prompt_path", "")))
-        return pending.is_file() and not pending.is_symlink()
+        return optional_backlog_artifact(pending, artifact_reader) is not None
     return False
 
 
@@ -246,13 +267,39 @@ def handoff_display_consistency_errors(handoff_text: str, counts: dict[str, int]
     return errors
 
 
-def completed_review_facts(run_dir: Path, handoff_text: str, *, candidate_digest: str | None = None) -> dict[str, Any]:
+def handoff_completion_marker_facts(handoff_text: str, *, allow_missing: bool = False) -> dict[str, Any]:
+    """缺失标记仅可由补充入口补证；明确未完成及相互冲突的标记永远拒绝。"""
+    marker_values: dict[str, list[str]] = {"handoff_status": [], "review_status": []}
+    in_code_block = False
+    for line in handoff_text.splitlines():
+        if line.lstrip().startswith(("```", "~~~")):
+            in_code_block = not in_code_block
+            continue
+        if not in_code_block:
+            marker = re.match(r"^\s*(?:-\s*)?(handoff_status|review_status):[ \t]*(.*)$", line, re.IGNORECASE)
+            if marker:
+                marker_values[marker.group(1).lower()].append(marker.group(2).strip().upper())
+    missing = []
+    for name in ("handoff_status", "review_status"):
+        values = marker_values[name]
+        if any(value != "COMPLETED" for value in values):
+            raise CandidateQualificationRefused("handoff_completion_invalid", f"{name} 明确未完成或标记冲突")
+        if not values:
+            missing.append(name)
+    if missing and not allow_missing:
+        raise CandidateQualificationRefused("handoff_completion_invalid", "handoff 与 review 均须完成")
+    return {"missing_markers": missing, "completion_source": "structured_review_facts" if missing else "handoff_markers_and_structured_review_facts"}
+
+
+def completed_review_facts(run_dir: Path, handoff_text: str, *, allow_missing_completion_markers: bool = False,
+                           candidate_digest: str | None = None,
+                           backlog_artifact_reader: Callable[[Path], dict[str, Any]] = read_regular_json_object,
+                           original_run_directory: Path | None = None) -> dict[str, Any]:
     try:
         legs = completed_reviewer_legs(run_dir)
     except ValueError as exc:
         raise CandidateQualificationRefused("reviewer_completion_invalid", str(exc)) from exc
-    if not all(re.search(rf"(?im)^\s*(?:-\s*)?{name}:\s*COMPLETED\s*$", handoff_text) for name in ("handoff_status", "review_status")):
-        raise CandidateQualificationRefused("handoff_completion_invalid", "handoff and review must both be completed")
+    handoff_completion_marker_facts(handoff_text, allow_missing=allow_missing_completion_markers)
     issue_ids: set[str] = set()
     if any(leg.issues for leg in legs) or rvf_merge_dispositions.merge_dispositions_path(run_dir).exists() or any((run_dir / "artifacts/fix-issues").glob("*.json")):
         try:
@@ -268,7 +315,9 @@ def completed_review_facts(run_dir: Path, handoff_text: str, *, candidate_digest
         delegated_ids = {entry["issue_id"] for entry in delegations}
         if not delegated_ids <= issue_ids:
             raise ValueError("委派包含未被 canonical merge 计入的问题")
-        counts, applied = canonical_fix_attempt_facts(run_dir, issue_ids, user_delegated_issue_ids=delegated_ids)
+        counts, applied = canonical_fix_attempt_facts(run_dir, issue_ids, user_delegated_issue_ids=delegated_ids,
+                                                     backlog_artifact_reader=backlog_artifact_reader,
+                                                     original_run_directory=original_run_directory)
     except (ValueError, TypeError, KeyError) as exc:
         raise CandidateQualificationRefused("canonical_fix_completion_invalid", str(exc)) from exc
     errors = handoff_display_consistency_errors(handoff_text, counts)
@@ -279,8 +328,47 @@ def completed_review_facts(run_dir: Path, handoff_text: str, *, candidate_digest
             "conclusion": DELEGATION_CONCLUSION if delegations else "fixes_applied_and_validated" if issue_ids else "no_issues"}
 
 
+def actual_fix_patch_changed_paths(patch_bytes: bytes, repo: Path) -> set[str]:
+    """逐段消费 Git 解析的实际改动，保留 rename 两端并排除 copy 来源及空操作。"""
+    changed_paths: set[str] = set()
+    for section in re.split(rb"(?m)(?=^diff --git )", patch_bytes):
+        if not section.strip():
+            continue
+        if not section.startswith(b"diff --git "):
+            raise ValueError("canonical issue 主路径的实际补丁缺少 Git diff 头")
+        numstats: list[list[bytes]] = []
+        for reverse in (False, True):
+            parsed = subprocess.run(
+                ["git", "apply", "--numstat", "-z", *(["--reverse"] if reverse else [])],
+                input=section, cwd=repo, env=clean_git_environment(), capture_output=True, check=False,
+            )
+            entries = [entry.split(b"\t", 2) for entry in parsed.stdout.split(b"\0") if entry]
+            if parsed.returncode or len(entries) != 1 or len(entries[0]) != 3:
+                raise ValueError("canonical issue 主路径的实际补丁无法解析为单文件改动")
+            numstats.append(entries[0])
+        summary = subprocess.run(
+            ["git", "apply", "--summary"], input=section, cwd=repo,
+            env=clean_git_environment(), capture_output=True, check=False,
+        )
+        if summary.returncode:
+            raise ValueError("canonical issue 主路径的实际补丁摘要无法解析")
+        forward, reverse = numstats
+        # 0/0 仍可表示空文件增删或真实 mode 变化；同路径自重命名自身不是改动。
+        file_created_or_deleted = re.search(rb"(?m)^ (?:create|delete) mode [0-7]{6} ", summary.stdout)
+        mode_change = re.search(rb"(?m)^ mode change ([0-7]{6}) => ([0-7]{6}) ", summary.stdout)
+        mode_changed = mode_change is not None and mode_change[1] != mode_change[2]
+        if (forward[:2] == [b"0", b"0"] and forward[2] == reverse[2]
+            and not file_created_or_deleted and not mode_changed):
+            continue
+        changed_paths.add(os.fsdecode(forward[2]))
+        # 来源必须由同一有效 diff 的反向解析证明，不能从任意 rename/copy 文本行提取。
+        if not re.search(rb"(?m)^ copy ", summary.stdout):
+            changed_paths.add(os.fsdecode(reverse[2]))
+    return safe_relative_paths(sorted(changed_paths))
+
+
 def applied_scope_expansion_facts(applied_attempts: list[dict[str, Any]], scope_paths: set[str], run_dir: Path,
-                                *, contract: Mapping[str, Any]) -> list[dict[str, Any]]:
+                                *, contract: Mapping[str, Any], original_run_directory: Path | None = None) -> list[dict[str, Any]]:
     expansions: list[dict[str, Any]] = []
     for facts in applied_attempts:
         attempt, result = facts["attempt"], facts["result"]
@@ -292,6 +380,11 @@ def applied_scope_expansion_facts(applied_attempts: list[dict[str, Any]], scope_
             raise ValueError("scope expansion requires a fixed and applied attempt")
         if any(attempt.get(key) != result.get(key) for key in ("run_id", "issue_id", "attempt_id")):
             raise ValueError("scope expansion attempt/result identity mismatch")
+        if any(facts[name].get("run_id") != contract.get("run_id") for name in ("issue", "attempt", "result")):
+            raise ValueError("scope expansion facts belong to a different run")
+        if any(facts[name].get("fix_issue_handling_mode", "validate_then_fix") != "validate_then_fix"
+               for name in ("issue", "attempt", "result")):
+            raise ValueError("validate-only issue 不能生成已应用修复的范围扩展凭据")
         changed_paths = safe_relative_paths(result.get("changed_paths", []))
         metadata = result.get("scope_expansion") or {}
         if not isinstance(metadata, dict):
@@ -302,35 +395,58 @@ def applied_scope_expansion_facts(applied_attempts: list[dict[str, Any]], scope_
         acknowledged = safe_relative_paths(metadata.get("acknowledged_protected_or_background_paths", []))
         declared = safe_relative_paths(metadata.get("declared_paths", []))
         confirmed = safe_relative_paths(attempt.get("confirmed_acknowledged_protected_or_background_paths", []))
-        guarded_patterns = [*contract.get("protected_files", []), *contract.get("background_files", []),
-                            *contract.get("excluded_path_prefixes", [])]
-        guarded_changes = {path for path in changed_paths for pattern in guarded_patterns
-                           if isinstance(pattern, str) and pattern and
-                           (path == pattern.rstrip("/") or path.startswith(pattern.rstrip("/") + "/"))}
+        classification = classify_fix_attempt_scope_expansion(
+            changed_paths=sorted(changed_paths),
+            boundary_paths=[*safe_relative_paths(attempt.get("issue_paths", [])), *scope_contract_paths(contract, "fix_allowlist")],
+            declared_paths=sorted(declared), acknowledged_protected_or_background_paths=sorted(acknowledged),
+            reason=metadata.get("reason"), scope_contract=contract, canonical_issue=facts["issue"],
+        )
+        canonical_declared = set(classification["canonical_issue_declared_paths"])
+        if canonical_declared and safe_relative_paths(attempt.get("issue_paths", [])) != set(
+            canonical_issue_authorized_fix_paths(facts["issue"])
+        ):
+            raise ValueError("canonical issue 主路径与 prepare 时登记的路径不一致")
+        if "canonical_issue_declared_paths" in metadata and safe_relative_paths(
+            metadata["canonical_issue_declared_paths"]
+        ) != canonical_declared:
+            raise ValueError("canonical issue 主路径的声明来源不一致")
+        guarded_changes = set(classification["acknowledged_protected_or_background_paths"]) | set(
+            classification["unacknowledged_protected_or_background_paths"])
         if not guarded_changes <= acknowledged & confirmed:
             raise ValueError("protected/background changes lack main-agent confirmation")
         if any(metadata.get(name) for name in ("blocked_paths", "undeclared_paths", "unacknowledged_protected_or_background_paths")):
             raise ValueError("applied attempt has undeclared or blocked scope expansion")
-        if not expanded <= declared or not acknowledged <= confirmed or not (expanded | acknowledged) <= changed_paths:
+        if not expanded <= declared | canonical_declared or not acknowledged <= confirmed or not (expanded | acknowledged) <= changed_paths:
             raise ValueError("scope expansion lacks declaration, applied patch, or main-agent confirmation")
-        if (expanded or acknowledged) and not str(metadata.get("reason") or "").strip():
+        if (expanded or acknowledged or classification["requires_explicit_scope_expansion_reason"]) and not classification["reason"]:
             raise ValueError("scope expansion has no reason")
         outside = changed_paths - scope_paths
         # 确认通道只覆盖冻结 guarded 路径；普通外扩仍须声明。
-        if not outside <= expanded | (acknowledged & guarded_changes):
+        if (not outside <= expanded | canonical_declared | (acknowledged & guarded_changes)
+            or classification["undeclared_paths"]):
             raise ValueError("applied patch has an undeclared path outside the reviewed scope")
+        if classification["blocked_paths"]:
+            raise ValueError("developer-tool-managed scope expansion is forbidden")
         qualified = outside | acknowledged
         if qualified:
             if any(path.startswith(prefix) for path in qualified for prefix in BUILTIN_DEVELOPER_TOOL_MANAGED_PATH_PREFIXES_EXCLUDED_FROM_REVIEW_SCOPE):
                 raise ValueError("developer-tool-managed scope expansion is forbidden")
             patch = Path(str(result.get("fix_patch_path", "")))
             expected_patch = run_dir / "artifacts/fix-attempts" / attempt["attempt_id"] / "fix.patch"
+            if original_run_directory is not None:
+                original_patch = original_run_directory / "artifacts/fix-attempts" / attempt["attempt_id"] / "fix.patch"
+                if patch != original_patch:
+                    raise ValueError("范围扩展的原补丁身份不匹配")
+                patch = expected_patch
             # 祖先路径可以使用别名；补丁本身仍须是绑定 attempt 的普通文件。
             if (patch.is_symlink() or expected_patch.is_symlink() or not patch.is_file()
                 or patch.resolve() != expected_patch.resolve()):
                 raise ValueError("scope expansion requires its actual applied patch")
+            patch_bytes = patch.read_bytes()
+            if canonical_declared and not canonical_declared <= actual_fix_patch_changed_paths(patch_bytes, Path(contract["repo"])):
+                raise ValueError("实际补丁未包含 canonical issue 声明的主路径")
             snapshots = {name: facts[name] for name in ("issue", "attempt", "result")}
             expansions.append({"paths": sorted(qualified), "issue_id": attempt["issue_id"], "attempt_id": attempt["attempt_id"],
-                               "fix_patch_sha256": hashlib.sha256(patch.read_bytes()).hexdigest(),
+                               "fix_patch_sha256": hashlib.sha256(patch_bytes).hexdigest(),
                                "facts": snapshots, "facts_sha256": hashlib.sha256(canonical_json_bytes(snapshots)).hexdigest()})
     return expansions

@@ -18,6 +18,8 @@ candidate_content_manifest_sha256``）。没有补修正、且没有无关脏文
 有补修正时内容摘要变了，才按 ``artifacts/handoff-validation-commands.json`` 的 argv 重跑。
 
 base-branch-sync 不并入本脚本，仍由 agent 在之后按 skill 调用。
+历史实际提交的追加验收另由 ``supplemental-completion inspect|record|verify`` 处理，
+其独立 schema、补审及隔离验证实现位于 ``supplemental_land_completion.py``。
 """
 
 from __future__ import annotations
@@ -571,6 +573,8 @@ def command_check_evidence(args: argparse.Namespace) -> int:
     handoff = run_dir / "artifacts/handoff.md"
     handoff_text = handoff.read_text(encoding="utf-8") if handoff.is_file() and not handoff.is_symlink() else ""
     intake = build_payload(handoff_text, repo, handoff)
+    if intake.get("run_identity_status") == "invalid":
+        raise ValueError("交接 run 身份不符：" + "；".join(intake.get("run_identity_errors", [])))
     stageable = set(land_stageable_path_universe(intake, contract, applied_fix_attempt_dispositions(run_dir)))
     stageable.update(repo_relative_path(repo, path) for path in args.extra_path)
     entries = repo_snapshot(repo).get("dirty_paths") or []
@@ -600,6 +604,18 @@ def build_prepare_report(args: argparse.Namespace) -> tuple[dict[str, Any], int]
     text, handoff_path = read_handoff_text(args)
     repo_argument = Path(args.repo).expanduser().resolve()
     intake = build_payload(text, repo_argument, handoff_path)
+    if intake.get("run_identity_status") == "invalid":
+        raise ValueError("交接 run 身份不符：" + "；".join(intake.get("run_identity_errors", [])))
+    if args.run_dir:
+        selected_run_directory = Path(args.run_dir).expanduser().resolve()
+        handoff_run_directory = intake.get("run_dir")
+        if handoff_run_directory and Path(handoff_run_directory).resolve() != selected_run_directory:
+            raise ValueError("显式 run 目录与交接绑定的 run 目录不符")
+        if (selected_run_directory / "artifacts").is_dir():
+            # 粘贴摘要可由显式目录补证，但其声明仍必须与该目录的正式身份一致。
+            intake = build_payload(text, repo_argument, selected_run_directory / "artifacts/handoff.md")
+            if intake.get("run_identity_status") == "invalid":
+                raise ValueError("交接 run 身份不符：" + "；".join(intake.get("run_identity_errors", [])))
     current_snapshot = intake["current_repo_snapshot"]
     if not current_snapshot.get("is_git_repo"):
         raise ValueError(f"--repo 不是 git worktree：{repo_argument}")
@@ -660,10 +676,16 @@ def build_prepare_report(args: argparse.Namespace) -> tuple[dict[str, Any], int]
         unrelated,
         leave_unrelated_dirty_paths_uncommitted=args.commit_staged_scope_only_and_leave_unrelated_dirty_paths,
     )
+    if run_dir is not None and (run_dir / "artifacts").is_dir() and intake.get("run_identity_status") != "verified":
+        gate_failures.append(RvfLandHardGateFailure(
+            RVF_LAND_EXIT_REVIEWED_SCOPE_CONTRADICTS_DIRTY_PATHS,
+            "run_identity_unavailable",
+            "精确 run 的 summary 或 scope contract 身份恢复可核验后重验；当前不生成正式计划。",
+        ))
 
     validation = (
         validation_reuse_assessment(repo_root, run_dir)
-        if run_dir is not None and (run_dir / "artifacts").is_dir()
+        if run_dir is not None and (run_dir / "artifacts").is_dir() and intake.get("run_identity_status") == "verified"
         else None
     )
     sections = parse_sections(text)
@@ -713,7 +735,8 @@ def build_prepare_report(args: argparse.Namespace) -> tuple[dict[str, Any], int]
         failure.reason_code in {"handoff_target_repository_unknown", "handoff_targets_another_repository"}
         for failure in gate_failures
     )
-    if run_dir is not None and (run_dir / "artifacts").is_dir() and not cross_repository:
+    if (run_dir is not None and (run_dir / "artifacts").is_dir() and not cross_repository
+            and intake.get("run_identity_status") == "verified"):
         # 11/12 在 commit 时按当时的工作树重新判定（补修正可能改变它们），所以只要仓库身份与
         # run 目录成立就落 plan；10 与 13 不会因补修正而改变，commit 直接信 plan。
         plan = {
@@ -1313,7 +1336,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     source.add_argument("--handoff-text-file", help="包含粘贴 handoff 正文的临时文件。")
     source.add_argument("--stdin", action="store_true", help="从 stdin 读 handoff 正文（用单引号 heredoc）。")
     prepare.add_argument("--repo", default=".")
-    prepare.add_argument("--run-dir", help="覆盖从 handoff 推断的 run 目录。")
+    prepare.add_argument("--run-dir", help="显式指定本轮 run 目录，须与 handoff 身份一致。")
     prepare.add_argument("--extra-path", action="append", default=[], help="reviewed scope 之外、确属本次工作的路径。")
     prepare.add_argument(
         "--cross-worktree",
@@ -1344,11 +1367,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
     qualification.add_argument("--run-dir", required=True)
     qualification.add_argument("--extra-path", action="append", default=[])
     qualification.add_argument(LEAVE_UNRELATED_DIRTY_PATHS_FLAG, action="store_true")
+    from supplemental_land_completion import add_argument_parser
+    add_argument_parser(subparsers)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_argument_parser().parse_args(argv)
+    if args.subcommand == "supplemental-completion":
+        from supplemental_land_completion import command
+        return command(args)
     try:
         if args.subcommand == "prepare":
             return command_prepare(args)
