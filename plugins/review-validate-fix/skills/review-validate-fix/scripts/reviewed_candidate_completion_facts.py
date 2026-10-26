@@ -308,10 +308,12 @@ def completed_review_facts(run_dir: Path, handoff_text: str, *, allow_missing_co
             raise CandidateQualificationRefused("merge_dispositions_check_failed", str(exc)) from exc
         issue_ids = set(dispositions.accounted_fix_issue_ids)
     try:
-        from rvf_elevated_issue_delegation import accepted_delegations, DELEGATION_CONCLUSION
+        from rvf_elevated_issue_delegation import accepted_delegations, DELEGATION_CONCLUSION, read_ledger
 
         contract = read_regular_json_object(run_dir / "artifacts/inputs/scope.contract.json")
-        delegations = accepted_delegations(Path(contract["repo"]), run_dir, candidate_digest=candidate_digest)
+        # 无委派事件的历史事实无需访问已回收的工作树；未处置 elevated 仍由 canonical attempt 阻断。
+        delegations = (accepted_delegations(Path(contract["repo"]), run_dir, candidate_digest=candidate_digest)
+                       if read_ledger(run_dir)[1] else [])
         delegated_ids = {entry["issue_id"] for entry in delegations}
         if not delegated_ids <= issue_ids:
             raise ValueError("委派包含未被 canonical merge 计入的问题")

@@ -13,6 +13,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterator
 
+from core.review_run_qualification_mutation_lock import guard_review_run_qualification_mutation
+
 
 REVIEW_PHASE_SEQUENCE = ("prepare", "review", "merge", "validate_fix", "verify", "handoff", "complete")
 TERMINAL_FIELDS = ("review_run_started_at", "review_run_terminal_status", "review_run_terminal_at")
@@ -211,10 +213,11 @@ def project_review_run_lifecycle(
     return payload
 
 
+@guard_review_run_qualification_mutation("run_directory")
 def merge_review_run_summary(
     run_directory: Path, updates: dict[str, Any], *, preserved_keys: set[str] | None = None,
 ) -> dict[str, Any]:
-    """所有组件共用提交锁，避免迟到 summary 覆盖终态或已经归档的接受事实。"""
+    """先取得资格锁，再提交元数据，保留终态并与消费者落地互斥。"""
     with review_run_metadata_lock(run_directory):
         path = run_directory / "summary.json"
         previous = read_json_object(path)

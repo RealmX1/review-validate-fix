@@ -525,6 +525,7 @@ class RunLedger:
         if self.diagnostics:
             payload["diagnostics"] = self.diagnostics
             payload["log_unavailable"] = True
+        self.last_summary = payload
         try:
             with review_run_qualification_mutation_lock(self.run_dir):
                 try:

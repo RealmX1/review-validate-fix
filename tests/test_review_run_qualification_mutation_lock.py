@@ -30,7 +30,7 @@ from core.review_run_qualification_mutation_lock import (
 WRITERS = (
     "prepare", "start", "stop", "apply", "awaiting_marker", "upsert", "merge",
     "review_result", "review_result_issue", "review_result_request", "review_result_rotation",
-    "reviewer_plan", "scope", "scope_finalization", "validation", "handoff", "summary", "finalize_summary", "evidence",
+    "reviewer_plan", "scope", "scope_finalization", "validation", "handoff", "summary", "lifecycle_summary", "finalize_summary", "evidence",
 )
 
 
@@ -109,6 +109,10 @@ def test_real_canonical_writer_waits_for_consumer_lock_then_resumes(tmp_path: Pa
             body = (f"from {module} import _atomic_write_json; import json; "
                     + f"path=Path({str(run_dir / relative_path)!r}); payload=json.loads(path.read_text()); "
                     + "payload['qualification_lock_protocol']='completed'; print(_atomic_write_json(path, payload))")
+        elif writer == "lifecycle_summary":
+            body = ("from core.run_ledger.review_run_lifecycle import merge_review_run_summary; "
+                    + f"print(merge_review_run_summary(Path({str(run_dir)!r}), "
+                    + "{'run_id':'rvf-candidate-evidence-test','qualification_lock_protocol':'completed'}))")
         elif writer == "scope":
             body = ("from prepare_review_run import write_scope_contract; "
                     + f"run=Path({str(run_dir)!r}); "
