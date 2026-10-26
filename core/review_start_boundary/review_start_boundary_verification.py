@@ -180,6 +180,11 @@ def verify_candidate_git_snapshot(
     if require_filesystem_identity and receipt.get("candidate_filesystem_state_sha256") != candidate_filesystem_state_sha256(repo, current.get("candidates", [])):
         invalid("候选文件在分界之后被修改或重建，即便内容已写回原样也须重新请求分界")
     summary = token_payload.get("candidate_summary") or {}
+    # 候选来源由 RVF 的候选快照绑定；宿主原生消息凭据只证明其独立的回退能力。
+    if "committed_scope_evidence" in binding_fields and (
+            receipt.get("committed_scope_evidence") != summary.get("committed_scope_evidence")
+            or current.get("committed_scope_evidence") != summary.get("committed_scope_evidence")):
+        invalid("已提交候选的固定窗口与归属证据发生变化")
     if receipt.get("comparison_base_tip") != summary.get("committed_round_baseline") or current.get("committed_round_baseline") != summary.get("committed_round_baseline"):
         invalid("比较基线与分界不一致")
     if current.get("kanban_task_id") != summary.get("kanban_task_id") or receipt.get("kanban_task_id") != summary.get("kanban_task_id"):

@@ -585,6 +585,7 @@ repo_required_files=(
   "core/rvf_user_local_data_paths.py"
   "core/review_start_boundary/review_candidate_snapshot.py"
   "tests/test_review_candidate_snapshot_without_native_rewind.py"
+  "tests/test_kanban_committed_candidate_provenance.py"
   "core/rvf_shared_runtime_constants/rvf_shared_runtime_constants.py"
   "core/provider_health/provider_health_guard.py"
   "adapters/codex/codex_provider_login.py"
@@ -996,6 +997,7 @@ require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scr
 run_step "tests: review_start_independent_user_turn_boundary" \
   "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q "$tests_dir/test_review_start_independent_user_turn_boundary.py" \
     "$tests_dir/test_review_candidate_snapshot_without_native_rewind.py" \
+    "$tests_dir/test_kanban_committed_candidate_provenance.py" \
     "$tests_dir/test_review_packet_from_frozen_candidate_snapshot.py" \
     "$tests_dir/test_review_start_boundary_request_retry.py" \
     "$tests_dir/test_review_without_pre_review_base_absorption.py"

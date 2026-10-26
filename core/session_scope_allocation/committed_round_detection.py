@@ -2,7 +2,7 @@
 
 给定 repo 路径 + task/session 身份，解析「本轮已提交但未审」改动的窗口下界 baseline：
 优先 review-highwater（最近一次完成 review 覆盖到的 HEAD，仅当其为当前 HEAD 祖先时采用），
-仅当从未完成过 review 时走 bootstrap（Kanban task 内取 round-baseline 与 task 分支点中更早者，
+仅当从未完成过 review 时走 bootstrap（Kanban 优先使用经适配层验证的创建锚点，
 其余取 round-baseline）；并解析 committed-round 的 base
 分支 ref（把被 rebase/cherry-pick 压平到第一父链的 base 工作排除出可审窗口）。
 
@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import subprocess
 from pathlib import Path
+from typing import Any, Mapping
 
 from core.session_scope_allocation import review_highwater_marker
 from core.session_scope_allocation.round_baseline_marker import resolve_round_baseline_head
@@ -159,28 +160,13 @@ def _resolve_committed_round_baseline(
     repo_path: Path,
     task_id: str | None,
     session_id: str | None,
+    *, scope_evidence: Mapping[str, Any] | None = None,
 ) -> str | None:
-    """committed-round 窗口下界：优先「最近一次完成 review 覆盖到的 HEAD」高水位
-    (``review_highwater_marker``，仅当其为当前 HEAD 祖先时采用）；某 task/session 从未完成过
-    review（无高水位）时走 bootstrap。
+    """优先使用仍可达的 review 高水位；Kanban 首审使用适配层已验证的创建锚点。
 
-    这样『在某轮提交、却没在该轮自己的 Stop 里被审』的孤儿提交不会因后续任意 prompt 推进
-    round-baseline 而落出窗口——它们留在 ``high-water..HEAD`` 内直到真被审，修掉
-    "since last user prompt" 语义下的第三面漏审盲区（见 ``review_highwater_marker`` 模块头）。
-
-    **bootstrap（无高水位）**：
-      * Kanban task 上下文（``task_id`` 解析得出）：取 round-baseline（上一条 prompt 的 HEAD）与
-        task 分支点 ``merge-base(<base ref>, HEAD)`` 中**更早**的那个。round-baseline 会被每条 prompt
-        顶到当前 HEAD，task 首轮从未审过时，被顶过去的已提交工作就永久落出窗口（实例：会话 893079be、
-        worktree 01457，35 个提交、约 1.57 万行非测试代码从未经过 RVF——被谢绝 / 延后、或唯一看见它们的
-        Stop 被熔断挡住，随后一条 prompt 就把它们推出了窗口）。分支点是稳定的：在第一次 review 完成
-        之前，task 分支上的提交都留在窗口里。base 工作的排除仍由 ``^<base ref>`` 负责，故不会把 base
-        上的提交算成本 task 的。
-      * 其它上下文：round-baseline（不变）。
-
-    EXPERIMENT_NODE: 分支点 bootstrap 只在 Kanban task 上下文启用——task 分支每个 task 独立、分支点之后的提交都属于本 task；非 task 会话可能停在长期特性分支上，旧提交在别的会话里审过但合并 diff 的 canonical hash 对不上，会被整条重派。备选是对所有会话启用，或改用「task 创建时记录的起点」代替 merge-base。
-
-    best-effort：高水位 / 分支点读取异常时静默回退 round-baseline。
+    core 只接收统一证据，不读取 Kanban 私有目录。证据缺失时保留旧观测窗口，
+    调用层同时标记 discovery unknown，不能把空观测说成没有未审工作。
+    非 Kanban 会话仍使用 round-baseline，本次修复不改变其范围。
     """
     try:
         highwater = review_highwater_marker.resolve_review_highwater_head(
@@ -190,8 +176,16 @@ def _resolve_committed_round_baseline(
         )
     except Exception:  # pragma: no cover - 高水位读取永不阻断
         highwater = None
+    if scope_evidence and scope_evidence.get("status") == "verified":
+        from core.session_scope_allocation.committed_candidate_scope_evidence import validate_committed_candidate_scope_evidence
+        validate_committed_candidate_scope_evidence(repo_path, scope_evidence, task_id=task_id)
     if highwater and _commit_is_ancestor_of_head(repo_path, highwater):
+        if (scope_evidence and scope_evidence.get("status") == "verified"
+                and _first_commit_is_ancestor_of_second(repo_path, highwater, str(scope_evidence["initial_base_commit"]))):
+            return str(scope_evidence["initial_base_commit"])
         return highwater
+    if scope_evidence and scope_evidence.get("status") == "verified":
+        return str(scope_evidence["initial_base_commit"])
     round_baseline = resolve_round_baseline_head(
         task_id=task_id, session_id=session_id, repo=repo_path
     )

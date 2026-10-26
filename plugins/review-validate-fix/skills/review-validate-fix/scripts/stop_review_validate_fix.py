@@ -7351,15 +7351,15 @@ def refresh_global_diff_tracker(
         event = context.get("event")
         if isinstance(event, dict):
             repo_resolved = Path(repo).expanduser().resolve()
-            committed_baseline = _resolve_committed_round_baseline(
-                repo_resolved,
-                current_kanban_task_id(event),
-                session_hook_id_from_event(event),
+            from committed_candidate_scope import resolve_committed_candidate_scope, committed_base_exclusion_for_scope
+            committed_baseline, committed_base_ref, scope_evidence = resolve_committed_candidate_scope(
+                repo_resolved, current_kanban_task_id(event), session_hook_id_from_event(event), event=event,
             )
+            context["committed_scope_evidence"] = scope_evidence
             # base 分支 ref：排除 rebase/cherry 压平到第一父链的 base 工作。与 detection 端
             # `maybe_route_committed_round_scope` 走同一个 `_resolve_committed_round_base_ref`
             # （入参仅 repo），detection 与 allocation 同源——见 ac042be 的下界同源教训。
-            committed_base_ref = _resolve_committed_round_base_ref(repo_resolved)
+            committed_base_ref = committed_base_exclusion_for_scope(repo_resolved, committed_base_ref, scope_evidence)
     except Exception:
         committed_baseline = None
         committed_base_ref = None
@@ -7371,6 +7371,7 @@ def refresh_global_diff_tracker(
             transcript,
             committed_baseline=committed_baseline,
             committed_base_ref=committed_base_ref,
+            committed_scope_evidence=context.get("committed_scope_evidence"),
         )
     except Exception as exc:
         # build_manifest 失败时 emit `tracker_refresh_failed`（保持原 ledger
@@ -7725,6 +7726,7 @@ def allocate_auto_review_scope(
                 transcript_max_line_number=transcript_max_line_number,
                 committed_baseline=context.get("committed_baseline"),
                 committed_base_ref=context.get("committed_base_ref"),
+                committed_scope_evidence=context.get("committed_scope_evidence"),
             )
             incomplete = patch_ownership_incomplete_details(manifest if isinstance(manifest, dict) else None, result)
             if incomplete is not None:
@@ -7766,6 +7768,7 @@ def allocate_auto_review_scope(
             auto_claim_observed=False,
             committed_baseline=context.get("committed_baseline"),
             committed_base_ref=context.get("committed_base_ref"),
+            committed_scope_evidence=context.get("committed_scope_evidence"),
         )
     except Exception as exc:
         ledger.event(
@@ -8687,24 +8690,31 @@ def maybe_route_committed_round_scope(
     if not repo:
         return None
     repo_path = Path(repo).expanduser().resolve()
-    baseline = _resolve_committed_round_baseline(
-        repo_path,
-        current_kanban_task_id(event),
-        session_hook_id_from_event(event),
+    from committed_candidate_scope import resolve_committed_candidate_scope, committed_base_exclusion_for_scope
+    baseline, base_ref, scope_evidence = resolve_committed_candidate_scope(
+        repo_path, current_kanban_task_id(event), session_hook_id_from_event(event), event=event,
     )
     if not baseline:
+        if scope_evidence and scope_evidence.get("status") not in {"verified", "unborn_head"}:
+            return skip_decision(
+                "Kanban 提交窗口尚无可验证的下界，等待来源变化后补证。",
+                ledger, "committed_candidate_evidence_pending", repo=repo, cwd=cwd,
+                committed_scope_evidence=scope_evidence,
+            )
         return None
     # base 分支 ref：把 rebase/cherry 压平到第一父链的 base 工作排除出可审窗口。
     # 与 allocation 端 `refresh_global_diff_tracker` 调**同一个**
     # `_resolve_committed_round_base_ref`（入参仅 repo_path，天然同源），否则 detection
     # 选中的窗口与 allocation 重建的窗口不一致 → no_session_owned_dirty 误判（ac042be 教训）。
-    base_ref = _resolve_committed_round_base_ref(repo_path)
+    base_ref = committed_base_exclusion_for_scope(repo_path, base_ref, scope_evidence)
     # Per-commit opt-out audit: surface which round commits the `RVF-Skip-Review`
     # trailer excluded BEFORE the empty-set early return, so even a round whose
     # commits are all opted-out (committed_paths == []) leaves an audit trace
     # instead of looking indistinguishable from "no committed work".
     try:
-        skip_review_shas = sorted(_list_round_skip_review_commit_shas(repo_path, baseline, base_ref))
+        skip_review_shas = sorted(_list_round_skip_review_commit_shas(
+            repo_path, baseline, base_ref, committed_scope_evidence=scope_evidence,
+        ))
     except Exception:
         skip_review_shas = []
     if skip_review_shas:
@@ -8724,10 +8734,17 @@ def maybe_route_committed_round_scope(
             repo_path,
             baseline,
             base_ref,
+            committed_scope_evidence=scope_evidence,
         )
     except Exception:
         committed_paths = []
     if not committed_paths:
+        if scope_evidence and scope_evidence.get("status") != "verified":
+            return skip_decision(
+                "Kanban 提交候选证据尚不完整，不能判定没有已提交未审工作。",
+                ledger, "committed_candidate_evidence_pending", repo=repo, cwd=cwd,
+                committed_scope_evidence=scope_evidence,
+            )
         return None
     # OBSERVATION-WINDOW(R9): review_state「已审」真相源过滤 —— 把已被本 session 审过的
     # committed 路径（其 committed 单元全 reviewed 且本 session 拥有）从候选里剔除，使 detection
@@ -8741,6 +8758,7 @@ def maybe_route_committed_round_scope(
             repo=repo_path,
             session_id=session_hook_id_from_event(event),
             candidate_paths=committed_paths,
+            committed_baseline=baseline,
         )
     except Exception:
         reviewed_committed_paths = set()
@@ -10705,6 +10723,14 @@ def decision_point_injection_decision(
     # 无候选 → 静默停，不写 injection ledger（保持 canary 分母干净：只有「候选非空」才是发起层
     # 该表态的分母）。
     if candidate_count <= 0:
+        if summary.get("candidate_discovery_complete") is False:
+            ledger.event(phase="gate", event="committed_candidate_evidence_pending", status="unknown",
+                         reason_code="committed_candidate_evidence_pending", repo=repo,
+                         committed_scope_evidence=summary.get("committed_scope_evidence"))
+            return skip_decision(
+                "Kanban 提交候选证据尚不完整，等待来源变化或下次真实 prompt 自动补证。",
+                ledger, "committed_candidate_evidence_pending", repo=repo, cwd=cwd,
+            )
         # 只有命中审查排除前缀的路径（如 Serena 自动生成的 .serena/）是脏的，也走这里；计数进 ledger，
         # run-logs 里才分得清「真干净」和「只有被排除路径是脏的」。
         review_scope_excluded_path_prefix_count = int(

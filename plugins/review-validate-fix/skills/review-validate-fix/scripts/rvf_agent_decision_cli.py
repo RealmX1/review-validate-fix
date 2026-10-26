@@ -887,6 +887,7 @@ def allocate_agentic_initiation_tracker_review_scope(
     output_scope_path: Path,
     committed_baseline: str | None = None,
     committed_base_ref: str | None = None,
+    committed_scope_evidence: Mapping[str, Any] | None = None,
     lease_ttl_seconds: int | None = AGENTIC_INITIATION_TRACKER_SCOPE_LEASE_TTL_SECONDS,
     force_full_rescope: bool = False,
 ) -> dict[str, Any]:
@@ -946,6 +947,7 @@ def allocate_agentic_initiation_tracker_review_scope(
             resolved_transcript.resolve(),
             committed_baseline=committed_baseline,
             committed_base_ref=committed_base_ref,
+            committed_scope_evidence=committed_scope_evidence,
             # Bash / 子代理 / mv·cp 写的文件按分层证据补判归属（08ac4）；只在 start 与 prepare 开启。
             enable_layered_session_write_attribution=True,
         )
@@ -1008,6 +1010,7 @@ def allocate_agentic_initiation_tracker_review_scope(
             auto_claim_observed=False,
             committed_baseline=committed_baseline,
             committed_base_ref=committed_base_ref,
+            committed_scope_evidence=committed_scope_evidence,
         )
     except Exception as exc:  # noqa: BLE001 - allocator 故障降级，不阻断已接受的一轮
         return _degraded_tracker_scope_allocation(
@@ -1273,6 +1276,7 @@ def default_prepare_pipeline(
             Path(repo), verified_boundary_receipt.get("comparison_base_ref"),
             verified_boundary_receipt.get("comparison_base_ref_tip"),
         ),
+        committed_scope_evidence=verified_boundary_receipt.get("committed_scope_evidence"),
         force_full_rescope=force_full_rescope,
     )
     ledger.event(
@@ -1378,6 +1382,7 @@ def default_prepare_pipeline(
     }
     if committed_baseline:
         payload["committed_round_baseline"] = committed_baseline
+        payload["committed_scope_evidence"] = verified_boundary_receipt.get("committed_scope_evidence")
         if committed_base_ref:
             payload["committed_round_base_ref"] = committed_base_ref
 

@@ -1218,6 +1218,11 @@ def prepare_run(
             manifest_cmd.extend(["--committed-baseline", committed_baseline])
         if committed_base_ref:
             manifest_cmd.extend(["--committed-base-ref", committed_base_ref])
+        committed_scope_evidence = verified_boundary_receipt.get("committed_scope_evidence")
+        if committed_scope_evidence is not None:
+            evidence_path = artifact_dir / "committed-candidate-scope-evidence.json"
+            evidence_path.write_text(json.dumps(committed_scope_evidence, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+            manifest_cmd.extend(["--committed-scope-evidence", str(evidence_path)])
         run(manifest_cmd)
         packet_session_manifest = session_manifest_path
         source_session_manifest = f"transcript:{transcript}"

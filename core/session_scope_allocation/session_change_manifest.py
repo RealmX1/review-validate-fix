@@ -11,7 +11,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 # 本模块迁入 core/ 后既被当作 ``core.session_scope_allocation.session_change_manifest``
 # import、也作为 CLI(``__main__``) 与 ``spec_from_file_location`` 直接加载。后两种上下文里
@@ -1065,6 +1065,7 @@ def build_manifest(
     include_all_transcript_ownership: bool = False,
     committed_baseline: str | None = None,
     committed_base_ref: str | None = None,
+    committed_scope_evidence: Mapping[str, Any] | None = None,
     enable_layered_session_write_attribution: bool = False,
     enable_file_change_time_window_attribution: bool = True,
 ) -> dict[str, Any]:
@@ -1123,7 +1124,8 @@ def build_manifest(
         try:
             committed_round_set = set(
                 reviewable_unit_diff_tracker._list_committed_round_changed_paths(
-                    root, committed_baseline, committed_base_ref
+                    root, committed_baseline, committed_base_ref,
+                    committed_scope_evidence=committed_scope_evidence,
                 )
             )
         except Exception:
@@ -1472,6 +1474,10 @@ def build_manifest(
     # they are still attributed instead of silently dropped (the second-gate
     # `no_session_owned_dirty` leak this closes).
     committed_round_owned: list[str] = []
+    has_verified_task_scope = bool(committed_scope_evidence and committed_scope_evidence.get("status") == "verified")
+    previously_session_owned_paths = reviewable_unit_diff_tracker.strong_session_owned_paths(
+        repo=root, session_id=session_id, log_root_override=tracker_log_root,
+    ) if has_verified_task_scope else set()
     for path in sorted(committed_round_set):
         if path in dirty_set:
             continue
@@ -1482,6 +1488,9 @@ def build_manifest(
         elif path in round_window_exec_paths:
             evidence = "exec_command"
         else:
+            if has_verified_task_scope and path not in previously_session_owned_paths:
+                # task 自有只证明候选资格；没有本 session 工具证据或强归属，不能自动认领。
+                continue
             evidence = "committed_round_git"
         key = (path, "path", "")
         if key in seen_live_units:
@@ -1612,6 +1621,7 @@ def build_manifest(
         "schema_drift_suspected": schema_drift_suspected,
         "owned_committed_round_paths": committed_round_owned,
         "committed_round_baseline": committed_baseline,
+        "committed_scope_evidence": dict(committed_scope_evidence) if committed_scope_evidence is not None else None,
         "unattributed_dirty_paths": unattributed_dirty,
         # 主循环之后分层补判出的归属（子代理写工具 / 命令文本 / agent 认领 / 时间窗），逐条带证据。
         "attribution_evidence": layered_attribution_evidence,
@@ -1685,6 +1695,7 @@ def main() -> int:
         help="Base branch ref (e.g. main) whose reachable commits are excluded from the "
         "committed-round window, so rebased/merged base-branch work is not mis-attributed.",
     )
+    parser.add_argument("--committed-scope-evidence", help="冻结的已提交候选证据 JSON 文件。")
     parser.add_argument(
         "--enable-layered-session-write-attribution",
         action="store_true",
@@ -1705,6 +1716,7 @@ def main() -> int:
             include_all_transcript_ownership=args.include_all_transcript_ownership,
             committed_baseline=args.committed_baseline,
             committed_base_ref=args.committed_base_ref,
+            committed_scope_evidence=json.loads(Path(args.committed_scope_evidence).read_text()) if args.committed_scope_evidence else None,
             enable_layered_session_write_attribution=args.enable_layered_session_write_attribution,
         )
     except Exception as exc:

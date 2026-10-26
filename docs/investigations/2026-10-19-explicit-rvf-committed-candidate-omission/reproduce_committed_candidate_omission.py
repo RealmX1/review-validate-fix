@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """在持久隔离目录复现候选遗漏；不运行 reviewer、不连接 Kanban、不改来源仓库。
 
-这是调查探针，断言针对 851a00d 的现状，known_defect 表示期望未来修复的行为。
+历史缺陷断言必须配合固定历史产品目录；修复验收使用正常 Kanban 证据发现路径。
 只允许新建输出目录；所有 Git 写操作及 RVF 状态写操作均限定在该目录。
 """
 
@@ -20,6 +20,7 @@ from unittest.mock import patch
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT_DIRECTORY = REPOSITORY_ROOT / "plugins/review-validate-fix/skills/review-validate-fix/scripts"
+ASSERTION_MODE = "historical-defects"
 sys.path.insert(0, str(SCRIPT_DIRECTORY))
 sys.path.insert(0, str(REPOSITORY_ROOT))
 
@@ -47,6 +48,7 @@ def isolated_runtime_environment(case_directory: Path):
         "CODEX_RVF_STATE_DIR": str(case_directory / "isolated-runtime-state"),
         "CODEX_RVF_SESSION_HOOK_STATE_DIR": str(case_directory / "isolated-session-hook-state"),
         "CODEX_RVF_PREP_ROOT": str(case_directory / "isolated-prep-files"),
+        "CODEX_RVF_CLINE_KANBAN_STATE_DIR": str(case_directory / "isolated-kanban-state"),
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": os.devnull,
         "PYTHONDONTWRITEBYTECODE": "1",
@@ -65,6 +67,8 @@ def initialize_repository(case_directory: Path) -> tuple[Path, str]:
     run_git(repository, "config", "user.name", "隔离调查探针")
     run_git(repository, "config", "user.email", "isolated-investigation@example.invalid")
     run_git(repository, "config", "core.hooksPath", os.devnull)
+    run_git(repository, "config", "maintenance.auto", "false")
+    run_git(repository, "config", "gc.auto", "0")
     commit_file(repository, "initial.txt", "初始内容\n")
     return repository, run_git(repository, "rev-parse", "HEAD")
 
@@ -73,14 +77,47 @@ def commit_file(repository: Path, path: str, content: str) -> str:
     (repository / path).write_text(content, encoding="utf-8")
     run_git(repository, "add", "--", path)
     run_git(repository, "commit", "-q", "-m", "test: 写入隔离调查内容")
-    return run_git(repository, "rev-parse", "HEAD")
+    commit = run_git(repository, "rev-parse", "HEAD")
+    if ASSERTION_MODE == "fix-acceptance" and run_git(repository, "branch", "--show-current") == "investigation-task":
+        update_isolated_kanban_provenance(repository, additional_commit=commit)
+    return commit
 
 
 def hook_event(repository: Path, *, task: bool = True, session: str = "investigation-session") -> dict:
     event = {"cwd": str(repository), "session_id": session, "hook_event_name": "UserPromptSubmit"}
     if task:
         event["kanban_task_id"] = "isolated-investigation-task"
+        if ASSERTION_MODE == "fix-acceptance":
+            update_isolated_kanban_provenance(repository, initial=run_git(repository, "rev-parse", "HEAD"))
     return event
+
+
+def update_isolated_kanban_provenance(repository: Path, *, initial: str | None = None,
+                                     additional_commit: str | None = None, captured_entry: dict | None = None) -> None:
+    """只重建隔离身份；来源事故使用捕获的原始条目，不读取后来的真实 tracker。"""
+    task_id = "isolated-investigation-task"
+    directory = Path(os.environ["CODEX_RVF_CLINE_KANBAN_STATE_DIR"]) / "workspaces/isolated-project"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "task-commit-integration-provenance.json"
+    if captured_entry:
+        entry = json.loads(json.dumps(captured_entry))
+        entry["taskId"] = task_id
+        entry["lastWorkspaceGitSnapshot"]["path"] = str(repository)
+    elif path.exists() and not initial:
+        entry = json.loads(path.read_text())["tasks"][task_id]
+    else:
+        entry = {"taskId": task_id, "baseRef": "main", "incarnations": [{
+            "incarnationId": f"{initial}:1", "initialBaseCommit": initial,
+            "captureSource": "worktree_creation", "startedAt": 1, "observedTaskCommits": [],
+        }], "lastWorkspaceGitSnapshot": {"path": str(repository)}}
+    if additional_commit:
+        from adapters.cline_kanban.committed_candidate_provenance import _stable_patch_id
+        entry["incarnations"][-1]["observedTaskCommits"].append({
+            "commitSha": additional_commit, "stablePatchId": _stable_patch_id(repository, additional_commit),
+        })
+    write_json(path, {"schemaVersion": 1, "tasks": {task_id: entry}})
+    write_json(directory / "sessions.json", {task_id: {"taskId": task_id, "workspacePath": str(repository)}})
+    write_json(directory / "board.json", {"columns": [{"cards": [{"id": task_id, "baseRef": "main"}]}]})
 
 
 def capture_baseline(event: dict) -> dict:
@@ -110,6 +147,9 @@ def summarize_case(case_directory: Path, label: str, event: dict, expected_count
     repository = Path(event["cwd"])
     result["investigation_case"] = label
     result["known_defect"] = known_defect
+    result["assertion_mode"] = ASSERTION_MODE
+    if ASSERTION_MODE == "fix-acceptance" and known_defect and event.get("kanban_task_id"):
+        expected_count = 10 if label.startswith("source-") else 1
     result["git_head"] = run_git(repository, "rev-parse", "HEAD")
     result["git_main"] = run_git(repository, "rev-parse", "main")
     result["raw_window_without_base_exclusion"] = tracker._list_committed_round_changed_paths(
@@ -120,7 +160,7 @@ def summarize_case(case_directory: Path, label: str, event: dict, expected_count
     return {"case": label, "candidate_path_count": result["candidate_path_count"],
             "review_state_filtered": result["review_state_filtered_committed_path_count"],
             "other_owner_filtered": result["filtered_out_other_session_path_count"],
-            "known_defect": known_defect}
+            "known_defect": known_defect, "assertion_mode": ASSERTION_MODE}
 
 
 def register_committed_work(repository: Path, baseline: str, *, owner: str = "investigation-session"):
@@ -195,10 +235,12 @@ def run_synthetic_matrix(output: Path) -> list[dict]:
                     repo=repository, session_id=event["session_id"], run_id="isolated-after-handback",
                     reviewer_id="isolated-fixture-reviewer", auto_claim_observed=False,
                     committed_baseline=initial, committed_base_ref="main",
+                    **({"committed_scope_evidence": candidate_summary(event)["committed_scope_evidence"]}
+                       if ASSERTION_MODE == "fix-acceptance" else {}),
                 )
-                assert allocation["status"] == "empty", allocation
+                assert allocation["status"] == ("allocated" if ASSERTION_MODE == "fix-acceptance" else "empty"), allocation
                 write_json(case_directory / "allocation-after-handback.json", allocation)
-                results.append({"case": "allocation-after-handback", "candidate_unit_count": 0,
+                results.append({"case": "allocation-after-handback", "candidate_unit_count": allocation["candidate_unit_count"],
                                 "known_defect": True})
                 highwater.write_review_highwater(task_id=event["kanban_task_id"],
                                                 session_id=event["session_id"], reviewed_head=initial,
@@ -206,10 +248,12 @@ def run_synthetic_matrix(output: Path) -> list[dict]:
                 results.append(summarize_case(case_directory, "handback-older-highwater", event, 0,
                                               known_defect=True))
                 payload = submit.inspect_user_prompt_submit({**event, "prompt": "/review-validate-fix"})
-                assert payload["status"] == "manual_decision_no_candidates", payload
-                assert "hookSpecificOutput" not in payload and "token" not in payload
+                accepted_statuses = {"manual_decision_injected", "manual_decision_deduplicated"} if ASSERTION_MODE == "fix-acceptance" else {"manual_decision_no_candidates"}
+                assert payload["status"] in accepted_statuses, payload
+                if ASSERTION_MODE != "fix-acceptance":
+                    assert "hookSpecificOutput" not in payload and "token" not in payload
                 write_json(case_directory / "manual-after-handback.json", submit._render_hook_payload(payload))
-                results.append({"case": "manual-after-handback", "candidate_path_count": 0,
+                results.append({"case": "manual-after-handback", "candidate_path_count": payload["candidate_path_count"],
                                 "known_defect": True})
             elif topology in ("merge-absorption", "rebase-absorption"):
                 run_git(repository, "checkout", "-q", "main")
@@ -281,7 +325,8 @@ def run_synthetic_matrix(output: Path) -> list[dict]:
     return results
 
 
-def replay_source_commits(output: Path, source_repository: Path, initial: str, head: str) -> list[dict]:
+def replay_source_commits(output: Path, source_repository: Path, initial: str, head: str,
+                         source_provenance_snapshot: Path | None = None) -> list[dict]:
     """只 fetch 指定本地仓库对象到全新仓库；不用真实 marker、tracker 或来源仓库 index。"""
     import rvf_user_prompt_submit as submit
     from core.session_scope_allocation import round_baseline_marker
@@ -294,6 +339,12 @@ def replay_source_commits(output: Path, source_repository: Path, initial: str, h
         run_git(repository, "checkout", "-q", "-B", "main", head)
         run_git(repository, "checkout", "-q", "-b", "investigation-task")
         event = hook_event(repository)
+        if ASSERTION_MODE == "fix-acceptance":
+            if source_provenance_snapshot is None:
+                raise ValueError("来源修复验收必须提供事故现场捕获的 provenance，不能读取后来的 tracker")
+            captured = json.loads(source_provenance_snapshot.read_text())
+            assert captured["incarnations"][-1]["initialBaseCommit"] == initial
+            update_isolated_kanban_provenance(repository, captured_entry=captured)
         capture_baseline(event)
         results = [summarize_case(case_directory, "source-default", event, 0, known_defect=True),
                    summarize_case(case_directory, "source-fixed-baseline-only", event, 0,
@@ -307,7 +358,10 @@ def replay_source_commits(output: Path, source_repository: Path, initial: str, h
                                    cwd=repository, input=json.dumps(event), capture_output=True,
                                    text=True, check=True)
         stdout = json.loads(completed.stdout)
-        assert "无可审候选" in stdout["systemMessage"] and "hookSpecificOutput" not in stdout
+        if ASSERTION_MODE == "fix-acceptance":
+            assert "hookSpecificOutput" in stdout, stdout
+        else:
+            assert "无可审候选" in stdout["systemMessage"] and "hookSpecificOutput" not in stdout
         write_json(case_directory / "hook-mode-stdout.json", stdout)
         round_baseline_marker.write_round_baseline_marker(
             task_id=event["kanban_task_id"], session_id=event["session_id"],
@@ -315,6 +369,8 @@ def replay_source_commits(output: Path, source_repository: Path, initial: str, h
         )
         results.append(summarize_case(case_directory, "source-persisted-initial-still-excluded", event, 0,
                                       known_defect=True))
+        if ASSERTION_MODE == "fix-acceptance":
+            return results
         # 反事实只注入 resolver；不修改生产代码，不把恢复候选冒充修复完成。
         import stop_decision_candidate_summary as summary
         with patch.object(summary, "_default_committed_baseline_resolver", lambda *_: initial), \
@@ -329,12 +385,24 @@ def replay_source_commits(output: Path, source_repository: Path, initial: str, h
 
 
 def main() -> None:
+    global ASSERTION_MODE, REPOSITORY_ROOT, SCRIPT_DIRECTORY
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--source-repository", type=Path)
+    parser.add_argument("--source-provenance-snapshot", type=Path)
+    parser.add_argument("--assertion-mode", choices=["historical-defects", "fix-acceptance"], default="fix-acceptance")
+    parser.add_argument("--product-root", type=Path, help="历史缺陷断言使用的固定产品源码目录。")
     parser.add_argument("--source-initial-commit", default="fc25ab76176ad34865cbbacfe421b83577a75606")
     parser.add_argument("--source-head-commit", default="55ea63d9b218449378dd2b1f0a9167fc04287ac7")
     arguments = parser.parse_args()
+    ASSERTION_MODE = arguments.assertion_mode
+    if arguments.product_root:
+        REPOSITORY_ROOT = arguments.product_root.resolve()
+        SCRIPT_DIRECTORY = REPOSITORY_ROOT / "plugins/review-validate-fix/skills/review-validate-fix/scripts"
+        sys.path.insert(0, str(SCRIPT_DIRECTORY))
+        sys.path.insert(0, str(REPOSITORY_ROOT))
+    if ASSERTION_MODE == "historical-defects" and not arguments.product_root:
+        raise ValueError("历史缺陷断言须显式提供固定历史 --product-root")
     output = arguments.output_directory.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=False)
     # 在任何产品 import 前封住其可变状态路径；内层每个用例再细分。
@@ -342,7 +410,10 @@ def main() -> None:
         results = run_synthetic_matrix(output)
         if arguments.source_repository:
             results += replay_source_commits(output, arguments.source_repository.resolve(),
-                                             arguments.source_initial_commit, arguments.source_head_commit)
+                                             arguments.source_initial_commit, arguments.source_head_commit,
+                                             arguments.source_provenance_snapshot)
+    for result in results:
+        result["assertion_mode"] = ASSERTION_MODE
     write_json(output / "regression-matrix-results.json", results)
     print(json.dumps({"asserted_case_count": len(results), "output_directory": str(output)}, ensure_ascii=False))
 

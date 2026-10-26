@@ -24,6 +24,7 @@ SNAPSHOT_BINDING_FIELDS = (
     "worktree_head_commit_sha", "comparison_base_tip", "comparison_base_ref",
     "comparison_base_ref_tip", "kanban_task_id", "local_review_base_ref", "local_review_base_tip",
     "packet_context_only_paths",
+    "committed_scope_evidence",
 )
 REPOSITORY_LOCAL_REVIEW_SCOPE_IGNORE_FILE_NAME = ".review-validate-fix-ignore"
 
@@ -167,8 +168,9 @@ def freeze_review_candidate_snapshot(*, token_payload: Mapping[str, Any], repo: 
             "schema": SNAPSHOT_SCHEMA, "decision_token": token, "session_id": token_payload["session_id"],
             "worktree": str(Path(repo).resolve()), "candidate_fingerprint": token_payload["candidate_fingerprint"],
             "worktree_head_commit_sha": head, "comparison_base_tip": summary.get("committed_round_baseline"),
+            "committed_scope_evidence": summary.get("committed_scope_evidence"),
             "comparison_base_ref": base_ref,
-            "comparison_base_ref_tip": git_output(repo, "rev-parse", base_ref) if base_ref else None,
+            "comparison_base_ref_tip": (summary.get("committed_scope_evidence") or {}).get("base_tip_commit") or (git_output(repo, "rev-parse", base_ref) if base_ref else None),
             "kanban_task_id": summary.get("kanban_task_id"), "local_review_base_ref": local_base,
             "local_review_base_tip": git_output(repo, "rev-parse", local_base) if local_base else None,
         }

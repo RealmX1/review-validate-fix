@@ -2,6 +2,8 @@
 
 调查任务：`review-validate-fix/c3b26`。来源：`Trace-of-Thought-Landing-Page/9895b`，native session `01a1515f-0b88-7993-a4b0-cc9606c29b3a`。调查日期：2026-10-19，以下时间均为 UTC。
 
+> 后续实施：2026-10-26 已按用户批准的计划实现 Kanban 修复，见[实施与验证报告](implementation-verification-report-2026-10-26.md)及[历史与修复矩阵对照](historical-versus-fixed-regression-results-2026-10-26.json)。下文保留 10 月 19 日的历史调查与当时“尚未实施”的结论，不用后来的状态改写事故现场。
+
 ## 结论与边界
 
 确认这是候选枚举缺陷。两道相互独立的前置筛选使已提交未审工作在进入 `review_state` 和 ownership 判断之前消失：

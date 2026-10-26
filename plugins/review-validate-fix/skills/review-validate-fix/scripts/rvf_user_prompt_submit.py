@@ -1105,6 +1105,12 @@ def _handle_manual_decision_point(
     # ② 无候选：manual 显式触发但本 worktree 自上次 review 以来无可审改动 → 只出 systemMessage
     # （不写 injection ledger，保持 canary 分母干净，与 Stop hook 无候选路径一致）。
     if candidate_count <= 0:
+        if summary.get("candidate_discovery_complete") is False:
+            return {
+                **manual_payload, "status": "manual_decision_candidate_evidence_pending",
+                "candidate_path_count": 0, "committed_scope_evidence": summary.get("committed_scope_evidence"),
+                "systemMessage": "Kanban 提交候选证据尚不完整，不能判定无候选；来源变化或下次真实 prompt 时自动补证。",
+            }
         return {
             **manual_payload,
             "status": "manual_decision_no_candidates",

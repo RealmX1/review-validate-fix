@@ -91,6 +91,7 @@ from core.session_scope_allocation.committed_round_detection import (  # noqa: E
 )
 
 import review_strictness_reference_calculator as strictness_calculator  # noqa: E402
+from committed_candidate_scope import resolve_committed_candidate_scope, committed_base_exclusion_for_scope  # noqa: E402
 from review_scope_excluded_path_prefixes import (  # noqa: E402
     BUILTIN_DEVELOPER_TOOL_MANAGED_PATH_PREFIXES_EXCLUDED_FROM_REVIEW_SCOPE,
     load_review_scope_excluded_path_prefixes,
@@ -236,7 +237,8 @@ def _default_committed_base_ref_resolver(repo_path: Path) -> str | None:
 
 
 def _default_reviewed_committed_paths_resolver(
-    repo_path: Path, session_id: str | None, candidate_committed_paths: set[str], log_root_override: Path | None
+    repo_path: Path, session_id: str | None, candidate_committed_paths: set[str], log_root_override: Path | None,
+    *, committed_baseline: str | None = None,
 ) -> set[str]:
     """# OBSERVATION-WINDOW(R9) —— 委托给中性核 tracker 的 review_state「已审」过滤器。
 
@@ -253,6 +255,7 @@ def _default_reviewed_committed_paths_resolver(
             session_id=session_id,
             candidate_paths=candidate_committed_paths,
             log_root_override=log_root_override,
+            committed_baseline=committed_baseline,
         )
     except Exception:  # pragma: no cover - 过滤器永不阻断摘要
         return set()
@@ -764,6 +767,7 @@ def build_candidate_summary(
     dirty_reviewed_change_resolver: Callable[[Path, str | None, Sequence[str], Path | None], Mapping[str, Any]] | None = None,
     strictness_rule_parameters: Mapping[str, Any] | None = None,
     fixed_committed_round_base_tip: str | None = None,
+    committed_scope_evidence: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """构造 Stop hook 注入用的候选摘要（结构见返回 dict / 模块 docstring）。
 
@@ -774,6 +778,8 @@ def build_candidate_summary(
     workspace_guard = workspace_guard or _default_workspace_guard
     task_id_resolver = task_id_resolver or _default_task_id_resolver
     session_id_resolver = session_id_resolver or _default_session_id_resolver
+    injected_baseline_resolver = committed_baseline_resolver
+    injected_base_ref_resolver = committed_base_ref_resolver
     committed_baseline_resolver = committed_baseline_resolver or _default_committed_baseline_resolver
     committed_base_ref_resolver = committed_base_ref_resolver or _default_committed_base_ref_resolver
     reviewed_committed_paths_resolver = (
@@ -798,20 +804,26 @@ def build_candidate_summary(
 
     task_id = task_id_resolver(event)
     session_id = session_id_resolver(event)
+    resolved_baseline, resolved_base_ref, committed_scope_evidence = resolve_committed_candidate_scope(
+        repo_path, task_id, session_id, event=event, frozen_evidence=committed_scope_evidence,
+    )
 
     # ② 窗口种子（bootstrap）：committed-round 的 SHA 同源 resolver（高水位 / round-baseline）。
     # R9 后种子仅作 committed 枚举窗口的下界；「已审/未审」裁决权改由 review_state 承担（③.5）。
     try:
-        baseline = committed_baseline_resolver(repo_path, task_id, session_id)
+        baseline = committed_baseline_resolver(repo_path, task_id, session_id) if injected_baseline_resolver else resolved_baseline
     except Exception:  # pragma: no cover - resolver 永不阻断
         baseline = None
     try:
-        base_ref = committed_base_ref_resolver(repo_path)
+        base_ref = committed_base_ref_resolver(repo_path) if injected_base_ref_resolver else resolved_base_ref
     except Exception:  # pragma: no cover
         base_ref = None
     committed_round_window_seed_source = _classify_committed_round_window_seed_source(
         baseline, task_id, session_id, repo_path, log_root_override
     )
+    if (committed_scope_evidence and committed_scope_evidence.get("status") == "verified"
+            and committed_round_window_seed_source != COMMITTED_ROUND_WINDOW_SEED_REVIEW_HIGHWATER):
+        committed_round_window_seed_source = str(committed_scope_evidence["stable_start_source"])
 
     # ③ 枚举：committed（种子..工作树，含 committed-but-unreviewed）∪ uncommitted（dirty）。
     committed_paths: list[str] = []
@@ -819,8 +831,8 @@ def build_candidate_summary(
         try:
             committed_paths = _list_committed_round_changed_paths(
                 repo_path, baseline,
-                frozen_committed_round_base_exclusion_ref(repo_path, base_ref, fixed_committed_round_base_tip)
-                if fixed_committed_round_base_tip else base_ref,
+                committed_base_exclusion_for_scope(repo_path, base_ref, committed_scope_evidence, fixed_committed_round_base_tip),
+                committed_scope_evidence=committed_scope_evidence,
             )
         except Exception:  # pragma: no cover
             committed_paths = []
@@ -838,7 +850,8 @@ def build_candidate_summary(
     # uncommitted_set 保留（re-dirtied 未审工作不被误剔）。与 detection 端调同一 tracker 过滤器，
     # 三处「已审」裁决同源。lower_bound_source 字段口径随之从窗口种子 SHA 切到 review_state 权威。
     reviewed_committed_paths = reviewed_committed_paths_resolver(
-        repo_path, session_id, committed_set, log_root_override
+        repo_path, session_id, committed_set, log_root_override,
+        **({"committed_baseline": baseline} if reviewed_committed_paths_resolver is _default_reviewed_committed_paths_resolver else {}),
     )
     review_state_filtered_committed_paths = sorted(committed_set & reviewed_committed_paths)
     committed_set = committed_set - reviewed_committed_paths
@@ -1028,6 +1041,8 @@ def build_candidate_summary(
         "kanban_task_id": task_id,
         "session_id": session_id,
         "committed_round_baseline": baseline,
+        "committed_scope_evidence": committed_scope_evidence,
+        "candidate_discovery_complete": committed_scope_evidence is None or committed_scope_evidence.get("status") in {"verified", "unborn_head"},
         "committed_round_base_ref": base_ref,
         "lower_bound_source": lower_bound_source,
         "committed_round_window_seed_source": committed_round_window_seed_source,

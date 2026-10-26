@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 # 本模块迁入 core/ 后既被当作 ``core.session_scope_allocation.reviewable_unit_diff_tracker``
 # import、也作为 CLI(``__main__``) 与 ``spec_from_file_location`` 直接加载。后两种上下文里
@@ -850,7 +850,7 @@ def _specs_from_observation(observation: _PathObservation | None, path: str) -> 
     ]
 
 
-def _classify_committed_path(repo: Path, path: str, baseline: str) -> _PathObservation | None:
+def _classify_committed_path(repo: Path, path: str, baseline: str, *, head_ref: str = "HEAD") -> _PathObservation | None:
     """Committed-round sibling of `_classify_path`. Where `_classify_path`
     reads worktree state (`git status`, the on-disk file) to classify a *dirty*
     change, this classifies the *net committed* change for `path` across the
@@ -863,7 +863,7 @@ def _classify_committed_path(repo: Path, path: str, baseline: str) -> _PathObser
 
     Returns None when there is no net committed change for the path (e.g. it was
     committed and then reverted within the round, leaving the trees equal)."""
-    spec_diff = f"{baseline}..HEAD"
+    spec_diff = f"{baseline}..{head_ref}"
     try:
         name_status = _run_git(
             repo, ["diff", "--no-renames", "--name-status", "-z", spec_diff, "--", path]
@@ -895,7 +895,7 @@ def _classify_committed_path(repo: Path, path: str, baseline: str) -> _PathObser
     if numstat:
         cols = numstat.split("\t", 2)
         if len(cols) >= 2 and cols[0] == "-" and cols[1] == "-":
-            postimage_sha = _blob_content_sha_at_ref(repo, "HEAD", path) or ""
+            postimage_sha = _blob_content_sha_at_ref(repo, head_ref, path) or ""
             if preimage_blob is None and postimage_sha == "":
                 return None
             return _PathObservation(
@@ -917,7 +917,7 @@ def _classify_committed_path(repo: Path, path: str, baseline: str) -> _PathObser
             # an untracked_file — git diff renders it as one all-`+` hunk.
             change_type="modify" if preimage_blob else "add",
             preimage_blob=preimage_blob,
-            postimage_hash=_blob_content_sha_at_ref(repo, "HEAD", path),
+            postimage_hash=_blob_content_sha_at_ref(repo, head_ref, path),
             old_path=None,
             hunks=tuple(hunks),
         )
@@ -933,7 +933,7 @@ def _classify_committed_path(repo: Path, path: str, baseline: str) -> _PathObser
             kind="tracked_hunk",
             change_type="add",
             preimage_blob=None,
-            postimage_hash=_blob_content_sha_at_ref(repo, "HEAD", path),
+            postimage_hash=_blob_content_sha_at_ref(repo, head_ref, path),
             old_path=None,
             hunks=(),
         )
@@ -963,39 +963,11 @@ def _commit_message_has_skip_review_trailer(message: str) -> bool:
 
 
 def _base_ref_exclude_revs(repo: Path, base_ref: str | None) -> list[str]:
-    """``["^<base-sha>"]`` to subtract base-branch commits that a rebase / cherry
-    replayed onto this round's first-parent line, or ``[]`` when no *safe*
-    exclusion applies.
+    """排除 base 可达的外部提交；直接在 base 分支工作时关闭排除。
 
-    The committed-round walks use ``--first-parent --no-merges``, which only drops
-    base work imported through a *merge* second parent (``git merge`` / ``git
-    pull``). A ``git rebase`` / ``git pull --rebase`` / ``base-branch-sync`` rebase
-    replays the base commits as ordinary first-parent commits, so they survive the
-    walk and get mis-attributed as this session's committed-but-unreviewed work.
-    Appending ``^<base_ref>`` removes every commit reachable from the live base
-    branch — exactly the replayed base work — while leaving the session's own
-    commits (not on base) in scope.
-
-    Safe-exclude preconditions (any miss → ``[]``, i.e. today's no-exclusion
-    behaviour, so this can never *over*-exclude):
-
-    - ``base_ref`` resolves to a real commit (unknown / ambiguous ref degrades
-      silently rather than breaking the walk);
-    - the current checkout's branch ref is NOT the base branch ref. Only when the
-      session is committing *on* the base branch itself (``symbolic-ref HEAD`` equals
-      ``<base_ref>``'s full ref, e.g. both ``refs/heads/main``) would ``^base_ref``
-      subtract the session's OWN commits → self-disable there (plain repo, agent on
-      ``main``). A *fast-forward* to the base tip (detached HEAD, or a non-base
-      feature branch quick-forwarded onto base — ``git merge --ff-only`` /
-      base-branch-sync non-divergent handback) leaves ``HEAD == base tip`` but NOT
-      on the base branch ref; ff can only succeed when the branch carries no own
-      commits, so ``baseline..HEAD`` is then pure base work and ``^base_ref`` safely
-      drops it. (The earlier ``merge-base --is-ancestor HEAD base`` guard treated
-      every ``HEAD == base tip`` alike and mis-self-disabled the ff-to-base case,
-      leaking base commits into committed-round.)
-
-    Resolving to a SHA pins the exclusion against ref churn and keeps all three
-    committed-round walks (skip-sha, count, allowlist) consistent within a call."""
+    最终拓扑不能区分 base→task 吸收与 task→base 落地。此函数只负责外部排除，
+    已落地自有提交由调用者用冻结的 scope evidence 单独并回；不以 ff 推断所有权。
+    """
     if not base_ref:
         return []
     try:
@@ -1004,12 +976,7 @@ def _base_ref_exclude_revs(repo: Path, base_ref: str | None) -> list[str]:
         return []
     if not sha:
         return []
-    # Self-disable ONLY when the current checkout's branch ref IS the base branch
-    # ref — i.e. the session is committing on the base branch itself, where
-    # ``^base_ref`` would subtract its OWN commits. A detached HEAD (``symbolic-ref``
-    # fails) or any non-base branch — including one fast-forwarded onto the base tip
-    # — is safe to exclude: ff implies the branch carries no own commits, so
-    # ``baseline..HEAD`` minus base is empty / own-only, never the base's work.
+    # 只有当前具名分支就是 base 时关闭排除；detached 和 task 分支继续排除外部工作。
     try:
         head_ref = _run_git(repo, ["symbolic-ref", "--quiet", "HEAD"]).strip()
     except RuntimeError:
@@ -1027,7 +994,8 @@ def _base_ref_exclude_revs(repo: Path, base_ref: str | None) -> list[str]:
 
 
 def _list_round_skip_review_commit_shas(
-    repo: Path, baseline: str, base_ref: str | None = None
+    repo: Path, baseline: str, base_ref: str | None = None,
+    *, committed_scope_evidence: Mapping[str, Any] | None = None,
 ) -> set[str]:
     """SHAs of this round's first-parent, non-merge commits that carry the
     ``RVF-Skip-Review`` opt-out trailer (see ``RVF_SKIP_REVIEW_COMMIT_TRAILER``).
@@ -1035,6 +1003,11 @@ def _list_round_skip_review_commit_shas(
     Walks the same first-parent/no-merges window the path collector uses (incl. the
     same ``^<base_ref>`` exclusion of rebase-replayed base commits), so an excluded
     commit's changes drop out of every committed-round consumer at once."""
+    if committed_scope_evidence and committed_scope_evidence.get("status") == "verified":
+        from core.session_scope_allocation.committed_round_detection import frozen_committed_round_base_exclusion_ref
+        base_ref = frozen_committed_round_base_exclusion_ref(
+            repo, committed_scope_evidence.get("base_ref"), committed_scope_evidence.get("base_tip_commit"),
+        )
     base_excludes = _base_ref_exclude_revs(repo, base_ref)
     try:
         # %H<US>%B<RS> — unit-sep between sha and body, record-sep between commits.
@@ -1054,11 +1027,16 @@ def _list_round_skip_review_commit_shas(
         sha = sha.strip()
         if sha and _commit_message_has_skip_review_trailer(body):
             skip.add(sha)
+    from core.session_scope_allocation.committed_candidate_scope_evidence import task_owned_commits_in_review_window
+    for commit in task_owned_commits_in_review_window(repo, baseline, committed_scope_evidence):
+        if _commit_message_has_skip_review_trailer(_run_git(repo, ["show", "-s", "--format=%B", commit])):
+            skip.add(commit)
     return skip
 
 
 def _list_committed_round_changed_paths(
-    repo: Path, baseline: str, base_ref: str | None = None
+    repo: Path, baseline: str, base_ref: str | None = None,
+    *, committed_scope_evidence: Mapping[str, Any] | None = None,
 ) -> list[str]:
     """Paths whose content differs between the `baseline` tree and `HEAD`,
     restricted to the work introduced by *this round's own* first-parent,
@@ -1085,6 +1063,11 @@ def _list_committed_round_changed_paths(
     (a path also touched by a non-skip round commit stays, since it remains in
     that commit's name-only block). This function is the cheap structural
     pre-filter; `build_manifest` then attributes the survivors."""
+    if committed_scope_evidence and committed_scope_evidence.get("status") == "verified":
+        from core.session_scope_allocation.committed_round_detection import frozen_committed_round_base_exclusion_ref
+        base_ref = frozen_committed_round_base_exclusion_ref(
+            repo, committed_scope_evidence.get("base_ref"), committed_scope_evidence.get("base_tip_commit"),
+        )
     try:
         net = _run_git(repo, ["diff", "--no-renames", "--name-only", "-z", f"{baseline}..HEAD"])
     except RuntimeError:
@@ -1092,7 +1075,11 @@ def _list_committed_round_changed_paths(
     net_paths = sorted({item for item in net.split("\0") if item})
     if not net_paths:
         return []
-    skip_shas = _list_round_skip_review_commit_shas(repo, baseline, base_ref)
+    from core.session_scope_allocation.committed_candidate_scope_evidence import task_owned_commits_in_review_window
+    task_owned_commits = task_owned_commits_in_review_window(repo, baseline, committed_scope_evidence)
+    skip_shas = _list_round_skip_review_commit_shas(
+        repo, baseline, base_ref, committed_scope_evidence=committed_scope_evidence,
+    )
     base_excludes = _base_ref_exclude_revs(repo, base_ref)
     # Fast path: the net (tree) diff already reflects only reviewable first-parent
     # own work when the round has no merges, no opt-out commits, AND no
@@ -1134,6 +1121,13 @@ def _list_committed_round_changed_paths(
     except RuntimeError:
         return net_paths
     allowed: set[str] = set()
+    # 已落地不是外部来源。仅把已验证且仍在窗口内的 task 自有提交并回白名单；
+    # 归属本 session、已审状态与路径排除仍由后续各自的门禁裁决。
+    for commit in task_owned_commits:
+        if commit not in skip_shas:
+            allowed.update(filter(None, _run_git(
+                repo, ["diff-tree", "--no-commit-id", "--no-renames", "--name-only", "-r", "-z", commit],
+            ).split("\0")))
     for block in log_out.split("\x1e"):
         block = block.strip("\n")
         if not block:
@@ -5403,6 +5397,7 @@ def _observe_and_upsert_units_in_txn(
     now_iso: str,
     committed_baseline: str | None = None,
     committed_base_ref: str | None = None,
+    committed_scope_evidence: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Walk the worktree (and, when `committed_baseline` is set, the net
     committed-round diff), upsert units for every observed change, and mark
@@ -5421,7 +5416,9 @@ def _observe_and_upsert_units_in_txn(
 
     committed_observed_unit_ids: set[str] = set()
     if committed_baseline:
-        for path in _list_committed_round_changed_paths(repo, committed_baseline, committed_base_ref):
+        for path in _list_committed_round_changed_paths(
+            repo, committed_baseline, committed_base_ref, committed_scope_evidence=committed_scope_evidence,
+        ):
             observation = _classify_committed_path(repo, path, committed_baseline)
             if observation is None:
                 continue
@@ -5441,12 +5438,11 @@ def _observe_and_upsert_units_in_txn(
     # Mark units whose change no longer appears in either observed set (file got
     # committed past the baseline / reverted) as `superseded` so they don't show
     # up as candidates. Reviewed units are left untouched by the helper.
-    _supersede_absent_units_in_txn(
-        conn,
-        worktree_key=worktree_key,
-        live_unit_ids=observed_unit_ids | committed_observed_unit_ids,
-        now_iso=now_iso,
-    )
+    if not committed_scope_evidence or committed_scope_evidence.get("status") in {"verified", "unborn_head"}:
+        _supersede_absent_units_in_txn(
+            conn, worktree_key=worktree_key,
+            live_unit_ids=observed_unit_ids | committed_observed_unit_ids, now_iso=now_iso,
+        )
 
     return {
         "branch_key": branch_key,
@@ -5787,12 +5783,36 @@ def _empty_allocate_result(
     }
 
 
+def strong_session_owned_paths(
+    *, repo: Path, session_id: str | None, log_root_override: Path | None = None,
+) -> set[str]:
+    """只读取得本 worktree 中本会话已证明归属的路径，不按 task 批量认领。"""
+    common = git_common_dir(repo)
+    if not common or not session_id or _disabled():
+        return set()
+    database = tracker_dir(log_root_override or log_root(), repo_key(common)) / SQLITE_FILENAME
+    if not database.exists():
+        return set()
+    try:
+        with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as connection:
+            return {row[0] for row in connection.execute(
+                "SELECT DISTINCT u.path FROM units u JOIN session_units s ON s.unit_id=u.unit_id "
+                "WHERE u.worktree_key=? AND u.is_tombstoned=0 AND s.session_id=? "
+                "AND s.assignment_kind IN ('owned','takeover') "
+                "AND s.evidence NOT IN ('file_change_time_window','kanban_task_worktree')",
+                (_worktree_key(str(repo.resolve())), session_id),
+            )}
+    except sqlite3.Error:
+        return set()
+
+
 def select_committed_paths_reviewed_by_session(
     *,
     repo: Path,
     session_id: str | None,
     candidate_paths: Iterable[str],
     log_root_override: Path | None = None,
+    committed_baseline: str | None = None,
 ) -> set[str]:
     """# OBSERVATION-WINDOW(R9) —— review_state「已审/未审」真相源过滤器（R9 真相源迁移落点）。
 
@@ -5847,6 +5867,7 @@ def select_committed_paths_reviewed_by_session(
         rows = conn.execute(
             f"""
             SELECT u.path AS path,
+                   u.unit_id AS unit_id,
                    u.review_state AS review_state,
                    CASE WHEN EXISTS (
                        SELECT 1
@@ -5881,11 +5902,21 @@ def select_committed_paths_reviewed_by_session(
             agg["all_reviewed"] = False
         if row["owned_by_session"]:
             agg["owned_by_session"] = True
-    return {
+    reviewed_paths = {
         path
         for path, agg in per_path.items()
         if agg["has_committed_unit"] and agg["all_reviewed"] and agg["owned_by_session"]
     }
+    if committed_baseline:
+        # 同路径追加新 hunk 后，旧的 reviewed 行不能代表当前净 diff 仍已审。
+        reviewed_ids = {row["unit_id"] for row in rows if row["review_state"] == "reviewed"}
+        reviewed_paths = {
+            path for path in reviewed_paths
+            if (current_ids := {spec.unit_id for spec in _specs_from_observation(
+                _classify_committed_path(repo, path, committed_baseline), path,
+            )}) and current_ids <= reviewed_ids
+        }
+    return reviewed_paths
 
 
 # ``DirtyPathReviewedChangeObservation.unit_kind`` 的哨兵值：该路径在 tracker 里压根没有「本
@@ -6238,6 +6269,7 @@ def allocate_review_scope(
     transcript_max_line_number: int | None = None,
     committed_baseline: str | None = None,
     committed_base_ref: str | None = None,
+    committed_scope_evidence: Mapping[str, Any] | None = None,
     union_with_prior_scope_unit_ids: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Producer half of the global reviewed-diff tracker.
@@ -6340,6 +6372,7 @@ def allocate_review_scope(
                 now_iso=now_iso,
                 committed_baseline=committed_baseline,
                 committed_base_ref=committed_base_ref,
+                committed_scope_evidence=committed_scope_evidence,
             )
             worktree_key = observation["worktree_key"]
 
@@ -6392,6 +6425,10 @@ def allocate_review_scope(
                 candidates=candidates,
                 prior_scope_unit_ids=union_with_prior_scope_unit_ids,
             )
+            if committed_scope_evidence and committed_scope_evidence.get("status") not in {"verified", "unborn_head"}:
+                # unknown 时保留旧记录供恢复，但只分配当前能实际观测到的独立工作。
+                observable = observation["observed_unit_ids"] | observation["committed_observed_unit_ids"]
+                candidates = [unit_id for unit_id in candidates if unit_id in observable]
             candidate_unit_count = len(candidates)
 
             # Step 5: exclude active-leased units (anti-join).
@@ -6480,6 +6517,7 @@ def allocate_review_scope(
                     # 原样继承——只按当时工作树重分配正是「口径被悄悄换掉」的成因。
                     "committed_baseline": committed_baseline,
                     "committed_base_ref": committed_base_ref,
+                    "committed_scope_evidence": dict(committed_scope_evidence) if committed_scope_evidence is not None else None,
                     # 并集全审：这批 unit 来自上一轮 scope，不是本轮新观察到的。reviewer 与
                     # handoff 据此区分「已定稿的那一段」与「刚写的那一段」。
                     "unioned_prior_scope_unit_ids": unioned_prior_scope_unit_ids,
@@ -6616,11 +6654,12 @@ def allocate_review_scope(
                 "repo_key": key,
                 "tracker_dir": str(directory),
             }
-        # status == "empty"
+        evidence_pending = bool(committed_scope_evidence and committed_scope_evidence.get("status") not in {"verified", "unborn_head"})
+        # 没有可分配单元时，证据缺失与已证明空集分别记账。
         _emit_event(
             events_path,
             {
-                "event": "allocate_review_scope_empty",
+                "event": "allocate_review_scope_evidence_pending" if evidence_pending else "allocate_review_scope_empty",
                 "rvf_state_phase": "review",
                 "session_id": session_id,
                 "run_id": run_id,
@@ -6630,14 +6669,14 @@ def allocate_review_scope(
                 "leased_excluded_count": leased_excluded_count,
                 "stale_freed": committed_payload["stale_freed"],
                 "takeover_from_session_id": committed_payload["takeover_from"],
-                "reason_code": REASON_NO_UNASSIGNED_REVIEW_SCOPE,
+                "reason_code": "committed_candidate_evidence_pending" if evidence_pending else REASON_NO_UNASSIGNED_REVIEW_SCOPE,
                 "reason_code_legacy_alias": LEGACY_REASON_NO_SESSION_OWNED_DIRTY,
             },
         )
         return _empty_allocate_result(
-            status="empty",
-            reason=REASON_NO_UNASSIGNED_REVIEW_SCOPE,
-            reason_legacy_alias=LEGACY_REASON_NO_SESSION_OWNED_DIRTY,
+            status="evidence_pending" if evidence_pending else "empty",
+            reason="committed_candidate_evidence_pending" if evidence_pending else REASON_NO_UNASSIGNED_REVIEW_SCOPE,
+            reason_legacy_alias=None if evidence_pending else LEGACY_REASON_NO_SESSION_OWNED_DIRTY,
             repo_key_value=key,
             tracker_dir_value=str(directory),
             candidate_unit_count=candidate_unit_count,
@@ -7370,6 +7409,7 @@ def _build_argparser() -> argparse.ArgumentParser:
     alloc.add_argument("--lease-ttl-seconds", type=int, default=None)
     alloc.add_argument("--dry-run", action="store_true")
     alloc.add_argument("--print-result", action="store_true")
+    alloc.add_argument("--committed-scope-evidence", help="冻结的已提交候选证据 JSON 文件。")
     alloc.add_argument(
         "--union-with-prior-scope",
         default=None,
@@ -7583,6 +7623,7 @@ def _main(argv: list[str] | None = None) -> int:
     prior_scope_unit_ids: list[str] | None = None
     committed_baseline = args.committed_baseline
     committed_base_ref = args.committed_base_ref
+    committed_scope_evidence = json.loads(Path(args.committed_scope_evidence).read_text()) if args.committed_scope_evidence else None
     if args.union_with_prior_scope:
         prior_path = Path(args.union_with_prior_scope).expanduser()
         try:
@@ -7620,6 +7661,8 @@ def _main(argv: list[str] | None = None) -> int:
             committed_baseline = prior_payload["committed_baseline"]
         if not committed_base_ref and isinstance(prior_payload.get("committed_base_ref"), str):
             committed_base_ref = prior_payload["committed_base_ref"]
+        if committed_scope_evidence is None:
+            committed_scope_evidence = prior_payload.get("committed_scope_evidence")
     result = allocate_review_scope(
         repo=repo_path,
         session_id=args.session_id,
@@ -7633,6 +7676,7 @@ def _main(argv: list[str] | None = None) -> int:
         log_root_override=log_root_override,
         committed_baseline=committed_baseline,
         committed_base_ref=committed_base_ref,
+        committed_scope_evidence=committed_scope_evidence,
         union_with_prior_scope_unit_ids=prior_scope_unit_ids,
     )
     if args.print_result:

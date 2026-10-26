@@ -130,7 +130,8 @@ def require_review_start_boundary(
         raise ReviewStartBoundaryNotVerified(INVALIDATED, "调用方 session/worktree 与 token 不一致")
     summary = token_payload.get("candidate_summary") or {}
     event_transcript = transcript_path or summary.get("transcript_path")
-    event = {"session_id":session_id, "cwd":repo, "transcript_path":event_transcript}
+    event = {"session_id":session_id, "cwd":repo, "transcript_path":event_transcript,
+             "kanban_task_id": summary.get("kanban_task_id")}
 
     def build_current_candidate_summary(fixed: Mapping[str, Any]) -> Mapping[str, Any]:
         return stop_decision_candidate_summary.build_candidate_summary(
@@ -138,6 +139,7 @@ def require_review_start_boundary(
             committed_baseline_resolver=lambda *_: fixed.get("comparison_base_tip"),
             committed_base_ref_resolver=lambda *_: fixed.get("comparison_base_ref"),
             fixed_committed_round_base_tip=fixed.get("comparison_base_ref_tip"),
+            committed_scope_evidence=fixed.get("committed_scope_evidence"),
         )
 
     snapshot = freeze_review_candidate_snapshot(
@@ -198,7 +200,8 @@ def require_native_review_start_boundary(
     native_transcript = receipt.get("transcript_path")
     if transcript_path and Path(transcript_path).resolve() != Path(str(native_transcript or "")).resolve():
         raise ReviewStartBoundaryNotVerified(INVALIDATED, "receipt 与本轮 transcript 不一致")
-    event = {"session_id": session_id, "cwd": repo, "transcript_path": native_transcript}
+    event = {"session_id": session_id, "cwd": repo, "transcript_path": native_transcript,
+             "kanban_task_id": receipt.get("kanban_task_id")}
     adapter = host_adapter_resolver.resolve_current_session_host_adapter(event)
     reader = getattr(adapter, "read_independent_user_turn_boundary_evidence", None)
     if reader is None:
@@ -211,6 +214,7 @@ def require_native_review_start_boundary(
             committed_baseline_resolver=lambda *_: receipt.get("comparison_base_tip"),
             committed_base_ref_resolver=lambda *_: receipt.get("comparison_base_ref"),
             fixed_committed_round_base_tip=receipt.get("comparison_base_ref_tip"),
+            committed_scope_evidence=(token_payload.get("candidate_summary") or {}).get("committed_scope_evidence"),
         ),
     )
     # Git/候选核验可能耗时；状态迁移前重新读取活动分支，静态缓存不能成为授权。
