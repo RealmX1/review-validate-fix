@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_DIRECTORY = ROOT / "plugins/review-validate-fix/skills/review-validate-fix/scripts"
@@ -94,8 +96,6 @@ def create_completed_run(tmp_path: Path, repo: Path, run_name: str = "run") -> P
         "task_change_paths": [],
         "interaction_primary_paths": [],
         "base_delta_protected_paths": [],
-        "bootstrap_receipt_path": None,
-        "bootstrap_receipt_digest": None,
         "candidate_evidence_path": None,
         "candidate_evidence_digest": None,
         "integration_candidate_receipt_path": None,
@@ -208,6 +208,32 @@ def write_merge_dispositions_and_upsert_fix_issues(
         assert upserted.returncode == 0, upserted.stderr
 
 
+def record_terminal_fix_attempt(run_dir: Path, issue_id: str, *, status: str = "fixed", applied: bool = True,
+                                attempt_number: int = 1, changed_paths: list[str] | None = None,
+                                scope_expansion: dict | None = None, confirmed_paths: list[str] | None = None) -> Path:
+    """构造终态账本 fixture；真实 apply 流程另由 land 的隔离 Git 回归覆盖。"""
+    run_id = json.loads((run_dir / "summary.json").read_text())["run_id"]
+    attempt_id = f"attempt-{issue_id}-{attempt_number}"
+    directory = run_dir / "artifacts/fix-attempts" / attempt_id
+    directory.mkdir(parents=True)
+    patch = directory / "fix.patch"
+    patch.write_text("fixture patch\n")
+    identity = {"schema_version": 1, "run_id": run_id, "issue_id": issue_id, "attempt_id": attempt_id}
+    attempt = {**identity, "created_at": f"2026-10-24T00:00:{attempt_number:02d}+00:00",
+               "repo": json.loads((run_dir / "summary.json").read_text())["repo"],
+               "status": "applied" if applied and status == "fixed" else status,
+               "scope_expansion": scope_expansion or {},
+               "confirmed_acknowledged_protected_or_background_paths": confirmed_paths or []}
+    result = {**identity, "status": status, "changed_paths": [{"path": path, "op": "modified"} for path in (changed_paths or [])],
+              "scope_expansion": scope_expansion or {}, "fix_patch_path": str(patch)}
+    if status == "validated_and_submitted_to_kanban_backlog":
+        result["kanban_backlog_submission"] = {"issue_id": issue_id, "attempt_id": attempt_id,
+            "groups": [{"outcome": "created_kanban_backlog_task", "kanban_task_id": "fixture-task"}]}
+    (directory / "attempt.json").write_text(json.dumps(attempt))
+    (directory / "result.json").write_text(json.dumps(result))
+    return directory
+
+
 def bind_scope_to_parent_evidence(
     run_dir: Path,
     repo: Path,
@@ -305,8 +331,6 @@ def test_writes_completion_gated_candidate_evidence_for_current_content(tmp_path
         evidence["subject"]["candidate_content_manifest_sha256"]
     )
     assert evidence["receipts"] == {
-        "bootstrap_path": None,
-        "bootstrap_sha256": None,
         "parent_evidence_path": None,
         "parent_evidence_sha256": None,
         "integration_candidate_path": None,
@@ -329,6 +353,37 @@ def test_writes_completion_gated_candidate_evidence_for_current_content(tmp_path
     )
     assert json.loads(reused.stdout)["status"] == "reused"
     assert not (evidence_path.parent / "immutable").exists()
+
+
+def test_unabsorbed_base_evidence_is_accepted_by_installed_handback_consumer(tmp_path: Path) -> None:
+    consumer = Path(os.environ.get("RVF_TEST_HAND_BACK_CONSUMER_SCRIPT", str(Path.home() / ".codex/skills/base-branch-sync/scripts/base-branch-sync-evidence-aware-optimistic-handback.py")))
+    if not consumer.is_file():
+        pytest.skip("本机未安装跨仓 handback consumer")
+    repo = repository(tmp_path / "repo")
+    common_ancestor = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "--detach", "-q")
+    (repo / "tracked.txt").write_text("reviewed task implementation\n")
+    git(repo, "add", "tracked.txt")
+    git(repo, "commit", "-qm", "test: 任务候选")
+    base_tip = git(repo, "commit-tree", git(repo, "rev-parse", f"{common_ancestor}^{{tree}}"),
+                   "-p", common_ancestor, "-m", "test: base 前移")
+    git(repo, "update-ref", "refs/heads/main", base_tip)
+    run_dir = create_completed_run(tmp_path, repo)
+    contract_path = run_dir / "artifacts/inputs/scope.contract.json"
+    contract = json.loads(contract_path.read_text())
+    for target in (contract, contract["canonical_scope"]):
+        target["comparison_base_tip"] = common_ancestor
+        target["reviewed_base_tip"] = common_ancestor
+    contract["scope_hash"] = hashlib.sha256(canonical_bytes(contract["canonical_scope"])).hexdigest()
+    contract_path.write_bytes(canonical_bytes(contract))
+    written = subprocess.run([sys.executable, str(WRITE_CANDIDATE_EVIDENCE), "--repo", str(repo), "--run-dir", str(run_dir)],
+                             env=clean_test_environment(), capture_output=True, text=True)
+    assert written.returncode == 0, written.stderr
+    inspected = subprocess.run([sys.executable, str(consumer), "inspect-reviewed-candidate-evidence", "--task-worktree", str(repo)],
+                               env=clean_test_environment(), capture_output=True, text=True)
+    assert inspected.returncode == 0, inspected.stdout + inspected.stderr
+    assert "VERIFIED" in inspected.stdout
+    assert git(repo, "rev-parse", "main") == base_tip
 
 
 def test_refuses_evidence_when_completion_or_validation_gate_is_not_satisfied(tmp_path: Path) -> None:
@@ -420,6 +475,7 @@ def test_uses_handoff_canonical_issue_count_instead_of_raw_reviewer_issue_count(
         "## Issue 处理结果\n\n- **[fixed]** `tracked.txt:1` - canonical issue\n",
         encoding="utf-8",
     )
+    record_terminal_fix_attempt(run_dir, "RVF-001")
     completed = subprocess.run(
         [sys.executable, str(WRITE_CANDIDATE_EVIDENCE), "--repo", str(repo), "--run-dir", str(run_dir)],
         capture_output=True,
@@ -465,6 +521,8 @@ def test_issues_submitted_to_kanban_backlog_count_as_completed_outcomes(tmp_path
         "## Issue 处理结果\n\n- **[fixed]** `tracked.txt:1` - in-round\n"
     )
     handoff.write_text(body, encoding="utf-8")
+    record_terminal_fix_attempt(run_dir, "RVF-001")
+    record_terminal_fix_attempt(run_dir, "RVF-002", status="validated_and_submitted_to_kanban_backlog")
     refused = subprocess.run(
         [sys.executable, str(WRITE_CANDIDATE_EVIDENCE), "--repo", str(repo), "--run-dir", str(run_dir)],
         capture_output=True,
@@ -577,61 +635,6 @@ def test_refuses_dirty_tracked_or_untracked_content_without_overwriting_current_
     assert evidence_path.read_bytes() == original_evidence
 
 
-def test_binds_bootstrap_receipt_only_from_the_task_git_directory(tmp_path: Path) -> None:
-    repo = repository(tmp_path / "repo")
-    run_dir = create_completed_run(tmp_path, repo)
-    git_dir = Path(git(repo, "rev-parse", "--absolute-git-dir"))
-    common_dir = Path(
-        git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
-    ).resolve()
-    head = git(repo, "rev-parse", "HEAD")
-    receipt_path = (
-        git_dir
-        / "base-branch-sync"
-        / "local-base-into-task-worktree-bootstrap-receipt.json"
-    )
-    receipt_path.parent.mkdir(parents=True)
-    receipt = {
-        "schema_name": "local-base-into-task-worktree-bootstrap-receipt",
-        "schema_version": 1,
-        "absorbed_base_tip": head,
-        "base_ref": "main",
-        "remote_name": "origin",
-        "task_tip_before_base_absorption": head,
-        "task_tip_after_base_absorption": head,
-        "git_common_directory_realpath": str(common_dir),
-        "task_worktree_realpath": str(repo.resolve()),
-        "boundary_status": "VERIFIED",
-        "lock_status": "RELEASED",
-        "target_repository_hooks_status": "DISABLED",
-        "wip_status": "NOT_REQUIRED_TASK_WORKTREE_CLEAN",
-    }
-    receipt_encoded = canonical_bytes(receipt)
-    receipt_path.write_bytes(receipt_encoded)
-    receipt_digest = hashlib.sha256(receipt_encoded).hexdigest()
-    Path(f"{receipt_path}.sha256").write_text(receipt_digest + "\n", encoding="ascii")
-    contract_path = run_dir / "artifacts/inputs/scope.contract.json"
-    contract = json.loads(contract_path.read_text(encoding="utf-8"))
-    updates = {
-        "bootstrap_receipt_path": str(receipt_path),
-        "bootstrap_receipt_digest": receipt_digest,
-    }
-    contract.update(updates)
-    contract["canonical_scope"].update(updates)
-    contract["scope_hash"] = hashlib.sha256(
-        canonical_bytes(contract["canonical_scope"])
-    ).hexdigest()
-    contract_path.write_bytes(canonical_bytes(contract))
-
-    completed = subprocess.run(
-        [sys.executable, str(WRITE_CANDIDATE_EVIDENCE), "--repo", str(repo), "--run-dir", str(run_dir)],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    evidence = json.loads(Path(json.loads(completed.stdout)["candidate_evidence_path"]).read_text())
-    assert evidence["receipts"]["bootstrap_path"] == str(receipt_path)
-    assert evidence["receipts"]["bootstrap_sha256"] == receipt_digest
 
 
 def test_non_opt_in_scope_is_skipped_only_in_explicit_if_eligible_mode(tmp_path: Path) -> None:
@@ -740,11 +743,8 @@ def test_refuses_opted_in_scope_with_missing_base_identity_before_writing(
 
 
 # ===========================================================================
-# K3（bootstrap receipt 换单调祖先性）与 K5（land 后 restamp + 落地 delta 收敛）
-#
-# **这一族全部带防恒等构造守卫。** 本文件既有的 9 个用例把四个 tip 与 `subject.head_oid` 构造成
-# 同一个 HEAD、全程不新建提交，于是唯一有区分度的断言结构性不可达——15 个 contract test 全绿，
-# 证明的只是「两个恒等值相等」。下面每条都先 `assert 两值不等` 再断言行为。
+# 单调祖先关系、land 后 restamp 与落地 delta 收敛。
+# 用不同提交构造各个 tip，先断言它们不相等，再验证行为。
 # ===========================================================================
 
 
@@ -760,34 +760,6 @@ def advance_local_base(repo: Path) -> str:
     return advanced
 
 
-def write_bootstrap_receipt(repo: Path, **overrides: object) -> tuple[Path, str]:
-    git_dir = Path(git(repo, "rev-parse", "--absolute-git-dir"))
-    common_dir = Path(
-        git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
-    ).resolve()
-    head = git(repo, "rev-parse", "HEAD")
-    receipt: dict[str, object] = {
-        "schema_name": "local-base-into-task-worktree-bootstrap-receipt",
-        "schema_version": 1,
-        "base_ref": "main",
-        "remote_name": "origin",
-        "absorbed_base_tip": git(repo, "rev-parse", "main"),
-        "task_tip_after_base_absorption": head,
-        "git_common_directory_realpath": str(common_dir),
-        "task_worktree_realpath": str(repo.resolve()),
-        "boundary_status": "VERIFIED",
-        "lock_status": "RELEASED",
-        "target_repository_hooks_status": "DISABLED",
-        "wip_status": "RESTORED_AND_DROPPED",
-    }
-    receipt.update(overrides)
-    path = git_dir / "base-branch-sync" / "local-base-into-task-worktree-bootstrap-receipt.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    encoded = canonical_bytes(receipt)
-    path.write_bytes(encoded)
-    digest = hashlib.sha256(encoded).hexdigest()
-    Path(f"{path}.sha256").write_text(digest + "\n", encoding="ascii")
-    return path, digest
 
 
 def rewrite_contract(run_dir: Path, **updates: object) -> dict[str, object]:
@@ -811,6 +783,98 @@ def run_writer(repo: Path, run_dir: Path) -> subprocess.CompletedProcess[str]:
         text=True,
         check=False,
     )
+
+
+@pytest.mark.parametrize("land_subcommand", ["check-evidence", "commit"])
+@pytest.mark.parametrize("index_state", ["unstaged", "partially_staged"])
+def test_same_run_content_change_refuses_before_staging_and_preserves_formal_evidence(
+    tmp_path: Path, land_subcommand: str, index_state: str
+) -> None:
+    from test_rvf_land_single_step_prepare_and_commit import commit, prepare, record_validation, run_land
+
+    repo = repository(tmp_path / "repo")
+    run_dir = create_completed_run(tmp_path, repo)
+    written = run_writer(repo, run_dir)
+    assert written.returncode == 0, written.stdout + written.stderr
+    evidence_path = Path(json.loads(written.stdout)["candidate_evidence_path"])
+    original_evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    contract_path = run_dir / "artifacts/inputs/scope.contract.json"
+    assert git(repo, "rev-parse", "HEAD") == json.loads(contract_path.read_text())["candidate_task_tip"]
+
+    if index_state == "partially_staged":
+        (repo / "tracked.txt").write_text("staged replacement\n", encoding="utf-8")
+        git(repo, "add", "tracked.txt")
+    (repo / "tracked.txt").write_text("changed after formal evidence\n", encoding="utf-8")
+    validation = record_validation(
+        tmp_path, repo, run_dir, "targeted-contract-tests", sys.executable, "-c", "print('passed')"
+    )
+    assert validation.returncode == 0, validation.stdout + validation.stderr
+    current_validation = json.loads((run_dir / "artifacts/validation-records.json").read_text())
+    assert current_validation["validation_records"][0]["candidate_content_manifest_sha256"] != (
+        original_evidence["subject"]["candidate_content_manifest_sha256"]
+    )
+    prepared = prepare(tmp_path, repo, run_dir)
+    assert prepared.returncode == 0, prepared.stdout + prepared.stderr
+    index_path = Path(git(repo, "rev-parse", "--absolute-git-dir")) / "index"
+
+    def source_control_and_formal_artifact_snapshot() -> dict[str, object]:
+        return {
+            "HEAD": git(repo, "rev-parse", "HEAD"),
+            "index": index_path.read_bytes(),
+            "worktree": (repo / "tracked.txt").read_bytes(),
+            "contract": contract_path.read_bytes(),
+            "evidence": evidence_path.read_bytes(),
+            "evidence_digest": Path(f"{evidence_path}.sha256").read_bytes(),
+        }
+
+    before = source_control_and_formal_artifact_snapshot()
+    refused = (
+        run_land(tmp_path, repo, "check-evidence", "--repo", str(repo), "--run-dir", str(run_dir))
+        if land_subcommand == "check-evidence"
+        else commit(tmp_path, repo, run_dir)
+    )
+    assert refused.returncode == 28, refused.stdout + refused.stderr
+    assert "same-run candidate content changed after evidence" in refused.stdout + refused.stderr
+    assert source_control_and_formal_artifact_snapshot() == before
+    assert not (contract_path.parent / "scope.contract.reviewed.json").exists()
+    assert not (evidence_path.parent / "immutable").exists()
+
+
+def test_same_run_restored_content_reuses_existing_formal_evidence(tmp_path: Path) -> None:
+    from test_rvf_land_single_step_prepare_and_commit import commit, prepare, record_validation, run_land
+
+    repo = repository(tmp_path / "repo")
+    run_dir = create_completed_run(tmp_path, repo)
+    written = run_writer(repo, run_dir)
+    assert written.returncode == 0, written.stdout + written.stderr
+    evidence_path = Path(json.loads(written.stdout)["candidate_evidence_path"])
+    original_evidence = evidence_path.read_bytes()
+    original_digest = Path(f"{evidence_path}.sha256").read_bytes()
+    contract_path = run_dir / "artifacts/inputs/scope.contract.json"
+    original_contract = contract_path.read_bytes()
+    original_head = git(repo, "rev-parse", "HEAD")
+    (repo / "tracked.txt").write_text("temporary replacement\n", encoding="utf-8")
+    git(repo, "add", "tracked.txt")
+    git(repo, "restore", "--source=HEAD", "--staged", "--worktree", "tracked.txt")
+    validation = record_validation(
+        tmp_path, repo, run_dir, "targeted-contract-tests", sys.executable, "-c", "print('passed')"
+    )
+    assert validation.returncode == 0, validation.stdout + validation.stderr
+    checked = run_land(tmp_path, repo, "check-evidence", "--repo", str(repo), "--run-dir", str(run_dir))
+    assert checked.returncode == 0, checked.stdout + checked.stderr
+    assert json.loads(checked.stdout)["status"] == "eligible"
+    prepared = prepare(tmp_path, repo, run_dir)
+    assert prepared.returncode == 0, prepared.stdout + prepared.stderr
+    recovered = commit(tmp_path, repo, run_dir)
+    assert recovered.returncode == 0, recovered.stdout + recovered.stderr
+    result = json.loads(recovered.stdout)
+    assert result["status"] == "nothing_to_commit"
+    assert result["candidate_evidence"]["status"] == "reused"
+    assert git(repo, "rev-parse", "HEAD") == original_head
+    assert contract_path.read_bytes() == original_contract
+    assert evidence_path.read_bytes() == original_evidence
+    assert Path(f"{evidence_path}.sha256").read_bytes() == original_digest
+    assert not (evidence_path.parent / "immutable").exists()
 
 
 def opted_in_repo_with_land_commit(
@@ -841,126 +905,12 @@ def opted_in_repo_with_land_commit(
     return repo, run_dir, prepare_time_head, post_land_head
 
 
-def test_base_drift_after_prepare_no_longer_blocks_evidence(tmp_path: Path) -> None:
-    """K3 核心回归：prepare 之后 local base 前移过一次，仍必须写得出 evidence。"""
-    repo, run_dir, prepare_time_head, _post_land_head = opted_in_repo_with_land_commit(tmp_path)
-    reviewed_base_tip = git(repo, "rev-parse", "main")
-
-    advanced_base_tip = advance_local_base(repo)
-    assert reviewed_base_tip != advanced_base_tip  # 防恒等守卫：base 必须真的动过
-
-    receipt_path, live_digest = write_bootstrap_receipt(
-        repo, absorbed_base_tip=advanced_base_tip, task_tip_after_base_absorption=prepare_time_head
-    )
-    stale_contract_digest = "0" * 64
-    assert live_digest != stale_contract_digest  # 防恒等守卫：冻结值必须真的对不上活文件
-    rewrite_contract(
-        run_dir,
-        reviewed_base_tip=reviewed_base_tip,
-        comparison_base_tip=reviewed_base_tip,
-        reviewed_task_tip=prepare_time_head,
-        candidate_task_tip=prepare_time_head,
-        bootstrap_receipt_path=str(receipt_path),
-        bootstrap_receipt_digest=stale_contract_digest,
-    )
-
-    completed = run_writer(repo, run_dir)
-    assert completed.returncode == 0, completed.stderr
-    evidence = json.loads(
-        Path(json.loads(completed.stdout)["candidate_evidence_path"]).read_text(encoding="utf-8")
-    )
-    # 写进 evidence 的 digest 必须是**活文件现算值**，否则下游重算对不上。
-    assert evidence["receipts"]["bootstrap_sha256"] == live_digest
 
 
-def test_reviewed_base_that_does_not_precede_the_absorbed_base_is_refused(tmp_path: Path) -> None:
-    """祖先性方向不能写反：absorbed base 必须是 reviewed base 的后代，不是反过来。"""
-    repo, run_dir, prepare_time_head, _post = opted_in_repo_with_land_commit(tmp_path)
-    older_base_tip = git(repo, "rev-parse", "main")
-    newer_base_tip = advance_local_base(repo)
-    assert older_base_tip != newer_base_tip
-
-    # 故意反向：receipt 说吸收了**旧** base，contract 说审的是**新** base。
-    receipt_path, _digest = write_bootstrap_receipt(
-        repo, absorbed_base_tip=older_base_tip, task_tip_after_base_absorption=prepare_time_head
-    )
-    rewrite_contract(
-        run_dir,
-        reviewed_base_tip=newer_base_tip,
-        comparison_base_tip=older_base_tip,
-        reviewed_task_tip=prepare_time_head,
-        candidate_task_tip=prepare_time_head,
-        bootstrap_receipt_path=str(receipt_path),
-        bootstrap_receipt_digest="0" * 64,
-    )
-
-    completed = run_writer(repo, run_dir)
-    assert completed.returncode != 0
-    assert "absorbed base does not descend from the reviewed base" in completed.stderr
 
 
-def test_task_rewound_behind_the_bootstrap_receipt_is_refused(tmp_path: Path) -> None:
-    repo, run_dir, prepare_time_head, post_land_head = opted_in_repo_with_land_commit(tmp_path)
-    reviewed_base_tip = git(repo, "rev-parse", "main")
-    unreachable_tip = git(
-        repo,
-        "commit-tree",
-        git(repo, "rev-parse", f"{post_land_head}^{{tree}}"),
-        "-p",
-        post_land_head,
-        "-m",
-        "a tip the task was rewound away from",
-    )
-    assert unreachable_tip != post_land_head
-
-    receipt_path, _digest = write_bootstrap_receipt(
-        repo,
-        absorbed_base_tip=reviewed_base_tip,
-        task_tip_after_base_absorption=unreachable_tip,
-    )
-    rewrite_contract(
-        run_dir,
-        reviewed_base_tip=reviewed_base_tip,
-        comparison_base_tip=reviewed_base_tip,
-        reviewed_task_tip=prepare_time_head,
-        candidate_task_tip=prepare_time_head,
-        bootstrap_receipt_path=str(receipt_path),
-        bootstrap_receipt_digest="0" * 64,
-    )
-
-    completed = run_writer(repo, run_dir)
-    assert completed.returncode != 0
-    assert "does not descend from the bootstrap receipt" in completed.stderr
 
 
-def test_bootstrap_receipt_bound_to_another_worktree_is_refused(tmp_path: Path) -> None:
-    """receipt 指向别的 worktree 必须拦。改内容后**必须重算 digest 并重写 sidecar**，
-
-    否则测到的是 sidecar 自洽那一层，而不是 subject binding 那一层。
-    """
-    repo, run_dir, prepare_time_head, _post = opted_in_repo_with_land_commit(tmp_path)
-    reviewed_base_tip = git(repo, "rev-parse", "main")
-    receipt_path, honest_digest = write_bootstrap_receipt(
-        repo,
-        absorbed_base_tip=reviewed_base_tip,
-        task_tip_after_base_absorption=prepare_time_head,
-        task_worktree_realpath="/somewhere/else",
-    )
-    # 防恒等守卫：sidecar 必须与被改过的内容自洽，才能确保第一层放行、第二层判罪。
-    assert Path(f"{receipt_path}.sha256").read_text().strip() == honest_digest
-    rewrite_contract(
-        run_dir,
-        reviewed_base_tip=reviewed_base_tip,
-        comparison_base_tip=reviewed_base_tip,
-        reviewed_task_tip=prepare_time_head,
-        candidate_task_tip=prepare_time_head,
-        bootstrap_receipt_path=str(receipt_path),
-        bootstrap_receipt_digest=honest_digest,
-    )
-
-    completed = run_writer(repo, run_dir)
-    assert completed.returncode != 0
-    assert "bootstrap receipt subject does not match the reviewed candidate" in completed.stderr
 
 
 def test_land_commit_restamps_the_contract_and_records_landing_provenance(tmp_path: Path) -> None:

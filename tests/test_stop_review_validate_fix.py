@@ -15,7 +15,10 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
+from independent_review_start_boundary_fixture import fixed_git_coordinates_for_review_start_boundary_unit_test
 
 from _rvf_test_support.repo import templated_repo
 from _rvf_test_support.compact_path_tree_assertions import paths_from_compact_path_tree_blocks
@@ -261,6 +264,7 @@ def invoke(
     if state_dir is None:
         state_dir = Path(tempfile.mkdtemp(prefix="rvf-test-stop-hook-state-"))
     env["RVF_HOME"] = str(state_dir / "rvf-home")
+    env["RVF_USER_LOCAL_DATA_ROOT"] = str(state_dir / "user-local-data")
     env["CODEX_RVF_STATE_DIR"] = str(state_dir)
     env["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(state_dir / "kanban-followup-in-progress")
     if extra_env is not None:
@@ -272,6 +276,19 @@ def invoke(
     # 默认把 terminal-notifier 指向无副作用的假 notifier，确保没有测试会在真机弹出
     # 真实 OS 通知；需要断言通知行为的测试自行传入 RVF_TERMINAL_NOTIFIER_BIN。
     env.setdefault("RVF_TERMINAL_NOTIFIER_BIN", str(_DEFAULT_FAKE_NOTIFIER))
+    # 旧续跑 transport 的正向测试已有接受阶段；为新门禁构造独立消息/Git 前置证明。
+    # 新发起与缺证据反例在专用分界套件直接运行生产入口，不走此夹具。
+    if env.get("CODEX_RVF_FORK_MODE") == "kanban-followup" and event.get("cwd"):
+        from independent_review_start_boundary_fixture import environment_with_synthetic_independent_review_start_boundary
+        candidate_repo = Path(str(event["cwd"]))
+        if candidate_repo.is_dir():
+            root_probe = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=candidate_repo, capture_output=True, text=True)
+            if root_probe.returncode == 0:
+                candidate_repo = Path(root_probe.stdout.strip())
+        has_head = subprocess.run(["git", "rev-parse", "--verify", "HEAD"], cwd=candidate_repo, capture_output=True).returncode == 0 if candidate_repo.is_dir() else False
+        if has_head:
+            env = environment_with_synthetic_independent_review_start_boundary(repo=candidate_repo, environment=env,
+                session_id=str(event.get("session_id") or "synthetic-native-session"), preserve_runtime_state_root=True)
     completed = subprocess.run(
         [sys.executable, str(SCRIPT)],
         input=json.dumps(event),
@@ -439,6 +456,14 @@ def load_hook_module():
     assert spec.loader is not None
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    # 保留旧后端/状态测试的职责；真实 gate 与子进程绕过面由专用集成套件验证。
+    import types
+    from independent_review_start_boundary_fixture import run_subprocess_with_independent_review_start_boundary
+    module.require_review_start_boundary_for_prepare = lambda **kw: fixed_git_coordinates_for_review_start_boundary_unit_test(kw["repo"], test_scope="stop-routing-unit")
+    module.bind_review_start_boundary_to_one_run = lambda **kw: (kw["run_id"], Path(kw["run_dir"]) if kw["run_dir"] is not None else None)
+    module.subprocess = types.SimpleNamespace(**vars(subprocess))
+    module.subprocess.run = run_subprocess_with_independent_review_start_boundary
+    appserver.subprocess = module.subprocess
     return module
 
 
@@ -491,6 +516,7 @@ def seed_finalize_run_dir(
     state: Path,
     repo: Path,
     run_id: str = "rvf-child",
+    session_id: str | None = None,
 ) -> tuple[Path, Path]:
     run_dir = state / "runs" / run_id
     artifacts = run_dir / "artifacts"
@@ -501,6 +527,7 @@ def seed_finalize_run_dir(
         json.dumps(
             {
                 "run_id": run_id,
+                "session_id": session_id,
                 "status": "started",
                 "reason_code": "test",
                 "repo": str(repo),
@@ -2850,7 +2877,385 @@ def test_kanban_task_workspace_mismatch_uses_task_lookup_without_workspace_env(t
     assert [call["argv"][0] for call in calls] == ["list"]
 
 
-def test_fork_experiment_missing_desktop_control_prepares_manual_not_continuation(
+@contextmanager
+def _isolated_workspace_guard_lookup(tmp_path: Path):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    isolated_environment = {
+        key: value for key, value in os.environ.items()
+        if not key.startswith(("CODEX_RVF_", "RVF_", "KANBAN_", "CLINE_KANBAN_"))
+    }
+    home = tmp_path / "isolated-home"
+    home.mkdir()
+    fake_client = tmp_path / "workspace-lookup-fake-client.py"
+    fake_client.write_text(
+        "import os, pathlib, sys\n"
+        "root = pathlib.Path(os.environ['WORKSPACE_LOOKUP_TEST_ROOT'])\n"
+        "assert sys.argv[1] == 'list', sys.argv\n"
+        "with (root / 'list-client-calls.txt').open('a') as handle: handle.write('list\\n')\n"
+        "if os.environ.get('WORKSPACE_LOOKUP_REPLACE_STATE'):\n"
+        "    (root / 'kanban-state/workspaces/project/sessions.json').write_bytes((root / 'replacement-sessions.json').read_bytes())\n"
+        "sys.stdout.buffer.write((root / 'list-response.json').read_bytes())\n"
+        "sys.stderr.write(os.environ.get('WORKSPACE_LOOKUP_LIST_STDERR', ''))\n"
+        "sys.exit(int(os.environ.get('WORKSPACE_LOOKUP_LIST_RETURNCODE', '0')))\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "list-response.json").write_text('{"ok": true, "tasks": []}', encoding="utf-8")
+    isolated_environment.update({
+        "HOME": str(home),
+        "RVF_HOME": str(tmp_path / "rvf-home"),
+        "RVF_USER_LOCAL_DATA_ROOT": str(tmp_path / "rvf-user-local-data"),
+        "CODEX_RVF_CLINE_KANBAN_STATE_DIR": str(tmp_path / "kanban-state"),
+        "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
+        "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "isolated fake task",
+        "KANBAN_TASK_ID": "workspace-guard-task",
+        "WORKSPACE_LOOKUP_TEST_ROOT": str(tmp_path),
+    })
+    with patch.dict(os.environ, isolated_environment, clear=True):
+        module = load_hook_module()
+        ledger = _make_test_ledger(module, tmp_path / "run-logs")
+        yield module, ledger
+
+
+def _write_workspace_guard_sessions(tmp_path: Path, workspace: Path, *, project: str = "project") -> Path:
+    sessions_path = tmp_path / "kanban-state" / "workspaces" / project / "sessions.json"
+    sessions_path.parent.mkdir(parents=True, exist_ok=True)
+    sessions_path.write_text(json.dumps({"session": {"taskId": "workspace-guard-task", "workspacePath": str(workspace)}}, ensure_ascii=False), encoding="utf-8")
+    return sessions_path
+
+
+def _lookup_workspace_guard(module, ledger, cwd_git_root: Path) -> dict:
+    return module.lookup_cline_kanban_task_workspace(
+        task_id="workspace-guard-task", project_path=str(cwd_git_root),
+        cwd_git_root=cwd_git_root, ledger=ledger,
+    )
+
+
+def test_workspace_guard_unique_state_workspace_skips_list_and_rechecks_final_guard(tmp_path: Path) -> None:
+    with _isolated_workspace_guard_lookup(tmp_path) as (module, ledger):
+        workspace = init_repo(tmp_path / "task-workspace", dirty=True)
+        nested_cwd = workspace / "nested-cwd"
+        nested_cwd.mkdir()
+        _write_workspace_guard_sessions(tmp_path, workspace)
+        assert module.kanban_task_workspace_guard_payload(event={}, cwd=str(nested_cwd), ledger=ledger) is None
+        events = _read_ledger_events(ledger)
+        assert events[-1]["event"] == "kanban_task_workspace_guard_matched"
+        lookup = events[-1]["workspace_lookup"]
+        assert lookup["source"] == "kanban_state_session_workspace"
+        assert lookup["task_list_lookup"]["invoked"] is False
+        assert lookup["fallback_reason"] is None
+        assert not (tmp_path / "list-client-calls.txt").exists()
+        artifact = json.loads(Path(lookup["artifact"]).read_text())
+        assert artifact["workspace_path"] == str(workspace.resolve())
+        assert artifact["state_lookup"]["state_scan_metrics"]["files_read"] == 1
+
+
+def test_workspace_guard_duplicate_same_resolved_workspace_is_unique(tmp_path: Path) -> None:
+    with _isolated_workspace_guard_lookup(tmp_path) as (module, ledger):
+        workspace = init_repo(tmp_path / "task-workspace", dirty=False)
+        alias = tmp_path / "workspace-symlink"
+        alias.symlink_to(workspace, target_is_directory=True)
+        _write_workspace_guard_sessions(tmp_path, workspace)
+        _write_workspace_guard_sessions(tmp_path, alias, project="other-project")
+        lookup = _lookup_workspace_guard(module, ledger, workspace)
+        assert len(lookup["matches"]) == 1
+        assert lookup["task_list_lookup"]["invoked"] is False
+
+
+def test_workspace_guard_direct_workspace_env_precedes_state_and_list(tmp_path: Path) -> None:
+    with _isolated_workspace_guard_lookup(tmp_path) as (module, ledger):
+        workspace = init_repo(tmp_path / "task-workspace", dirty=False)
+        os.environ["KANBAN_TASK_WORKSPACE_PATH"] = str(workspace)
+        with patch.object(module, "lookup_kanban_task_workspace_from_state", side_effect=AssertionError("direct env 不应扫描 state")):
+            assert _lookup_workspace_guard(module, ledger, workspace) == {
+                "workspace_path": str(workspace), "source": "kanban_workspace_env",
+            }
+        assert not (tmp_path / "list-client-calls.txt").exists()
+
+
+def test_workspace_guard_state_path_probe_errors_fall_back_and_preserve_mismatch(tmp_path: Path) -> None:
+    for shape in ("workspace-symlink-loop", "dangling-workspace-symlink", "dangling-sessions-symlink", "sessions-symlink-loop"):
+        case = tmp_path / shape
+        with _isolated_workspace_guard_lookup(case) as (module, ledger):
+            unrelated_workspace = init_repo(case / "unrelated-dirty-workspace", dirty=True)
+            task_workspace = init_repo(case / "task-workspace", dirty=False)
+            _write_workspace_guard_sessions(case, unrelated_workspace)
+            invalid_project_directory = case / "kanban-state/workspaces/invalid-project"
+            if shape == "workspace-symlink-loop":
+                invalid_project_directory.symlink_to(invalid_project_directory, target_is_directory=True)
+            elif shape == "dangling-workspace-symlink":
+                invalid_project_directory.symlink_to(case / "missing-project", target_is_directory=True)
+            else:
+                invalid_project_directory.mkdir()
+                invalid_sessions_path = invalid_project_directory / "sessions.json"
+                invalid_sessions_path.symlink_to(
+                    invalid_sessions_path if shape == "sessions-symlink-loop" else case / "missing-sessions.json"
+                )
+            (case / "list-response.json").write_text(json.dumps({
+                "tasks": [{"id": "workspace-guard-task", "workspacePath": str(task_workspace)}],
+            }))
+            state_lookup = module.lookup_kanban_task_workspace_from_state(
+                task_id="workspace-guard-task", project_path=str(unrelated_workspace),
+            )
+            assert state_lookup["errors"], (shape, state_lookup)
+            assert state_lookup["state_scan_metrics"]["files_read"] == 1
+            payload = module.kanban_task_workspace_guard_payload(event={}, cwd=str(unrelated_workspace), ledger=ledger)
+            assert payload["continue"] is True
+            assert "decision" not in payload
+            assert "kanban_task_workspace_mismatch" in payload["systemMessage"], shape
+            assert (case / "list-client-calls.txt").read_text().splitlines() == ["list"]
+
+
+def test_workspace_guard_state_projects_without_sessions_remain_complete(tmp_path: Path) -> None:
+    with _isolated_workspace_guard_lookup(tmp_path) as (module, ledger):
+        workspace = init_repo(tmp_path / "task-workspace", dirty=False)
+        _write_workspace_guard_sessions(tmp_path, workspace)
+        (tmp_path / "kanban-state/workspaces/project-without-sessions").mkdir()
+        (tmp_path / "kanban-state/workspaces/ordinary-file").write_text("普通文件")
+        lookup = _lookup_workspace_guard(module, ledger, workspace)
+        assert lookup["errors"] == []
+        assert lookup["state_scan_metrics"]["files_read"] == 1
+        assert lookup["task_list_lookup"]["invoked"] is False
+        assert not (tmp_path / "list-client-calls.txt").exists()
+
+
+def test_workspace_guard_unsafe_state_shapes_fall_back_to_list(tmp_path: Path) -> None:
+    for shape in ("missing-state", "missing-task", "ambiguous", "malformed", "non-object", "invalid-utf8", "missing-directory", "not-git", "cwd-mismatch", "read-error", "disappeared-state-file", "enumeration-error", "symlink-loop"):
+        case = tmp_path / shape
+        with _isolated_workspace_guard_lookup(case) as (module, ledger):
+            workspace = init_repo(case / "task-workspace", dirty=False)
+            sessions_path = _write_workspace_guard_sessions(case, workspace)
+            if shape == "missing-state":
+                shutil.rmtree(case / "kanban-state")
+            elif shape == "missing-task":
+                sessions_path.write_text('{"session": {"taskId": "another-task"}}')
+            elif shape == "ambiguous":
+                _write_workspace_guard_sessions(case, init_repo(case / "another-workspace", dirty=False), project="other-project")
+            elif shape in ("malformed", "non-object", "invalid-utf8"):
+                malformed = _write_workspace_guard_sessions(case, workspace, project="other-project")
+                malformed.write_bytes({"malformed": b"{", "non-object": b"[]", "invalid-utf8": b"\xff"}[shape])
+            elif shape in ("missing-directory", "not-git", "cwd-mismatch", "symlink-loop"):
+                candidate = case / "invalid-workspace"
+                if shape == "not-git":
+                    candidate.mkdir()
+                elif shape == "cwd-mismatch":
+                    init_repo(candidate, dirty=False)
+                elif shape == "symlink-loop":
+                    candidate.symlink_to(candidate)
+                _write_workspace_guard_sessions(case, candidate)
+            (case / "list-response.json").write_text(json.dumps({"tasks": [{"id": "workspace-guard-task", "workspacePath": str(workspace)}]}))
+            read_bytes = Path.read_bytes
+            iterdir = Path.iterdir
+            def guarded_read(path):
+                if shape == "read-error" and path == sessions_path:
+                    raise PermissionError("隔离读取失败")
+                if shape == "disappeared-state-file" and path == sessions_path:
+                    raise FileNotFoundError("已发现的 sessions 文件在读取前消失")
+                return read_bytes(path)
+            def guarded_enumeration(path):
+                if shape == "enumeration-error" and path == case / "kanban-state/workspaces":
+                    raise PermissionError("隔离枚举失败")
+                return iterdir(path)
+            with patch.object(Path, "read_bytes", guarded_read), patch.object(Path, "iterdir", guarded_enumeration):
+                lookup = _lookup_workspace_guard(module, ledger, workspace)
+            assert lookup["source"] == "cline_kanban_task_list_workspace", (shape, lookup)
+            assert lookup["workspace_path"] == str(workspace)
+            assert lookup["fallback_reason"] is not None
+            assert (case / "list-client-calls.txt").read_text().splitlines() == ["list"]
+
+
+def test_workspace_guard_state_scan_reports_actual_utf8_bytes_and_parse_errors(tmp_path: Path) -> None:
+    with _isolated_workspace_guard_lookup(tmp_path) as (module, _ledger):
+        workspace = init_repo(tmp_path / "中文目录", dirty=False)
+        sessions = _write_workspace_guard_sessions(tmp_path, workspace)
+        malformed = _write_workspace_guard_sessions(tmp_path, workspace, project="malformed-project")
+        malformed.write_bytes(b"{")
+        lookup = module.lookup_kanban_task_workspace_from_state(task_id="workspace-guard-task", project_path=str(workspace))
+        assert len(sessions.read_bytes()) > len(sessions.read_text(encoding="utf-8"))
+        assert lookup["state_scan_metrics"]["files_read"] == 2
+        assert lookup["state_scan_metrics"]["bytes_read"] == len(sessions.read_bytes()) + 1
+        assert lookup["state_scan_metrics"]["duration_ms"] >= 0
+        assert len(lookup["errors"]) == 1
+
+
+def test_workspace_guard_json_decoder_resource_errors_fall_back_and_preserve_mismatch(tmp_path: Path) -> None:
+    json_nesting_depth = 10_000
+    decoder_failures = {
+        "oversized-integer": (b'{"value":' + b"9" * 5000 + b"}", "ValueError"),
+        "deep-nesting": (b'{"value":' + b"[" * json_nesting_depth + b"0" + b"]" * json_nesting_depth + b"}", "RecursionError"),
+    }
+    for shape, (invalid_json_bytes, expected_error_type) in decoder_failures.items():
+        case = tmp_path / shape
+        with _isolated_workspace_guard_lookup(case) as (module, ledger):
+            unrelated_workspace = init_repo(case / "中文错误目录", dirty=True)
+            task_workspace = init_repo(case / "task-workspace", dirty=False)
+            valid_sessions = _write_workspace_guard_sessions(case, unrelated_workspace)
+            invalid_sessions = _write_workspace_guard_sessions(case, unrelated_workspace, project="invalid-project")
+            invalid_sessions.write_bytes(invalid_json_bytes)
+            (case / "list-response.json").write_text(json.dumps({
+                "tasks": [{"id": "workspace-guard-task", "workspacePath": str(task_workspace)}],
+            }))
+            state_lookup = module.lookup_kanban_task_workspace_from_state(
+                task_id="workspace-guard-task", project_path=str(unrelated_workspace),
+            )
+            assert len(state_lookup["matches"]) == 1
+            assert any(f"{expected_error_type}:" in error for error in state_lookup["errors"]), state_lookup
+            assert state_lookup["state_scan_metrics"]["files_read"] == 2
+            assert state_lookup["state_scan_metrics"]["bytes_read"] == len(valid_sessions.read_bytes()) + len(invalid_json_bytes)
+            payload = module.kanban_task_workspace_guard_payload(event={}, cwd=str(unrelated_workspace), ledger=ledger)
+            assert payload["continue"] is True
+            assert "decision" not in payload
+            assert "kanban_task_workspace_mismatch" in payload["systemMessage"], shape
+            assert (case / "list-client-calls.txt").read_text().splitlines() == ["list"]
+
+
+def test_workspace_guard_list_fallback_rechecks_state_after_client_failure(tmp_path: Path) -> None:
+    with _isolated_workspace_guard_lookup(tmp_path) as (module, ledger):
+        workspace = init_repo(tmp_path / "task-workspace", dirty=False)
+        original_workspace = init_repo(tmp_path / "old-workspace", dirty=False)
+        sessions = _write_workspace_guard_sessions(tmp_path, original_workspace)
+        (tmp_path / "replacement-sessions.json").write_text(json.dumps({"session": {"taskId": "workspace-guard-task", "workspacePath": str(workspace)}}))
+        os.environ["WORKSPACE_LOOKUP_REPLACE_STATE"] = "1"
+        os.environ["WORKSPACE_LOOKUP_LIST_RETURNCODE"] = "2"
+        os.environ["WORKSPACE_LOOKUP_LIST_STDERR"] = "隔离 client 失败"
+        lookup = _lookup_workspace_guard(module, ledger, workspace)
+        assert lookup["workspace_path"] == str(workspace.resolve())
+        assert lookup["task_list_lookup"]["returncode"] == 2
+        assert lookup["task_list_lookup"]["error"] == "隔离 client 失败"
+        assert "fallback_state_scan_metrics" in json.loads(Path(lookup["artifact"]).read_text())
+        assert str(workspace) in sessions.read_text()
+
+
+def test_workspace_guard_invalid_list_json_preserves_unresolved_verdict(tmp_path: Path) -> None:
+    with _isolated_workspace_guard_lookup(tmp_path) as (module, ledger):
+        workspace = init_repo(tmp_path / "task-workspace", dirty=False)
+        (tmp_path / "list-response.json").write_bytes(b"{")
+        lookup = _lookup_workspace_guard(module, ledger, workspace)
+        assert lookup["source"] == "cline_kanban_workspace_lookup_invalid_json"
+        assert lookup["workspace_path"] is None
+        assert "JSONDecodeError" in lookup["error"]
+
+
+def test_workspace_guard_compact_artifact_and_events_never_copy_list_stdout(tmp_path: Path) -> None:
+    with _isolated_workspace_guard_lookup(tmp_path) as (module, ledger):
+        workspace = init_repo(tmp_path / "task-workspace", dirty=False)
+        stdout = json.dumps({"tasks": [], "unrelated_payload": "正文不得复制" * 100_000}, ensure_ascii=False).encode("utf-8")
+        (tmp_path / "list-response.json").write_bytes(stdout)
+        assert module.kanban_task_workspace_guard_payload(event={}, cwd=str(workspace), ledger=ledger) is None
+        event = _read_ledger_events(ledger)[-1]
+        lookup = event["workspace_lookup"]
+        artifact = Path(lookup["artifact"])
+        assert artifact.stat().st_size < 16_384
+        assert "正文不得复制" not in artifact.read_text()
+        assert "正文不得复制" not in json.dumps(event, ensure_ascii=False)
+        assert lookup["task_list_lookup"]["stdout_bytes"] == len(stdout)
+        assert lookup["task_list_lookup"]["stdout_sha256"] == hashlib.sha256(stdout).hexdigest()
+        assert lookup["task_list_lookup"]["error"] is None
+
+
+def test_workspace_guard_full_stdout_requires_explicit_debug_and_stays_out_of_events(tmp_path: Path) -> None:
+    with _isolated_workspace_guard_lookup(tmp_path) as (module, ledger):
+        workspace = init_repo(tmp_path / "task-workspace", dirty=False)
+        os.environ["CODEX_RVF_CLINE_KANBAN_WORKSPACE_LOOKUP_DEBUG_FULL_STDOUT"] = "1"
+        lookup = _lookup_workspace_guard(module, ledger, workspace)
+        artifact = json.loads(Path(lookup["artifact"]).read_text())
+        assert artifact["stdout"] == (tmp_path / "list-response.json").read_text()
+        assert "stdout" not in lookup["task_list_lookup"]
+
+
+def test_workspace_guard_list_spawn_failure_uses_state_fallback(tmp_path: Path) -> None:
+    with _isolated_workspace_guard_lookup(tmp_path) as (module, ledger):
+        workspace = init_repo(tmp_path / "task-workspace", dirty=False)
+        with patch.object(module.subprocess, "run", side_effect=OSError("隔离启动失败")):
+            lookup = _lookup_workspace_guard(module, ledger, workspace)
+        assert lookup["workspace_path"] is None
+        assert lookup["task_list_lookup"]["returncode"] is None
+        assert "隔离启动失败" in lookup["task_list_lookup"]["error"]
+
+
+def test_workspace_guard_state_mismatch_still_blocks_unrelated_dirty_repo(tmp_path: Path) -> None:
+    with _isolated_workspace_guard_lookup(tmp_path) as (module, ledger):
+        dirty = init_repo(tmp_path / "unrelated-dirty-workspace", dirty=True)
+        task_workspace = init_repo(tmp_path / "task-workspace", dirty=False)
+        _write_workspace_guard_sessions(tmp_path, task_workspace)
+        payload = module.kanban_task_workspace_guard_payload(event={}, cwd=str(dirty), ledger=ledger)
+        assert payload["continue"] is True
+        assert "decision" not in payload
+        assert "kanban_task_workspace_mismatch" in payload["systemMessage"]
+        assert (tmp_path / "list-client-calls.txt").read_text().splitlines() == ["list"]
+
+
+def test_workspace_guard_foreign_project_task_id_collision_preserves_mismatch(tmp_path: Path) -> None:
+    with _isolated_workspace_guard_lookup(tmp_path) as (module, ledger):
+        canonical_project = init_repo_with_head(tmp_path / "canonical-project")
+        task_workspace = tmp_path / "task-worktree"
+        run(["git", "worktree", "add", "--detach", str(task_workspace), "HEAD"], canonical_project)
+        foreign_workspace = init_repo(tmp_path / "foreign-dirty-project", dirty=True)
+        os.environ["KANBAN_PROJECT_PATH"] = str(canonical_project)
+        _write_workspace_guard_sessions(tmp_path, foreign_workspace, project="foreign-project")
+        (tmp_path / "list-response.json").write_text(json.dumps({
+            "tasks": [{"id": "workspace-guard-task", "workspacePath": str(task_workspace)}],
+        }))
+        payload = module.kanban_task_workspace_guard_payload(event={}, cwd=str(foreign_workspace), ledger=ledger)
+        assert payload is not None
+        assert payload["continue"] is True
+        assert "decision" not in payload
+        assert "kanban_task_workspace_mismatch" in payload["systemMessage"]
+        assert (tmp_path / "list-client-calls.txt").read_text().splitlines() == ["list"]
+
+
+def test_workspace_guard_canonical_project_and_linked_task_worktree_skip_list_without_extra_git_queries(tmp_path: Path) -> None:
+    with _isolated_workspace_guard_lookup(tmp_path) as (module, ledger):
+        canonical_project = init_repo_with_head(tmp_path / "canonical-project")
+        task_workspace = tmp_path / "task-worktree"
+        run(["git", "worktree", "add", "--detach", str(task_workspace), "HEAD"], canonical_project)
+        nested_cwd = task_workspace / "nested-cwd"
+        nested_cwd.mkdir()
+        os.environ["KANBAN_PROJECT_PATH"] = str(canonical_project)
+        _write_workspace_guard_sessions(tmp_path, task_workspace)
+        with patch.object(module.subprocess, "run", wraps=subprocess.run) as git_queries:
+            assert module.kanban_task_workspace_guard_payload(event={}, cwd=str(nested_cwd), ledger=ledger) is None
+        event = _read_ledger_events(ledger)[-1]
+        assert event["event"] == "kanban_task_workspace_guard_matched"
+        assert event["workspace_lookup"]["task_list_lookup"]["invoked"] is False
+        assert event["workspace_lookup"]["fallback_reason"] is None
+        assert not (tmp_path / "list-client-calls.txt").exists()
+        assert len([call for call in git_queries.call_args_list if call.args[0][0] == "git"]) <= 3
+
+
+def test_workspace_guard_unverified_project_repository_identity_falls_back_to_list(tmp_path: Path) -> None:
+    for shape in ("missing-project", "non-git-project", "project-git-query-failed", "project-git-spawn-failed"):
+        case = tmp_path / shape
+        with _isolated_workspace_guard_lookup(case) as (module, ledger):
+            workspace = init_repo(case / "task-workspace", dirty=False)
+            project_path = case / "canonical-project"
+            if shape == "non-git-project":
+                project_path.mkdir()
+            elif shape != "missing-project":
+                init_repo(project_path, dirty=False)
+            _write_workspace_guard_sessions(case, workspace)
+            (case / "list-response.json").write_text(json.dumps({
+                "tasks": [{"id": "workspace-guard-task", "workspacePath": str(workspace)}],
+            }))
+            original_run = subprocess.run
+            def guarded_git_query(command, *args, **kwargs):
+                if command[:3] == ["git", "-C", str(project_path)]:
+                    if shape == "project-git-spawn-failed":
+                        raise OSError("隔离项目 Git 启动失败")
+                    if shape == "project-git-query-failed":
+                        return subprocess.CompletedProcess(command, 128, stdout="", stderr="隔离项目 Git 查询失败")
+                return original_run(command, *args, **kwargs)
+            with patch.object(module.subprocess, "run", guarded_git_query):
+                lookup = module.lookup_cline_kanban_task_workspace(
+                    task_id="workspace-guard-task", project_path=str(project_path),
+                    cwd_git_root=workspace, ledger=ledger,
+                )
+            assert lookup["source"] == "cline_kanban_task_list_workspace", (shape, lookup)
+            assert lookup["workspace_path"] == str(workspace)
+            assert lookup["fallback_reason"] is not None
+            assert (case / "list-client-calls.txt").read_text().splitlines() == ["list"]
+
+
+def test_fork_experiment_without_boundary_never_prepares_manual_or_continuation(
     tmp_path: Path,
 ) -> None:
     state = tmp_path / "state"
@@ -2875,12 +3280,11 @@ def test_fork_experiment_missing_desktop_control_prepares_manual_not_continuatio
 
     assert "decision" not in payload
     assert payload["continue"] is True
-    assert "reason=manual_prepared" in payload["systemMessage"]
+    assert "reason=review_start_boundary_pending" in payload["systemMessage"]
     latest = latest_summary(state)
-    assert latest["status"] == "manual-prepared"
-    assert latest["desktop_control_unavailable_fallback"] == "manual"
-    assert latest["socket_selection"]["desktop_control"]["reason"] == "missing"
-    assert latest["socket_selection"]["bridge_policy"] == "report"
+    assert latest["status"] == "skipped"
+    assert "desktop_control_unavailable_fallback" not in latest
+    assert "socket_selection" not in latest
     assert latest["marker"] == "RVF_FORK_EXPERIMENT"
 
 
@@ -3745,6 +4149,36 @@ def test_rvf_land_commit_leaves_next_stop_without_candidates_under_self_derived_
 
     run_dir = tmp_path / "rvf-run"
     (run_dir / "artifacts").mkdir(parents=True)
+    # 本例只验证封窗状态根；提供有效契约但不 opt-in evidence，避免伪造双评审工件。
+    canonical_scope = {
+        "version": 3,
+        "repo": str(repo.resolve()),
+        "scope_mode": "custom",
+        "primary_files": ["f.txt"],
+        "fix_allowlist": ["f.txt"],
+        "task_change_paths": [],
+        "background_files": [],
+        "protected_files": [],
+        "excluded_path_prefixes": [],
+        "review_kind": "implementation",
+        "base_ref": "main",
+        "remote_name": "origin",
+        "comparison_base_tip": None,
+        "reviewed_base_tip": None,
+        "reviewed_task_tip": None,
+        "candidate_task_tip": None,
+    }
+    contract = {
+        **canonical_scope,
+        "run_id": run_dir.name,
+        "canonical_scope": canonical_scope,
+        "scope_hash": hashlib.sha256(
+            json.dumps(canonical_scope, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+    }
+    contract_path = run_dir / "artifacts" / "inputs" / "scope.contract.json"
+    contract_path.parent.mkdir()
+    contract_path.write_text(json.dumps(contract, ensure_ascii=False), encoding="utf-8")
     handoff_path = run_dir / "artifacts" / "handoff.md"
     handoff_path.write_text(
         "# Review-validate-fix 交接上下文\n\n## 状态\n\n"
@@ -3777,13 +4211,14 @@ def test_rvf_land_commit_leaves_next_stop_without_candidates_under_self_derived_
     land_env = {**self_derived_root_env, "RVF_SESSION_ID": session_id}
     rvf_land_script = SCRIPT.with_name("rvf_land.py")
     prepare = subprocess.run(
-        [sys.executable, str(rvf_land_script), "prepare", "--handoff", str(handoff_path), "--repo", str(repo)],
+        [sys.executable, str(rvf_land_script), "prepare", "--handoff", str(handoff_path), "--repo", str(repo), "--format", "json"],
         capture_output=True,
         text=True,
         cwd=repo,
         env=land_env,
     )
     assert prepare.returncode == 0, (prepare.stdout, prepare.stderr)
+    assert json.loads(prepare.stdout)["candidate_evidence_qualification"]["status"] == "skipped_not_applicable"
     commit = subprocess.run(
         [sys.executable, str(rvf_land_script), "commit", "--run-dir", str(run_dir), "--message-file", "-"],
         input="feat: 加一行\n\n验证：\n[[rvf-land-validation-summary]]\n",
@@ -3797,6 +4232,7 @@ def test_rvf_land_commit_leaves_next_stop_without_candidates_under_self_derived_
     assert land_result["status"] == "committed", land_result
     assert land_result["validation"]["mode"] == "reused_run_validation_index_with_zero_execution", land_result
     assert land_result["round_baseline_seal"]["sealed"] is True, land_result
+    assert land_result["candidate_evidence"]["status"] == "skipped_not_applicable", land_result
     landed_head = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True
     ).stdout.strip()
@@ -4224,8 +4660,7 @@ def test_handoff_file_clears_kanban_followup_in_progress_marker(tmp_path: Path) 
     state = tmp_path / "state"
     # cwd 必须是真实 git 仓：锁 key 含仓身份，清锁侧要按同一身份才定位得到这把锁。
     repo = init_repo_with_head(tmp_path / "repo")
-    handoff = tmp_path / "handoff.md"
-    handoff.write_text("# handoff\n", encoding="utf-8")
+    run_dir, handoff = seed_finalize_run_dir(state=state, repo=repo)
     marker_dir = state / "kanban-followup-in-progress"
     marker_dir.mkdir(parents=True)
     marker_path = marker_dir / in_progress_lock_marker_name(
@@ -4240,8 +4675,8 @@ def test_handoff_file_clears_kanban_followup_in_progress_marker(tmp_path: Path) 
                 "expires_at": "2999-01-01T00:00:00Z",
                 "kanban_task_id": "task-active",
                 "session_id": "session-active",
-                "run_id": "rvf-existing",
-                "run_dir": str(tmp_path / "existing-run"),
+                "run_id": run_dir.name,
+                "run_dir": str(run_dir),
             },
             ensure_ascii=False,
             indent=2,
@@ -4364,7 +4799,7 @@ def test_handoff_advisory_surfaces_finalize_record_errors(tmp_path: Path) -> Non
 def test_handoff_advisory_launches_detached_analyze_thread(tmp_path: Path) -> None:
     state = tmp_path / "state"
     repo = init_repo_with_head(tmp_path / "repo")
-    run_dir, handoff = seed_finalize_run_dir(state=state, repo=repo)
+    run_dir, handoff = seed_finalize_run_dir(state=state, repo=repo, session_id="child-session")
     transcript = write_same_session_transcript_with_marker(
         tmp_path / "rollout.jsonl",
         repo,
@@ -4420,7 +4855,7 @@ def test_handoff_advisory_launches_detached_analyze_thread(tmp_path: Path) -> No
 def test_analyze_thread_env_sets_suppress_stop_hook(tmp_path: Path) -> None:
     state = tmp_path / "state"
     repo = init_repo_with_head(tmp_path / "repo")
-    run_dir, handoff = seed_finalize_run_dir(state=state, repo=repo)
+    run_dir, handoff = seed_finalize_run_dir(state=state, repo=repo, session_id="child-session")
     transcript = write_same_session_transcript_with_marker(
         tmp_path / "rollout.jsonl",
         repo,
@@ -4487,7 +4922,7 @@ def test_analyze_thread_self_stop_is_suppressed(tmp_path: Path) -> None:
 def test_analyze_thread_idempotent_when_session_exists(tmp_path: Path) -> None:
     state = tmp_path / "state"
     repo = init_repo_with_head(tmp_path / "repo")
-    run_dir, handoff = seed_finalize_run_dir(state=state, repo=repo)
+    run_dir, handoff = seed_finalize_run_dir(state=state, repo=repo, session_id="child-session")
     transcript = write_same_session_transcript_with_marker(
         tmp_path / "rollout.jsonl",
         repo,
@@ -4527,7 +4962,7 @@ def test_analyze_thread_idempotent_when_session_exists(tmp_path: Path) -> None:
 def test_analyze_thread_launch_failure_does_not_break_handoff(tmp_path: Path) -> None:
     state = tmp_path / "state"
     repo = init_repo_with_head(tmp_path / "repo")
-    run_dir, handoff = seed_finalize_run_dir(state=state, repo=repo)
+    run_dir, handoff = seed_finalize_run_dir(state=state, repo=repo, session_id="child-session")
     transcript = write_same_session_transcript_with_marker(
         tmp_path / "rollout.jsonl",
         repo,
@@ -5462,7 +5897,10 @@ def test_guardian_liveness_alarm_merges_into_stop_payload(tmp_path: Path) -> Non
         assert module._apply_guardian_liveness_alarm(None) is None
 
         # seed 历史活跃证据(analyze 完成计数;fake 派发器避免真拉 tmux)→ 三条件命中 → 告警。
+        completed_analysis_run_directory = tmp_path / "synthetic-completed-analysis-run"
+        completed_analysis_run_directory.mkdir()
         guardian.record_analyze_completion(
+            run_dir=str(completed_analysis_run_directory),
             guardian_analysis_dispatcher=lambda **_kw: {"launch_status": "faked"}
         )
         alarm = guardian.evaluate_initiation_layer_liveness()
@@ -5595,6 +6033,19 @@ def test_agentic_initiation_e2e_dogfood_signal_to_guardian(tmp_path: Path) -> No
         cli = _ilu.module_from_spec(cli_spec)
         sys.modules[cli_spec.name] = cli
         cli_spec.loader.exec_module(cli)
+        # 与 invoke 的独立临时会话保持一致，不能继承运行本测试的真实 Kanban task 身份。
+        for inherited_identity_name in tuple(os.environ):
+            if inherited_identity_name.startswith(("KANBAN_", "CLINE_KANBAN_")):
+                saved_env.setdefault(inherited_identity_name, os.environ[inherited_identity_name])
+                os.environ.pop(inherited_identity_name)
+        # 本仓回归使用合成原生独立消息；原生可选 rewind 另由隔离 Codex PTY 实验验证。
+        from independent_review_start_boundary_fixture import environment_with_synthetic_independent_review_start_boundary
+        boundary_environment = environment_with_synthetic_independent_review_start_boundary(
+            repo=dirty, environment=os.environ.copy(), session_id="e2e-dogfood-session", preserve_runtime_state_root=True,
+            existing_token=token, native_transcript_path=transcript, accept_decision_before_prepare=False)
+        for boundary_key in ("RVF_REVIEW_START_BOUNDARY_RECEIPT", "RVF_SCOPE_CONTRACT", "CODEX_THREAD_ID", "CODEX_RVF_CLINE_KANBAN_TASK_CMD"):
+            saved_env.setdefault(boundary_key, os.environ.get(boundary_key))
+            os.environ[boundary_key] = boundary_environment[boundary_key]
         import rvf_decision_token_store as dts  # noqa: PLC0415
         import agentic_initiation_guardian_dispatch as guardian  # noqa: PLC0415
         import agentic_initiation_injection_attempt_ledger as injection_ledger  # noqa: PLC0415
@@ -5623,7 +6074,7 @@ def test_agentic_initiation_e2e_dogfood_signal_to_guardian(tmp_path: Path) -> No
         assert "降级" in start_result.message, start_result.message
         run_dir = Path(start_result.detail["run_dir"])
         assert run_dir.is_dir(), run_dir
-        assert str(run_dir).startswith(str(state)), run_dir  # run 落盘同样被隔离
+        assert run_dir.resolve().is_relative_to(state.resolve()), run_dir  # run 落盘同样被隔离
         prepare_artifacts = start_result.detail["prepare_artifacts"]
         assert Path(prepare_artifacts["review_packet"]).is_file(), prepare_artifacts
         assert Path(prepare_artifacts["scope_contract"]).is_file(), prepare_artifacts
@@ -5776,6 +6227,19 @@ def test_agentic_initiation_start_produces_session_owned_scope_with_tracker_leas
         cli = _ilu.module_from_spec(cli_spec)
         sys.modules[cli_spec.name] = cli
         cli_spec.loader.exec_module(cli)
+        # 与 invoke 的独立临时会话保持一致，不能继承运行本测试的真实 Kanban task 身份。
+        for inherited_identity_name in tuple(os.environ):
+            if inherited_identity_name.startswith(("KANBAN_", "CLINE_KANBAN_")):
+                saved_env.setdefault(inherited_identity_name, os.environ[inherited_identity_name])
+                os.environ.pop(inherited_identity_name)
+        # 本仓回归使用合成原生独立消息；原生可选 rewind 另由隔离 Codex PTY 实验验证。
+        from independent_review_start_boundary_fixture import environment_with_synthetic_independent_review_start_boundary
+        boundary_environment = environment_with_synthetic_independent_review_start_boundary(
+            repo=repo, environment=os.environ.copy(), session_id=session_id, preserve_runtime_state_root=True,
+            existing_token=token, native_transcript_path=transcript, accept_decision_before_prepare=False)
+        for boundary_key in ("RVF_REVIEW_START_BOUNDARY_RECEIPT", "RVF_SCOPE_CONTRACT", "CODEX_THREAD_ID", "CODEX_RVF_CLINE_KANBAN_TASK_CMD"):
+            saved_env.setdefault(boundary_key, os.environ.get(boundary_key))
+            os.environ[boundary_key] = boundary_environment[boundary_key]
 
         # 刻意**不传** --transcript-path：默认路径上 agent 通常不会带它，回退必须由候选摘要里
         # Stop hook 盖的那份兜住（这正是横幅之外的第二条保险）。
@@ -5807,7 +6271,7 @@ def test_agentic_initiation_start_produces_session_owned_scope_with_tracker_leas
         assert contract["session_manifest_path"], contract
         assert contract["primary_files"] == ["changed.txt"], contract["primary_files"]
         # 在途凭证与 run 工件都必须落在隔离 state 下（绝不写真实 ~/.rvf）。
-        assert str(start_result.detail["run_dir"]).startswith(str(state)), start_result.detail
+        assert Path(start_result.detail["run_dir"]).resolve().is_relative_to(state.resolve()), start_result.detail
         marker_path = start_result.detail["in_flight_receipt"].get("marker_path")
         assert marker_path and str(marker_path).startswith(str(state)), start_result.detail
     finally:
@@ -5865,6 +6329,19 @@ def test_agentic_initiation_start_releases_tracker_lease_when_prepare_does_not_c
         cli = _ilu.module_from_spec(cli_spec)
         sys.modules[cli_spec.name] = cli
         cli_spec.loader.exec_module(cli)
+        # 与 invoke 的独立临时会话保持一致，不能继承运行本测试的真实 Kanban task 身份。
+        for inherited_identity_name in tuple(os.environ):
+            if inherited_identity_name.startswith(("KANBAN_", "CLINE_KANBAN_")):
+                saved_env.setdefault(inherited_identity_name, os.environ[inherited_identity_name])
+                os.environ.pop(inherited_identity_name)
+        # 本仓回归使用合成原生独立消息；原生可选 rewind 另由隔离 Codex PTY 实验验证。
+        from independent_review_start_boundary_fixture import environment_with_synthetic_independent_review_start_boundary
+        boundary_environment = environment_with_synthetic_independent_review_start_boundary(
+            repo=repo, environment=os.environ.copy(), session_id=session_id, preserve_runtime_state_root=True,
+            existing_token=token, native_transcript_path=transcript, accept_decision_before_prepare=False)
+        for boundary_key in ("RVF_REVIEW_START_BOUNDARY_RECEIPT", "RVF_SCOPE_CONTRACT", "CODEX_THREAD_ID", "CODEX_RVF_CLINE_KANBAN_TASK_CMD"):
+            saved_env.setdefault(boundary_key, os.environ.get(boundary_key))
+            os.environ[boundary_key] = boundary_environment[boundary_key]
         import prepare_review_run  # noqa: PLC0415
         from datetime import datetime, timezone  # noqa: PLC0415
         from core.session_scope_allocation import reviewable_unit_diff_tracker as tracker  # noqa: PLC0415
@@ -6249,15 +6726,6 @@ def main() -> int:
         test_kanban_followup_stale_takeover_rechecks_marker_before_unlink,
         test_kanban_followup_shared_lock_blocks_second_dispatch_with_different_state_roots,
         test_awaiting_dispatched_agent_marker_skips_rvf_when_main_agent_parks_on_dispatch,
-        test_kanban_followup_waiting_bootstrap_lock_directs_sync_instead_of_handoff,
-        test_kanban_followup_stale_waiting_bootstrap_lock_revives_instead_of_reopening,
-        test_kanban_followup_bootstrap_gate_resume_reuses_run_and_artifact_loss_clears,
-        test_kanban_followup_stale_bootstrap_gate_resume_reactivates_lock,
-        test_kanban_followup_bootstrap_replay_claim_is_atomic_across_concurrent_stops,
-        test_kanban_followup_lock_without_bootstrap_gate_keeps_legacy_stale_consumption,
-        test_kanban_followup_bootstrap_waiting_is_bounded_by_reengage_and_revive_budgets,
-        test_kanban_followup_bootstrap_replay_classifies_artifact_loss_and_retries_after_timeout,
-        test_kanban_followup_bootstrap_reengage_budget_exhausted_diagnostic_splits_replay_pending,
         test_accepted_review_run_receipt_suppresses_repeated_decision_point_injection,
         test_rewound_acceptance_reconciles_receipt_via_decision_token_needle,
         test_kanban_followup_awaiting_agent_decision_lock_skips_without_nudging,
@@ -6274,8 +6742,25 @@ def main() -> int:
         test_review_reopen_reconciles_abandoned_followup_lock,
         test_kanban_task_workspace_mismatch_skips_unrelated_dirty_repo,
         test_kanban_task_workspace_mismatch_uses_task_lookup_without_workspace_env,
+        test_workspace_guard_unique_state_workspace_skips_list_and_rechecks_final_guard,
+        test_workspace_guard_duplicate_same_resolved_workspace_is_unique,
+        test_workspace_guard_direct_workspace_env_precedes_state_and_list,
+        test_workspace_guard_state_path_probe_errors_fall_back_and_preserve_mismatch,
+        test_workspace_guard_state_projects_without_sessions_remain_complete,
+        test_workspace_guard_unsafe_state_shapes_fall_back_to_list,
+        test_workspace_guard_state_scan_reports_actual_utf8_bytes_and_parse_errors,
+        test_workspace_guard_json_decoder_resource_errors_fall_back_and_preserve_mismatch,
+        test_workspace_guard_list_fallback_rechecks_state_after_client_failure,
+        test_workspace_guard_invalid_list_json_preserves_unresolved_verdict,
+        test_workspace_guard_compact_artifact_and_events_never_copy_list_stdout,
+        test_workspace_guard_full_stdout_requires_explicit_debug_and_stays_out_of_events,
+        test_workspace_guard_list_spawn_failure_uses_state_fallback,
+        test_workspace_guard_state_mismatch_still_blocks_unrelated_dirty_repo,
+        test_workspace_guard_foreign_project_task_id_collision_preserves_mismatch,
+        test_workspace_guard_canonical_project_and_linked_task_worktree_skip_list_without_extra_git_queries,
+        test_workspace_guard_unverified_project_repository_identity_falls_back_to_list,
         test_cline_kanban_mode_marks_unavailable_when_task_start_fails,
-        test_fork_experiment_missing_desktop_control_prepares_manual_not_continuation,
+        test_fork_experiment_without_boundary_never_prepares_manual_or_continuation,
         test_missing_desktop_control_fail_policy_reports,
         test_fork_session_visibility_waits_only_for_active_session,
         test_app_server_fork_waits_for_session_file_before_deeplink,
@@ -6434,12 +6919,17 @@ def main() -> int:
         test_run_activity_probe_does_not_descend_into_fix_attempt_worktree_tree,
         test_run_activity_probe_anchor_enumeration_stays_within_stat_budget,
         test_stale_in_progress_lock_with_recent_activity_only_below_artifacts_root_is_revived,
+        # f03b5：在途凭证指向已 finalize 的 run ⇒ 对账清除、绝不续跑；判据不放宽；不误清别的 run；
+        # 完成证据先于心跳续期核对。
+        test_kanban_followup_in_progress_marker_of_already_finalized_run_is_reconciled_without_reengage,
+        test_kanban_followup_in_progress_marker_of_unfinalized_run_with_existing_run_dir_still_reengages,
+        test_kanban_followup_reconcile_for_finalized_run_keeps_other_run_marker,
+        test_kanban_followup_stale_marker_of_finalized_run_is_not_revived_by_run_activity,
         # 硬顶的**上界**本身也要有守卫：续期只判「续之前有没有越界」，不截断续期后的 expires_at，
         # 硬顶就能被整整绕过一个 TTL。
         test_revived_in_progress_lock_never_outlives_the_revival_absolute_cap,
         # 心跳坐在 bootstrap「复活预算耗尽 ⇒ 放弃本轮」的 fall-through 上，必须尊重那个放弃。
         # 走调用方，因为只调内层函数的既有守卫对这条缝结构性失明（假绿）。
-        test_bootstrap_revive_budget_exhaustion_is_not_undone_by_run_activity_heartbeat,
     ]
     assert_every_defined_test_is_registered(
         globals(),

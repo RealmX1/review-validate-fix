@@ -850,9 +850,16 @@ def send_task_message(
     idempotency_key: str,
     attempt_id: str | None,
     wait_for_terminal_status_timeout_ms: int | None = None,
+    deliver_when_agent_idle: bool = False,
+    max_wait_for_agent_idle_ms: int | None = None,
+    required_native_independent_user_turn_session_id: str | None = None,
 ) -> dict[str, Any]:
     if prompt is None and prompt_file is None:
         raise KanbanError("message requires --prompt or --prompt-file")
+    if required_native_independent_user_turn_session_id is not None and (
+        not required_native_independent_user_turn_session_id.strip() or not deliver_when_agent_idle
+    ):
+        raise KanbanError("原生独立回合投递必须绑定非空会话并启用空闲投递")
     port = task_runtime_port(task_cmd=task_cmd, start_cmd=start_cmd)
     command = task_command(
         task_cmd,
@@ -869,6 +876,12 @@ def send_task_message(
     command.extend(["--source", source, "--idempotency-key", idempotency_key])
     if attempt_id:
         command.extend(["--attempt-id", attempt_id])
+    if deliver_when_agent_idle:
+        if not max_wait_for_agent_idle_ms or max_wait_for_agent_idle_ms <= 0:
+            raise KanbanError("空闲投递必须提供正数等待截止")
+        command.extend(["--deliver-when-agent-idle", "--max-wait-for-agent-idle-ms", str(max_wait_for_agent_idle_ms)])
+    if required_native_independent_user_turn_session_id is not None:
+        command.extend(["--require-native-independent-user-turn-for-session", required_native_independent_user_turn_session_id])
     # 契约第 4 条：`--wait-for-terminal-status` 只能做**短等**，不能拿来等满契约的 196.5s
     # 收敛预算——CLI 自己的硬超时会把等待预算 clamp 掉。真正的终态由 `message-status` 轮询
     # （见 read_task_message_terminal_delivery_status）拿。传 None/0 即完全不等（默认）。
@@ -968,6 +981,7 @@ def read_task_message_terminal_delivery_status(
     task_id: str,
     idempotency_key: str,
     timeout: float | None = None,
+    review_start_boundary_observation_nonce: str | None = None,
 ) -> dict[str, Any]:
     """`kanban task message-status`：读一条已投递消息的**诚实**终态回执。
 
@@ -985,6 +999,8 @@ def read_task_message_terminal_delivery_status(
         "--idempotency-key",
         idempotency_key,
     )
+    if review_start_boundary_observation_nonce:
+        command.extend(["--review-start-boundary-observation-nonce", review_start_boundary_observation_nonce])
     completed = run_command(
         command, cwd=repo, check=False, env=runtime_env(port), timeout=timeout
     )
@@ -1071,6 +1087,9 @@ def main() -> int:
     parser.add_argument("--idempotency-key")
     # 短等而已（契约第 4 条）：真正的终态靠 message-status 轮询，不靠把这个数调大。
     parser.add_argument("--wait-for-terminal-status-timeout-ms", type=int, default=0)
+    parser.add_argument("--deliver-when-agent-idle", action="store_true")
+    parser.add_argument("--max-wait-for-agent-idle-ms", type=int)
+    parser.add_argument("--require-native-independent-user-turn-for-session")
     parser.add_argument("--start-in-plan-mode", action="store_true")
     parser.add_argument("--auto-review-enabled", action="store_true")
     parser.add_argument("--auto-review-mode", default=os.environ.get("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE", "commit"))
@@ -1181,6 +1200,9 @@ def main() -> int:
                 idempotency_key=args.idempotency_key,
                 attempt_id=args.attempt_id,
                 wait_for_terminal_status_timeout_ms=args.wait_for_terminal_status_timeout_ms,
+                deliver_when_agent_idle=args.deliver_when_agent_idle,
+                max_wait_for_agent_idle_ms=args.max_wait_for_agent_idle_ms,
+                required_native_independent_user_turn_session_id=args.require_native_independent_user_turn_for_session,
             )
     # 三个降级运行态各有专属退出码：它们**都不是**「投递失败」，shell 调用方必须能分辨。
     except KanbanTerminalDeliveryInterfaceUnavailableError as exc:

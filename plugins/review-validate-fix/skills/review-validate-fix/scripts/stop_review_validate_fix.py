@@ -6,6 +6,7 @@ import os
 import re
 import shlex  # 决策点横幅里渲染 --transcript-path 命令样例（路径可能含空格）
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -19,6 +20,8 @@ from typing import Any, Iterator
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401 — 把 pyroot 加入 sys.path，供 adapters.* import
+from review_start_boundary_gate import require_review_start_boundary_for_prepare, bind_review_start_boundary_to_one_run
+from core.review_start_boundary.review_start_boundary_verification import INVALIDATED, PENDING, ReviewStartBoundaryNotVerified
 from codex_gui_without_kanban_task_stop_hook_policy import (  # noqa: E402
     CODEX_GUI_WITHOUT_KANBAN_TASK_STOP_HOOK_DISABLED_REASON,
     disabled_codex_gui_stop_hook_payload,
@@ -93,7 +96,7 @@ from rvf_handoff import (
     notify_kanban_followup_stranded,
     resolve_kanban_task_url,
 )
-from rvf_run_finalize import finalize_for_handoff, surface_finalize_record_errors
+from rvf_run_finalize import finalize_for_handoff, resolve_run_dir, surface_finalize_record_errors
 from rvf_analyze_advisory import (
     RVF_ANALYZE_FOLLOWUP_MARKER,
     current_kanban_task_id,
@@ -109,7 +112,6 @@ try:
     import codex_invoked_skill
 except Exception:  # pragma: no cover - structured read is best-effort
     codex_invoked_skill = None
-import rvf_bootstrap_gate
 from kanban_followup_trigger_transcript_presence import (
     TRIGGER_PRESENCE_OFF_ANCESTOR_CHAIN_REWOUND,
     TRIGGER_PRESENCE_ON_ANCESTOR_CHAIN,
@@ -121,23 +123,21 @@ from kanban_followup_trigger_transcript_presence import (
 from kanban_followup_lock import (
     STATE_DELIVERED_AWAITING_AGENT_DECISION as KANBAN_FOLLOWUP_LOCK_STATE_AWAITING_DECISION,
     STATE_IN_PROGRESS as KANBAN_FOLLOWUP_LOCK_STATE_IN_PROGRESS,
-    STATE_WAITING_BOOTSTRAP as KANBAN_FOLLOWUP_LOCK_STATE_WAITING_BOOTSTRAP,
     STATUS_ACTIVE as KANBAN_FOLLOWUP_LOCK_ACTIVE,
     STATUS_STALE as KANBAN_FOLLOWUP_LOCK_STALE,
     marker_state as kanban_followup_lock_state,
     promote_marker_out_of_awaiting_agent_decision as promote_kanban_followup_lock_out_of_awaiting,
     clear_marker as clear_kanban_followup_lock,
+    clear_markers_belonging_to_handed_off_run,
+    marker_belongs_to_handed_off_run,
+    read_finalize_completion_evidence_for_in_progress_marker_run,
+    read_in_progress_markers_for_task_and_session,
     revive_marker as revive_kanban_followup_lock,
     revive_count as kanban_followup_lock_revive_count,
     in_flight_run_shows_recent_activity as in_flight_rvf_run_shows_recent_activity,
     seconds_since_last_run_activity as seconds_since_last_in_flight_rvf_run_activity,
     marker_exceeds_revival_absolute_cap as kanban_followup_lock_exceeds_revival_absolute_cap,
     seconds_since_marker_armed as seconds_since_kanban_followup_lock_armed,
-    stamp_bootstrap_gate as stamp_kanban_followup_bootstrap_gate,
-    bootstrap_reengage_count as kanban_followup_bootstrap_reengage_count,
-    bump_bootstrap_reengage_count as bump_kanban_followup_bootstrap_reengage_count,
-    claim_bootstrap_replay_in_flight as claim_kanban_followup_bootstrap_replay_in_flight,
-    release_bootstrap_replay_in_flight as release_kanban_followup_bootstrap_replay_in_flight,
     marker_status as kanban_followup_lock_status,
     read_marker as read_kanban_followup_lock,
     reengage_nudge_count as kanban_followup_lock_nudge_count,
@@ -177,6 +177,7 @@ from core.session_scope_allocation.reviewable_unit_diff_tracker import (
     allocate_review_scope,
     find_manual_rvf_run_for_scope_hash,
     lease_release,
+    read_tracker_lease_reconciliation_evidence_for_exact_run,
     select_committed_paths_reviewed_by_session,
     sweep_stale,
 )
@@ -217,6 +218,7 @@ from cline_kanban_client import (
     unpark_task as cline_kanban_unpark_task,
 )
 from core.cline_kanban_terminal_delivery.cline_kanban_terminal_delivery_receipt import (  # noqa: E402 — 终端投递回执契约的唯一判读点（cline-kanban task cdea3 契约；RVF 只读）
+    TERMINAL_DELIVERY_STATUS_CONVERGENCE_CONTRACT_BUDGET_SECONDS,
     REDISPATCH_DISPOSITION_ALLOWED_WITH_FRESH_IDEMPOTENCY_KEY,
     REDISPATCH_DISPOSITION_NOT_NEEDED,
     REDISPATCH_DISPOSITION_REQUIRES_HUMAN_CONFIRMATION,
@@ -1408,6 +1410,10 @@ def write_dispatch_prep_file(
     origin_metadata_path: str | None = None,
     parent_thread_path: Path | None = None,
 ) -> rvf_prep_file.PrepFileRecord:
+    boundary = require_review_start_boundary_for_prepare(repo=str(origin_repo or target_worktree or origin_cwd or ""))
+    if boundary.get("session_id") and origin_session_id != boundary["session_id"]:
+        raise ReviewStartBoundaryNotVerified(INVALIDATED, "准备来源会话与分界不一致")
+    bind_review_start_boundary_to_one_run(receipt=boundary, run_id=ledger.run_id, run_dir=ledger.run_dir)
     tracker_scope_meta = getattr(ledger, "tracker_scope_meta", None)
     tracker_scope_path = None
     tracker_lease_id = None
@@ -1431,6 +1437,7 @@ def write_dispatch_prep_file(
         "target_session_id": target_session_id,
         "rvf_run": {
             "run_id": ledger.run_id,
+            "review_start_boundary_receipt": boundary,
             "run_dir": str(ledger.run_dir),
             "artifacts_dir": str(artifacts_dir),
             "scope_contract_path": str(artifacts_dir / "inputs" / "scope.contract.json"),
@@ -2146,17 +2153,29 @@ def clear_kanban_followup_lock_for_event(
     *,
     cwd: str | None,
     handoff_path: str | None = None,
+    handed_off_run_id: str | None = None,
+    handed_off_run_dir: str | Path | None = None,
 ) -> list[str]:
     task_id = current_kanban_task_id(event)
     session_id = kanban_followup_lock_session_id(event)
-    removed = clear_kanban_followup_lock(
+    removed, kept = clear_markers_belonging_to_handed_off_run(
         task_id=task_id,
         session_id=session_id,
         repo=kanban_followup_lock_repository_anchor(event, cwd=cwd),
+        run_id=handed_off_run_id,
+        run_dir=handed_off_run_dir,
     )
+    if kept:
+        ledger.event(
+            phase="complete", event="kanban_followup_in_progress_marker_kept_for_other_run",
+            status="warning", reason_code="kanban_followup_handoff_marker_not_cleared",
+            handed_off_run_id=handed_off_run_id,
+            handed_off_run_dir=str(handed_off_run_dir) if handed_off_run_dir else None,
+            kept_kanban_followup_in_progress_markers=kept,
+        )
     # handoff 完成顺带清掉残留 pending（对称卫生）：正常路径投递落地时 UPS arm 已清，
     # 这里兜底处理「同 token pending 因故未被清」的尾巴。
-    removed_pending = clear_kanban_followup_pending(task_id=task_id)
+    removed_pending = [] if kept else clear_kanban_followup_pending(task_id=task_id)
     if removed or removed_pending:
         ledger.event(
             phase="complete",
@@ -2178,6 +2197,51 @@ def clear_kanban_followup_lock_for_event(
             ),
         )
     return removed
+
+
+def complete_rvf_handoff_and_clear_in_flight_marker_for_stop_event(
+    event: dict[str, Any], ledger: RunLedger, *, handoff_path: Path,
+    payload: dict[str, Any], cwd: str | None, decision_kind: str,
+) -> None:
+    """两个常规 Stop 出口共用收尾；附属通知失败也不能遗留本 run 的在途凭证。"""
+    finalize_record = None
+    try:
+        finalize_record = finalize_for_handoff(
+            handoff_path=handoff_path, event=event, decision_kind=decision_kind,
+        )
+        surface_finalize_record_errors(ledger, finalize_record, payload=payload)
+        surface_rvf_analyze_advisory(
+            event=event, ledger=ledger, payload=payload, finalize_record=finalize_record,
+        )
+    except Exception as exc:
+        ledger.event(
+            phase="handoff", event="finalize_failed", status="warning",
+            reason_code="finalize_error", level="warn",
+            error={"kind": type(exc).__name__, "message": str(exc)},
+        )
+    try:
+        finalized_identity = finalize_record or {}
+        if not finalized_identity:
+            # 通知发布可能在完成锁落盘后抛错；恢复完整身份，不能退回仅按目录清理。
+            resolved_run_dir = resolve_run_dir(handoff_path=handoff_path, event=event)
+            completion_evidence = (
+                read_finalize_completion_evidence_for_in_progress_marker_run({"run_dir": str(resolved_run_dir)})
+                if resolved_run_dir is not None else None
+            )
+            recovered_run_id = completion_evidence.get("finalize_run_id") if completion_evidence else None
+            if isinstance(recovered_run_id, str) and recovered_run_id.strip():
+                finalized_identity = {"run_id": recovered_run_id, "run_dir": resolved_run_dir}
+        clear_kanban_followup_lock_for_event(
+            event, ledger, cwd=cwd, handoff_path=str(handoff_path),
+            handed_off_run_id=finalized_identity.get("run_id"),
+            handed_off_run_dir=finalized_identity.get("run_dir"),
+        )
+    except Exception as exc:
+        ledger.event(
+            phase="handoff", event="handoff_marker_cleanup_failed", status="warning",
+            reason_code="handoff_marker_cleanup_error", level="warn",
+            error={"kind": type(exc).__name__, "message": str(exc)},
+        )
 
 
 def _query_kanban_terminal_delivery_receipt(
@@ -2553,6 +2617,69 @@ def _kanban_followup_withheld_dispatch_decision(
     )
 
 
+def reconcile_backup_consumption_for_followup_marker(
+    marker: dict[str, Any], ledger: RunLedger, *, cwd: str | None = None,
+) -> dict[str, Any]:
+    """只按精确 run 与 worktree 补证；补写／清理失败不能把历史完成重新变成续跑。"""
+    import independent_backup_route as backup_route
+
+    repository_anchor = cwd or marker.get("cwd")
+    run_dir = marker.get("run_dir")
+    if not isinstance(repository_anchor, str) or not isinstance(run_dir, str) or not run_dir:
+        return {"status": "not_consumed"}
+    try:
+        root = backup_route.control_directory(Path(repository_anchor))
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        return {"status": "not_consumed"}
+    if not root.exists():
+        return {"status": "not_consumed"}
+    try:
+        evidence = backup_route.reconcile_original_run_backup_consumption(Path(repository_anchor), Path(run_dir))
+        if evidence["status"] == "consumed":
+            original_run = Path(evidence["original_run_directory"])
+            if not marker_belongs_to_handed_off_run(marker, run_id=original_run.name, run_dir=original_run):
+                evidence = {"status": "unknown", "verification_gaps": ["凭证的 run ID 与已消费原 run 目录不一致"],
+                            "recovery_condition": "原凭证的 run ID／目录恢复一致后自动重验"}
+    except (backup_route.BackupRouteOwned, OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
+        evidence = {"status": "unknown", "verification_gaps": [f"{type(exc).__name__}: {exc}"],
+                    "recovery_condition": "后续 Stop 在同 worktree 的 Git／持久完成记录恢复可读后自动补证"}
+    if evidence["status"] != "not_consumed":
+        if evidence["status"] == "unknown":
+            name = "stop-followup-verification-" + hashlib.sha256(str(marker.get("_marker_path", run_dir)).encode()).hexdigest()
+            backup_route.preserve_stop_backup_verification_observation(root, name, evidence)
+        ledger.event(
+            phase="gate", event="kanban_followup_backup_consumption_verification_observed",
+            status="completed" if evidence["status"] == "consumed" else "warning",
+            reason_code="kanban_followup_backup_consumption_" + evidence["status"],
+            cwd=str(repository_anchor), kanban_followup_marker=marker,
+            independent_backup_consumption_evidence=evidence,
+        )
+    return evidence
+
+
+def clear_backup_consumed_followup_pending(
+    ledger: RunLedger, *, task_id: str | None, evidence: dict[str, Any],
+) -> list[str]:
+    """仅清匹配原 run 的 pending；不改 token／投递回执，也不撤回另一轮的投递。"""
+    original_run = Path(evidence["original_run_directory"])
+    pending = read_kanban_followup_pending(task_id=task_id)
+    if pending is None or not marker_belongs_to_handed_off_run(pending, run_id=original_run.name, run_dir=original_run):
+        return []
+    removed = clear_kanban_followup_pending(
+        task_id=task_id, token=pending.get("token"), run_id=original_run.name, run_dir=original_run,
+    )
+    ledger.event(
+        phase="gate", event="kanban_followup_pending_reconciled_for_backup_consumed_run",
+        status="completed" if removed else "warning",
+        reason_code="kanban_followup_pending_run_consumed_by_independent_backup",
+        kanban_followup_pending_marker=pending,
+        independent_backup_consumption_evidence=evidence,
+        removed_kanban_followup_pending_marker_paths=removed,
+        recovery_condition=None if removed else "后续 Stop 核验同 run 后重试清理，不再次催办或重投原 run",
+    )
+    return removed
+
+
 def _kanban_followup_pending_decision(
     event: dict[str, Any],
     ledger: RunLedger,
@@ -2578,6 +2705,17 @@ def _kanban_followup_pending_decision(
     pending = read_kanban_followup_pending(task_id=task_id)
     if pending is None:
         return None
+    backup_consumption = reconcile_backup_consumption_for_followup_marker(pending, ledger, cwd=cwd)
+    if backup_consumption["status"] == "consumed":
+        if reconcile_tracker_leases_for_backup_consumed_followup(pending, ledger, evidence=backup_consumption):
+            clear_backup_consumed_followup_pending(ledger, task_id=task_id, evidence=backup_consumption)
+        return None
+    if backup_consumption["status"] == "unknown":
+        return skip_decision(
+            "备用消费证据暂不可核验；保留原 pending，后续 Stop 自动补证，本次不重投。",
+            ledger, "kanban_followup_backup_consumption_unknown", cwd=cwd,
+            independent_backup_consumption_evidence=backup_consumption,
+        )
     status = kanban_followup_pending_status(pending)
     pending_path = pending.get("_marker_path")
 
@@ -2978,6 +3116,10 @@ def _maybe_redispatch_stranded_kanban_followup(
     重投前**必须先中和旧 token**（tombstone + ``message-cancel``），且中和、投递、pending 落盘
     三件事全部在 per-task 派发闸内完成 —— 见函数体内两处注释。
     """
+    backup_consumption = reconcile_backup_consumption_for_followup_marker(marker, ledger)
+    if backup_consumption["status"] != "not_consumed":
+        return {"redispatched": False, "reason": "independent-backup-consumption-" + backup_consumption["status"],
+                "independent_backup_consumption_evidence": backup_consumption}
     if not is_truthy(os.environ.get(KANBAN_FOLLOWUP_AUTO_REDISPATCH_ENV)):
         return {"redispatched": False, "reason": "disabled"}
     attempt_count = kanban_followup_pending_redispatch_attempt_count(marker)
@@ -3334,6 +3476,15 @@ def sweep_stranded_kanban_followup_pending(
             # 避免两条路径语义打架。
             if current_task_id and marker_task_id == current_task_id:
                 continue
+            backup_consumption = reconcile_backup_consumption_for_followup_marker(marker, ledger)
+            if backup_consumption["status"] == "consumed":
+                if reconcile_tracker_leases_for_backup_consumed_followup(marker, ledger, evidence=backup_consumption):
+                    clear_backup_consumed_followup_pending(ledger, task_id=marker_task_id, evidence=backup_consumption)
+                processed += 1
+                continue
+            if backup_consumption["status"] == "unknown":
+                processed += 1
+                continue
             # 真相驱动搁浅判定：优先读 kanban session.state（投递落地与否的地面真相），
             # 15min 挂钟 TTL 仅作拿不到 state 时的降级兜底。见 _kanban_task_session_liveness。
             liveness = _kanban_task_session_liveness(
@@ -3450,405 +3601,6 @@ def awaiting_dispatched_agent_decision(
         awaiting_dispatched_agent_ids=dispatched_ids,
         awaiting_dispatched_agent_dispatchers=dispatchers,
         awaiting_dispatched_agent_markers=active,
-    )
-
-
-KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_TIMEOUT_ENV = (
-    "RVF_KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_TIMEOUT_SECONDS"
-)
-DEFAULT_KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_TIMEOUT_SECONDS = 60
-# 等待态的**终止界**。护住一轮 bootstrap 等待是对的，但无界地护住它只是把 32cad 的「反复重开」
-# 换成同样糟糕的「永久驻留」：agent 若始终没能完成吸收（skill 不可用、冲突无人解、用户已转去
-# 做别的事），锁会一直被复活、Stop 会一直被 block。故给两条界：
-#   - re-engage 预算用尽 → 退回静默 skip（不再硬挡 agent 干停，仍留 user-facing 诊断）；
-#   - 复活次数用尽 → 不再复活，让既有 stale 语义接手清锁，本轮被明确放弃而不是无限驻留。
-KANBAN_FOLLOWUP_BOOTSTRAP_REENGAGE_BUDGET_ENV = (
-    "RVF_KANBAN_FOLLOWUP_BOOTSTRAP_REENGAGE_BUDGET"
-)
-DEFAULT_KANBAN_FOLLOWUP_BOOTSTRAP_REENGAGE_BUDGET = 3
-KANBAN_FOLLOWUP_BOOTSTRAP_REVIVE_BUDGET_ENV = "RVF_KANBAN_FOLLOWUP_BOOTSTRAP_REVIVE_BUDGET"
-DEFAULT_KANBAN_FOLLOWUP_BOOTSTRAP_REVIVE_BUDGET = 3
-# 一次 prepare 重放的**并发**去重窗口。占位在起 replay **之前**抢、在这次
-# `replay_prepare_for_gate` 收尾时释放，所以窗口只需要覆盖「一个还活着的持有者最长可能持有它
-# 多久」= 重放预算 + 子进程强杀余量（`rvf_bootstrap_gate.REPLAY_SUBPROCESS_KILL_GRACE_SECONDS`）
-# + 一段余量；余量的用途是在持有者**崩在半路**（Stop hook 进程被 harness 预算杀掉、机器休眠）时
-# 让下一个 Stop 接手，而不是让占位永久堵死本轮。
-#
-# 刻意**不再**是 15min 量级：那个默认值来自「重放超时后后台 prepare worker 仍在写同一个 run
-# 目录、故整个窗口内不得再起第二次」的旧立论，而重放子进程化之后它已不成立（见下面
-# receipt_valid 分支里对 timeout 的处理）。窗口太长的代价是实打实的：一个本可立刻重试的可恢复
-# 轮次会被白挡满一整个窗口。
-KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_IN_FLIGHT_WINDOW_ENV = (
-    "RVF_KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_IN_FLIGHT_WINDOW_SECONDS"
-)
-KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_IN_FLIGHT_WINDOW_MARGIN_SECONDS = 60
-
-
-def _kanban_followup_bootstrap_replay_in_flight_window_seconds() -> float:
-    """在途重放占位的接手窗口（秒）：默认按重放的**硬上限**推导，env 可覆盖。
-
-    推导而不是写死一个常数，是为了让「窗口 ≥ 一次合法重放的最长时长」这条不变式在
-    `RVF_KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_TIMEOUT_SECONDS` 被调大时自动成立——否则窗口会短于
-    一次仍在跑的重放，另一个 Stop 就能就地接手并起第二次 prepare，正是占位要防的事。
-    """
-    replay_timeout = _kanban_followup_env_int(
-        KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_TIMEOUT_ENV,
-        DEFAULT_KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_TIMEOUT_SECONDS,
-    )
-    derived_default = int(
-        replay_timeout
-        + rvf_bootstrap_gate.REPLAY_SUBPROCESS_KILL_GRACE_SECONDS
-        + KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_IN_FLIGHT_WINDOW_MARGIN_SECONDS
-    )
-    return float(
-        _kanban_followup_env_int(
-            KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_IN_FLIGHT_WINDOW_ENV, derived_default
-        )
-    )
-
-
-BOOTSTRAP_REPLAY_IN_FLIGHT_REASON = "bootstrap_replay_in_flight"
-BOOTSTRAP_REPLAY_INCOMPLETE_REASON = "bootstrap_replay_incomplete"
-# 这两条等待的共同前提是「receipt 已验证通过、只差 prepare 收尾」，与「还没吸收 base」相反：
-# 给 agent 的定向指令必须换成「别再跑同步 skill / 别动 receipt」，否则重跑会产出另一份 receipt，
-# 下一轮按 digest 判 tampered（RVF-002 把 digest 落盘之后这条路径才真正生效）。
-BOOTSTRAP_REPLAY_PENDING_REASONS = frozenset(
-    {BOOTSTRAP_REPLAY_IN_FLIGHT_REASON, BOOTSTRAP_REPLAY_INCOMPLETE_REASON}
-)
-
-
-def _bootstrap_replay_error_text(replay: dict[str, Any] | None) -> str:
-    """从一次重放结果里取出人类可读的 error（缺省空串）。"""
-    if not isinstance(replay, dict):
-        return ""
-    error = replay.get("error")
-    return str(error) if error else ""
-
-
-def _bootstrap_replay_in_flight_reconciliation(
-    reconciliation: rvf_bootstrap_gate.BootstrapGateReconciliation,
-    *,
-    age_seconds: float,
-    window_seconds: float,
-) -> rvf_bootstrap_gate.BootstrapGateReconciliation:
-    """把「**另一个** Stop 此刻正在跑本轮重放」渲染成一条可区分的等待结论（不 resume、不清锁）。
-
-    与 ``bootstrap_replay_incomplete`` 分开：那条是「本进程起的这次重放已经收尾但没成功、下一次
-    Stop 可以立刻再试」，这条是「占位被别人握着，本轮**刻意不起第二次**」——占位只在一次
-    `replay_prepare_for_gate` 调用期间存在，所以它在途 = 真的有另一个进程正在写这个 run。
-    """
-    return rvf_bootstrap_gate.BootstrapGateReconciliation(
-        outcome=rvf_bootstrap_gate.OUTCOME_STILL_WAITING,
-        phase=rvf_bootstrap_gate.PHASE_BOOTSTRAP_INTERRUPTED_RETRYABLE,
-        reason=BOOTSTRAP_REPLAY_IN_FLIGHT_REASON,
-        diagnostic=(
-            "bootstrap receipt 已通过校验，另一个 Stop 此刻正在跑本轮 prepare 重放"
-            f"（占位已在途 {age_seconds:.0f}s / 接手窗口 {window_seconds:.0f}s）；"
-            "为避免同一个 run 目录被并发重复写入，本次不再启动第二次重放。"
-        ),
-        resume_run_id=reconciliation.resume_run_id,
-        resume_run_dir=reconciliation.resume_run_dir,
-    )
-
-
-def _kanban_followup_bootstrap_gate_decision(
-    ledger: RunLedger,
-    *,
-    marker: dict[str, Any],
-    task_id: str | None,
-    session_id: str | None,
-    cwd: str | None,
-    store_expired: bool,
-) -> tuple[bool, StopDecision | None]:
-    """in-progress 锁上挂着 bootstrap 等待 gate 时的读侧判定。返回 ``(handled, decision)``。
-
-    ``handled=False`` = 这把锁与 bootstrap 无关，调用方继续走原有 active / stale 逻辑。
-
-    这里同时堵住 32cad 家族的根因：等待期跨过 1h 锁 TTL 时，原 stale 分支会无条件清锁 +
-    ``return None``，让常规 gate 把这一轮当成「没人在跑」而重铸 token / 重开 run。改为先按
-    gate 重新判定——仍在等 / 冲突未解 / 证据不可信一律 **revive 锁并定向 re-engage**（既不清、
-    也不新开）；receipt 有效才按**原 run** 重放 prepare；只有工件确实丢了才清锁回 fresh。
-    """
-    gate = rvf_bootstrap_gate.gate_of(marker)
-    if not rvf_bootstrap_gate.is_waiting_gate(gate):
-        return False, None
-    assert gate is not None  # narrow for readers
-    marker_path = marker.get("_marker_path")
-    reconciliation = rvf_bootstrap_gate.reconcile_bootstrap_gate(
-        gate, store_expired=store_expired
-    )
-
-    def _event(name: str, **fields: Any) -> None:
-        # reconciliation 的字段一律带 ``bootstrap_`` 前缀落账：它自带 ``phase``/``reason``，
-        # 与 ledger.event 自己的 phase / reason_code 形参同名，直接 spread 会撞成重复关键字。
-        ledger.event(
-            phase="gate",
-            event=name,
-            status="completed",
-            reason_code=f"kanban_followup_bootstrap_{reconciliation.reason}",
-            cwd=cwd,
-            cline_kanban_task_id=task_id,
-            session_id=session_id,
-            kanban_followup_in_progress_marker_path=marker_path,
-            bootstrap_gate=dict(gate),
-            **{f"bootstrap_{key}": value for key, value in reconciliation.to_dict().items()},
-            **fields,
-        )
-
-    def _artifacts_lost(event_name: str) -> tuple[bool, StopDecision | None]:
-        # 等待期工件已消失 → 这一轮无从恢复（也无在途工作可撞）。清锁回 fresh 是安全的，
-        # 并把丢失原因显式落账，避免它表现成一次无声的「锁自己没了」。
-        removed = clear_kanban_followup_lock(
-            task_id=task_id,
-            session_id=session_id,
-            repo=kanban_followup_lock_repository_anchor(cwd=cwd, marker=marker),
-        )
-        _event(event_name, consumed_kanban_followup_in_progress_marker_paths=removed)
-        return True, None
-
-    if reconciliation.outcome == rvf_bootstrap_gate.OUTCOME_ARTIFACT_LOST:
-        return _artifacts_lost("kanban_followup_bootstrap_gate_artifacts_lost")
-
-    if reconciliation.outcome == rvf_bootstrap_gate.OUTCOME_RECEIPT_VALID:
-        # ①「继续持有等待态」前先把校验通过的 receipt 路径/digest 盖回锁上的 gate。
-        # `build_bootstrap_gate` 造 gate 时 receipt 还不存在（digest 恒为 None），没有这一步，
-        # `bootstrap_receipt_digest_changed` 那条篡改判据在真实路径上永远不可达：后续每一轮
-        # 都只做身份校验，一份被替换但仍能通过身份校验的 receipt 不会被判成篡改。
-        gate = rvf_bootstrap_gate.gate_with_verified_receipt(gate, reconciliation)
-        stamp_kanban_followup_bootstrap_gate(marker, gate=gate)
-
-        # ② 起重放**之前**先原子 claim，收尾时释放（见下面的 elif claimed 分支）。抢不到 =
-        # 另一个 Stop 此刻正握着占位跑这一轮重放，本轮绝不能再起第二次（同一 prep / 同一 run_id
-        # 会并发重复写同一个 run 目录）。占位必须**先于** replay 且落在 marker payload 之外：
-        # 事后才写标记的话，两个并发 Stop 会同时读到「无在途标记」并各自进入 replay；
-        # 而写进 marker 的话，另一个 Stop 上面 ① 的整份读-改-写会把刚落的占位抹掉。
-        in_flight_window = _kanban_followup_bootstrap_replay_in_flight_window_seconds()
-        replay: dict[str, Any] | None = None
-        replay_status: str | None = None
-        claimed, in_flight_age = claim_kanban_followup_bootstrap_replay_in_flight(
-            marker, window_seconds=in_flight_window
-        )
-        if not claimed:
-            reconciliation = _bootstrap_replay_in_flight_reconciliation(
-                reconciliation,
-                age_seconds=in_flight_age if in_flight_age is not None else 0.0,
-                window_seconds=in_flight_window,
-            )
-        else:
-            # 抢到了（含「上一枚占位已过接手窗口 → 就地接手」：那个持有者已经崩在半路，
-            # 允许再试一次；prep 若已被另一个 Stop 的重放推进为 completed，本次重放幂等短路直接成功）。
-            replayed = rvf_bootstrap_gate.replay_prepare_for_gate(
-                gate,
-                timeout_seconds=float(
-                    _kanban_followup_env_int(
-                        KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_TIMEOUT_ENV,
-                        DEFAULT_KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_TIMEOUT_SECONDS,
-                    )
-                ),
-            )
-            replay = replayed if isinstance(replayed, dict) else None
-            replay_status = replay.get("status") if replay is not None else None
-        if replay_status == rvf_bootstrap_gate.REPLAY_STATUS_COMPLETED:
-            assert replay is not None  # narrow for readers
-            # bootstrap 收尾 → 进入 REVIEWING：摘掉 gate、锁回 in_progress（**不清锁**，
-            # 否则常规 gate 会把这一轮当没人跑而重开），并 force-continue 让 agent 接着审。
-            if store_expired:
-                # 本轮是从 STALE 分支进来的：只把 state 改回 in_progress **不够**。
-                # `stamp_bootstrap_gate` 是读-改-写，会原样保留已经过期的 ``expires_at``，
-                # 于是下一次 Stop 仍判 stale；而此时 gate 已被摘掉 → 本函数 handled=False →
-                # 交还既有 stale 分支 clear_kanban_followup_lock + return None → 常规 gate
-                # 判「没人在跑」→ 为同一个仍在继续的 run 再开一轮 review。正是这套改动本来
-                # 要根治的 32cad 失败模式在这条路径上原样复活。故摘 gate 的同时必须把锁续期
-                # 回 active：下一次 Stop 读到的必须是一把 **active 的 in_progress 锁**。
-                revive_kanban_followup_lock(marker)
-            stamp_kanban_followup_bootstrap_gate(
-                marker, gate=None, state=KANBAN_FOLLOWUP_LOCK_STATE_IN_PROGRESS
-            )
-            _event(
-                "kanban_followup_bootstrap_gate_resolved",
-                resumed_run_id=replay.get("run_id"),
-                resumed_run_dir=replay.get("run_dir"),
-            )
-            return True, reengage_decision(
-                "local base 已吸收、bootstrap receipt 校验通过，本轮 RVF 的 prepare 已就绪"
-                f"（run_id={replay.get('run_id') or '<unknown>'}，"
-                f"run_dir={replay.get('run_dir') or '<unknown>'}）。"
-                "请继续完成**这一轮**的 review 并 handoff，**不要**新开 review。",
-                ledger,
-                reason_code="kanban_followup_bootstrap_resumed",
-                cwd=cwd,
-                cline_kanban_task_id=task_id,
-                session_id=session_id,
-                kanban_followup_in_progress_marker_path=marker_path,
-                active_rvf_run_id=replay.get("run_id"),
-                active_rvf_run_dir=replay.get("run_dir"),
-                **stop_hook_rvf_state_fields(
-                    phase="complete",
-                    backend="kanban-followup",
-                    backend_raw="kanban-followup",
-                    completion_gate="kanban_followup_bootstrap_resumed",
-                ),
-            )
-        elif replay_status == rvf_bootstrap_gate.REPLAY_STATUS_ARTIFACT_LOST:
-            # prep 文件已不可用（TTL 300s ≪ 一次 bootstrap 等待，且 sweep_stale 会删它）：
-            # 这一轮**没有**可恢复的在途工作，继续硬等只会白白熬光 re-engage / revive 预算。
-            # 走与 reconcile 级 artifact_lost 同一条「显式诊断 + 清锁安全重来」路径。
-            reconciliation = rvf_bootstrap_gate.BootstrapGateReconciliation(
-                outcome=rvf_bootstrap_gate.OUTCOME_ARTIFACT_LOST,
-                phase=rvf_bootstrap_gate.PHASE_BOOTSTRAP_INTERRUPTED_RETRYABLE,
-                reason="bootstrap_replay_artifact_lost",
-                diagnostic=(
-                    "bootstrap receipt 已通过校验，但本轮 prepare 的 prep 工件已不可用"
-                    f"（{_bootstrap_replay_error_text(replay) or '<unknown>'}）；"
-                    "本轮无从恢复，已清锁以便安全重来。"
-                ),
-            )
-            return _artifacts_lost("kanban_followup_bootstrap_gate_replay_artifact_lost")
-        elif claimed:
-            # 抢到占位、也确实起了重放，但它既没 completed 也没 artifact_lost（timeout / failed /
-            # 又撞回 waiting_local_base_bootstrap，或契约外地没回传可分类 status）：一律
-            # 「**释放占位** + 维持等待、绝不清锁」，让下一次 Stop 能立刻重试同一个 run 的 prepare。
-            #
-            # timeout 也走这里（而不是扣着占位硬扛满一个替换窗口）：重放跑在独立子进程里
-            # （`rvf_bootstrap_gate._replay_prepare_in_subprocess`）——内层预算到点由子进程写完结果
-            # `os._exit`（那个非守护 prepare worker 线程随进程一起消失），外层硬上限到点按**进程组**
-            # SIGKILL，两种收尾都不留在途的 prepare 写者。原先「`prepare_run_from_prep_file` 只
-            # shutdown(wait=False)、后台 worker 仍在写同一个 run 目录」的保留立论随子进程化失效；
-            # 并发去重本来就由 replay **之前**那次 O_EXCL claim 负责，与超时后是否保留占位无关。
-            # 继续扣着占位只会把一轮本可立刻重试的可恢复失败白拖满窗口，还给 agent 一条事实错误的
-            # 「仍在后台进行」。超时后真正的残留只剩被 orphan 的 git 孙进程（index.lock 量级、秒级
-            # 自消；真撞上也只是下一次重放再报一次可重试失败），远小于任何有意义的窗口。
-            release_kanban_followup_bootstrap_replay_in_flight(marker)
-            replay_error = _bootstrap_replay_error_text(replay)
-            reconciliation = rvf_bootstrap_gate.BootstrapGateReconciliation(
-                outcome=rvf_bootstrap_gate.OUTCOME_STILL_WAITING,
-                phase=rvf_bootstrap_gate.PHASE_BOOTSTRAP_INTERRUPTED_RETRYABLE,
-                reason=BOOTSTRAP_REPLAY_INCOMPLETE_REASON,
-                diagnostic=(
-                    "bootstrap receipt 已通过校验，但本轮 prepare 重放未完成"
-                    f"（status={replay_status or '<unknown>'}"
-                    f"{'，' + replay_error if replay_error else ''}）；"
-                    "重放已收尾、没有在途写者，下一次 Stop 会立刻重试同一个 run 的 prepare。"
-                ),
-                resume_run_id=reconciliation.resume_run_id,
-                resume_run_dir=reconciliation.resume_run_dir,
-            )
-
-    # still_waiting / conflict / tampered（含重放未成）：**既不 resume 也不 clear**。
-    # 锁过期就地复活，让这一轮继续被保护，然后给一条模型可见的定向指令。
-    #
-    # 「等的是什么」必须在**所有**下游出口之前定下来：receipt 已验证通过、只差 prepare 收尾
-    # （replay_pending）与「base 还没吸收」是方向完全相反的两种等待，任何一条出口把前者当后者
-    # 渲染，就是在教人去再跑一次同步 skill —— 那会产出第二份 receipt，下一轮按 digest 判 tampered
-    # 把这一轮锁死。
-    replay_pending = reconciliation.reason in BOOTSTRAP_REPLAY_PENDING_REASONS
-    revive_budget = _kanban_followup_env_int(
-        KANBAN_FOLLOWUP_BOOTSTRAP_REVIVE_BUDGET_ENV,
-        DEFAULT_KANBAN_FOLLOWUP_BOOTSTRAP_REVIVE_BUDGET,
-    )
-    if store_expired:
-        if kanban_followup_lock_revive_count(marker) >= revive_budget:
-            # 复活预算耗尽：本轮 bootstrap 迟迟没完成，交还给既有 stale 语义清锁并明确放弃，
-            # 而不是让一把永不过期的等待锁长期挡住这个 task。
-            _event(
-                "kanban_followup_bootstrap_gate_revive_budget_exhausted",
-                bootstrap_revive_budget=revive_budget,
-            )
-            return False, None
-        revive_kanban_followup_lock(marker)
-    reengage_budget = _kanban_followup_env_int(
-        KANBAN_FOLLOWUP_BOOTSTRAP_REENGAGE_BUDGET_ENV,
-        DEFAULT_KANBAN_FOLLOWUP_BOOTSTRAP_REENGAGE_BUDGET,
-    )
-    if kanban_followup_bootstrap_reengage_count(marker) >= reengage_budget > 0:
-        # 定向指令已给够却仍没进展：不再硬挡 agent 干停（防死循环），但等待态原样保留——
-        # 下一轮 Stop 若发现 receipt 已就绪，仍会按原 run 接续。
-        _event(
-            "kanban_followup_bootstrap_gate_reengage_budget_exhausted",
-            bootstrap_reengage_budget=reengage_budget,
-        )
-        return True, skip_decision(
-            (
-                # replay_pending：base 早已吸收、receipt 也已校验通过，只差 prepare 收尾。这条
-                # 出口落进 ledger summary/events，是事后排障的记录——写成「需要先跑同步 skill」
-                # 会把排障的人推向本函数下方 `bootstrap_replay_pending_reengage_reason` 明确
-                # 禁止的动作（再产一份 receipt → 下一轮判 tampered 锁死本轮）。
-                "本轮 Cline Kanban RVF follow-up 的 pre-review local-base bootstrap **已完成**"
-                f"（run_id={marker.get('run_id') or '<unknown>'}，"
-                f"local base `{gate.get('local_base_ref') or '<unknown>'}` 已吸收、"
-                "bootstrap receipt 已校验通过，只差本轮 prepare 收尾；"
-                "**不要**再跑一次同步 skill 或改动 receipt）；"
-                if replay_pending
-                else "本轮 Cline Kanban RVF follow-up 仍卡在 pre-review local-base bootstrap"
-                f"（run_id={marker.get('run_id') or '<unknown>'}，"
-                f"需要先跑 `{gate.get('required_sync_skill') or '<sync skill>'}` "
-                f"吸收 local base `{gate.get('local_base_ref') or '<unknown>'}`）；"
-            )
-            + "定向提示预算已用尽，本次 Stop 不再打断，也不会新开一轮 RVF。",
-            ledger,
-            "kanban_followup_waiting_local_base_bootstrap",
-            cwd=cwd,
-            backend="kanban-followup",
-            cline_kanban_task_id=task_id,
-            session_id=session_id,
-            kanban_followup_in_progress_marker_path=marker_path,
-            bootstrap_phase=reconciliation.phase,
-            active_rvf_run_id=marker.get("run_id"),
-            active_rvf_run_dir=marker.get("run_dir"),
-            **stop_hook_rvf_state_fields(
-                phase="complete",
-                backend="kanban-followup",
-                backend_raw="kanban-followup",
-                completion_gate="kanban_followup_waiting_local_base_bootstrap",
-            ),
-        )
-    bumped = bump_kanban_followup_bootstrap_reengage_count(marker)
-    _event(
-        (
-            "kanban_followup_bootstrap_gate_replay_pending"
-            if replay_pending
-            else "kanban_followup_bootstrap_gate_waiting"
-        ),
-        lock_revived=store_expired,
-        bootstrap_reengage_count=bumped,
-        bootstrap_reengage_budget=reengage_budget,
-    )
-    return True, reengage_decision(
-        (
-            rvf_bootstrap_gate.bootstrap_replay_pending_reengage_reason(
-                gate,
-                reconciliation,
-                resume_hint=(
-                    "本轮会在下一次 Stop 自动接续 prepare 并进入 review；"
-                    "在那之前 RVF 不会另开一轮。"
-                ),
-            )
-            if replay_pending
-            else rvf_bootstrap_gate.bootstrap_waiting_reengage_reason(
-                gate,
-                reconciliation,
-                resume_hint=(
-                    "完成后本轮会在下一次 Stop 自动接续 prepare 并进入 review；"
-                    "在那之前 RVF 不会另开一轮。"
-                ),
-            )
-        ),
-        ledger,
-        reason_code=f"kanban_followup_bootstrap_{reconciliation.reason}",
-        cwd=cwd,
-        cline_kanban_task_id=task_id,
-        session_id=session_id,
-        kanban_followup_in_progress_marker_path=marker_path,
-        bootstrap_phase=reconciliation.phase,
-        bootstrap_outcome=reconciliation.outcome,
-        active_rvf_run_id=marker.get("run_id"),
-        active_rvf_run_dir=marker.get("run_dir"),
-        **stop_hook_rvf_state_fields(
-            phase="complete",
-            backend="kanban-followup",
-            backend_raw="kanban-followup",
-            completion_gate="kanban_followup_waiting_local_base_bootstrap",
-        ),
     )
 
 
@@ -3970,6 +3722,7 @@ def release_tracker_lease_for_reconciled_kanban_followup_lock(
     marker: dict[str, Any],
     *,
     reason: str,
+    verified_tracker_lease_identity: tuple[str, str, str] | None = None,
 ) -> tuple[str | None, dict[str, Any]]:
     """清锁时连带释放该轮 RVF 的 tracker lease，让 scope unit 退回 ``available``。
 
@@ -3980,7 +3733,9 @@ def release_tracker_lease_for_reconciled_kanban_followup_lock(
     Stop hook 是 best-effort 路径：tracker 侧任何异常一律吞掉转成诊断，绝不阻断 Stop 主流程
     （形状照抄本文件 ``patch_ownership_incomplete_skip_payload`` 的 lease 释放写法）。
     """
-    lease_id, repo, source = _tracker_lease_identity_for_kanban_followup_lock(marker)
+    lease_id, repo, source = (verified_tracker_lease_identity
+                             if verified_tracker_lease_identity is not None
+                             else _tracker_lease_identity_for_kanban_followup_lock(marker))
     if not lease_id:
         return None, {
             "status": "unresolved",
@@ -4015,6 +3770,48 @@ def release_tracker_lease_for_reconciled_kanban_followup_lock(
     return lease_id, result
 
 
+def reconcile_tracker_leases_for_backup_consumed_followup(
+    marker: dict[str, Any], ledger: RunLedger, *, evidence: dict[str, Any],
+) -> bool:
+    """先释放已消费原 run 的精确 lease，再允许清凭证；失败留原凭证供后续 Stop 自动重试。"""
+    original_run = Path(evidence["original_run_directory"])
+    lease_id, _, source = _tracker_lease_identity_for_kanban_followup_lock(marker)
+    # 仓身份取自已核验的备用交付事实，不能让陈旧 marker 把释放导向另一个 tracker。
+    repo = evidence["result"]["worktree"]
+    verification = read_tracker_lease_reconciliation_evidence_for_exact_run(
+        repo=repo, run_id=original_run.name, expected_lease_id=lease_id,
+    )
+    releases = []
+    terminal_states = {"completed", "stale-released", "failed-released"}
+    if verification["status"] == "verified":
+        for lease in verification["leases"]:
+            if lease["state"] in terminal_states:
+                continue
+            _, result = release_tracker_lease_for_reconciled_kanban_followup_lock(
+                marker, reason="kanban_followup_original_run_consumed_by_independent_backup",
+                verified_tracker_lease_identity=(lease["lease_id"], repo,
+                    source if lease["lease_id"] == lease_id and source else "native-tracker-exact-run"),
+            )
+            releases.append(result)
+        if releases:
+            verification = read_tracker_lease_reconciliation_evidence_for_exact_run(
+                repo=repo, run_id=original_run.name, expected_lease_id=lease_id,
+            )
+    ready_for_marker_cleanup = (verification["status"] == "verified"
+                               and all(lease["state"] in terminal_states for lease in verification["leases"]))
+    ledger.event(
+        phase="gate", event="kanban_followup_backup_consumed_tracker_lease_reconciliation",
+        status="completed" if ready_for_marker_cleanup else "warning",
+        reason_code="kanban_followup_backup_consumed_tracker_lease_reconciled" if ready_for_marker_cleanup
+                    else "kanban_followup_backup_consumed_tracker_lease_retry_pending",
+        kanban_followup_marker=marker, independent_backup_consumption_evidence=evidence,
+        tracker_lease_reconciliation_evidence=verification, tracker_lease_release_results=releases,
+        recovery_condition=None if ready_for_marker_cleanup else
+            "保留同 run 凭证；后续 Stop 在原 tracker／run 身份恢复可读写后自动重验，不催办或重投已消费 run",
+    )
+    return ready_for_marker_cleanup
+
+
 def _kanban_followup_awaiting_agent_decision_decision(
     ledger: RunLedger,
     *,
@@ -4027,8 +3824,7 @@ def _kanban_followup_awaiting_agent_decision_decision(
 ) -> tuple[bool, StopDecision | None]:
     """处理 ``delivered_awaiting_agent_decision`` 态，返回 ``(handled, decision)``。
 
-    - trigger 确在祖先链上 → **升格**（按有无 bootstrap gate 落到 waiting_bootstrap /
-      in_progress），``handled=False`` 让调用方落回常规分支（nudge 预算等一切照旧）。
+    - trigger 确在祖先链上 → **升格**到 in_progress，``handled=False`` 让调用方落回常规分支。
     - 尚未确认落地且锁仍在 awaiting 短窗内 → ``skip_decision``：**只做互斥去重，不发 nudge**。
       这正是本次要根治的那一格——历史实现在这里会催 agent「收尾这一轮」。
     - awaiting 短窗已过仍未确认 → 清锁 + **释放本轮 lease** 交回常规 gate，按**当时**工作树重新
@@ -4063,7 +3859,7 @@ def _kanban_followup_awaiting_agent_decision_decision(
         if promoted_state:
             return False, None
         # 升格写盘失败（``promote_...`` 只在 OSError 时返回 None）→ **磁盘上这把锁仍是 awaiting**。
-        # 此处绝不能 ``return False, None`` 把它交给下面的常规 in_progress / bootstrap 分支：那条
+        # 此处绝不能 ``return False, None`` 把它交给下面的常规 in_progress 分支：那条
         # 路会对一把「磁盘态仍是未确认接手」的锁发 re-engage nudge——正是本轮要根治的那个行为
         # （ledger 记了 warning 但控制流照走，等于没 fail-closed）。故 fail-closed：往下继续按
         # awaiting 处理（窗口内只互斥去重、不 nudge；窗口已过则回收 + 释放 lease），下一次 Stop
@@ -4177,10 +3973,82 @@ def kanban_followup_in_progress_decision(
     task_id = current_kanban_task_id(event)
     session_id = kanban_followup_lock_session_id(event)
     repository_anchor = kanban_followup_lock_repository_anchor(event, cwd=cwd)
-    marker = read_kanban_followup_lock(
-        task_id=task_id, session_id=session_id, repo=repository_anchor
-    )
+    marker = None
+    unknown_backup_consumptions = []
+    completed_marker_paths: set[str] = set()
+    # 同一次 Stop 先对账 task / session 两把锁；完成的 X 不能遮住仍在途的 Y。
+    for candidate in read_in_progress_markers_for_task_and_session(
+        task_id=task_id, session_id=session_id, repo=repository_anchor,
+    ):
+        if candidate["_marker_path"] in completed_marker_paths:
+            continue
+        backup_consumption = reconcile_backup_consumption_for_followup_marker(candidate, ledger, cwd=cwd)
+        if backup_consumption["status"] == "consumed":
+            if not reconcile_tracker_leases_for_backup_consumed_followup(candidate, ledger, evidence=backup_consumption):
+                # 保留恢复入口，同时把已消费 run 从本轮 nudge／续期候选中剔除。
+                completed_marker_paths.add(candidate["_marker_path"])
+                if marker is not None and marker["_marker_path"] in completed_marker_paths:
+                    marker = None
+                continue
+            original_run = Path(backup_consumption["original_run_directory"])
+            removed, kept = clear_markers_belonging_to_handed_off_run(
+                task_id=task_id, session_id=session_id, repo=repository_anchor,
+                run_id=original_run.name, run_dir=original_run,
+            )
+            clear_backup_consumed_followup_pending(ledger, task_id=task_id, evidence=backup_consumption)
+            cleanup_failures = [item for item in kept if item["cleanup_reason"] == "marker_unlink_failed"]
+            completed_marker_paths.add(candidate["_marker_path"])
+            completed_marker_paths.update(removed)
+            completed_marker_paths.update(item["_marker_path"] for item in cleanup_failures)
+            if marker is not None and marker["_marker_path"] in completed_marker_paths:
+                marker = None
+            ledger.event(
+                phase="gate", event="kanban_followup_lock_reconciled_for_backup_consumed_run",
+                status="warning" if cleanup_failures else "completed",
+                reason_code="kanban_followup_in_progress_marker_run_consumed_by_independent_backup",
+                cwd=cwd, kanban_followup_in_progress_marker=candidate,
+                independent_backup_consumption_evidence=backup_consumption,
+                removed_kanban_followup_in_progress_marker_paths=removed,
+                kept_kanban_followup_in_progress_markers=kept,
+            )
+            continue
+        completion = read_finalize_completion_evidence_for_in_progress_marker_run(candidate)
+        if completion is None:
+            if backup_consumption["status"] == "unknown":
+                unknown_backup_consumptions.append(backup_consumption)
+                continue
+            if marker is None:
+                marker = candidate
+            continue
+        removed, kept = clear_markers_belonging_to_handed_off_run(
+            task_id=task_id, session_id=session_id, repo=repository_anchor,
+            run_id=candidate.get("run_id"), run_dir=candidate.get("run_dir"),
+        )
+        cleanup_failures = [item for item in kept if item["cleanup_reason"] == "marker_unlink_failed"]
+        completed_marker_paths.update(removed)
+        completed_marker_paths.update(item["_marker_path"] for item in cleanup_failures)
+        # 已选快照也可能刚被对账为完成；即使删除失败，也不能进入 nudge 再写回。
+        if marker is not None and marker["_marker_path"] in completed_marker_paths:
+            marker = None
+        ledger.event(
+            phase="gate", event="kanban_followup_lock_reconciled_for_already_finalized_run",
+            status="warning" if cleanup_failures else "completed",
+            reason_code="kanban_followup_in_progress_marker_run_already_finalized",
+            cwd=cwd, cline_kanban_task_id=task_id, session_id=session_id,
+            kanban_followup_in_progress_marker=candidate,
+            reconciled_blocking_run_id=candidate.get("run_id"),
+            reconciled_blocking_run_dir=candidate.get("run_dir"),
+            finalize_completion_evidence=completion,
+            removed_kanban_followup_in_progress_marker_paths=removed,
+            kept_kanban_followup_in_progress_markers=kept,
+        )
     if marker is None:
+        if unknown_backup_consumptions:
+            return skip_decision(
+                "备用消费证据暂不可核验；保留原在途凭证，后续 Stop 自动补证，本次不催办或续期。",
+                ledger, "kanban_followup_backup_consumption_unknown", cwd=cwd,
+                independent_backup_consumption_evidence=unknown_backup_consumptions,
+            )
         # 无 in-progress 锁（从未落地或已 handoff 清掉）→ 转交 pending 对账：判断上一条
         # dispatch 是否在途（去重）或已静默丢投（重投）。
         return _kanban_followup_pending_decision(
@@ -4243,7 +4111,7 @@ def kanban_followup_in_progress_decision(
         )
         if handled:
             return awaiting_decision
-        # 升格成功（trigger 确在祖先链上）→ 落回下面的常规 in_progress / waiting_bootstrap 分支。
+        # 升格成功（trigger 确在祖先链上）→ 落回下面的常规 in_progress 分支。
         status = kanban_followup_lock_status(marker)
         lock_state = kanban_followup_lock_state(marker)
 
@@ -4283,19 +4151,6 @@ def kanban_followup_in_progress_decision(
                 removed_kanban_followup_in_progress_marker_paths=removed_lock,
             )
             return None
-        # bootstrap 等待：这一轮**还没开始 review**，只是在等 local base 被吸收。必须排在下面的
-        # nudge/skip 之前——那两条都以「review 正在跑、只差 handoff」为前提，对一个还卡在
-        # bootstrap 门前的 agent 发「继续收尾、输出 handoff」是错误指令。
-        handled, bootstrap_decision = _kanban_followup_bootstrap_gate_decision(
-            ledger,
-            marker=marker,
-            task_id=task_id,
-            session_id=session_id,
-            cwd=cwd,
-            store_expired=False,
-        )
-        if handled:
-            return bootstrap_decision
         # B（re-engage nudge）：锁 active 但 agent 停在「未 handoff」处时，历史行为是无条件
         # 返回 {"continue":true} 静默放行 → agent 当回合干停、RVF 不再 force-continue，于是它
         # 被这把锁一路静默挡停直到 handoff/TTL（实测曾冻 47min）。这里改为：在 nudge 预算内
@@ -4397,20 +4252,6 @@ def kanban_followup_in_progress_decision(
             ),
         )
 
-    # 锁已过 TTL（stale / invalid）。清它之前先问一句：这一轮是不是只是**还在等 bootstrap**？
-    # 若是，清锁会让常规 gate 判「没人在跑」而重铸 token / 重开 run——正是历史上那条既漏审又
-    # 多派的路径。等待态一律改为就地复活 + 定向 re-engage，只有工件真丢了才落到下面的清理。
-    handled, bootstrap_decision = _kanban_followup_bootstrap_gate_decision(
-        ledger,
-        marker=marker,
-        task_id=task_id,
-        session_id=session_id,
-        cwd=cwd,
-        store_expired=True,
-    )
-    if handled:
-        return bootstrap_decision
-
     # 心跳续期（B）：清锁之前再问一句「这一轮其实还在跑吗？」
     #
     # 原本这里是无条件清锁 —— 而 TTL 被证实短于它要保护的事件（实测 p50 = 84.3min、53% 超过
@@ -4427,11 +4268,8 @@ def kanban_followup_in_progress_decision(
     # 拿不到证据（run_dir 缺失 / 不可读 / 久无活动）一律**不**续期：抑制性凭证的失败方向必须是
     # 「多问一次」而不是「静默续命」。
     #
-    # 绝对硬顶（F2a：任何 wait 分支都要有与被等对象无关的上界）由**本调用点**负责，不塞进
-    # ``revive_marker`` 的默认行为——bootstrap 等待那条路径有它自己的上界形态（复活次数预算），
-    # 且其中「收尾时把锁续回 active」那一处必须成功，在共享路径上塞墙钟硬顶会把 32cad 回归放
-    # 回来。硬顶自 ``armed_at`` 起算、不随续期前移；越过之后无论 run 写得多勤都不再续——「它还
-    # 在写日志」恰恰是活锁最典型的样子。
+    # 绝对硬顶由本调用点负责。硬顶自 ``armed_at`` 起算，不随续期前移；越过之后无论 run
+    # 写得多勤都不再续，避免仅靠日志写入无限续期。
     #
     # 硬顶要真的是硬顶，需要**两道**判定，缺一道就只是个建议值：
     #   ① 续期之前判「还能不能续」（``..._exceeds_revival_absolute_cap``）；
@@ -4441,18 +4279,8 @@ def kanban_followup_in_progress_decision(
     # 5h59m 的锁被续到 armed + 7.98h，6h 硬顶被整整绕过一个 TTL）。② 之后上界闭合在 armed + cap：
     # 硬顶那一刻锁必然转 stale，回到这里就只剩 ① 那条「不再续、清锁交回常规 gate」的出口。
     #
-    # 第一个合取项是 RVF-003：心跳只对**真的在跑 review** 的锁生效，绝不覆盖 bootstrap 侧刚刚
-    # 作出的放弃决定。上面那次 gate 判定返回 ``handled=False`` 有两种成因，处置**相反**：
-    #   * 这把锁与 bootstrap 无关（没有等待 gate）→ 正是心跳要保护的长 review；
-    #   * 等待 gate 还在、但复活预算已耗尽 → bootstrap 已**明确放弃本轮**，把 stale 语义交还给
-    #     下面的清锁。此时再按 run 活动续期，等于把「3 次复活」的等待上界偷换成「6h 硬顶」。
-    # 判据取 marker 的 ``state`` 而不是 gate 形状，因为真正的理由在证据的语义上：心跳的存活证据
-    # 是「run 目录近期有写入」，而等待态的 run 目录是被 **prepare 重放**写的，不代表 review 在
-    # 推进——receipt 已验证却重放反复失败时，重放本身就刚写过 run 目录，恰好把这条证据变成永动机。
     if (
-        kanban_followup_lock_state(marker)
-        != KANBAN_FOLLOWUP_LOCK_STATE_WAITING_BOOTSTRAP
-        and in_flight_rvf_run_shows_recent_activity(marker)
+        in_flight_rvf_run_shows_recent_activity(marker)
         and not kanban_followup_lock_exceeds_revival_absolute_cap(marker)
         and revive_kanban_followup_lock(
             marker, truncate_expiry_to_revival_absolute_cap=True
@@ -4625,6 +4453,22 @@ def git_toplevel_or_none(path: Path) -> Path | None:
     return Path(value).expanduser().resolve() if value else None
 
 
+def git_worktree_root_and_common_directory_or_none(path: Path) -> tuple[Path, Path] | None:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        values = completed.stdout.strip().splitlines()
+        if completed.returncode != 0 or len(values) != 2 or not all(values):
+            return None
+        return Path(values[0]).resolve(strict=True), Path(values[1]).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
 def _task_workspace_from_mapping(value: dict[str, Any]) -> str | None:
     for key in ("workspace_path", "workspacePath"):
         candidate = value.get(key)
@@ -4656,21 +4500,63 @@ def lookup_kanban_task_workspace_from_state(
     task_id: str,
     project_path: str | None,
 ) -> dict[str, Any]:
+    scan_started = time.monotonic()
     workspaces_dir = cline_kanban_state_dir() / "workspaces"
     checked: list[str] = []
     matches: list[dict[str, str]] = []
     errors: list[str] = []
-    if not workspaces_dir.is_dir():
-        return {"workspace_path": None, "source": "kanban_state_missing", "checked": checked}
-    for sessions_path in sorted(workspaces_dir.glob("*/sessions.json")):
-        checked.append(str(sessions_path))
+    state_scan_metrics = {"files_read": 0, "bytes_read": 0, "duration_ms": 0.0}
+    result: dict[str, Any] = {
+        "workspace_path": None,
+        "source": "kanban_state_missing_task_workspace",
+        "checked": checked,
+        "matches": matches,
+        "errors": errors,
+        "project_path": project_path,
+        "state_scan_metrics": state_scan_metrics,
+    }
+    try:
+        workspace_directories = sorted(workspaces_dir.iterdir())
+    except FileNotFoundError:
+        result["source"] = "kanban_state_missing"
+        workspace_directories = []
+    except OSError as exc:
+        errors.append(f"{workspaces_dir}: {type(exc).__name__}: {exc}")
+        workspace_directories = []
+    for workspace_directory in workspace_directories:
+        sessions_path = workspace_directory / "sessions.json"
         try:
-            payload = json.loads(sessions_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+            if not stat.S_ISDIR(workspace_directory.stat().st_mode):
+                continue
+        except OSError as exc:
+            checked.append(str(sessions_path))
+            errors.append(f"{workspace_directory}: {type(exc).__name__}: {exc}")
+            continue
+        try:
+            sessions_path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            checked.append(str(sessions_path))
             errors.append(f"{sessions_path}: {type(exc).__name__}: {exc}")
             continue
-        sessions = payload.values() if isinstance(payload, dict) else []
-        for session in sessions:
+        checked.append(str(sessions_path))
+        try:
+            contents = sessions_path.read_bytes()
+        except OSError as exc:
+            errors.append(f"{sessions_path}: {type(exc).__name__}: {exc}")
+            continue
+        state_scan_metrics["files_read"] += 1
+        state_scan_metrics["bytes_read"] += len(contents)
+        try:
+            payload = json.loads(contents.decode("utf-8"))
+        except (ValueError, RecursionError) as exc:
+            errors.append(f"{sessions_path}: {type(exc).__name__}: {exc}")
+            continue
+        if not isinstance(payload, dict):
+            errors.append(f"{sessions_path}: sessions JSON 必须是对象")
+            continue
+        for session in payload.values():
             if not isinstance(session, dict):
                 continue
             session_task_id = session.get("taskId") or session.get("task_id") or session.get("id")
@@ -4683,27 +4569,22 @@ def lookup_kanban_task_workspace_from_state(
     unique = []
     seen: set[str] = set()
     for match in matches:
-        resolved = str(Path(match["workspace_path"]).expanduser().resolve())
+        try:
+            resolved = str(Path(match["workspace_path"]).expanduser().resolve())
+        except (OSError, RuntimeError, ValueError) as exc:
+            errors.append(f"{match['sessions_path']}: {type(exc).__name__}: {exc}")
+            continue
         if resolved in seen:
             continue
         seen.add(resolved)
         unique.append({**match, "workspace_path": resolved})
+    result["matches"] = unique
     if len(unique) == 1:
-        return {
-            "workspace_path": unique[0]["workspace_path"],
-            "source": "kanban_state_session_workspace",
-            "checked": checked,
-            "matches": unique,
-            "errors": errors,
-        }
-    return {
-        "workspace_path": None,
-        "source": "kanban_state_ambiguous" if unique else "kanban_state_missing_task_workspace",
-        "checked": checked,
-        "matches": unique,
-        "errors": errors,
-        "project_path": project_path,
-    }
+        result.update(workspace_path=unique[0]["workspace_path"], source="kanban_state_session_workspace")
+    elif unique:
+        result["source"] = "kanban_state_ambiguous"
+    state_scan_metrics["duration_ms"] = (time.monotonic() - scan_started) * 1000
+    return result
 
 
 def lookup_cline_kanban_task_workspace(
@@ -4711,10 +4592,81 @@ def lookup_cline_kanban_task_workspace(
     project_path: str,
     task_id: str,
     ledger: RunLedger,
+    cwd_git_root: Path,
+    cwd_git_common_directory: Path | None = None,
 ) -> dict[str, Any]:
     direct = current_kanban_workspace_path({})
     if direct:
         return {"workspace_path": direct, "source": "kanban_workspace_env"}
+    lookup_started = time.monotonic()
+    state_lookup = lookup_kanban_task_workspace_from_state(task_id=task_id, project_path=project_path)
+    lookup = state_lookup
+    fallback_reason = state_lookup["source"]
+    state_workspace = state_lookup.get("workspace_path")
+    if state_lookup["errors"]:
+        fallback_reason = "kanban_state_read_failed"
+    elif state_workspace:
+        try:
+            cwd_git_identity = (
+                (cwd_git_root, cwd_git_common_directory)
+                if cwd_git_common_directory is not None
+                else git_worktree_root_and_common_directory_or_none(cwd_git_root)
+            )
+            state_git_identity = (
+                cwd_git_identity
+                if cwd_git_identity and _same_existing_path(Path(state_workspace), cwd_git_identity[0])
+                else git_worktree_root_and_common_directory_or_none(Path(state_workspace))
+            )
+            if cwd_git_identity is None or state_git_identity is None:
+                fallback_reason = "kanban_state_workspace_git_root_unavailable"
+            elif not _same_existing_path(cwd_git_root, state_git_identity[0]):
+                fallback_reason = "kanban_state_workspace_git_root_mismatch"
+            else:
+                project_git_identity = (
+                    cwd_git_identity
+                    if _same_existing_path(Path(project_path).expanduser(), cwd_git_identity[0])
+                    else git_worktree_root_and_common_directory_or_none(Path(project_path).expanduser())
+                )
+                if project_git_identity is None:
+                    fallback_reason = "kanban_state_workspace_project_git_repository_unavailable"
+                elif not _same_existing_path(state_git_identity[1], project_git_identity[1]):
+                    fallback_reason = "kanban_state_workspace_project_git_repository_mismatch"
+                else:
+                    fallback_reason = None
+        except (OSError, RuntimeError, ValueError) as exc:
+            fallback_reason = "kanban_state_workspace_git_root_unavailable"
+            state_lookup["errors"].append(f"{type(exc).__name__}: {exc}")
+    task_list_lookup: dict[str, Any] = {
+        "invoked": False, "returncode": None, "duration_ms": 0.0,
+        "stdout_bytes": 0, "stdout_sha256": None, "error": None,
+    }
+    stdout = b""
+    if fallback_reason is not None:
+        lookup, task_list_lookup, stdout = lookup_cline_kanban_task_workspace_from_list(
+            project_path=project_path, task_id=task_id, ledger=ledger
+        )
+    artifact_payload = {
+        "task_id": task_id,
+        "workspace_path": lookup.get("workspace_path"),
+        "source": lookup["source"],
+        "fallback_reason": fallback_reason,
+        "error": lookup.get("error") or task_list_lookup.get("error"),
+        "duration_ms": (time.monotonic() - lookup_started) * 1000,
+        "state_lookup": state_lookup,
+        "task_list_lookup": task_list_lookup,
+    }
+    if lookup is not state_lookup and "state_scan_metrics" in lookup:
+        artifact_payload["fallback_state_scan_metrics"] = lookup["state_scan_metrics"]
+    if task_list_lookup["invoked"] and os.environ.get("CODEX_RVF_CLINE_KANBAN_WORKSPACE_LOOKUP_DEBUG_FULL_STDOUT") == "1":
+        artifact_payload["stdout"] = stdout.decode("utf-8", errors="replace")
+    artifact = ledger.artifact("kanban-followup-workspace-lookup.json", artifact_payload)
+    return {**lookup, "artifact": artifact, "fallback_reason": fallback_reason, "task_list_lookup": task_list_lookup}
+
+
+def lookup_cline_kanban_task_workspace_from_list(
+    *, project_path: str, task_id: str, ledger: RunLedger,
+) -> tuple[dict[str, Any], dict[str, Any], bytes]:
+    """保留 list-first 的查询与 state 回退；正文只在显式 debug artifact 中保存。"""
     client = cline_kanban_script_path("CODEX_RVF_CLINE_KANBAN_CLIENT", DEFAULT_CLINE_KANBAN_CLIENT)
     task_cmd = os.environ.get("CODEX_RVF_CLINE_KANBAN_TASK_CMD", DEFAULT_CLINE_KANBAN_TASK_CMD)
     command = [
@@ -4726,47 +4678,48 @@ def lookup_cline_kanban_task_workspace(
         "--task-cmd",
         task_cmd,
     ]
-    completed = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        env={**os.environ, **ledger.env()},
-        check=False,
-    )
-    artifact = ledger.artifact(
-        "kanban-followup-workspace-lookup.json",
-        {
-            "command": command,
-            "returncode": completed.returncode,
-            "stdout": completed.stdout,
-            "stderr": completed.stderr,
-        },
-    )
-    if completed.returncode == 0:
+    list_started = time.monotonic()
+    stdout = stderr = b""
+    returncode = None
+    error = None
+    try:
+        completed = subprocess.run(command, capture_output=True, env={**os.environ, **ledger.env()}, check=False)
+        stdout, stderr, returncode = completed.stdout, completed.stderr, completed.returncode
+    except OSError as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    stderr_excerpt = stderr[:4096].decode("utf-8", errors="replace")
+    if returncode:
+        error = stderr_excerpt.strip() or f"task list 返回退出码 {returncode}"
+    metadata = {
+        "invoked": True,
+        "command": command,
+        "returncode": returncode,
+        "duration_ms": (time.monotonic() - list_started) * 1000,
+        "stdout_bytes": len(stdout),
+        "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
+        "stderr_bytes": len(stderr),
+        "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+        "stderr_excerpt": stderr_excerpt,
+        "error": error,
+    }
+    if returncode == 0:
         try:
-            payload = json.loads(completed.stdout)
-        except json.JSONDecodeError as exc:
-            return {
+            payload = json.loads(stdout.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            return ({
                 "workspace_path": None,
                 "source": "cline_kanban_workspace_lookup_invalid_json",
-                "artifact": artifact,
                 "error": f"{type(exc).__name__}: {exc}",
-            }
+            }, metadata, stdout)
         if isinstance(payload, dict):
             workspace = kanban_task_workspace_from_payload(payload, task_id)
             if workspace:
-                return {
+                return ({
                     "workspace_path": workspace,
                     "source": "cline_kanban_task_list_workspace",
-                    "artifact": artifact,
-                }
+                }, metadata, stdout)
     state_lookup = lookup_kanban_task_workspace_from_state(task_id=task_id, project_path=project_path)
-    state_lookup["task_list_lookup"] = {
-        "artifact": artifact,
-        "returncode": completed.returncode,
-        "error": completed.stderr.strip() or completed.stdout.strip(),
-    }
-    return state_lookup
+    return state_lookup, metadata, stdout
 
 
 def kanban_task_workspace_guard_payload(
@@ -4778,7 +4731,8 @@ def kanban_task_workspace_guard_payload(
     task_id = current_kanban_task_id(event)
     if not (task_id and cwd):
         return None
-    cwd_root = git_toplevel_or_none(Path(cwd).expanduser())
+    cwd_git_identity = git_worktree_root_and_common_directory_or_none(Path(cwd).expanduser())
+    cwd_root = cwd_git_identity[0] if cwd_git_identity else git_toplevel_or_none(Path(cwd).expanduser())
     if cwd_root is None:
         return None
     direct_workspace = current_kanban_workspace_path(event)
@@ -4791,6 +4745,8 @@ def kanban_task_workspace_guard_payload(
             project_path=project_path,
             task_id=task_id,
             ledger=ledger,
+            cwd_git_root=cwd_root,
+            cwd_git_common_directory=cwd_git_identity[1] if cwd_git_identity else None,
         )
     raw_workspace = lookup.get("workspace_path")
     if not isinstance(raw_workspace, str) or not raw_workspace.strip():
@@ -4850,6 +4806,7 @@ def freeze_cline_kanban_dispatch_artifacts(
     dispatch_prep: rvf_prep_file.PrepFileRecord,
     target_flow: str,
 ) -> dict[str, Any]:
+    require_review_start_boundary_for_prepare(repo=cwd, receipt=(dispatch_prep.payload.get("rvf_run") or {}).get("review_start_boundary_receipt"))
     scope_text = dispatch_scope_of_work_text(
         target_flow=target_flow,
         cwd=cwd,
@@ -5668,6 +5625,9 @@ def start_cline_kanban_followup_message(
     idempotency_key: str | None = None,
     timeout: float | None = None,
     artifact_label: str = "kanban-followup",
+    deliver_when_agent_idle: bool = False,
+    decision_token_expires_at: str | None = None,
+    required_native_independent_user_turn_session_id: str | None = None,
 ) -> dict[str, Any]:
     """经 cline-kanban 终端投递把 ``prompt`` 投成目标 task 的一条真实 user message。
 
@@ -5725,6 +5685,17 @@ def start_cline_kanban_followup_message(
     ]
     if attempt_id:
         command.extend(["--attempt-id", attempt_id])
+    if deliver_when_agent_idle:
+        if not required_native_independent_user_turn_session_id:
+            raise KanbanFollowupDeliveryNotAttemptedError("独立决策点投递缺少目标原生会话")
+        if not decision_token_expires_at:
+            raise KanbanFollowupDeliveryNotAttemptedError("独立决策点投递缺少 token 截止时间")
+        remaining_seconds = (decision_token_store.parse_timestamp(decision_token_expires_at) - decision_token_store.utc_now()).total_seconds()
+        idle_wait_ms = int((remaining_seconds - TERMINAL_DELIVERY_STATUS_CONVERGENCE_CONTRACT_BUDGET_SECONDS) * 1000)
+        if idle_wait_ms <= 0:
+            raise KanbanFollowupDeliveryNotAttemptedError("token 剩余时效不足以投递独立决策点")
+        command.extend(["--deliver-when-agent-idle", "--max-wait-for-agent-idle-ms", str(idle_wait_ms)])
+        command.extend(["--require-native-independent-user-turn-for-session", required_native_independent_user_turn_session_id])
     # 契约第 4 条：短等而已（默认 0 = 完全不等，保持 Stop 链路的既有时延）。开大它并不能等满
     # 契约的 196.5s 收敛预算——CLI 硬超时会把等待 clamp 掉；真正的终态靠 message-status 轮询。
     wait_ms = _kanban_followup_env_int(
@@ -6076,6 +6047,13 @@ def run_review_validate_fix_child_fork(
             cwd=cwd,
         )
 
+    if mode != "dry-run":
+        try:
+            boundary = require_review_start_boundary_for_prepare(repo=str(origin_repo or cwd or ""))
+            if boundary.get("session_id") and boundary["session_id"] != parent_session_id:
+                raise ReviewStartBoundaryNotVerified(INVALIDATED, "fork 父会话与开审分界不一致")
+        except ReviewStartBoundaryNotVerified as exc:
+            return skip_payload(exc.reason, ledger, exc.status, cwd=cwd, **(extra_summary or {}))
     effective_prompt = prompt
     if suppress_child_stop_hook and SUPPRESS_STOP_HOOK_MARKER not in effective_prompt:
         effective_prompt = (
@@ -6113,17 +6091,19 @@ def run_review_validate_fix_child_fork(
         mode,
         cline_kanban_worktree_mode=cline_kanban_worktree_mode,
     )
-    dispatch_prep = write_dispatch_prep_file(
-        ledger=ledger,
-        origin_session_id=parent_session_id,
-        origin_repo=origin_repo or cwd,
-        origin_cwd=cwd,
-        target_flow=target_flow,
-        target_worktree=None if target_flow == "flow-2-branch" else cwd,
-        origin_metadata_path=origin_path,
-        parent_thread_path=parent_thread_path,
-    )
-    effective_prompt = add_dispatch_prep_to_prompt(effective_prompt, dispatch_prep)
+    dispatch_prep = None
+    if mode != "dry-run":
+        dispatch_prep = write_dispatch_prep_file(
+            ledger=ledger,
+            origin_session_id=parent_session_id,
+            origin_repo=origin_repo or cwd,
+            origin_cwd=cwd,
+            target_flow=target_flow,
+            target_worktree=None if target_flow == "flow-2-branch" else cwd,
+            origin_metadata_path=origin_path,
+            parent_thread_path=parent_thread_path,
+        )
+        effective_prompt = add_dispatch_prep_to_prompt(effective_prompt, dispatch_prep)
     prompt_path = ledger.artifact("fork.prompt.txt", effective_prompt)
     ledger.event(
         phase="fork",
@@ -6135,7 +6115,7 @@ def run_review_validate_fix_child_fork(
             key: value
             for key, value in {
                 "prompt": prompt_path,
-                "dispatch_prep_file": str(dispatch_prep.path),
+                "dispatch_prep_file": str(dispatch_prep.path) if dispatch_prep is not None else None,
             }.items()
             if value
         },
@@ -6143,7 +6123,7 @@ def run_review_validate_fix_child_fork(
         log_prefix=log_prefix,
     )
 
-    dispatch_prep_fields = dispatch_prep_summary_fields(dispatch_prep, target_flow=target_flow)
+    dispatch_prep_fields = dispatch_prep_summary_fields(dispatch_prep, target_flow=target_flow) if dispatch_prep is not None else {}
     result: dict[str, Any] = {
         "mode": mode,
         "log_prefix": log_prefix,
@@ -6690,6 +6670,10 @@ def launch_backend(
             backend=decision.backend,
         )
     cwd = decision.cwd or fork_cwd_for_event(event, decision.repo)
+    try:
+        require_review_start_boundary_for_prepare(repo=decision.repo)
+    except ReviewStartBoundaryNotVerified as exc:
+        return skip_payload(exc.reason, ledger, exc.status, repo=decision.repo, cwd=cwd)
     if decision.backend == "kanban-followup":
         task_id = current_kanban_task_id(event)
         if not task_id:
@@ -7594,6 +7578,11 @@ def allocate_auto_review_scope(
                          metadata without any tracker writes.
     """
     repo = context.get("repo")
+    if not dry_run:
+        try:
+            require_review_start_boundary_for_prepare(repo=str(repo or ""))
+        except ReviewStartBoundaryNotVerified as exc:
+            return skip_payload(exc.reason, ledger, exc.status, repo=repo)
     if _tracker_disabled():
         if dry_run:
             # The dispatcher dry-run path also predates the tracker — feed it
@@ -8527,6 +8516,16 @@ def route_reviewable_scope(
     后者自解析 round-baseline marker 把 committed 单元喂进 manifest，因此 committed
     改动与 dirty 改动的归属 / 分配 / 去重完全一致。
     """
+    backend = normalize_backend_from_env(event)
+    if backend == "off":
+        return skip_decision("CODEX_RVF_MODE=off", ledger, "mode_off", repo=repo, cwd=cwd, backend=backend)
+    if backend == "report-only":
+        return report_only_decision(repo, ledger)
+    # 旧路由也不得在证明分界前消费 reopen 意图或分配审查 lease。
+    try:
+        require_review_start_boundary_for_prepare(repo=repo)
+    except ReviewStartBoundaryNotVerified as exc:
+        return skip_decision(exc.reason, ledger, exc.status, repo=repo, cwd=cwd)
     all_changed_paths = candidate_paths
     session_precheck = precheck_session_scope_for_dirty_route(
         event,
@@ -8915,7 +8914,7 @@ def classify_review_initiation_lifecycle(
 
     第 3 条是**兜底**而非主机制：真正的延续在 ``evaluate_stop_event`` 更早处就被
     ``awaiting_dispatched_agent_decision`` / ``kanban_followup_in_progress_decision`` 接走了
-    （两者覆盖 in_progress / waiting_bootstrap / awaiting-decision / pending-in-flight）。走到
+    （两者覆盖 in_progress / awaiting-decision / pending-in-flight）。走到
     这里还能读到活凭证属于不该发生的状态，故写一条 ``warn`` 级 ledger 让它可观测。
     """
     if backend in _RVF_INITIATION_DISABLED_BACKENDS:
@@ -8928,6 +8927,9 @@ def classify_review_initiation_lifecycle(
         session_id=kanban_followup_lock_session_id(event),
         repo=kanban_followup_lock_repository_anchor(event, cwd=cwd),
     )
+    if marker is not None and reconcile_backup_consumption_for_followup_marker(marker, ledger, cwd=cwd)["status"] == "consumed":
+        # 清理失败的历史凭证不能在下游兜底里重新遮住当前新候选。
+        marker = None
     # 只有 **active** 凭证才算在途：stale 凭证按 TTL 自然失效，绝不能让一把忘了清的锁把发起
     # 决策点永久静默掉（87e9338「锁 squat」那一族缺陷的对偶）。
     if marker is not None and kanban_followup_lock_status(marker) == KANBAN_FOLLOWUP_LOCK_ACTIVE:
@@ -11294,6 +11296,7 @@ def _decision_point_non_minted_outcome_decision(
         )
 
     if outcome == decision_token_store.MINT_OUTCOME_DECLINED_COOLDOWN:
+        declined_record = mint.session_scoped_declined_candidate_fingerprint_record or {}
         injection_attempt_ledger.record_injection_attempt(
             worktree=worktree,
             session_id=session_id,
@@ -11312,12 +11315,16 @@ def _decision_point_non_minted_outcome_decision(
             cwd=cwd,
             session_id=session_id,
             candidate_fingerprint=fingerprint,
+            declined_by_session_id=declined_record.get("session_id"),
+            declined_decision_token=declined_record.get("token"),
+            declined_at=declined_record.get("declined_at"),
+            decline_reason=declined_record.get("reason"),
         )
         return _decision_point_silent_stop(
             ledger,
             reason_code=REASON_DECISION_POINT_DECLINED_COOLDOWN,
             message=(
-                "review-validate-fix: 候选指纹处于 declined 冷却中（agent 已谢绝且改动未变），"
+                "review-validate-fix: 本会话曾谢绝开审且候选未变（本会话指纹冷却），"
                 "本次 Stop 静默停，不再注入。"
             ),
             repo=repo,
@@ -11752,6 +11759,9 @@ def _decision_point_out_of_band_delivery_decision(
                 ledger=ledger,
                 idempotency_key=idempotency_key,
                 artifact_label="decision-point-banner",
+                deliver_when_agent_idle=True,
+                decision_token_expires_at=mint.record.payload["expires_at"],
+                required_native_independent_user_turn_session_id=session_id,
             )
         except KanbanFollowupDeliveryVerdictNotYetAvailableError as exc:
             # 「还没结论」**不是**失败：这条消息可能已被受理并随后落地。按未确认投递继续。
@@ -11900,6 +11910,7 @@ def _decision_point_out_of_band_delivery_decision(
                 status=receipt.terminal_delivery_status,
                 detail={
                     "kanban_task_id": task_id,
+                    "kanban_project_path": project_path,
                     "idempotency_key": idempotency_key,
                     "terminal_delivery_verdict_not_yet_available": verdict_not_yet_available,
                     "receipt_field_source": receipt.receipt_field_source,
@@ -12053,6 +12064,8 @@ def _decision_point_out_of_band_delivery_outcome_unknown_decision(
             status=None,
             detail={
                 "kanban_task_id": task_id,
+                "kanban_project_path": project_path,
+                "idempotency_key": decision_point_out_of_band_idempotency_key(token),
                 "out_of_band_delivery_outcome_unknown": True,
                 "out_of_band_delivery_outcome_unknown_error": delivery_error,
                 "fell_back_to_stop_hook_self_injection": False,
@@ -12251,6 +12264,25 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
     cwd_value = event.get("cwd")
     cwd = cwd_value if isinstance(cwd_value, str) and cwd_value else None
 
+    backup_suppresses_current_candidate = False
+    backup_candidate_verification_pending = False
+    if cwd:
+        from independent_backup_route import (
+            control_directory, marker_present, read_stop_backup_verification_observation, should_suppress_normal_stop,
+        )
+        backup_suppresses_current_candidate = should_suppress_normal_stop(Path(cwd))
+        if backup_suppresses_current_candidate:
+            backup_candidate_observation = read_stop_backup_verification_observation(
+                control_directory(Path(cwd)), "stop-content-verification-observation")
+            backup_candidate_verification_pending = (
+                backup_candidate_observation.get("status") == "unknown"
+                and bool(backup_candidate_observation.get("recovery_after_operation")))
+        if backup_suppresses_current_candidate and marker_present(control_directory(Path(cwd)) / "active-owner"):
+            return skip_decision(
+                "存在备用路线控制记录；读取持久接续状态并保留原失败，不重入普通自动路径。",
+                ledger, "independent_backup_route_owns_or_completed_candidate", cwd=cwd,
+            )
+
     if is_truthy(os.environ.get(RVF_ANALYZE_THREAD)):
         return skip_decision(
             "检测到 RVF_ANALYZE_THREAD：当前 Stop event 来自 detached "
@@ -12282,33 +12314,9 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
     if handoff_path_value is not None:
         payload = handoff_completion_payload(event, ledger, cwd=cwd)
         if payload is not None:
-            try:
-                finalize_record = finalize_for_handoff(
-                    handoff_path=handoff_path_value,
-                    event=event,
-                    decision_kind="handoff-advisory",
-                )
-                surface_finalize_record_errors(ledger, finalize_record, payload=payload)
-                surface_rvf_analyze_advisory(
-                    event=event,
-                    ledger=ledger,
-                    payload=payload,
-                    finalize_record=finalize_record,
-                )
-            except Exception as exc:
-                ledger.event(
-                    phase="handoff",
-                    event="finalize_failed",
-                    status="warning",
-                    reason_code="finalize_error",
-                    level="warn",
-                    error={"kind": type(exc).__name__, "message": str(exc)},
-                )
-            clear_kanban_followup_lock_for_event(
-                event,
-                ledger,
-                cwd=cwd,
-                handoff_path=str(handoff_path_value),
+            complete_rvf_handoff_and_clear_in_flight_marker_for_stop_event(
+                event, ledger, handoff_path=handoff_path_value, payload=payload,
+                cwd=cwd, decision_kind="handoff-advisory",
             )
             return payload_decision(payload, reason_code="handoff_file_ready", cwd=cwd)
 
@@ -12343,6 +12351,17 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
     in_progress_decision = kanban_followup_in_progress_decision(event, ledger, cwd=cwd)
     if in_progress_decision is not None:
         return in_progress_decision
+
+    if backup_suppresses_current_candidate:
+        if backup_candidate_verification_pending:
+            return skip_decision(
+                "当前候选的备用覆盖记录仍在分页补证；尚未确认已覆盖，后续 Stop 自动接续，本次不重复发起 RVF。",
+                ledger, "independent_backup_route_candidate_verification_pending", cwd=cwd,
+            )
+        return skip_decision(
+            "当前候选已有备用交付记录；原 run 消费已单独对账，本次不重复发起 RVF。",
+            ledger, "independent_backup_route_owns_or_completed_candidate", cwd=cwd,
+        )
 
     if latest_user and RVF_ANALYZE_FOLLOWUP_MARKER in latest_user:
         return skip_decision(
@@ -12397,14 +12416,6 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
     if session_control is not None:
         return session_control
 
-    manual_marker_payload = manual_rvf_session_marker_payload(event, ledger)
-    if manual_marker_payload is not None:
-        return payload_decision(
-            manual_marker_payload,
-            reason_code="manual_rvf_already_ran",
-            cwd=cwd,
-        )
-
     session_id = session_hook_id_from_event(event)
     if session_id and session_hook_disabled(session_id):
         return skip_decision(
@@ -12419,6 +12430,27 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
 
     if should_suppress(event, latest_user):
         return skip_decision("检测到 suppress 标记或环境变量。", ledger, "suppressed", cwd=cwd)
+
+    if cwd and session_id:
+        # 恢复精确仓库/会话的旧归档，不重开 review，也不产生 agent_directive。
+        try:
+            from review_run_terminal_archive import resume_pending_review_run_terminal_archives
+
+            restored_archives = resume_pending_review_run_terminal_archives(repo=Path(cwd), session_id=session_id)
+            if restored_archives:
+                ledger.event(phase="analysis", event="terminal_archive_recovery_observed", status="completed",
+                             terminal_archive_recovery_results=restored_archives)
+        except Exception as exc:
+            ledger.event(phase="analysis", event="terminal_archive_recovery_waiting", status="warning",
+                         error=f"{type(exc).__name__}: {exc}")
+
+    manual_marker_payload = manual_rvf_session_marker_payload(event, ledger)
+    if manual_marker_payload is not None:
+        return payload_decision(
+            manual_marker_payload,
+            reason_code="manual_rvf_already_ran",
+            cwd=cwd,
+        )
 
     cwd_result: GateResult | None = None
     if cwd:

@@ -15,6 +15,8 @@
   ],
   "enabled": true,
   "label": "alternative-reviewer:kimi-code",
+  "reviewer_model_selection_source": "kimi_latest_managed_stable_model",
+  "_comment_model_selection": "每次启动通过官方 OAuth 刷新目录选择最新稳定标准/Pro 模型，健康检查与评审固定同一 alias；显式 --model 或原生会话恢复保留原选择。刷新失败直接报错，不继承旧默认值。",
   "command": [
     "kimi",
     "--output-format",

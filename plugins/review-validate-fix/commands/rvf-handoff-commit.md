@@ -5,6 +5,38 @@ argument-hint: "<handoff path or pasted handoff content>"
 
 # RVF Handoff Commit
 
+<!-- rvf-independent-backup-route:begin -->
+<!-- source-sha256: 50628c9e95ad36589bc86404b63cf10f3421f6769b80693baeee520b70d8d670 -->
+## 独立备用路线（主执行 Agent）
+
+正常工具因派发、格式、登记、wrapper 或环境故障无法完成已授权工作时，自主采用本节；确定性故障直接切换，可能瞬时恢复的同一故障最多恢复重试一次。**本节核验成立后，可替代下文固定脚本、结果 JSON、缓存及不得手工提交的要求。** 用户 Stop、提交／同步／push／部署限制、显式 external 要求与真实质量义务继续有效。仅缺机器证据时先自行查原始记录，不默认询问用户。
+
+先核对需求与授权来源、task／session、真实 worktree、Git common-dir、唯一原 run／handoff 和候选。原 run 尚未创建时如实记无，不选 latest，不制造 token／原生接受／passed。提交或投递结果未知先对账，不能换身份盲重试。故障和旧 evidence 原样保存，备用交付另记；分类、计数、查重或建卡不可用不阻断交付。
+
+接管辅助器是本 skill 随附、仅依赖标准库与 Git 的 `independent_backup_route.py`（RVF：`review-validate-fix/scripts/`，同步 Skill：`scripts/`）。用选定的 Python 解释器运行（共享同步脚本以 `BASE_BRANCH_SYNC_PYTHON_EXECUTABLE` 固定该解释器），先 `status --repo <worktree>`；`claim --repo <worktree> --operation-id <唯一ID> --artifacts-directory <持久目录> --authorization-file <原话与适用授权文件> --reason <实际故障> --original-run-directory <原run> --delivery-stage <review|fix_validate|land|base_sync>`。没有原 run 时省略该参数。重启复用原 ID 与目录。登记授权来源本身不扩大权限。
+
+正常写入会先登记 reservation，再检查接管目录；备用方先原子占位，再等待原写入结束。`waiting_for_normal_mutations` 时只补证，不开始备用写入。原进程已退出但结果未知时，检查已登记的全部下属进程组、Git／原生控制面，保存对账证据后用 `reconcile-normal-mutation --repo <worktree> --operation-id <原ID> --reservation-name <文件名> --evidence-file <证据>` 归档。父进程退出不代表 Git／hook 已停止；活进程不能按 TTL 偷取。旧版本写入方不识别接管协议时，先证明其退出／隔离。
+
+辅助器不可用时，直接用 `git rev-parse --absolute-git-dir` 定位 `rvf-independent-backup-route/`，原子 `mkdir` 其 `active-owner` 子目录阻止新正常写入，并以不覆盖写入的方式把原 operation ID 存为该目录的 `manual-operation-id` 单行文件；先检查 `normal-mutations/` 全部原写入已结束且结果已对账，再由唯一执行者继续。保存同等身份、候选、原始结果和命令日志到持久 Markdown。不要删除不明接管目录、reservation 或旧 evidence 来强迫放行。辅助器恢复后，用 `adopt-manual-ownership` 复用原 `--repo`、`--operation-id`、`--artifacts-directory`、`--authorization-file`、`--reason`、原 run／delivery stage，并以 `--evidence-file <原始手工接管与对账记录>` 补录；不移走 marker，补录不会打开竞写窗口。若 mkdir 后即中断而 ID 文件缺失，先从 task 原始命令和持久日志证明目录归属，再补写同一 ID；不能猜测或覆盖别人的 ID。结果未知仍保持未知。
+
+交接材料放 task 持久交接目录；无该目录时使用 `~/.rvf/user-local-data/independent-backup-route-artifacts/` 的独立 operation 子目录。复制原始结果／输入，保存 Git 快照及固定 ref，不能只引用将被删除的工作树或临时文件。每阶段保存实际命令 argv、cwd、退出码、必要环境说明、内容摘要及问题处置；不保存秘密值。`record-stage --repo <worktree> --operation-id <原ID> --stage <阶段> --evidence-file <原始材料或报告>` 记录执行 Agent 核验的事实；land 加 `--commit <实际SHA>`，base_sync 另加 `--base-ref refs/heads/<本地base>`。
+
+最后核对全部所需阶段与当前内容，再 `finish --repo <worktree> --operation-id <原ID> --evidence-file <最终报告>`。已发生的提交／落地先复用，不重复执行；完成后新内容仍进入正常审查。输出 `RVF_BACKUP_ROUTE_RESULT_FILE: <持久绝对路径>`，分别报告备用结果与原自动化状态；不用普通 handoff marker 冒充正常 finalize。独立结论由原始材料支持，不要求额外 JSON schema。
+
+原 run 已消费与当前候选覆盖分别核验：后续提交改变 HEAD 不复活旧 run，新内容也不因历史消费被当作已审。Stop 先按精确 run、operation 与 worktree Git 目录对账在途／pending 凭证，再考虑续跑或重投；清理失败不得再催原 run，其他 run 保留。索引缺失／损坏时自动查同 operation 的持久完成原件，有界分页进度和缺口落盘供下次 Stop 接续；仍无法核验则记 `unknown` 与重验条件，诊断不驱动新回合。根目录、子目录与符号链接入口统一按真实 worktree 根计算候选指纹。
+
+尚未查尽分页时静默等待机器补证，不提前视为未覆盖；命中记录在候选未变时优先重新核验，候选变化则重置旧游标／缓存资格。无关 run 的已知坏记录不冻结其他 run；同 run 的归档原件缺失仍保留未知。清理前先核验并回收精确 tracker lease，缺 artifact 从原生账本补证，失败保留凭证自动重试；pending 发布和清理使用共同写锁，避免误删另一 run。dispatcher 转交仍遵守宿主既有 plan 等守卫。
+
+`review_only`／`validate_fix` 子代理仍只执行分配角色，不能因本节自行接管、提交或发起完整 RVF。后台完成通知或任务重启后先读接续记录；条件未满足时保留机器可检测的恢复条件并继续独立工作，不做无变化重试。
+
+### 本入口：提交已审工作
+
+1. 核对原双评审、逐项处置、已应用修复、当前范围和内容；已有合格结果继续使用，不因 land 故障重审。新增实现字节补足相应覆盖；真实归属不明先自行读历史、tracker 与原始材料，只暂停涉及内容的写入。
+2. wrapper 故障时从原命令记录、handoff 与仓库要求确定检查，直接验证当前内容。已有结果仅在内容和执行条件仍匹配时复用。实际必需的 hook／签名义务继续完成，不能用绕过 hook 掩盖红测。
+3. 接管就绪后保全原 index 与无关 WIP，只 stage 明确的自有范围（rename 两端均覆盖）；使用 conventional commit。核对提交前后实际字节、提交路径和 hook 改写。未审新内容补验证／覆盖，不手工伪造封窗或 evidence。
+4. 提交成功而登记失败时，核实 HEAD、父提交、内容和现有日志，记录实际 SHA 并从后续阶段接续；不创建重复或空 audit commit。同步仅在原任务已授权时继续。完成报告区分 commit、正常 evidence、base 整合、push、部署与 Done。
+<!-- rvf-independent-backup-route:end -->
+
 你正在处理一个已经到达的 RVF handoff。用户会把 handoff 文件路径或完整 handoff 正文放在 `$ARGUMENTS` 中。
 
 原始意图：
@@ -47,7 +79,7 @@ argument-hint: "<handoff path or pasted handoff content>"
 | exit | 阶段 | 含义 | 怎么办 |
 |---|---|---|---|
 | 0 | prepare / commit | 通过 / 已完成 | prepare 后进入分析；commit 后按输出汇报 |
-| 2 | prepare / commit | 参数或输入错误：缺 `--run-dir`、commit message 为空或仍含草稿占位、`--extra-path` 不在当前 worktree 内 | 未 stage、未 commit。按 stderr 的 `rvf_land: …` 修正后重跑同一条命令 |
+| 2 | 参数/输入错误，或结果工件持久化失败（`land_commit_result_persistence_failed`） | 参数错误时未 stage、未 commit；持久化失败须检查 JSON 的 `status`、`commit_oid` 和 `candidate_evidence`，保存真实 stdout，不盲目重复提交 |
 | 10 | prepare / commit | 目标仓库与当前 worktree 不共享 git common dir，或无法确定目标仓库 | 停止，说明风险 |
 | 11 | prepare / commit | scope 与 dirty 矛盾 | 停止并报告 |
 | 12 | prepare / commit | 有 scope 外脏文件且没带保留开关 | 确属本次工作就加 `--extra-path`；是并行改动就加 `--commit-staged-scope-only-and-leave-unrelated-dirty-paths` 重跑 prepare |
@@ -60,6 +92,7 @@ argument-hint: "<handoff path or pasted handoff content>"
 | 25 | commit | 已提交，但工作树还有保留开关放行范围之外的脏路径 | evidence 跳过；如实报告 `dirty_paths_remaining_beyond_declared_unrelated`，不要补写 evidence |
 | 26 | commit | 已提交，但 commit 期间 hook 改变了提交内容：改写了文件（`reason_code=candidate_content_changed_during_commit`），或把 stage 集合外的路径加进了提交（`reason_code=committed_paths_outside_stage_set`） | 不回滚；**未封窗、未写 evidence**，下一次 Stop 会照常审这些字节。如实报告被改写的文件，**不要手动封窗、不要伪造 evidence** |
 | 27 | commit | 提交前拒绝：合并处置缺失 / 不合法 / 过期（`reason_code=merge_dispositions_check_failed`） | 跨 worktree 模式下 contract 指向 RVF worktree、evidence 本就不写，预检放行，正常不会出现；若出现，按 `merge_dispositions_errors` 用 `rvf merge write` 补齐、`rvf merge check` 复核后重跑 commit |
+| 28 | 提交前完整 evidence 资格检查拒绝；稳定原因码与明细见 `candidate_evidence_qualification` | 未 stage、未 commit。修正 reviewer 完成事实、最新 attempt/result、handoff 数量矛盾、验证、身份、范围或 receipt 后重跑；不得手改 evidence 或冻结工件 |
 
 ## 输出
 
@@ -69,3 +102,17 @@ argument-hint: "<handoff path or pasted handoff content>"
 - commit hash 和 commit message。
 - 验证结果（commit JSON 的 `validation`）。
 - 仍然保留的 unrelated dirty 文件或风险。
+
+## Evidence 资格检查与已有提交恢复
+
+`rvf land check-evidence --repo <worktree> --run-dir <run>` 是完整只读 dry-run：不执行验证、不 stage、不写 run、contract 或 evidence。JSON 的 `status` 为 `eligible`、`refused_fail_closed` 或明确的 skip 状态，`reason_code` 稳定；拒绝时 exit 28。prepare 展示同一资格结果；commit 完成必要验证重放后、staging 前重新检查，缺失/过期处置仍为 exit 27，其余资格拒绝为 exit 28。只有真正需等 commit 才能证明的 HEAD/tree、hook 改写和并发变化留在提交后复核。
+
+完成计数以 reviewer results、merge dispositions、canonical fix-issue 和最新 attempt/result 为准。handoff 的统计句与实际结果条目只核对一致性，正文提及结果标签不会计数。R3 仅在明确兜底路由且两份 canonical mimic 结果完整有效时通过。用户全局 ignore 仅影响判脏，不会隐藏 tracked 修改。
+
+合法 scope expansion 必须有声明、fixed/applied 事实及补丁；protected/background 扩展还需主会话确认。`--extra-path` 只表达 stage 意图，不能替代这些资格。含扩展的 evidence 为 schema version 2，并引用 canonical 扩展凭据；旧 base-branch-sync 消费者必须拒绝该版本，需按跨仓契约升级后验收。普通无扩展候选继续使用 version 1。
+
+已有真实提交且内容仍是同一已审候选时，显式绑定原 run 执行 prepare → commit：`nothing_to_commit` 分支会生成 evidence，不增加实现提交。重复运行应返回 `candidate_evidence.status=reused`，保留最初 reviewed tip 和摘要。
+
+commit 的结构化结果持久化在 `artifacts/rvf-land-commit-result.json`（带 SHA256），不可变历史位于 `artifacts/rvf-land-commit-execution-results/<sha256>.json`；stdout 给出 `land_commit_result_path` / `land_commit_result_sha256`。历史记录绑定 run、worktree、提交前后 HEAD 与内容摘要，拒绝结果不代表提交成功或已进入 local main。
+
+结果工件写入失败时 exit 2，JSON 为 `reason_code=land_commit_result_persistence_failed`；此时必须结合 `status`、`commit_oid` 与 `candidate_evidence` 判断实际结果，提交可能已经完成，不能把 exit 2 一概解释成“未 stage、未 commit”。

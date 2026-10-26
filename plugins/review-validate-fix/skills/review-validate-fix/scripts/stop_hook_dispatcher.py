@@ -15,10 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
 from core.run_ledger.run_ledger import RunLedger, start_run  # noqa: E402
 from rvf_handoff import handoff_completion_payload, handoff_path_from_event
-from rvf_run_finalize import finalize_for_handoff, surface_finalize_record_errors
 from rvf_analyze_advisory import (
     RVF_ANALYZE_FOLLOWUP_MARKER,
-    surface_rvf_analyze_advisory,
 )
 from core.session_scope_allocation.session_change_manifest import build_manifest
 from codex_gui_without_kanban_task_stop_hook_policy import disabled_codex_gui_stop_hook_payload
@@ -1199,6 +1197,17 @@ def main() -> int:
         emit(disabled_gui_payload)
         return 0
 
+    independent_backup_candidate_requires_in_progress_run_reconciliation = False
+    if isinstance(cwd, str):
+        from independent_backup_route import control_directory, marker_present, should_suppress_normal_stop
+        if should_suppress_normal_stop(Path(cwd)):
+            if marker_present(control_directory(Path(cwd)) / "active-owner"):
+                return emit_terminal_payload(
+                    ledger, status="skipped", reason_code="independent_backup_route_owns_or_completed_candidate",
+                    message="存在独立备用路线控制记录，普通自动路径保持静默",
+                    detail="读取持久接续记录；不重复发起普通 RVF 或自动收尾。",
+                )
+            independent_backup_candidate_requires_in_progress_run_reconciliation = True
     if suppress_requested():
         ledger.event(
             phase="dev-sync",
@@ -1251,28 +1260,12 @@ def main() -> int:
     if handoff_path_value is not None:
         payload = handoff_completion_payload(event, ledger, cwd=cwd)
         if payload is not None:
-            try:
-                finalize_record = finalize_for_handoff(
-                    handoff_path=handoff_path_value,
-                    event=event,
-                    decision_kind="dispatcher-handoff",
-                )
-                surface_finalize_record_errors(ledger, finalize_record, payload=payload)
-                surface_rvf_analyze_advisory(
-                    event=event,
-                    ledger=ledger,
-                    payload=payload,
-                    finalize_record=finalize_record,
-                )
-            except Exception as exc:
-                ledger.event(
-                    phase="handoff",
-                    event="finalize_failed",
-                    status="warning",
-                    reason_code="finalize_error",
-                    level="warn",
-                    error={"kind": type(exc).__name__, "message": str(exc)},
-                )
+            from stop_review_validate_fix import complete_rvf_handoff_and_clear_in_flight_marker_for_stop_event
+
+            complete_rvf_handoff_and_clear_in_flight_marker_for_stop_event(
+                event, ledger, handoff_path=handoff_path_value, payload=payload,
+                cwd=str(cwd) if isinstance(cwd, str) else None, decision_kind="handoff",
+            )
             emit(payload)
             return 0
     latest_user = latest_user_message_from_event(event)
@@ -1291,6 +1284,9 @@ def main() -> int:
             message="rvf-analyze follow-up trigger turn; skipped dispatcher sync and installed hook",
             detail="检测到 RVF analyze follow-up trigger，已跳过主 RVF 自动触发。",
         )
+    if independent_backup_candidate_requires_in_progress_run_reconciliation:
+        # 候选覆盖不等于没有其他在途 run；先保留宿主守卫，再交 core 按 run 对账。
+        return run_installed_stop_hook(raw_input, ledger)
     sync_needed, reason, repo = should_sync(event)
     if not sync_needed:
         ledger.event(

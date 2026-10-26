@@ -17,6 +17,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 TESTS_DIRECTORY = Path(__file__).resolve().parent
 sys.path.insert(0, str(TESTS_DIRECTORY))
 # 复用 evidence 测试的「已完成 run」构造器，而不是手抄一份：两边断言的是同一份 run 形状，
@@ -342,6 +344,40 @@ def test_prepare_hard_gate_exit_codes(tmp_path: Path) -> None:
         json.loads(scopeless.stdout)["hard_gate_failures"][0]["reason_code"]
         == "reviewed_scope_unknown_with_dirty_worktree"
     )
+    assert not (scopeless_run / "artifacts/rvf-land-prepare-plan.json").exists()
+
+
+def test_prepare_refuses_explicit_run_directory_conflicting_with_handoff_before_writing_plan(tmp_path: Path) -> None:
+    repo, handoff_run, _counter = reviewed_dirty_run(tmp_path)
+    selected_run = create_completed_run(tmp_path, repo, "another-run")
+    completed = prepare(tmp_path, repo, handoff_run, "--run-dir", str(selected_run))
+    assert completed.returncode == 2, completed.stdout + completed.stderr
+    assert "run" in completed.stderr
+    assert not (selected_run / "artifacts/rvf-land-prepare-plan.json").exists()
+    assert not (handoff_run / "artifacts/rvf-land-prepare-plan.json").exists()
+
+
+def test_prepare_can_bind_pasted_handoff_to_exact_explicit_run_directory(tmp_path: Path) -> None:
+    repo, run_dir, _counter = reviewed_dirty_run(tmp_path)
+    completed = run_land(
+        tmp_path, repo, "prepare", "--stdin", "--repo", str(repo), "--run-dir", str(run_dir),
+        "--format", "json", stdin_text="# 本轮交接\n- handoff_status: COMPLETED\n",
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    report = json.loads(completed.stdout)
+    assert report["run_id"] == json.loads((run_dir / "summary.json").read_text())["run_id"]
+    assert report["run_dir"] == str(run_dir)
+    assert report["prepare_plan_path"]
+
+
+def test_prepare_refuses_pasted_run_id_conflicting_with_selected_run(tmp_path: Path) -> None:
+    repo, run_dir, _counter = reviewed_dirty_run(tmp_path)
+    completed = run_land(
+        tmp_path, repo, "prepare", "--stdin", "--repo", str(repo), "--run-dir", str(run_dir),
+        "--format", "json", stdin_text="- run id: `rvf-foreign-run`\n- handoff_status: COMPLETED\n",
+    )
+    assert completed.returncode == 2, completed.stdout + completed.stderr
+    assert not (run_dir / "artifacts/rvf-land-prepare-plan.json").exists()
 
 
 def test_commit_refuses_stale_prepare_plan_and_unfilled_draft(tmp_path: Path) -> None:
@@ -401,11 +437,18 @@ def run_fix_ledger_script(tmp_path: Path, script_name: str, *arguments: str) -> 
     return json.loads(completed.stdout.strip().splitlines()[-1])
 
 
-def test_prepare_reads_fix_ledger_written_by_real_fix_attempt_script(tmp_path: Path) -> None:
-    """ledger 由真实 ``rvf_fix_issue.py`` / ``rvf_fix_attempt.py`` 写出（不手抄字段形状）：
-    stop 写 ``changed_paths`` 为 ``{path, op}`` 列表、apply 把 attempt.json 的 status 改成 applied。
-    已合回的修复必须进「已采纳」，其补丁路径（含 scope expansion 新增文件）必须并入可 stage 全集。"""
+def applied_expansion_run_from_real_attempt_lifecycle(
+    tmp_path: Path, *, acknowledge_guarded_helper: bool = False
+) -> tuple[Path, Path, str, list[str]]:
+    """经真实 prepare/start/stop/apply 生成已应用扩展，同时保留其主会话确认事实。"""
     repo, run_dir, _counter = reviewed_dirty_run(tmp_path)
+    if acknowledge_guarded_helper:
+        (repo / "fix-helper-outside-reviewed-scope.txt").write_text("原有背景改动\n", encoding="utf-8")
+        rewrite_scope_contract_fields(
+            run_dir,
+            background_files=["fix-helper-outside-reviewed-scope.txt"],
+            protected_files=["fix-helper-outside-reviewed-scope.txt"],
+        )
     log_root = tmp_path / "fix-ledger-tracker-state"
     issue_file = tmp_path / "rvf-land-ledger-issue.json"
     issue_file.write_text(
@@ -463,7 +506,8 @@ def test_prepare_reads_fix_ledger_written_by_real_fix_attempt_script(tmp_path: P
         attempt_id,
         "--status",
         "fixed",
-        "--scope-expansion-path",
+        ("--acknowledged-protected-or-background-path-modification" if acknowledge_guarded_helper
+         else "--scope-expansion-path"),
         "fix-helper-outside-reviewed-scope.txt",
         "--scope-expansion-reason",
         "最小修复需要一个新文件",
@@ -471,9 +515,17 @@ def test_prepare_reads_fix_ledger_written_by_real_fix_attempt_script(tmp_path: P
     )
     assert all(isinstance(entry, dict) for entry in stopped["changed_paths"])
     applied = run_fix_ledger_script(
-        tmp_path, "rvf_fix_attempt.py", "apply", "--attempt-id", attempt_id, "--target-repo", str(repo), *common
+        tmp_path, "rvf_fix_attempt.py", "apply", "--attempt-id", attempt_id, "--target-repo", str(repo),
+        *(["--confirm-acknowledged-protected-or-background-path-modification"] if acknowledge_guarded_helper else []),
+        *common,
     )
     assert applied["status"] == "applied"
+    return repo, run_dir, attempt_id, common
+
+
+def test_prepare_reads_fix_ledger_written_by_real_fix_attempt_script(tmp_path: Path) -> None:
+    """ledger 由真实 stop/apply 写出；已合回修复的补丁路径（含扩展）必须并入可 stage 全集。"""
+    repo, run_dir, attempt_id, _common = applied_expansion_run_from_real_attempt_lifecycle(tmp_path)
 
     prepared = prepare(tmp_path, repo, run_dir)
     assert prepared.returncode == 0, prepared.stdout + prepared.stderr
@@ -490,6 +542,118 @@ def test_prepare_reads_fix_ledger_written_by_real_fix_attempt_script(tmp_path: P
     accepted_section = draft.split("已采纳（fixed 且已合回工作树）：", 1)[1].split("未采纳：", 1)[0]
     assert "- RVF-L1" in accepted_section
     assert "RVF-L1" not in draft.split("未采纳：", 1)[1]
+    # 正式 land 必须消费真实 stop/apply 写出的扩展事实，而非只在 prepare 中展示它。
+    handoff = run_dir / "artifacts/handoff.md"
+    handoff.write_text(handoff.read_text().replace("共 0 条，0 真实修复", "共 1 条，1 真实修复") +
+                       "\n- **[fixed]** `tracked.txt:2` - RVF-L1\n")
+    for name in ("targeted-contract-tests", "handoff-validation-001"):
+        validated = record_validation(tmp_path, repo, run_dir, name, sys.executable, "-c", "print('passed')")
+        assert validated.returncode == 0, validated.stderr
+    assert prepare(tmp_path, repo, run_dir).returncode == 0
+    landed = commit(tmp_path, repo, run_dir)
+    assert landed.returncode == 0, landed.stdout + landed.stderr
+    result = json.loads(landed.stdout)
+    assert result["candidate_evidence"]["status"] == "written"
+    candidate = json.loads(Path(result["candidate_evidence"]["candidate_evidence_path"]).read_text())
+    assert candidate["schema_version"] == 2
+    expansion = json.loads(Path(candidate["scope"]["applied_scope_expansion_receipt_path"]).read_text())
+    assert expansion["expansions"][0]["attempt_id"] == attempt_id
+    assert expansion["expansions"][0]["paths"] == ["fix-helper-outside-reviewed-scope.txt"]
+
+
+@pytest.mark.parametrize("acknowledge_guarded_helper", [False, True])
+def test_land_keeps_historical_applied_expansion_when_latest_attempt_is_false_positive(
+    tmp_path: Path, acknowledge_guarded_helper: bool
+) -> None:
+    """最新误报只更新完成结论，不能抹掉历史已应用补丁或主会话对背景路径的确认。"""
+    repo, run_dir, applied_attempt_id, common = applied_expansion_run_from_real_attempt_lifecycle(
+        tmp_path, acknowledge_guarded_helper=acknowledge_guarded_helper
+    )
+    next_attempt = run_fix_ledger_script(
+        tmp_path, "rvf_fix_attempt.py", "prepare", "--repo", str(repo), "--issue-id", "RVF-L1", *common
+    )
+    next_attempt_id = next_attempt["attempt_id"]
+    run_fix_ledger_script(tmp_path, "rvf_fix_attempt.py", "start", "--attempt-id", next_attempt_id, *common)
+    # 最新 attempt 的外部改动并未 apply；即使同名 WIP 出现在主工作树，也不能借历史 applied 放行。
+    unrelated_wip_path = "latest-unapplied-other-session-wip.txt"
+    (Path(next_attempt["worktree_path"]) / unrelated_wip_path).write_text("未应用的 attempt 改动\n", encoding="utf-8")
+    stopped = run_fix_ledger_script(
+        tmp_path, "rvf_fix_attempt.py", "stop", "--attempt-id", next_attempt_id, "--status", "false_positive",
+        "--scope-expansion-path", unrelated_wip_path, "--scope-expansion-reason", "误报 attempt 的未应用改动", *common,
+    )
+    assert unrelated_wip_path in {entry["path"] for entry in stopped["all_changed_paths"]}
+    assert unrelated_wip_path in {entry["path"] for entry in stopped["changed_paths"]}
+    handoff = run_dir / "artifacts/handoff.md"
+    handoff.write_text(handoff.read_text().replace("共 0 条，0 真实修复 / 0 误报", "共 1 条，0 真实修复 / 1 误报") +
+                       "\n- **[false_positive]** `tracked.txt:2` - RVF-L1\n", encoding="utf-8")
+    for name in ("targeted-contract-tests", "handoff-validation-001"):
+        validated = record_validation(tmp_path, repo, run_dir, name, sys.executable, "-c", "print('passed')")
+        assert validated.returncode == 0, validated.stderr
+
+    (repo / unrelated_wip_path).write_text("主工作树里其他会话的 WIP\n", encoding="utf-8")
+    index_before = git(repo, "diff", "--cached", "--binary")
+    refused_wip = prepare(tmp_path, repo, run_dir)
+    refused_report = json.loads(refused_wip.stdout)
+    assert sorted(refused_report["stageable_dirty_paths"]) == ["fix-helper-outside-reviewed-scope.txt", "tracked.txt"]
+    assert refused_wip.returncode == 12, refused_wip.stdout + refused_wip.stderr
+    assert refused_report["unrelated_dirty_paths"] == [unrelated_wip_path]
+    assert (repo / unrelated_wip_path).read_text(encoding="utf-8") == "主工作树里其他会话的 WIP\n"
+    assert git(repo, "diff", "--cached", "--binary") == index_before
+    # 移除本测试特意加入的 WIP 后，完整 prepare/commit 仍应绑定历史 applied 扩展并写出 v2 evidence。
+    (repo / unrelated_wip_path).unlink()
+    prepared = prepare(tmp_path, repo, run_dir)
+    assert prepared.returncode == 0, prepared.stdout + prepared.stderr
+    report = json.loads(prepared.stdout)
+    assert report["candidate_evidence_qualification"]["status"] == "eligible"
+    disposition = report["issue_dispositions_from_fix_ledger"][0]
+    assert disposition["fix_status"] == "false_positive"
+    assert disposition["fix_applied_to_worktree"] is False
+    assert disposition["changed_paths"] == ["fix-helper-outside-reviewed-scope.txt", "tracked.txt"]
+    assert disposition["confirmed_acknowledged_paths"] == (
+        ["fix-helper-outside-reviewed-scope.txt"] if acknowledge_guarded_helper else []
+    )
+    landed = commit(tmp_path, repo, run_dir)
+    assert landed.returncode == 0, landed.stdout + landed.stderr
+    result = json.loads(landed.stdout)
+    assert paths_in_head_commit(repo) == ["fix-helper-outside-reviewed-scope.txt", "tracked.txt"]
+    assert result["candidate_evidence"]["status"] == "written"
+    candidate = json.loads(Path(result["candidate_evidence"]["candidate_evidence_path"]).read_text())
+    assert candidate["schema_version"] == 2
+    expansion = json.loads(Path(candidate["scope"]["applied_scope_expansion_receipt_path"]).read_text())
+    assert expansion["expansions"][0]["attempt_id"] == applied_attempt_id
+    assert expansion["expansions"][0]["paths"] == ["fix-helper-outside-reviewed-scope.txt"]
+    assert git(repo, "status", "--porcelain") == ""
+
+
+@pytest.mark.parametrize("latest_attempt_status", ["failed", "started"])
+def test_land_refuses_latest_unresolved_attempt_despite_historical_applied_expansion(
+    tmp_path: Path, latest_attempt_status: str
+) -> None:
+    """历史 applied 只证明路径归属，最新失败或未完成的 issue 仍须在 stage/commit 前拒绝。"""
+    repo, run_dir, _applied_attempt_id, common = applied_expansion_run_from_real_attempt_lifecycle(tmp_path)
+    next_attempt = run_fix_ledger_script(
+        tmp_path, "rvf_fix_attempt.py", "prepare", "--repo", str(repo), "--issue-id", "RVF-L1", *common
+    )
+    run_fix_ledger_script(tmp_path, "rvf_fix_attempt.py", "start", "--attempt-id", next_attempt["attempt_id"], *common)
+    if latest_attempt_status == "failed":
+        run_fix_ledger_script(
+            tmp_path, "rvf_fix_attempt.py", "stop", "--attempt-id", next_attempt["attempt_id"], "--status", "failed", *common
+        )
+    for name in ("targeted-contract-tests", "handoff-validation-001"):
+        validated = record_validation(tmp_path, repo, run_dir, name, sys.executable, "-c", "print('passed')")
+        assert validated.returncode == 0, validated.stderr
+    head_before = git(repo, "rev-parse", "HEAD")
+    index_before = git(repo, "diff", "--cached", "--binary")
+    prepared = prepare(tmp_path, repo, run_dir)
+    assert prepared.returncode == 0, prepared.stdout + prepared.stderr
+    report = json.loads(prepared.stdout)
+    assert sorted(report["stageable_dirty_paths"]) == ["fix-helper-outside-reviewed-scope.txt", "tracked.txt"]
+    assert report["candidate_evidence_qualification"]["reason_code"] == "canonical_fix_completion_invalid"
+    refused = commit(tmp_path, repo, run_dir)
+    assert refused.returncode == 28, refused.stdout + refused.stderr
+    assert json.loads(refused.stdout)["reason_code"] == "canonical_fix_completion_invalid"
+    assert git(repo, "rev-parse", "HEAD") == head_before
+    assert git(repo, "diff", "--cached", "--binary") == index_before
 
 
 

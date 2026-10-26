@@ -5,6 +5,39 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
 
 # Review Validate Fix
 
+<!-- rvf-independent-backup-route:begin -->
+<!-- source-sha256: 50628c9e95ad36589bc86404b63cf10f3421f6769b80693baeee520b70d8d670 -->
+## 独立备用路线（主执行 Agent）
+
+正常工具因派发、格式、登记、wrapper 或环境故障无法完成已授权工作时，自主采用本节；确定性故障直接切换，可能瞬时恢复的同一故障最多恢复重试一次。**本节核验成立后，可替代下文固定脚本、结果 JSON、缓存及不得手工提交的要求。** 用户 Stop、提交／同步／push／部署限制、显式 external 要求与真实质量义务继续有效。仅缺机器证据时先自行查原始记录，不默认询问用户。
+
+先核对需求与授权来源、task／session、真实 worktree、Git common-dir、唯一原 run／handoff 和候选。原 run 尚未创建时如实记无，不选 latest，不制造 token／原生接受／passed。提交或投递结果未知先对账，不能换身份盲重试。故障和旧 evidence 原样保存，备用交付另记；分类、计数、查重或建卡不可用不阻断交付。
+
+接管辅助器是本 skill 随附、仅依赖标准库与 Git 的 `independent_backup_route.py`（RVF：`review-validate-fix/scripts/`，同步 Skill：`scripts/`）。用选定的 Python 解释器运行（共享同步脚本以 `BASE_BRANCH_SYNC_PYTHON_EXECUTABLE` 固定该解释器），先 `status --repo <worktree>`；`claim --repo <worktree> --operation-id <唯一ID> --artifacts-directory <持久目录> --authorization-file <原话与适用授权文件> --reason <实际故障> --original-run-directory <原run> --delivery-stage <review|fix_validate|land|base_sync>`。没有原 run 时省略该参数。重启复用原 ID 与目录。登记授权来源本身不扩大权限。
+
+正常写入会先登记 reservation，再检查接管目录；备用方先原子占位，再等待原写入结束。`waiting_for_normal_mutations` 时只补证，不开始备用写入。原进程已退出但结果未知时，检查已登记的全部下属进程组、Git／原生控制面，保存对账证据后用 `reconcile-normal-mutation --repo <worktree> --operation-id <原ID> --reservation-name <文件名> --evidence-file <证据>` 归档。父进程退出不代表 Git／hook 已停止；活进程不能按 TTL 偷取。旧版本写入方不识别接管协议时，先证明其退出／隔离。
+
+辅助器不可用时，直接用 `git rev-parse --absolute-git-dir` 定位 `rvf-independent-backup-route/`，原子 `mkdir` 其 `active-owner` 子目录阻止新正常写入，并以不覆盖写入的方式把原 operation ID 存为该目录的 `manual-operation-id` 单行文件；先检查 `normal-mutations/` 全部原写入已结束且结果已对账，再由唯一执行者继续。保存同等身份、候选、原始结果和命令日志到持久 Markdown。不要删除不明接管目录、reservation 或旧 evidence 来强迫放行。辅助器恢复后，用 `adopt-manual-ownership` 复用原 `--repo`、`--operation-id`、`--artifacts-directory`、`--authorization-file`、`--reason`、原 run／delivery stage，并以 `--evidence-file <原始手工接管与对账记录>` 补录；不移走 marker，补录不会打开竞写窗口。若 mkdir 后即中断而 ID 文件缺失，先从 task 原始命令和持久日志证明目录归属，再补写同一 ID；不能猜测或覆盖别人的 ID。结果未知仍保持未知。
+
+交接材料放 task 持久交接目录；无该目录时使用 `~/.rvf/user-local-data/independent-backup-route-artifacts/` 的独立 operation 子目录。复制原始结果／输入，保存 Git 快照及固定 ref，不能只引用将被删除的工作树或临时文件。每阶段保存实际命令 argv、cwd、退出码、必要环境说明、内容摘要及问题处置；不保存秘密值。`record-stage --repo <worktree> --operation-id <原ID> --stage <阶段> --evidence-file <原始材料或报告>` 记录执行 Agent 核验的事实；land 加 `--commit <实际SHA>`，base_sync 另加 `--base-ref refs/heads/<本地base>`。
+
+最后核对全部所需阶段与当前内容，再 `finish --repo <worktree> --operation-id <原ID> --evidence-file <最终报告>`。已发生的提交／落地先复用，不重复执行；完成后新内容仍进入正常审查。输出 `RVF_BACKUP_ROUTE_RESULT_FILE: <持久绝对路径>`，分别报告备用结果与原自动化状态；不用普通 handoff marker 冒充正常 finalize。独立结论由原始材料支持，不要求额外 JSON schema。
+
+原 run 已消费与当前候选覆盖分别核验：后续提交改变 HEAD 不复活旧 run，新内容也不因历史消费被当作已审。Stop 先按精确 run、operation 与 worktree Git 目录对账在途／pending 凭证，再考虑续跑或重投；清理失败不得再催原 run，其他 run 保留。索引缺失／损坏时自动查同 operation 的持久完成原件，有界分页进度和缺口落盘供下次 Stop 接续；仍无法核验则记 `unknown` 与重验条件，诊断不驱动新回合。根目录、子目录与符号链接入口统一按真实 worktree 根计算候选指纹。
+
+尚未查尽分页时静默等待机器补证，不提前视为未覆盖；命中记录在候选未变时优先重新核验，候选变化则重置旧游标／缓存资格。无关 run 的已知坏记录不冻结其他 run；同 run 的归档原件缺失仍保留未知。清理前先核验并回收精确 tracker lease，缺 artifact 从原生账本补证，失败保留凭证自动重试；pending 发布和清理使用共同写锁，避免误删另一 run。dispatcher 转交仍遵守宿主既有 plan 等守卫。
+
+`review_only`／`validate_fix` 子代理仍只执行分配角色，不能因本节自行接管、提交或发起完整 RVF。后台完成通知或任务重启后先读接续记录；条件未满足时保留机器可检测的恢复条件并继续独立工作，不做无变化重试。
+
+### 本入口：评审、修复与验证
+
+1. 复用原不可变候选；缺失时使用辅助器 `freeze-candidate --repo <worktree> --operation-id <原ID> --comparison-base-tip <明确基线commit> --candidate-path <明确文件>...`，或以独立 Git index 保存同等快照。包含必要上下文，区分 finding 范围与背景 WIP；不移动真实 HEAD／index，不 reset 已提交工作。
+2. 首次并行派发两个独立新上下文，给同一需求、范围、固定基线、候选快照与正常质量标准。互不读取对方输出，reviewer 不改源码。优先可用 external；不可用且原任务允许时使用本宿主两个新实例，不依赖 dispatcher 先报告 R3。同模型相关错误与共用额度风险如实记录。
+3. writer/checker 故障时保留原始 Markdown／stdout；主执行者核实是否真已审完。缺腿、request、空输出不计完成。输入未变且独立性可证明时只补缺腿；候选改变后补审新增内容及受影响交互，无法界定则扩大范围。将两个真实完成结果与上下文／输入绑定写入 review 阶段材料。
+4. 每条发现记录采纳、合并或驳回依据。向 validator/fixer 只传去来源的问题、代码与复现线索；可用时继续独立 validate/fix 子代理。修复先验证属实，保存实际补丁与应用事实，保全其他 WIP。范围外发现持久留档，不等待建卡服务。
+5. 直接执行最终内容所需的真实验证；隔离端口、缓存、coverage 和构建输出，无法隔离时仅串行冲突命令。reviewer 的探索命令不冒充最终验证。真实失败须解决；wrapper 恢复不是前置条件。记录 review、fix_validate，随后只继续已授权的 land／同步。
+<!-- rvf-independent-backup-route:end -->
+
 本 skill 只处理显式 `$review-validate-fix`、`/review-validate-fix` 或 `:review-validate-fix` 调用。`agents/openai.yaml` 的 `policy.allow_implicit_invocation` 必须保持 `false`。
 
 不要因为上下文提到 review、fix、handoff 或 Stop hook 就自动启动 RVF。
@@ -23,13 +56,13 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
 3. 写一份 scope-of-work / session context 文件，说明用户意图、本轮实际完成的工作或 manual scope、需要审查的文件、逐文件编辑明细、已跑验证、关键取舍和不确定点。
 4. Scope-of-work 不要只列 created/modified/deleted 文件。
 5. 若当前 prompt 或环境已提供冻结的 RVF run artifacts，复用既有 `review-env.sh`、scope contract 和 review packet；不要新建 run。
-6. 否则运行 `scripts/prepare_review_run.py --repo <repo> --session-context <file>`；在 transcript 或 manifest 可用时传入对应参数；在已知主修改文件、manual scope 文件或背景 WIP 时，分别传入 `--primary-file` / `--background-file`，避免无 manifest 时降级到 `manual-all-uncommitted` 把背景 WIP 纳入 `primary_files` / `fix_allowlist`。
+6. 否则使用真实决策 token 运行 `scripts/prepare_review_run.py --repo <repo> --decision-token <token> --session-context <file>`，冻结独立候选快照。原生回退 receipt 是可选自动化证据，缺失或能力不可用时继续普通审查并在 handoff 后人工 land/base 同步；不得手填原生成功字段；在 transcript 或 manifest 可用时传入对应参数；在已知主修改文件、manual scope 文件或背景 WIP 时，分别传入 `--primary-file` / `--background-file`，避免无 manifest 时降级到 `manual-all-uncommitted` 把背景 WIP 纳入 `primary_files` / `fix_allowlist`。
    - 审**已提交**工作（无父会话自动检测时的显式杠杆）：传 `--base-ref <commit>`（committed-round baseline）+ `--transcript <session.jsonl>`，packet 即用 `git diff <base-ref>` 渲染已提交改动（base-ref 须是 HEAD 祖先，否则自动回退 HEAD）。仍然不需要 `git reset`。
 7. 后续使用脚本生成的 `review-agent-context.md` / `review-env.sh` / prompt artifacts；不要手写 `RVF_*` export block，也不要把脚本内部 env/config 当成 agent 需要记忆的状态机。
 
 ### 统一发起协议：唯一的发起消息是**发起决策点横幅**
 
-**持续关闭策略**：没有对应 Kanban task 的 Codex GUI 会话不自动发起或续跑 RVF，直到用户明确要求恢复。该策略随源码部署，重启、redeploy、会话级 `RVF_STOP_HOOK: on` 和 stable/dev channel 切换均不解除。直接手动调用本 skill、`/review-validate-fix` 或 `:review-validate-fix` 继续可用；Stop 只为有效 handoff 静默记账、释放锁，不自动启动 analyze。Kanban task 内、Codex CLI 和其它宿主维持既有行为。
+**持续关闭策略**：没有对应 Kanban task 的 Codex GUI 会话不自动发起或续跑 RVF，直到用户明确要求恢复。该策略随源码部署，重启、redeploy、会话级 `RVF_STOP_HOOK: on` 和 stable/dev channel 切换均不解除。直接手动调用本 skill、`/review-validate-fix` 或 `:review-validate-fix` 不受这项关闭策略限制，仍须通过真实授权与候选快照 gate；Stop 只为有效 handoff 静默记账、释放锁，不自动启动 analyze。Kanban task 内、Codex CLI 和其它宿主维持既有行为。
 
 自动 RVF 的发起**一律**先给你一份决策点正文，首行是 `=== REVIEW-VALIDATE-FIX 发起决策点：由你自主决定 start 或 decline ===`，正文含候选摘要 + `RVF_DECISION_TOKEN=<token>` + CLI 命令样例。是否发起由你决定，开发者已预先授权，不需要征询开发者：简析后用 `rvf start`（发起）或 `rvf decline`（谢绝）显式表态。**这条规则不分环境**——在不在 Cline Kanban task 内、Claude 还是 Codex，横幅的**正文与决策协议完全一致**。
 
@@ -44,7 +77,9 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
 
 **结构性谢绝会在本会话 snooze 这片工作范围。** 同一会话、同一 worktree 的自动横幅会保持静默，直到出现工作边界：提交（HEAD 变化）、范围明显扩大（出现新路径**且**未审行数比基线多出 50% 以上）、同一批文件上的未审行数涨到基线的 3 倍**且**多出至少 150 行，或 12 小时到期。开发者发来新 prompt 不解除 snooze，只把「范围扩大 / 行数翻倍」的对比基线挪到那一刻（后台任务完成通知之类 host 自己合成的回合不算发话）。开发者手动触发 `/review-validate-fix` 不受 snooze 与延后的限制，此时横幅会明说「用户推翻了你的谢绝 / 延后」，不要照上次的判断再谢绝一次。
 
-**开发者口头要求开审、而你本会话最近一次表态是谢绝时**，不要回答「token 已终态，请你手动触发」，直接撤回自己的谢绝：`rvf start --reopen-own-declined-decision --reason "<开发者原话>"`。它与开发者手动触发同样豁免冷却 / snooze / 熔断，但只能撤回本会话**最近一枚** token、且那枚必须是 declined；回执与遥测会记成「agent 按开发者口头要求撤回」，与开发者手动触发区分开。
+**自主延后恢复**：条件满足后执行 `rvf request-review-start-boundary --deferred-decision-token <旧 token> --reason "<自主判断理由>"`，只请求下一条独立消息，随后结束当前 turn。需要可自动回退的起点时，收到新消息并验证原生 user turn、当前候选与不可变 Git checkpoint 后再注册自动收尾。普通审查仍可使用有效决策 token 与独立候选快照继续，不因缺少回退起点而等待宿主升级。候选变化或旧分界失效时用 `--decision-token <当前 token>` 请求新分界。Agent 的 reason 永远不是开发者原话证据，也不豁免熔断或结构性谢绝。
+
+**审查输入与可选原生回退**：`start`、直接 prepare 和 dispatch 共用授权、范围及 `review_candidate_snapshot` 验证；Harness 版本仅用于诊断。原生 receipt、本次 nonce 和独立 UserMessage 只决定自动回退资格，缺少这些能力时普通 review/fix/handoff 继续，之后人工 land/base 同步。不能把 accepted/submitted、hook 合成消息或 latest checkpoint 冒充原生回退证据，也不能伪造 receipt。token 撤销、错误会话/目录及真实候选失效继续拒绝。只有可读且 token/run 匹配的 `registered` 记录允许发布自动恢复完成通知；注册记录缺失、损坏或为 `pending/disabled` 时均关闭自动动作；结果未知不以新幂等键重试。协议见 `docs/architecture/review-start-independent-user-turn-boundary-contract.md`。
 
 变的只是横幅**怎么送到你面前**（transport，与决策协议正交）：
 
@@ -64,7 +99,7 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
 
 **用户 rewind 掉横幅之后**：那枚 token 当轮作废（移出去重索引、**不计** decline 冷却与铸造熔断），下一次 Stop 会重新征询一次。所以看到「同一批改动又被问了一遍」且中间发生过 rewind，那是设计行为，不是重复派发。
 
-接受之后**不会再有第二条注入消息**。执行所需的一切从 `rvf start` 的回执里读：`detail.execution_handoff` 带 `target_repo` / `prep_file` / `review_env` / `review_packet` / `scope_contract` / `scope_of_work` / `review_agent_context` / `session_manifest` / `worktree_bootstrap` / `origin_metadata` / `handoff_path` / `intent_artifact_status_file` 与 handoff 契约；人类可读行与 `RVF_AGENT_RESULT_JSON:` 两种形态都有，回执末尾的 `next:` 行已按顺序排好、参数已填好，照抄即可。完整流程：
+接受之后**不会再有第二条注入消息**。执行所需的一切从 `rvf start` 的回执里读：`detail.execution_handoff` 带 `target_repo` / `prep_file` / `review_env` / `review_packet` / `scope_contract` / `scope_of_work` / `review_agent_context` / `session_manifest` / `worktree_bootstrap` / `origin_metadata` / `handoff_path` 与 handoff 契约；人类可读行与 `RVF_AGENT_RESULT_JSON:` 两种形态都有，回执末尾的 `next:` 行已按顺序排好、参数已填好，照抄即可。完整流程：
 
 ```
 rvf start --token <decision-token> [--transcript-path <session.jsonl>] --reason "<一句话理由>"
@@ -125,32 +160,13 @@ rvf decline-dispatched-review --token <dispatch-token> --reason <一句话理由
 >
 > 两条都受同一套 rewind 对账保护：用户 rewind 掉那一段（trigger 或横幅离开祖先链）则锁被 reconcile 清掉。所以「被拽回去跑一轮自己从没见过的 RVF」不该再发生；若仍发生，是缺陷，请如实上报而不是照跑。
 
-### Opt-in 仓库的预审 base 同步
+### 审查与 base 整合
 
-- `prepare_review_run.py` 从 local base ref 对应提交里的 `AGENTS.md` 读取 `RVF-PRE-REVIEW-BASE-SYNC-SKILL:`，不依赖旧 task worktree 自己是否已有该标记。
-- 若返回 `status=bootstrap_required_before_rvf`（退出码 3），先调用标记指定的单向同步 skill，再对同一 scope 重新 prepare；不要在 RVF 内持有 base lock，也不要绕过 gate。
-- 这**不是失败，而是一个可恢复的等待态**。经 dispatch prep 进入时（`rvf start` / kanban follow-up），
-  prepare 返回 `status=waiting_local_base_bootstrap` 并附一枚 `bootstrap_gate` 子记录（见
-  `scripts/rvf_bootstrap_gate.py`）：
-  - `rvf start` 以退出码 `6`（`bootstrap_required`）返回，token 保持 `acknowledged` 并挂上 run 锚点；
-    跑完同步 skill 后 `rvf start --token <t> --retry` **复用同一 run** 接续，不是第二轮独立 RVF。
-  - kanban follow-up 的 in-progress 锁改记 `state=waiting_bootstrap`；锁 TTL 到期时会被**复活**而不是清掉重开。
-  - 恢复前一律重新校验 base 身份 / worktree 与 git common-dir 身份 / receipt digest；证据不可信或冲突未解时
-    维持等待（既不进 review 也不清等待态），只有等待期工件确实丢失才安全重来。receipt 首次校验通过后，
-    其路径与 digest 会被**写回仍在等待的 gate**（token payload / 锁 marker），使后续每一轮真的能判出
-    「receipt 被换过」——所以 bootstrap 完成后**不要**再跑一次同步 skill 或改动 receipt。
-  - prepare 重放的结果按类分流，不是一个成功/失败位：`artifact_lost`（prep 文件已过 TTL / 被 sweep）
-    立刻清等待态安全重来；`timeout` 与其余失败一样按**可重试等待**处理——重放跑在独立子进程里
-    （内层预算到点自己写结果退出，外层硬上限按进程组 SIGKILL），收尾后不留在途 prepare 写者，
-    故本轮释放在途占位、下一次 Stop 立刻重试同一个 run 的 prepare。
-  - 并发去重靠起重放**之前**那次 `O_EXCL` 占位：占位只在一次重放调用期间存在，
-    `RVF_KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_IN_FLIGHT_WINDOW_SECONDS` 是它的**接手**窗口（默认按
-    重放预算 + 子进程强杀余量 + 余量推导），只用于持有者崩在半路时让下一个 Stop 接手。
-- 调用同步 skill 时传 `BASE_BRANCH_SYNC_POST_ABSORPTION_REVIEW_OWNER=RVF`，声明吸收后的审查归 RVF。
-- 单向同步只提供 bootstrap receipt、base delta 事实，以及（若上游写了）一份 base↔task intent 复核 artifact；同步流程本身不再做一轮完整语义审查。
-- 其后的 implementation review **仍是普通实现审查**：base delta 本身不进 finding 范围（那是 `review_kind=base_drift_integration` 轮次的职责）。intent artifact 以 context 形式注入 reviewer/fixer，用于**归因分类**与背景理解，**不**扩大也不缩小 finding 范围。
-- intent artifact 缺失或非法时**一律标注放行、绝不阻断**：两侧部署节奏天然不同步，「文件没写出来」不等于「状态不安全」。结局落成机器事实 `intent_artifact_status`（`consumed` / `missing` / `invalid`），写进 run 工件 `base-task-intent-reconciliation-status.json`、handoff `## 状态`，并追加到 `$RVF_HOME/intent-artifact-consumption-outcomes/<repo>.jsonl`。
-- 未 opt-in 的仓库、旧 scope contract 和普通用户维持原行为。
+RVF 审查开审分界固定的任务候选。candidate、比较基线与 base 排除范围在本轮内使用固定 Git OID；本地 base 的后续前移不改变这份审查范围。
+
+默认自动流程在计划草拟后、实现完成后及 RVF 准备阶段均不吸收 base。可以只读查看 local main 的变化并记录交互风险；不要执行预审 merge/rebase，也不要为追赶浮动 main 重新准备候选。真实候选改变时保留旧快照，通过正式恢复入口建立新候选和分界，不就地修改旧 fingerprint。
+
+`rvf-land` 完成候选提交与 evidence 后，`base-branch-sync` 负责吸收落地时的 base、复核语义交互并按需验证。需要单独审查整合结果时使用 `review_kind=base_drift_integration` 及对应 integration receipt。
 
 ## 模式
 
@@ -171,12 +187,12 @@ rvf decline-dispatched-review --token <dispatch-token> --reason <一句话理由
 
 ## 执行段速查：每一步一条 `rvf` 命令
 
-token 与 run 目录都可省——`rvf` 按「显式参数 > `RVF_RUN_DIR` > 当前 cwd 所在 fix attempt worktree > 本会话本仓的 in-flight marker > 本 worktree 最近一次已接受的决策 token」自动推断（Claude Code 的 Bash 不保留 shell 状态，所以不要指望 `source review-env.sh` 跨调用生效）。没有决策 token 的 fallback 路径（直接跑 `prepare_review_run.py`）给 `rvf` 显式 `--run-dir <run_dir>`。解析不出当前会话 id 的 host（Kimi 等）上推断一律 fail-closed：回执里给出的命令已经带好 `--run-dir`，照抄即可；自己拼的 `rvf` 命令也带上（`rvf validate` 用 `--rvf-run-dir`）。
+token 与 run 目录都可省——`rvf` 按「显式参数 > `RVF_RUN_DIR` > 当前 cwd 所在 fix attempt worktree > 本会话本仓的 in-flight marker > 本 worktree 最近一次已接受的决策 token」自动推断（Claude Code 的 Bash 不保留 shell 状态，所以不要指望 `source review-env.sh` 跨调用生效）。直接跑 `prepare_review_run.py` 也必须以真实决策 token 冻结候选快照，原生消息/checkpoint receipt 只用于可选自动回退；执行后给 `rvf` 显式 `--run-dir <run_dir>`。解析不出当前会话 id 的 host（Kimi 等）上推断一律 fail-closed：回执里给出的命令已经带好 `--run-dir`，照抄即可；自己拼的 `rvf` 命令也带上（`rvf validate` 用 `--rvf-run-dir`）。
 
 | 步骤 | 命令 | 需要你判断的点 |
 | --- | --- | --- |
 | 发起 / 谢绝 | `rvf start --reason "…"` / `rvf decline --decline-kind <structural_not_needed\|deferred_until_condition> --reason "…"` | 要不要审；不审的话是「不需要审」还是「晚点再审」 |
-| 撤回自己的谢绝 | `rvf start --reopen-own-declined-decision --reason "<开发者原话>"` | 开发者口头要求开审时用 |
+| 自主恢复延后决策 | `rvf request-review-start-boundary --deferred-decision-token <旧 token> --reason "<条件满足理由>"` | 请求下一独立 turn，不在当前 turn 开审 |
 | 写 scope-of-work | 覆盖回执给出的 `scope_of_work` 文件，再 `rvf scope rerender-scope-of-work` | 本轮改了什么、为什么、审时盯哪里 |
 | 派发 | `rvf dispatch --strictness <light\|standard\|strict>` | 严格度档 |
 | 等 reviewer | `rvf wait`（按 host 的等法见下） | 无 |
@@ -233,6 +249,7 @@ token 与 run 目录都可省——`rvf` 按「显式参数 > `RVF_RUN_DIR` > �
   2. 子代理在 attempt worktree 内改完后，照抄参数块里的整行收尾命令 `cd <attempt worktree> && rvf fix stop --attempt-id … --run-dir … --status …`。不能靠 cwd 反推：Claude 子代理每次 Bash 调用都会重置 cwd。
   3. 全部子代理结束后 `rvf apply --all-stopped`：按 attempt 创建顺序合回所有已 stop 的 fixed attempt，逐条报告 `applied` / `merge_conflict` / `scope_expansion_conflict`，**遇到冲突就停下交给你判断**（merge_conflict 记为该 attempt 未合并，不得手工搬运后伪装成已归因 patch）。
 - `--status elevated` 必须通过 `--result-file <elevation-detail.json>` 写入升级详情；自然语言 final 只作日志。
+- 用户明确把 elevated 问题交给其他 Task 后，可用 `rvf elevated-issue-delegation record|verify|resume` 留下可审计处置，详见 [用户委派与收尾](references/user-delegated-elevated-issue-disposition.md)。问题仍为 elevated，已核验委派只改变原候选的阻断性；不等待目标完成，不增加 Land、同步或 push 权限。
 - **elevated 不即时交开发者，先自解析、再延迟到末端。** 收到 reviewer / fixer 标记的 elevated concern 后，主会话先尝试自行决断：① 以自身 context 判断；② 依据不足则派 subagent 在代码库中找分辨/决策依据。只有 context + 代码库都不足以决断时，才真正记为 `elevated`（能决断的就地转 `fixed` / `false_positive`）。即便确属 elevated，也不当场打断流程去问，而是先把所有非 elevated issue 验证/修复完，到 workflow 末端再处理（见 Handoff）。
 
 ## 最终验证证据
@@ -247,7 +264,7 @@ token 与 run 目录都可省——`rvf` 按「显式参数 > `RVF_RUN_DIR` > �
 
 ## Handoff
 
-- Handoff 默认写入当前 RVF run 的 `artifacts/handoff.md` 并持续更新（`rvf handoff` 打印落点与 `intent_artifact_status_file`）。
+- Handoff 默认写入当前 RVF run 的 `artifacts/handoff.md` 并持续更新（`rvf handoff` 打印落点）。
 - 最终回复第一行输出 `RVF_HANDOFF_FILE: <绝对路径>`，空一行后按 `references/handoff-template.md` 规定的固定分行标签结构追加极短中文摘要（不要挤成一段）；该模板是摘要结构的唯一详述处。Stop hook 会把该 marker 当作完成信号，run 结束时发送 OS 系统通知（不再自动用编辑器打开 handoff）；不要再手动调用任何「打开 handoff」脚本。
 - **存在任何 `[elevated]` 时，只在所有非 elevated issue 验证/修复完、handoff 与相关 brief 更新完之后，才于 workflow 末端的最终回复里逐条把升级直接摆给用户（简述卡点 + 候选方向）**，绝不只塞进 handoff 正文靠两行标签摘要带过，也不在 review 一发现就当场打断流程去问——升级即「需用户决策」。当某条升级是只有用户能拍板的方案选择（trade-off）时，用 `AskUserQuestion` 把选项摆出来让其当场选。
 - Handoff 只写确认过的事实，不把背景 WIP 或其他 session 的改动混成本轮工作。

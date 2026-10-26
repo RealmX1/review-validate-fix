@@ -20,6 +20,7 @@ import tempfile
 import time
 import traceback
 from pathlib import Path
+from independent_review_start_boundary_fixture import fixed_git_coordinates_for_review_start_boundary_unit_test
 
 from _rvf_test_support.kanban_followup_lock_marker_name import in_progress_lock_marker_name
 from _rvf_test_support.registry_completeness_guard import (
@@ -157,7 +158,7 @@ def load_prepare_review_run_module():
     """加载 prepare_review_run 模块（进程内直调 prepare_run_from_prep_file 等）。
 
     与 load_rvf_agent_decision_cli_module 同构：它 top-level import 兄弟脚本
-    （rvf_prep_file / rvf_bootstrap_gate）与 core.*（经 _rvf_pyroot），故先保证 ROOT +
+    （rvf_prep_file）与 core.*（经 _rvf_pyroot），故先保证 ROOT +
     SCRIPT_DIR 在 sys.path 上。
     """
     if str(ROOT) not in sys.path:
@@ -170,24 +171,13 @@ def load_prepare_review_run_module():
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    # 本测试簇只验证既有状态机；真实宿主/Git 分界由独立集成测试覆盖。
+    module.require_review_start_boundary_for_prepare = lambda **kwargs: fixed_git_coordinates_for_review_start_boundary_unit_test(kwargs["repo"], test_scope="prepare-unit")
+    # 专用状态机夹具维持绑定器的 Path 返回契约；真实双向绑定由隔离 Git 集成套件验证。
+    module.bind_review_start_boundary_to_one_run = lambda receipt, run_id, run_dir: (run_id, Path(run_dir) if run_dir is not None else None)
     return module
 
 
-def load_rvf_bootstrap_gate_module():
-    """加载 rvf_bootstrap_gate 模块（pre-review local-base bootstrap 的等待状态机）。"""
-    if str(ROOT) not in sys.path:
-        sys.path.insert(0, str(ROOT))
-    if str(SCRIPT_DIR) not in sys.path:
-        sys.path.insert(0, str(SCRIPT_DIR))
-    spec = importlib.util.spec_from_file_location(
-        "rvf_bootstrap_gate", SCRIPT_DIR / "rvf_bootstrap_gate.py"
-    )
-    if spec is None or spec.loader is None:
-        raise AssertionError("failed to load rvf_bootstrap_gate module")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
 
 
 def load_rvf_decision_token_store_module():
@@ -366,7 +356,7 @@ def _seed_analysis_payload(run_dir: Path) -> dict[str, str]:
 
 def test_rvf_analyze_thread_builds_claude_command(_root: Path | None = None) -> None:
     module = load_rvf_analyze_thread_module()
-    argv, uses_stdin = module.build_analyze_command(module.HOST_CLAUDE)
+    argv, uses_stdin = module.build_analyze_command(module.HOST_CLAUDE, analysis_directory=Path("/formal-analysis"))
     assert uses_stdin is True
     assert Path(argv[0]).name == "claude"
     assert "-p" in argv
@@ -378,14 +368,14 @@ def test_rvf_analyze_thread_builds_claude_command(_root: Path | None = None) -> 
 
 def test_rvf_analyze_thread_builds_codex_command(_root: Path | None = None) -> None:
     module = load_rvf_analyze_thread_module()
-    argv, uses_stdin = module.build_analyze_command(module.HOST_CODEX)
+    argv, uses_stdin = module.build_analyze_command(module.HOST_CODEX, analysis_directory=Path("/formal-analysis"))
     assert uses_stdin is True
     assert Path(argv[0]).name == "codex"
     assert "exec" in argv
     assert argv[-1] == "-"
     assert "--sandbox" in argv and "workspace-write" in argv
     # 未知 host 兜底到 codex 向量。
-    fallback_argv, _ = module.build_analyze_command("totally-unknown-host")
+    fallback_argv, _ = module.build_analyze_command("totally-unknown-host", analysis_directory=Path("/formal-analysis"))
     assert fallback_argv == argv
 
 
@@ -531,6 +521,8 @@ def load_check_review_output_module():
     return module
 
 
+from independent_review_start_boundary_fixture import run_subprocess_with_independent_review_start_boundary
+
 def run(
     cmd: list[str],
     cwd: Path | None = None,
@@ -550,6 +542,18 @@ def run(
         raise AssertionError(completed.stderr.strip() or completed.stdout.strip() or f"{cmd[0]} failed")
     return completed
 
+
+
+def run_with_independent_review_start_boundary(cmd, cwd=None, input_text=None, env=None):
+    """既有 prepare CLI 正向回归显式补齐新契约；独立 gate 反例仍直接运行生产入口。"""
+    if len(cmd) > 1 and Path(cmd[1]).name == "prepare_review_run.py" and "--repo" in cmd:
+        from independent_review_start_boundary_fixture import environment_with_synthetic_independent_review_start_boundary
+        def argument(name):
+            return cmd[cmd.index(name) + 1] if name in cmd else None
+        env = environment_with_synthetic_independent_review_start_boundary(
+            repo=Path(argument("--repo")), environment=env,
+            run_id=argument("--rvf-run-id"), run_dir=argument("--rvf-run-dir"))
+    return run(cmd, cwd=cwd, input_text=input_text, env=env)
 
 def read_jsonl(path: Path) -> list[dict[str, object]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -1579,6 +1583,11 @@ def test_prepare_run_from_prep_file_timeout_returns_immediately(tmp_path: Path) 
 
     prepare_module = importlib.import_module("prepare_review_run")
     original_prepare_run = prepare_module.prepare_run
+    original_boundary_gate = prepare_module.require_review_start_boundary_for_prepare
+    original_run_binding = prepare_module.bind_review_start_boundary_to_one_run
+    # 本用例只测 worker 超时，不测宿主；前置绑定仍保持真实接口的返回类型。
+    prepare_module.require_review_start_boundary_for_prepare = lambda **kw: fixed_git_coordinates_for_review_start_boundary_unit_test(kw["repo"], test_scope="prepare-timeout")
+    prepare_module.bind_review_start_boundary_to_one_run = lambda receipt, run_id, run_dir: (run_id, Path(run_dir))
 
     def slow_prepare_run(**_: object) -> dict[str, object]:
         # Sleep well past our 1-second timeout to prove that the wrapper does
@@ -1597,6 +1606,8 @@ def test_prepare_run_from_prep_file_timeout_returns_immediately(tmp_path: Path) 
         elapsed = time.monotonic() - start
     finally:
         prepare_module.prepare_run = original_prepare_run
+        prepare_module.require_review_start_boundary_for_prepare = original_boundary_gate
+        prepare_module.bind_review_start_boundary_to_one_run = original_run_binding
 
     # Wall-clock must reflect the 1s timeout, not the 5s worker sleep. Allow
     # generous slack for slow CI but still well below the worker's 5s sleep.
@@ -2668,6 +2679,7 @@ def test_contract_check_entrypoints_default_quiet_with_verbose_flag() -> None:
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
         "verbose=0\n"
+        f"export RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE={shlex.quote(sys.executable)}\n"
         f"{skill_script[function_start:function_end]}\n"
         f"run_step failing {shlex.quote(sys.executable)} -c "
         "'import sys; print(\"boom\"); sys.exit(7)'\n"
@@ -2779,6 +2791,7 @@ def test_contract_check_parallel_test_steps_record_parallel_timing() -> None:
             "#!/usr/bin/env bash\n"
             "set -euo pipefail\n"
             "verbose=0\n"
+            f"export RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE={shlex.quote(sys.executable)}\n"
             f"tests_dir={shlex.quote(str(tests_dir))}\n"
             f"export RVF_CONTRACT_TIMING_JSONL={shlex.quote(str(timing_path))}\n"
             "export RVF_CONTRACT_TIMING_SCRIPT=\"$0\"\n"
@@ -4200,7 +4213,7 @@ def _slice_2b_prepare(
     if extra_args:
         cmd.extend(extra_args)
     env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root)}
-    completed = subprocess.run(cmd, capture_output=True, text=True, env=env, check=False)
+    completed = run_subprocess_with_independent_review_start_boundary(cmd, capture_output=True, text=True, env=env, check=False)
     if completed.returncode != 0:
         return completed, None
     payload = json.loads(output_json.read_text(encoding="utf-8"))
@@ -4282,6 +4295,9 @@ def test_scope_contract_v2_emitted_without_tracker_scope(tmp: Path) -> None:
     assert canonical["version"] == 3
     assert set(canonical.keys()) == {
         "version",
+        "review_start_boundary_receipt",
+        "review_candidate_snapshot",
+        "automatic_closeout_eligibility",
         "repo",
         "scope_mode",
         "primary_files",
@@ -4301,8 +4317,6 @@ def test_scope_contract_v2_emitted_without_tracker_scope(tmp: Path) -> None:
         "task_change_paths",
         "interaction_primary_paths",
         "base_delta_protected_paths",
-        "bootstrap_receipt_path",
-        "bootstrap_receipt_digest",
         "candidate_evidence_path",
         "candidate_evidence_digest",
         "integration_candidate_receipt_path",
@@ -4425,7 +4439,7 @@ def test_tracker_scope_requires_session_manifest_or_transcript(tmp: Path) -> Non
     base_dir.mkdir(parents=True, exist_ok=True)
     log_root = tmp / "logs"
     env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root)}
-    completed = subprocess.run(
+    completed = run_subprocess_with_independent_review_start_boundary(
         [
             sys.executable,
             str(PREPARE_REVIEW_RUN),
@@ -4519,6 +4533,18 @@ def test_existing_cross_session_conflicts_path_unchanged_with_tracker_scope(tmp:
         repo=repo,
         session_id="other-session",
         run_id="run-other",
+        worktree=None,
+        branch=None,
+        owned_paths=["tracked.txt"],
+        apply_patch_paths={"tracked.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    # 构造双方均有明确写入归属的冲突；只有他会话认领的路径不属于本次候选。
+    module.register_claims(
+        repo=repo,
+        session_id="synthetic-native-session",
+        run_id="run-current",
         worktree=None,
         branch=None,
         owned_paths=["tracked.txt"],
@@ -4822,6 +4848,8 @@ def test_committed_round_base_ref_drives_manifest_attribution(tmp: Path) -> None
     manifest's committed-round attribution (not only the packet diff-base), so prepare builds a
     session-owned packet instead of aborting with 'session manifest has no owned paths'."""
     repo, _ = _committed_round_repo(tmp)
+    # 在独立任务分支提交，使开审候选登记的分支点与显式比较 OID 相同。
+    run(["git", "switch", "-q", "-c", "committed-review-task"], cwd=repo)
     (repo / "f.txt").write_text("base\nCOMMITTED\n", encoding="utf-8")
     run(["git", "commit", "-qam", "slice"], cwd=repo)
     baseline = run(["git", "rev-parse", "HEAD~1"], cwd=repo).stdout.strip()
@@ -4843,7 +4871,7 @@ def test_committed_round_base_ref_drives_manifest_attribution(tmp: Path) -> None
         "--base-ref", baseline, "--rvf-backend", "manual",
     ]
     env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(tmp / "logs")}
-    completed = subprocess.run(cmd, capture_output=True, text=True, env=env, check=False)
+    completed = run_subprocess_with_independent_review_start_boundary(cmd, capture_output=True, text=True, env=env, check=False)
     assert completed.returncode == 0, completed.stderr
     payload = json.loads(output_json.read_text(encoding="utf-8"))
     art = Path(payload["artifacts_dir"])
@@ -6378,6 +6406,8 @@ def load_dispatch_reviewers_module():
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    # 本测试簇只验证既有状态机；真实宿主/Git 分界由独立集成测试覆盖。
+    module.require_prepared_run_review_start_boundary = lambda **kwargs: {"test_scope": "dispatch-unit"}
     return module
 
 
@@ -6394,6 +6424,13 @@ def load_agentic_initiation_guardian_dispatch_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def guardian_completed_run_directory(tmp_path: Path, run_name: str) -> str:
+    """每次完成事件使用真实存在且互不混淆的自产 run 目录。"""
+    run_directory = tmp_path / "synthetic-completed-analysis-runs" / run_name
+    run_directory.mkdir(parents=True, exist_ok=True)
+    return str(run_directory)
 
 
 def test_guardian_analyze_completion_milestones_and_retirement(tmp_path: Path) -> None:
@@ -6416,7 +6453,7 @@ def test_guardian_analyze_completion_milestones_and_retirement(tmp_path: Path) -
         retirement_prompts: list[str] = []
         for i in range(1, 18):
             result = guardian.record_analyze_completion(
-                run_dir=f"/tmp/run-{i}",
+                run_dir=guardian_completed_run_directory(tmp_path, f"milestone-run-{i}"),
                 root=root,
                 guardian_analysis_dispatcher=fake_dispatcher,
             )
@@ -6441,6 +6478,7 @@ def test_guardian_analyze_completion_milestones_and_retirement(tmp_path: Path) -
             raise RuntimeError("boom")
 
         result = guardian.record_analyze_completion(
+            run_dir=guardian_completed_run_directory(tmp_path, "failed-guardian-dispatch-run"),
             root=tmp_path / "guardian-root-2", guardian_analysis_dispatcher=broken_dispatcher
         )
         assert result["status"] == "recorded" and result["analyze_completion_count"] == 1
@@ -6480,11 +6518,13 @@ def test_guardian_failed_milestones_retry_and_retire_only_after_success(
 
     root = tmp_path / "retry"
     first = guardian.record_analyze_completion(
+        run_dir=guardian_completed_run_directory(tmp_path, "first-failed-milestone-run"),
         root=root, guardian_analysis_dispatcher=broken_dispatcher
     )
     assert first["analyze_completion_count"] == 1
     assert first["milestone_dispatched"] is None and "dispatch_error" in first
     second = guardian.record_analyze_completion(
+        run_dir=guardian_completed_run_directory(tmp_path, "second-completed-milestone-run"),
         root=root,
         guardian_analysis_dispatcher=lambda **kw: {
             "launch_status": "launched",
@@ -6500,6 +6540,7 @@ def test_guardian_failed_milestones_retry_and_retire_only_after_success(
 
     # 返回 launch_failed（非抛异常）同样不能误记成功。
     returned_failure = guardian.record_analyze_completion(
+        run_dir=guardian_completed_run_directory(tmp_path, "returned-dispatch-failure-run"),
         root=tmp_path / "returned-launch-failure",
         guardian_analysis_dispatcher=lambda **_kw: {
             "launch_status": "launch_failed",
@@ -6523,6 +6564,7 @@ def test_guardian_failed_milestones_retry_and_retire_only_after_success(
         encoding="utf-8",
     )
     failed_16 = guardian.record_analyze_completion(
+        run_dir=guardian_completed_run_directory(tmp_path, "sixteenth-completed-run"),
         root=retirement_root, guardian_analysis_dispatcher=broken_dispatcher
     )
     assert failed_16["analyze_completion_count"] == 16
@@ -6530,6 +6572,7 @@ def test_guardian_failed_milestones_retry_and_retire_only_after_success(
     assert failed_16["retirement_prompt"] is None
 
     retried_16 = guardian.record_analyze_completion(
+        run_dir=guardian_completed_run_directory(tmp_path, "seventeenth-completed-run"),
         root=retirement_root,
         guardian_analysis_dispatcher=lambda **_kw: {"launch_status": "already_running"},
     )
@@ -6563,6 +6606,7 @@ def test_guardian_counter_read_modify_write_is_serialized(tmp_path: Path) -> Non
         results = list(
             pool.map(
                 lambda _i: guardian.record_analyze_completion(
+                    run_dir=guardian_completed_run_directory(tmp_path, f"concurrent-completed-run-{_i}"),
                     root=analyze_root,
                     guardian_analysis_dispatcher=lambda **_kw: {"launch_status": "launched"},
                 ),
@@ -6598,7 +6642,8 @@ def test_guardian_initiation_liveness_alarm_paths(tmp_path: Path) -> None:
         guardian.record_stop_event_heartbeat(now=now)
         assert guardian.evaluate_initiation_layer_liveness(now=now) is None
         # seed 历史活跃证据(analyze 完成计数)→ stop>0 且注入/review 双零 → 告警。
-        guardian.record_analyze_completion(guardian_analysis_dispatcher=noop_dispatcher)
+        guardian.record_analyze_completion(run_dir=guardian_completed_run_directory(tmp_path, "liveness-activation-run"),
+                                          guardian_analysis_dispatcher=noop_dispatcher)
         alarm = guardian.evaluate_initiation_layer_liveness(now=now)
         assert alarm is not None, alarm
         assert alarm["alarm"] == "initiation_layer_suspected_silent_death"
@@ -6614,7 +6659,8 @@ def test_guardian_initiation_liveness_alarm_paths(tmp_path: Path) -> None:
 
         clean_root = tmp_path / "guardian-root-injection-branch"
         guardian.record_stop_event_heartbeat(now=now, root=clean_root)
-        guardian.record_analyze_completion(root=clean_root, guardian_analysis_dispatcher=noop_dispatcher)
+        guardian.record_analyze_completion(run_dir=guardian_completed_run_directory(tmp_path, "liveness-injection-run"),
+                                          root=clean_root, guardian_analysis_dispatcher=noop_dispatcher)
         assert guardian.evaluate_initiation_layer_liveness(now=now, root=clean_root) is not None
         injection_ledger.record_injection_attempt(
             worktree=str(tmp_path / "repo"),
@@ -6645,6 +6691,7 @@ def test_guardian_liveness_utc_day_bucket_boundary(tmp_path: Path) -> None:
         root = tmp_path / "guardian"
         guardian.record_stop_event_heartbeat(now=now, root=root)
         guardian.record_analyze_completion(
+            run_dir=guardian_completed_run_directory(tmp_path, "liveness-day-bucket-run"),
             now=now,
             root=root,
             guardian_analysis_dispatcher=lambda **_kw: {"launch_status": "launched"},
@@ -6756,8 +6803,8 @@ def test_detached_wrapper_executes_real_guardian_cli_post_exit(tmp_path: Path) -
     assert counter["last_run_dir"] == str(run_dir)
 
 
-def test_rvf_analyze_thread_wires_guardian_post_exit_cli_signature(tmp_path: Path) -> None:
-    """analyze launcher 生成的 tmux wrapper 含真实 guardian CLI 子命令与 run-dir 参数。"""
+def test_rvf_analyze_thread_wires_verified_archive_execution(tmp_path: Path) -> None:
+    """analyze launcher 把完成计数交给正式归档校验包装器。"""
     module = load_rvf_analyze_thread_module()
     run_dir = tmp_path / "runs" / "rvf-post-exit-wire"
     analysis = _seed_analysis_payload(run_dir)
@@ -6783,8 +6830,8 @@ def test_rvf_analyze_thread_wires_guardian_post_exit_cli_signature(tmp_path: Pat
     assert result["launch_status"] == "launched"
     tmux_argv = json.loads(tmux_calls.read_text(encoding="utf-8").splitlines()[0])["argv"]
     wrapper = tmux_argv[-1]
-    assert str(SCRIPT_DIR / "agentic_initiation_guardian_dispatch.py") in wrapper
-    assert "record-analyze-completion" in wrapper
+    assert str(SCRIPT_DIR / "rvf_analyze_formal_archive_verified_execution.py") in wrapper
+    assert "record-analyze-completion" not in wrapper
     assert "--run-dir" in wrapper and str(run_dir) in wrapper
 
 
@@ -7403,7 +7450,7 @@ def test_decision_token_direct_minted_paths_to_ack_and_decline(tmp: Path) -> Non
     assert declined.state == dts.STATE_DECLINED
     assert declined.payload["decline_reason"] == "not this round"
     # decline 顺带把指纹写入冷却表。
-    assert dts.is_fingerprint_in_declined_cooldown(worktree="/wt", candidate_fingerprint="fpB", cooldown_root=cd_root)
+    assert dts.is_fingerprint_in_declined_cooldown(worktree="/wt", session_id="sb", candidate_fingerprint="fpB", cooldown_root=cd_root)
 
 
 def test_decision_token_illegal_transitions_rejected(tmp: Path) -> None:
@@ -7550,7 +7597,7 @@ def test_decision_token_dedup_same_key_returns_existing(tmp: Path) -> None:
 
 
 def test_decision_token_declined_fingerprint_cooldown_write_query(tmp: Path) -> None:
-    """declined 指纹冷却表读写：record/is/read/clear 按 (worktree, fingerprint) 键；
+    """declined 指纹冷却表读写：record/is/read/clear 按 (worktree, session_id, fingerprint) 键；
     冷却命中时 mint 返回 declined_cooldown 且不计入熔断。"""
     dts = load_rvf_decision_token_store_module()
     roots = _decision_token_store_roots(tmp)
@@ -7558,16 +7605,16 @@ def test_decision_token_declined_fingerprint_cooldown_write_query(tmp: Path) -> 
     t0 = _fixed_utc(0)
 
     path = dts.record_declined_fingerprint(
-        worktree="/wt", candidate_fingerprint="fpX", reason="too small", token="0123456789abcdef",
+        worktree="/wt", session_id="sc", candidate_fingerprint="fpX", reason="too small", token="0123456789abcdef",
         now=t0, cooldown_root=cd_root,
     )
     assert path.is_file()
-    assert dts.is_fingerprint_in_declined_cooldown(worktree="/wt", candidate_fingerprint="fpX", cooldown_root=cd_root)
+    assert dts.is_fingerprint_in_declined_cooldown(worktree="/wt", session_id="sc", candidate_fingerprint="fpX", cooldown_root=cd_root)
     # 键隔离：不同 worktree / 不同指纹都不命中。
-    assert not dts.is_fingerprint_in_declined_cooldown(worktree="/wt2", candidate_fingerprint="fpX", cooldown_root=cd_root)
-    assert not dts.is_fingerprint_in_declined_cooldown(worktree="/wt", candidate_fingerprint="fpY", cooldown_root=cd_root)
+    assert not dts.is_fingerprint_in_declined_cooldown(worktree="/wt2", session_id="sc", candidate_fingerprint="fpX", cooldown_root=cd_root)
+    assert not dts.is_fingerprint_in_declined_cooldown(worktree="/wt", session_id="sc", candidate_fingerprint="fpY", cooldown_root=cd_root)
 
-    payload = dts.read_declined_fingerprint(worktree="/wt", candidate_fingerprint="fpX", cooldown_root=cd_root)
+    payload = dts.read_declined_fingerprint(worktree="/wt", session_id="sc", candidate_fingerprint="fpX", cooldown_root=cd_root)
     assert payload is not None and payload["reason"] == "too small"
 
     # 冷却命中 → mint 拒铸为 declined_cooldown，且不记铸造请求。
@@ -7577,9 +7624,9 @@ def test_decision_token_declined_fingerprint_cooldown_write_query(tmp: Path) -> 
     assert dts.count_recent_mint_requests("sc", now=t0, root=cb_root) == 0, "冷却拒铸不应计入熔断"
 
     # clear 幂等：首删 True、再删 False，删后不再命中。
-    assert dts.clear_declined_fingerprint(worktree="/wt", candidate_fingerprint="fpX", cooldown_root=cd_root)
-    assert not dts.clear_declined_fingerprint(worktree="/wt", candidate_fingerprint="fpX", cooldown_root=cd_root)
-    assert not dts.is_fingerprint_in_declined_cooldown(worktree="/wt", candidate_fingerprint="fpX", cooldown_root=cd_root)
+    assert dts.clear_declined_fingerprint(worktree="/wt", session_id="sc", candidate_fingerprint="fpX", cooldown_root=cd_root)
+    assert not dts.clear_declined_fingerprint(worktree="/wt", session_id="sc", candidate_fingerprint="fpX", cooldown_root=cd_root)
+    assert not dts.is_fingerprint_in_declined_cooldown(worktree="/wt", session_id="sc", candidate_fingerprint="fpX", cooldown_root=cd_root)
 
 
 def test_decision_token_mint_explicit_user_request_clears_declined_cooldown(tmp: Path) -> None:
@@ -7594,11 +7641,11 @@ def test_decision_token_mint_explicit_user_request_clears_declined_cooldown(tmp:
     t0 = _fixed_utc(0)
 
     dts.record_declined_fingerprint(
-        worktree="/wt", candidate_fingerprint="fpU", reason="agent declined earlier",
+        worktree="/wt", session_id="su", candidate_fingerprint="fpU", reason="agent declined earlier",
         now=t0, cooldown_root=cd_root,
     )
     # 对照：默认（自动路径）仍被冷却挡住。
-    auto = dts.mint_decision_token(worktree="/wt", session_id="sa", candidate_fingerprint="fpU", now=t0, **roots)
+    auto = dts.mint_decision_token(worktree="/wt", session_id="su", candidate_fingerprint="fpU", now=t0, **roots)
     assert auto.outcome == dts.MINT_OUTCOME_DECLINED_COOLDOWN
     assert auto.explicit_user_request_overrode_agent_declined_cooldown is False
 
@@ -7612,10 +7659,11 @@ def test_decision_token_mint_explicit_user_request_clears_declined_cooldown(tmp:
     assert manual.declined_cooldown_record_still_blocks_automatic_path is False
     # 冷却记录已被物理清除 ⇒ 自动路径也解锁。
     assert not dts.is_fingerprint_in_declined_cooldown(
-        worktree="/wt", candidate_fingerprint="fpU", cooldown_root=cd_root
+        worktree="/wt", session_id="su", candidate_fingerprint="fpU", cooldown_root=cd_root
     )
-    auto_after = dts.mint_decision_token(worktree="/wt", session_id="sa", candidate_fingerprint="fpU", now=t0, **roots)
-    assert auto_after.outcome == dts.MINT_OUTCOME_MINTED
+    auto_after = dts.mint_decision_token(worktree="/wt", session_id="su", candidate_fingerprint="fpU", now=t0, **roots)
+    assert auto_after.outcome == dts.MINT_OUTCOME_DEDUPLICATED
+    assert auto_after.token == manual.token, "冷却已解除，仍须复用同会话尚在等待的决策 token"
 
     # 未命中冷却时两个标志都保持 False（不谎报推翻、也不谎报仍被挡）。
     fresh = dts.mint_decision_token(
@@ -7641,12 +7689,12 @@ def test_decision_token_mint_explicit_user_request_reports_override_even_when_co
     t0 = _fixed_utc(0)
 
     dts.record_declined_fingerprint(
-        worktree="/wt", candidate_fingerprint="fpW", reason="agent declined earlier",
+        worktree="/wt", session_id="sw", candidate_fingerprint="fpW", reason="agent declined earlier",
         now=t0, cooldown_root=cd_root,
     )
 
     # 只让「冷却表目录下的文件」删除失败，其余 unlink（token 落盘等）照常，避免误伤别处。
-    blocked_dir = dts.declined_fingerprint_root(cd_root).resolve()
+    blocked_dir = (dts.declined_fingerprint_root(cd_root) / dts.SESSION_SCOPED_DECLINED_CANDIDATE_FINGERPRINT_SUBDIRNAME).resolve()
     original_unlink = Path.unlink
 
     def unlink_failing_only_inside_declined_cooldown_dir(self, *args, **kwargs):
@@ -7669,10 +7717,13 @@ def test_decision_token_mint_explicit_user_request_reports_override_even_when_co
     # 磁盘事实：记录仍在，自动路径依旧被挡。
     assert manual.declined_cooldown_record_still_blocks_automatic_path is True
     assert dts.is_fingerprint_in_declined_cooldown(
-        worktree="/wt", candidate_fingerprint="fpW", cooldown_root=cd_root
+        worktree="/wt", session_id="sw", candidate_fingerprint="fpW", cooldown_root=cd_root
     )
+    # 手动 token 先终局化，排除活跃 token 去重门，让下一次自动申请确实走到冷却门。
+    dts.acknowledge_decision_token(manual.token, root=roots["root"], now=t0)
+    dts.mark_dispatched(manual.token, strictness="standard", root=roots["root"], now=t0)
     auto_after = dts.mint_decision_token(
-        worktree="/wt", session_id="sa", candidate_fingerprint="fpW", now=t0, **roots
+        worktree="/wt", session_id="sw", candidate_fingerprint="fpW", now=t0, **roots
     )
     assert auto_after.outcome == dts.MINT_OUTCOME_DECLINED_COOLDOWN
 
@@ -8480,6 +8531,11 @@ def load_rvf_agent_decision_cli_module():
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    # 本测试簇只验证既有状态机；真实宿主/Git 分界由独立集成测试覆盖。
+    module.require_review_start_boundary = lambda **kwargs: {"test_scope": "decision-state-unit", "automatic_closeout_eligibility": {"status": "unavailable", "reason_code": "isolated_unit_test_host"}}
+    module.require_prepared_run_review_start_boundary = lambda **kwargs: {"test_scope": "decision-state-unit"}
+    # 专用状态机夹具维持绑定器的 Path 返回契约；真实双向绑定由隔离 Git 集成套件验证。
+    module.bind_review_start_boundary_to_one_run = lambda receipt, run_id, run_dir: (run_id, Path(run_dir) if run_dir is not None else None)
     return module
 
 
@@ -8549,13 +8605,8 @@ def _agent_cli_stub_prepare(tmp: Path, *, run_name: str = "run-1", primary_files
 
     def _stub(
         *, token_record, repo, session_id, transcript_path, now, timeout_seconds=60.0,
-        resume_run_id=None, resume_run_dir=None,
-        parent_attempt_run_id=None, parent_attempt_run_dir=None,
     ):
         state["calls"] += 1
-        state["last_resume_run_id"] = resume_run_id
-        state["last_resume_run_dir"] = resume_run_dir
-        state["last_parent_attempt_run_id"] = parent_attempt_run_id
         if state["calls"] <= fail_first_n:
             return {"status": "failed", "error": "stub prepare 故意失败", "run_id": None, "run_dir": None, "artifacts": {}}
         run_dir = tmp / "runs" / run_name
@@ -9256,7 +9307,7 @@ def test_agent_cli_decline_persists_reason_and_cooldown(tmp: Path) -> None:
 
     # 指纹入 declined 冷却表（指纹未变不再注入）。
     assert dts.is_fingerprint_in_declined_cooldown(
-        worktree=wt, candidate_fingerprint="fpDecline", cooldown_root=roots.cooldown_root
+        worktree=wt, session_id="s1", candidate_fingerprint="fpDecline", cooldown_root=roots.cooldown_root
     )
     # 遥测记 declined。
     assert "declined" in [r["event"] for r in read_jsonl(roots.telemetry_root / f"{tok}.jsonl")]
@@ -10893,8 +10944,7 @@ def test_run_start_no_unreviewed_scope_holds_token_acknowledged_and_offers_force
         return {
             "status": cli.PREPARE_STATUS_NO_UNREVIEWED_SCOPE,
             "run_id": "run-nus", "run_dir": str(tmp / "runs" / "run-nus"),
-            "artifacts": {}, "error": None, "prep_token": None, "bootstrap_gate": None,
-            "initiation_run_id": "run-nus", "initiation_run_dir": str(tmp / "runs" / "run-nus"),
+            "artifacts": {}, "error": None, "prep_token": None,
             "tracker_scope_allocation": {
                 "status": cli.AGENTIC_INITIATION_TRACKER_SCOPE_NO_UNREVIEWED_SCOPE,
                 "tracker_scope_path": None, "tracker_lease_id": None, "tracker_scope_hash": None,
@@ -10945,14 +10995,6 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "circuit_breaker_refused_mint_requests_do_not_keep_the_breaker_tripped",
             lambda: test_circuit_breaker_refused_mint_requests_do_not_keep_the_breaker_tripped(root / "f4-5"),
-        ),
-        (
-            "reopen_own_declined_decision_refuses_unless_newest_token_of_this_session_is_declined",
-            lambda: test_reopen_own_declined_decision_refuses_unless_newest_token_of_this_session_is_declined(root / "f4-6"),
-        ),
-        (
-            "reopen_own_declined_decision_mints_with_agent_provenance_and_overrides_cooldown_and_snooze",
-            lambda: test_reopen_own_declined_decision_mints_with_agent_provenance_and_overrides_cooldown_and_snooze(root / "f4-7"),
         ),
         (
             "extra_token_payload_fields_cannot_override_system_written_explicit_user_request_fields",
@@ -11182,8 +11224,8 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             ),
         ),
         (
-            "rvf_analyze_thread_wires_guardian_post_exit_cli_signature",
-            lambda: test_rvf_analyze_thread_wires_guardian_post_exit_cli_signature(
+            "rvf_analyze_thread_wires_verified_archive_execution",
+            lambda: test_rvf_analyze_thread_wires_verified_archive_execution(
                 root / "analyze-guardian-post-exit-wire"
             ),
         ),
@@ -12141,93 +12183,9 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             ),
         ),
         (
-            "prepare_review_run_blocks_opted_in_repo_until_local_base_is_absorbed",
-            lambda: test_prepare_review_run_blocks_opted_in_repo_until_local_base_is_absorbed(
-                root / "prepare-local-base-bootstrap-gate"
-            ),
-        ),
-        (
             "prepare_review_run_rejects_invalid_local_base_ref",
             lambda: test_prepare_review_run_rejects_invalid_local_base_ref(
                 root / "prepare-invalid-local-base-ref"
-            ),
-        ),
-        (
-            "prepare_from_prep_file_waits_for_local_base_bootstrap_with_recoverable_gate",
-            lambda: test_prepare_from_prep_file_waits_for_local_base_bootstrap_with_recoverable_gate(
-                root / "bootstrap-gate-waiting"
-            ),
-        ),
-        (
-            "bootstrap_gate_reconciles_receipt_conflict_and_tamper_fail_closed",
-            lambda: test_bootstrap_gate_reconciles_receipt_conflict_and_tamper_fail_closed(
-                root / "bootstrap-gate-conflict-tamper"
-            ),
-        ),
-        (
-            "bootstrap_gate_reports_artifact_loss_and_opt_in_withdrawal_without_raising",
-            lambda: test_bootstrap_gate_reports_artifact_loss_and_opt_in_withdrawal_without_raising(
-                root / "bootstrap-gate-artifact-loss"
-            ),
-        ),
-        (
-            "bootstrap_gate_never_carries_environment_or_credential_values",
-            lambda: test_bootstrap_gate_never_carries_environment_or_credential_values(
-                root / "bootstrap-gate-no-env-leak"
-            ),
-        ),
-        (
-            "agent_cli_start_parks_on_bootstrap_then_resumes_same_run",
-            lambda: test_agent_cli_start_parks_on_bootstrap_then_resumes_same_run(
-                root / "bootstrap-agent-cli-resume"
-            ),
-        ),
-        (
-            "ups_stamps_waiting_bootstrap_onto_armed_kanban_followup_lock",
-            lambda: test_ups_stamps_waiting_bootstrap_onto_armed_kanban_followup_lock(
-                root / "bootstrap-ups-lock-stamp"
-            ),
-        ),
-        (
-            "bootstrap_replay_after_receipt_reuses_the_same_run_end_to_end",
-            lambda: test_bootstrap_replay_after_receipt_reuses_the_same_run_end_to_end(
-                root / "bootstrap-replay-same-run"
-            ),
-        ),
-        (
-            "held_bootstrap_gate_persists_verified_receipt_digest_so_swapped_receipt_is_tampered",
-            lambda: test_held_bootstrap_gate_persists_verified_receipt_digest_so_swapped_receipt_is_tampered(
-                root / "bootstrap-gate-digest-writeback"
-            ),
-        ),
-        (
-            "bootstrap_gate_g0_rejects_forged_origin_run_lineage_and_lost_run_artifacts",
-            lambda: test_bootstrap_gate_g0_rejects_forged_origin_run_lineage_and_lost_run_artifacts(
-                root / "bootstrap-gate-g0-forgery"
-            ),
-        ),
-        (
-            "bootstrap_gate_recovers_when_local_base_advances_during_the_wait",
-            lambda: test_bootstrap_gate_recovers_when_local_base_advances_during_the_wait(
-                root / "bootstrap-gate-base-advanced"
-            ),
-        ),
-        (
-            "agent_cli_start_retry_resumes_after_local_base_advances_during_the_wait",
-            lambda: test_agent_cli_start_retry_resumes_after_local_base_advances_during_the_wait(
-                root / "bootstrap-agent-cli-base-advanced"
-            ),
-        ),
-        (
-            "agent_cli_concurrent_bootstrap_resume_claims_prepare_exactly_once",
-            lambda: test_agent_cli_concurrent_bootstrap_resume_claims_prepare_exactly_once(
-                root / "bootstrap-agent-cli-replay-claim"
-            ),
-        ),
-        (
-            "bootstrap_replay_hard_bounds_a_stuck_prepare_in_a_killable_subprocess",
-            lambda: test_bootstrap_replay_hard_bounds_a_stuck_prepare_in_a_killable_subprocess(
-                root / "bootstrap-replay-hard-deadline"
             ),
         ),
         (
@@ -12847,6 +12805,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             ),
         ),
         (
+            "kanban_followup_trigger_presence_on_codex_rollout_without_uuid_chain_is_unknown_not_absent",
+            lambda: test_kanban_followup_trigger_presence_on_codex_rollout_without_uuid_chain_is_unknown_not_absent(
+                root / "trigger-presence-codex-rollout-T1"
+            ),
+        ),
+        (
             "kanban_followup_trigger_transcript_scan_reads_only_bounded_tail",
             lambda: test_kanban_followup_trigger_transcript_scan_reads_only_bounded_tail(
                 root / "trigger-presence-scan-T1"
@@ -13044,6 +13008,24 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "dispatch_reviewers_detached_exports_codex_rvf_log_root",
             lambda: test_dispatch_reviewers_detached_exports_codex_rvf_log_root(
                 root / "dispatch-detached-exports"
+            ),
+        ),
+        (
+            "dispatch_reviewers_detached_exports_current_task_and_native_session_identity",
+            lambda: test_dispatch_reviewers_detached_exports_current_task_and_native_session_identity(
+                root / "dispatch-detached-current-identity"
+            ),
+        ),
+        (
+            "dispatch_reviewers_detached_candidate_summary_ignores_stale_server_identity",
+            lambda: test_dispatch_reviewers_detached_candidate_summary_ignores_stale_server_identity(
+                root / "dispatch-detached-candidate-identity"
+            ),
+        ),
+        (
+            "dispatch_reviewers_detached_preserves_parent_harness_marker_and_candidate_summary",
+            lambda: test_dispatch_reviewers_detached_preserves_parent_harness_marker_and_candidate_summary(
+                root / "dispatch-detached-parent-harness-marker"
             ),
         ),
         (
@@ -13290,7 +13272,7 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         ),
         (
             "agent_cli_start_receipt_renders_intent_status_and_ordered_next_steps",
-            lambda: test_agent_cli_start_receipt_renders_intent_status_and_ordered_next_steps(root / "agent-cli-start-receipt"),
+            lambda: test_agent_cli_start_receipt_renders_ordered_next_steps(root / "agent-cli-start-receipt"),
         ),
         # --- T1/T2/T3 集成审计修复包 F2：执行段 ---
         (
@@ -13653,7 +13635,7 @@ globals().update({_n: getattr(_difftrk, _n) for _n in _difftrk.__all__})
 # 让（未改动的）注册表 lambda 解析到它们。注册顺序 / 分片身份保持不变。
 from _rvf_review_support import prepare_review_run_bootstrap as _preprev
 _preprev.inject(
-    run=run,
+    run=run_with_independent_review_start_boundary,
     init_repo=init_repo,
     write_codex_transcript=write_codex_transcript,
     PREPARE_REVIEW_RUN=PREPARE_REVIEW_RUN,
@@ -13661,7 +13643,6 @@ _preprev.inject(
     APPLY_WORKTREE_BOOTSTRAP=APPLY_WORKTREE_BOOTSTRAP,
     # pre-review local-base bootstrap 等待生命周期簇所需（进程内直调 prepare / gate / 入口 A CLI）。
     load_prepare_review_run_module=load_prepare_review_run_module,
-    load_rvf_bootstrap_gate_module=load_rvf_bootstrap_gate_module,
     load_rvf_prep_file_module=load_rvf_prep_file_module,
     load_rvf_decision_token_store_module=load_rvf_decision_token_store_module,
     load_rvf_agent_decision_cli_module=load_rvf_agent_decision_cli_module,

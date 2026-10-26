@@ -18,9 +18,13 @@ candidate_content_manifest_sha256``）。没有补修正、且没有无关脏文
 有补修正时内容摘要变了，才按 ``artifacts/handoff-validation-commands.json`` 的 argv 重跑。
 
 base-branch-sync 不并入本脚本，仍由 agent 在之后按 skill 调用。
+历史实际提交的追加验收另由 ``supplemental-completion inspect|record|verify`` 处理，
+其独立 schema、补审及隔离验证实现位于 ``supplemental_land_completion.py``。
 """
 
 from __future__ import annotations
+
+from independent_backup_route import normal_worktree_mutation, tracked_subprocess_run
 
 import argparse
 import json
@@ -54,6 +58,7 @@ from validation_result_cache import (  # noqa: E402
 )
 from write_reviewed_task_candidate_evidence import (  # noqa: E402
     CandidateEvidenceNotApplicable,
+    candidate_evidence_qualification,
     merge_dispositions_errors_that_would_refuse_candidate_evidence,
     reviewed_scope_path_universe,
     write_evidence,
@@ -83,6 +88,7 @@ RVF_LAND_EXIT_CANDIDATE_CONTENT_CHANGED_DURING_COMMIT = 26
 # 提交前拒绝：evidence 会走合并处置强校验（reviewer 报过 issue 或处置工件存在）而处置缺失/不合法/过期——
 # 放行则提交后 evidence 必然 refused_fail_closed。未 stage、未 commit。
 RVF_LAND_EXIT_MERGE_DISPOSITIONS_CHECK_FAILED_BEFORE_COMMIT = 27
+RVF_LAND_EXIT_CANDIDATE_EVIDENCE_QUALIFICATION_FAILED_BEFORE_COMMIT = 28
 
 RVF_LAND_PREPARE_PLAN_ARTIFACT_NAME = "rvf-land-prepare-plan.json"
 RVF_LAND_PREPARE_PLAN_SCHEMA_NAME = "rvf-land-prepare-plan"
@@ -136,7 +142,7 @@ class RvfLandHardGateFailure(Exception):
 
 
 def run_git(repo_root: Path, *arguments: str, check: bool = False) -> subprocess.CompletedProcess[str]:
-    completed = subprocess.run(
+    completed = tracked_subprocess_run(
         ["git", "-C", str(repo_root), *arguments],
         capture_output=True,
         text=True,
@@ -191,7 +197,7 @@ def applied_fix_attempt_dispositions(run_dir: Path) -> list[dict[str, Any]]:
     """从 fix ledger（``fix-attempts/*/{attempt,result}.json`` + ``fix-issues/*.json``）读每条 issue 的处置。
 
     handoff 正文格式因 agent 而异，「已采纳哪些 RVF-NNN」以机器 ledger 为准，不解析 markdown。
-    同一 issue 多次 attempt 时优先取已 apply 的那一次，其次取最新一次。
+    最新 attempt 决定完成状态；实际应用过的各次补丁共同决定改动路径。
     """
     artifacts = run_dir / "artifacts"
     titles: dict[str, str] = {}
@@ -199,13 +205,16 @@ def applied_fix_attempt_dispositions(run_dir: Path) -> list[dict[str, Any]]:
         issue = read_json_object_or_none(issue_path)
         if issue and isinstance(issue.get("issue_id"), str):
             titles[issue["issue_id"]] = str(issue.get("title") or "")
-    chosen: dict[str, tuple[tuple[int, float], dict[str, Any]]] = {}
+    chosen: dict[str, tuple[tuple[int, str], dict[str, Any]]] = {}
+    applied_paths_by_issue: dict[str, set[str]] = {}
+    confirmed_paths_by_issue: dict[str, set[str]] = {}
     attempts_root = artifacts / "fix-attempts"
     for attempt_directory in sorted(attempts_root.iterdir()) if attempts_root.is_dir() else []:
         result_path = attempt_directory / "result.json"
-        result = read_json_object_or_none(result_path)
+        result = read_json_object_or_none(result_path) or {}
         attempt = read_json_object_or_none(attempt_directory / "attempt.json") or {}
-        if not result or not isinstance(result.get("issue_id"), str):
+        issue_id = attempt.get("issue_id") or result.get("issue_id")
+        if not isinstance(issue_id, str):
             continue
         # ``rvf_fix_attempt.py apply`` 成功合回后把 attempt.json 的 status 改写成 applied；
         # result.json 的 status 保持 stop 时的 fix 结论（fixed / false_positive / ...）。
@@ -218,20 +227,25 @@ def applied_fix_attempt_dispositions(run_dir: Path) -> list[dict[str, Any]]:
             if isinstance(path, str) and path:
                 fix_patch_changed_paths.append(path)
         disposition = {
-            "issue_id": result["issue_id"],
-            "title": titles.get(result["issue_id"], ""),
+            "issue_id": issue_id,
+            "title": titles.get(issue_id, ""),
             "fix_status": result.get("status"),
             "fix_applied_to_worktree": applied,
             "changed_paths": list(dict.fromkeys(fix_patch_changed_paths)),
+            "confirmed_acknowledged_paths": attempt.get("confirmed_acknowledged_protected_or_background_paths") or [],
         }
-        rank = (1 if applied else 0, result_path.stat().st_mtime)
-        previous = chosen.get(result["issue_id"])
+        if applied:
+            applied_paths_by_issue.setdefault(issue_id, set()).update(fix_patch_changed_paths)
+            confirmed_paths_by_issue.setdefault(issue_id, set()).update(disposition["confirmed_acknowledged_paths"])
+        # 完成状态不能让旧 applied attempt 遮住更新的失败；正式资格由结构化完成检查裁定。
+        rank = (0, str(attempt.get("created_at") or ""))
+        previous = chosen.get(issue_id)
         if previous is None or rank > previous[0]:
-            chosen[result["issue_id"]] = (rank, disposition)
+            chosen[issue_id] = (rank, disposition)
     for issue_id, title in titles.items():
         if issue_id not in chosen:
             chosen[issue_id] = (
-                (0, 0.0),
+                (0, ""),
                 {
                     "issue_id": issue_id,
                     "title": title,
@@ -240,6 +254,10 @@ def applied_fix_attempt_dispositions(run_dir: Path) -> list[dict[str, Any]]:
                     "changed_paths": [],
                 },
             )
+    for issue_id, (_rank, disposition) in chosen.items():
+        # 完成结论取最新 attempt；路径与确认只取历史实际 applied 的补丁，不能被后续误报或失败抹掉。
+        disposition["changed_paths"] = sorted(applied_paths_by_issue.get(issue_id, set()))
+        disposition["confirmed_acknowledged_paths"] = sorted(confirmed_paths_by_issue.get(issue_id, set()))
     return [chosen[issue_id][1] for issue_id in sorted(chosen)]
 
 
@@ -287,9 +305,8 @@ def land_stageable_path_universe(
     ``primary_files`` 时不会把它从 background / protected 里删掉；这与 fix attempt 的口径一致（fix_allowlist
     内的路径不受 protected 拦截，protected 只拦边界之外的路径）。handoff 标注的 protected 路径没有例外。
 
-    已合回 fix 的补丁路径照常并入：其中 scope expansion 路径是 fix attempt 显式声明过的，但它们不在
-    contract 全集里、evidence 会拒绝——prepare 用 ``stageable_dirty_paths_outside_candidate_evidence_
-    landing_universe`` 在提交前把这一后果摆出来。
+    已合回 fix 的补丁路径照常并入；冻结全集之外的路径由同源资格检查区分合法已应用扩展与未审追加，
+    ``stageable_dirty_paths_outside_candidate_evidence_landing_universe`` 仅展示这份差集。
     """
     contract_has_path_universe = contract is not None and bool(reviewed_scope_path_universe(contract))
     reviewed_primary_boundary = (
@@ -303,8 +320,7 @@ def land_stageable_path_universe(
         else set(intake.get("reviewed_scope_paths") or [])
     )
     for disposition in dispositions:
-        if disposition["fix_applied_to_worktree"]:
-            universe.update(disposition["changed_paths"])
+        universe.update(disposition["changed_paths"])
     contract_not_automatically_stageable_patterns = (
         scope_contract_path_list(contract, LAND_NOT_AUTOMATICALLY_STAGEABLE_SCOPE_CONTRACT_FIELD_NAMES)
         if contract is not None
@@ -315,6 +331,11 @@ def land_stageable_path_universe(
         for path in (intake.get("intake_hints") or {}).get("protected_paths") or []
         if isinstance(path, str)
     }
+    confirmed_applied_paths = {
+        path for disposition in dispositions
+        for path in disposition.get("confirmed_acknowledged_paths", [])
+        if path in disposition["changed_paths"]
+    }
     return sorted(
         path
         for path in universe
@@ -322,6 +343,7 @@ def land_stageable_path_universe(
         and path not in handoff_protected
         and (
             path in reviewed_primary_boundary
+            or path in confirmed_applied_paths
             or not path_matches_scope_contract_path_pattern(path, contract_not_automatically_stageable_patterns)
         )
     )
@@ -530,10 +552,70 @@ def commit_message_draft(run_id: str | None, dispositions: list[dict[str, Any]])
     return "\n".join(lines)
 
 
+def land_candidate_evidence_qualification(
+    repo: Path, run_dir: Path, in_scope: list[dict[str, str]], unrelated: list[dict[str, str]],
+    *, leave_unrelated: bool, cross_worktree: bool,
+) -> dict[str, Any]:
+    if leave_unrelated and unrelated:
+        return {"status": "skipped_unrelated_dirty_paths_left_uncommitted_by_explicit_flag",
+                "reason_code": "unrelated_dirty_paths_explicitly_preserved"}
+    contract = reviewed_scope_contract(run_dir)
+    if cross_worktree and contract and Path(str(contract.get("repo", ""))).resolve() != repo:
+        return {"status": "skipped_cross_worktree_candidate_identity", "reason_code": "cross_worktree_contract_has_different_subject"}
+    paths = {path for entry in in_scope for path in dirty_entry_paths(entry)}
+    return candidate_evidence_qualification(repo, run_dir, pending_stage_paths=paths)
+
+
+def command_check_evidence(args: argparse.Namespace) -> int:
+    repo = Path(repository_identity(Path(args.repo).expanduser().resolve())[0]).resolve()
+    run_dir = Path(args.run_dir).expanduser().resolve(strict=True)
+    contract = reviewed_scope_contract(run_dir)
+    handoff = run_dir / "artifacts/handoff.md"
+    handoff_text = handoff.read_text(encoding="utf-8") if handoff.is_file() and not handoff.is_symlink() else ""
+    intake = build_payload(handoff_text, repo, handoff)
+    if intake.get("run_identity_status") == "invalid":
+        raise ValueError("交接 run 身份不符：" + "；".join(intake.get("run_identity_errors", [])))
+    stageable = set(land_stageable_path_universe(intake, contract, applied_fix_attempt_dispositions(run_dir)))
+    stageable.update(repo_relative_path(repo, path) for path in args.extra_path)
+    entries = repo_snapshot(repo).get("dirty_paths") or []
+    in_scope, unrelated = partition_dirty_entries(entries, stageable)
+    qualification = land_candidate_evidence_qualification(repo, run_dir, in_scope, unrelated,
+        leave_unrelated=args.commit_staged_scope_only_and_leave_unrelated_dirty_paths, cross_worktree=False)
+    result = {"schema": "rvf-candidate-evidence-qualification", "schema_version": 1,
+              "repo_root": str(repo), "run_dir": str(run_dir), "run_id": (contract or {}).get("run_id"), **qualification}
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return RVF_LAND_EXIT_CANDIDATE_EVIDENCE_QUALIFICATION_FAILED_BEFORE_COMMIT if qualification["status"] == "refused_fail_closed" else 0
+
+
+def persist_land_commit_result(run_dir: Path, repo: Path, result: dict[str, Any]) -> None:
+    plan = read_json_object_or_none(prepare_plan_artifact_path(run_dir)) or {}
+    payload = {"schema": "rvf-land-commit-execution-result", "schema_version": 1,
+               "run_id": plan.get("run_id"), "run_dir": str(run_dir), "repo_root": str(repo),
+               "head_oid_before_commit": plan.get("head_oid_at_prepare"), "head_oid_after_commit": head_oid(repo),
+               "candidate_content_manifest_sha256": candidate_content_manifest_sha256(repo), "result": dict(result)}
+    digest = sha256_hex(canonical_json_bytes(payload))
+    path = run_dir / "artifacts/rvf-land-commit-execution-results" / f"{digest}.json"
+    write_json_with_digest(path, payload)
+    write_json_with_digest(run_dir / "artifacts/rvf-land-commit-result.json", payload)
+    result.update({"land_commit_result_path": str(path), "land_commit_result_sha256": digest})
+
+
 def build_prepare_report(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     text, handoff_path = read_handoff_text(args)
     repo_argument = Path(args.repo).expanduser().resolve()
     intake = build_payload(text, repo_argument, handoff_path)
+    if intake.get("run_identity_status") == "invalid":
+        raise ValueError("交接 run 身份不符：" + "；".join(intake.get("run_identity_errors", [])))
+    if args.run_dir:
+        selected_run_directory = Path(args.run_dir).expanduser().resolve()
+        handoff_run_directory = intake.get("run_dir")
+        if handoff_run_directory and Path(handoff_run_directory).resolve() != selected_run_directory:
+            raise ValueError("显式 run 目录与交接绑定的 run 目录不符")
+        if (selected_run_directory / "artifacts").is_dir():
+            # 粘贴摘要可由显式目录补证，但其声明仍必须与该目录的正式身份一致。
+            intake = build_payload(text, repo_argument, selected_run_directory / "artifacts/handoff.md")
+            if intake.get("run_identity_status") == "invalid":
+                raise ValueError("交接 run 身份不符：" + "；".join(intake.get("run_identity_errors", [])))
     current_snapshot = intake["current_repo_snapshot"]
     if not current_snapshot.get("is_git_repo"):
         raise ValueError(f"--repo 不是 git worktree：{repo_argument}")
@@ -594,10 +676,16 @@ def build_prepare_report(args: argparse.Namespace) -> tuple[dict[str, Any], int]
         unrelated,
         leave_unrelated_dirty_paths_uncommitted=args.commit_staged_scope_only_and_leave_unrelated_dirty_paths,
     )
+    if run_dir is not None and (run_dir / "artifacts").is_dir() and intake.get("run_identity_status") != "verified":
+        gate_failures.append(RvfLandHardGateFailure(
+            RVF_LAND_EXIT_REVIEWED_SCOPE_CONTRADICTS_DIRTY_PATHS,
+            "run_identity_unavailable",
+            "精确 run 的 summary 或 scope contract 身份恢复可核验后重验；当前不生成正式计划。",
+        ))
 
     validation = (
         validation_reuse_assessment(repo_root, run_dir)
-        if run_dir is not None and (run_dir / "artifacts").is_dir()
+        if run_dir is not None and (run_dir / "artifacts").is_dir() and intake.get("run_identity_status") == "verified"
         else None
     )
     sections = parse_sections(text)
@@ -617,8 +705,7 @@ def build_prepare_report(args: argparse.Namespace) -> tuple[dict[str, Any], int]
         "leave_unrelated_dirty_paths_uncommitted": bool(
             args.commit_staged_scope_only_and_leave_unrelated_dirty_paths
         ),
-        # 会进提交、但不在 evidence 落地 delta 收敛判据（scope contract 路径全集）内的路径：contract 已 opt-in
-        # evidence 时，提交后 evidence 必然 refused_fail_closed（提交不回滚）。来源只可能是 --extra-path 或已合回 fix 的 scope expansion 路径。
+        # 冻结范围之外的路径差集。资格检查另行证明已应用扩展；extra-path 不构成该证明。
         "stageable_dirty_paths_outside_candidate_evidence_landing_universe": (
             dirty_paths_outside(in_scope, reviewed_scope_path_universe(contract)) if contract is not None else []
         ),
@@ -632,6 +719,11 @@ def build_prepare_report(args: argparse.Namespace) -> tuple[dict[str, Any], int]
         },
         "handoff_status_completed": bool(re.search(r"handoff_status:\s*COMPLETED", text, re.IGNORECASE)),
         "validation": validation,
+        "candidate_evidence_qualification": (
+            land_candidate_evidence_qualification(repo_root, run_dir, in_scope, unrelated,
+                leave_unrelated=args.commit_staged_scope_only_and_leave_unrelated_dirty_paths,
+                cross_worktree=args.cross_worktree) if run_dir is not None else None
+        ),
         "scoped_diff": render_scoped_diff(repo_root, in_scope, args.diff_max_lines),
         "target_worktree_scoped_diff": target_worktree_scoped_diff(intake, stageable, args),
         "commit_message_draft": commit_message_draft(run_id, dispositions),
@@ -643,7 +735,8 @@ def build_prepare_report(args: argparse.Namespace) -> tuple[dict[str, Any], int]
         failure.reason_code in {"handoff_target_repository_unknown", "handoff_targets_another_repository"}
         for failure in gate_failures
     )
-    if run_dir is not None and (run_dir / "artifacts").is_dir() and not cross_repository:
+    if (run_dir is not None and (run_dir / "artifacts").is_dir() and not cross_repository
+            and intake.get("run_identity_status") == "verified"):
         # 11/12 在 commit 时按当时的工作树重新判定（补修正可能改变它们），所以只要仓库身份与
         # run 目录成立就落 plan；10 与 13 不会因补修正而改变，commit 直接信 plan。
         plan = {
@@ -692,8 +785,12 @@ def render_prepare_report_text(report: dict[str, Any], exit_code: int) -> str:
     lines += [f"- {path}" for path in report["stageable_dirty_paths"]] or ["- <无：没有可提交的改动，commit 只做验证/封窗/evidence>"]
     outside_evidence = report["stageable_dirty_paths_outside_candidate_evidence_landing_universe"]
     if outside_evidence:
-        lines.append("⚠️ 以下路径会进提交，但不在 scope contract 路径全集内：contract 已 opt-in evidence 时，提交后 evidence 必然 refused_fail_closed（提交不回滚）。")
+        lines.append("以下路径在冻结范围之外；已声明且已应用的扩展可通过资格检查，其余情况在提交前拒绝。")
         lines += [f"  - {path}" for path in outside_evidence]
+    qualification = report.get("candidate_evidence_qualification") or {}
+    lines.append(f"\nEvidence 资格：{qualification.get('status')} / {qualification.get('reason_code')}")
+    if qualification.get("reason"):
+        lines.append(str(qualification["reason"]))
     if report["unrelated_dirty_paths"] and report["leave_unrelated_dirty_paths_uncommitted"]:
         lines.append(f"\n## scope 外脏文件：按 {LEAVE_UNRELATED_DIRTY_PATHS_FLAG} 原样保留，不 stage、不提交（evidence 跳过）")
         lines += [f"- {path}" for path in report["unrelated_dirty_paths"]]
@@ -822,7 +919,7 @@ def replay_structured_validation_commands(repo_root: Path, run_dir: Path) -> lis
             invocation += ["--environment-key", key]
         if entry["requires_base_worktree_context"]:
             invocation.append("--requires-base-worktree-context")
-        completed = subprocess.run(
+        completed = tracked_subprocess_run(
             [*invocation, "--", *entry["argv"]],
             capture_output=True,
             text=True,
@@ -918,9 +1015,47 @@ def command_commit(args: argparse.Namespace) -> int:
     # 只认显式 --run-dir：reviewer 子进程与 Codex task shell 都带着 RVF_RUN_DIR（指向活 run），
     # 环境变量回退会把别处 shell 的 land 引到那个 run 上。
     run_dir = Path(args.run_dir).expanduser().resolve()
+    repo_root = Path(repository_identity(Path(args.repo).expanduser().resolve())[0]).resolve()
+    result: dict[str, Any] | None = None
+    failure_output = None
+    result_persistence_started = False
+    result_persistence_completed = False
+    try:
+        with normal_worktree_mutation(repo_root, "rvf-land-commit", run_dir):
+            from rvf_elevated_issue_delegation import resume_pending_delegations_for_authorized_land
+
+            delegation_recovery = resume_pending_delegations_for_authorized_land(repo_root, run_dir)
+            try:
+                result = land_commit_result_from_prepare_plan(args, run_dir, repo_root)
+            except RvfLandHardGateFailure as failure:
+                result = {"status": "refused", **failure.as_payload()}
+                failure_output = failure.details.get("failure_output")
+            if delegation_recovery:
+                result["elevated_issue_delegation_recovery"] = delegation_recovery
+            plan = read_json_object_or_none(prepare_plan_artifact_path(run_dir)) or {}
+            if result["status"] != "refused" or plan.get("repo_root") == str(repo_root):
+                result_persistence_started = True
+                persist_land_commit_result(run_dir, repo_root, result)
+                result_persistence_completed = True
+    except (OSError, RuntimeError, ValueError) as exc:
+        if result is None or not result_persistence_started or result_persistence_completed:
+            raise
+        # 异常先退出保护区间以保留 unknown reservation，再回显已发生的提交或拒绝。
+        result["land_commit_result_persistence_error"] = str(exc)
+        if result["status"] != "refused":
+            result.update({"exit_code": RVF_LAND_EXIT_USAGE_ERROR,
+                           "reason_code": "land_commit_result_persistence_failed"})
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if failure_output:
+        print(failure_output, file=sys.stderr)
+    return result["exit_code"]
+
+
+def land_commit_result_from_prepare_plan(
+    args: argparse.Namespace, run_dir: Path, repo_root: Path,
+) -> dict[str, Any]:
     message = read_commit_message(args.message_file)
     plan = load_prepare_plan(run_dir)
-    repo_root = Path(repository_identity(Path(args.repo).expanduser().resolve())[0]).resolve()
     if plan.get("cross_worktree_gate_failed"):
         raise RvfLandHardGateFailure(
             RVF_LAND_EXIT_CROSS_WORKTREE_HANDOFF,
@@ -945,8 +1080,7 @@ def command_commit(args: argparse.Namespace) -> int:
         failure.details.setdefault("dirty_paths_changed_since_prepare", dirty_paths_changed_since_prepare)
         raise
     result["dirty_paths_changed_since_prepare"] = dirty_paths_changed_since_prepare
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-    return result["exit_code"]
+    return result
 
 
 def land_commit_after_prepare_plan_checks(
@@ -956,6 +1090,7 @@ def land_commit_after_prepare_plan_checks(
     repo_root: Path,
     message: str,
     dirty_entries: list[dict[str, str]],
+    *, validation_with_completed_replay: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     extra_paths = sorted(
         set(plan.get("extra_paths") or []) | {repo_relative_path(repo_root, path) for path in args.extra_path}
@@ -995,11 +1130,42 @@ def land_commit_after_prepare_plan_checks(
             merge_dispositions_errors=list(merge_dispositions_errors),
         )
 
-    validation = ensure_validation_satisfies_evidence_gate(repo_root, run_dir)
+    if validation_with_completed_replay is None:
+        validation = ensure_validation_satisfies_evidence_gate(repo_root, run_dir)
+        from core.review_run_qualification_mutation_lock import review_run_qualification_mutation_lock
+
+        # 验证子进程发布 validation index 也持同锁；先完成重放，再锁内复核全部资格和提交。
+        with review_run_qualification_mutation_lock(run_dir):
+            if plan.get("head_oid_at_prepare") != head_oid(repo_root):
+                raise RvfLandHardGateFailure(RVF_LAND_EXIT_PREPARE_PLAN_MISSING_OR_STALE, "prepare_plan_stale", "等待资格锁期间 HEAD 已变化；重跑 prepare。")
+            return land_commit_after_prepare_plan_checks(args, plan, run_dir, repo_root, message,
+                [entry for entry in repo_snapshot(repo_root).get("dirty_paths") or [] if isinstance(entry, dict)],
+                validation_with_completed_replay=validation)
+    validation = validation_with_completed_replay
+
+    qualification = land_candidate_evidence_qualification(
+        repo_root, run_dir, in_scope, unrelated, leave_unrelated=leave_unrelated_dirty_paths_uncommitted,
+        cross_worktree=bool(plan.get("cross_worktree_mode")),
+    )
+    if qualification["status"] == "refused_fail_closed":
+        raise RvfLandHardGateFailure(
+            RVF_LAND_EXIT_CANDIDATE_EVIDENCE_QUALIFICATION_FAILED_BEFORE_COMMIT,
+            qualification["reason_code"],
+            "提交前 evidence 资格检查拒绝；未 stage、未 commit。按 qualification 原因修正后重跑。",
+            candidate_evidence_qualification=qualification,
+        )
 
     stage_paths = sorted({path for entry in in_scope for path in (entry.get("path"), entry.get("old_path")) if path})
-    if stage_paths:
-        run_git(repo_root, "add", "-A", "--", *stage_paths, check=True)
+    already_staged_deletions = {
+        entry["path"] for entry in in_scope if entry.get("status", "").startswith("D")
+        and not (repo_root / entry["path"]).exists() and not (repo_root / entry["path"]).is_symlink()
+    }
+    paths_needing_add = sorted(set(stage_paths) - already_staged_deletions)
+    if paths_needing_add:
+        staged = run_git(repo_root, "add", "-A", "--", *paths_needing_add)
+        if staged.returncode != 0:
+            raise RvfLandHardGateFailure(RVF_LAND_EXIT_GIT_COMMIT_FAILED, "git_stage_failed", "git add 失败；未 commit。",
+                                         git_output=staged.stdout + staged.stderr)
     # 检查与提交都限定在 stage 集合：``commit --only`` 只提交列出的路径，别人预先 stage（或在
     # 本命令运行期间 git add）的 scope 外路径原样留在 index，既不进提交，也不影响这里的判定。
     has_staged_changes = (
@@ -1110,13 +1276,16 @@ def land_commit_after_prepare_plan_checks(
                 "reason": f"按 {LEAVE_UNRELATED_DIRTY_PATHS_FLAG} 保留了 scope 外脏文件，工作树不 clean，"
                 "evidence 无法绑定唯一 HEAD/tree。",
             }
+        elif qualification["status"] == "skipped_cross_worktree_candidate_identity":
+            candidate_evidence = qualification
         else:
             try:
                 candidate_evidence = write_evidence(repo_root, run_dir)
             except CandidateEvidenceNotApplicable as exc:
                 candidate_evidence = {"status": "skipped_not_applicable", "reason": str(exc)}
             except (OSError, RuntimeError, ValueError) as exc:
-                candidate_evidence = {"status": "refused_fail_closed", "reason": str(exc)}
+                candidate_evidence = {"status": "refused_fail_closed", "reason": str(exc),
+                                      "reason_code": getattr(exc, "reason_code", "candidate_evidence_write_failed_after_commit")}
     if committed_paths_outside_stage_set or content_changed_during_commit:
         exit_code = RVF_LAND_EXIT_CANDIDATE_CONTENT_CHANGED_DURING_COMMIT
     elif dirty_paths_remaining_beyond_declared_unrelated:
@@ -1143,6 +1312,12 @@ def land_commit_after_prepare_plan_checks(
         "candidate_content_manifest_sha256_after_commit": content_digest_after_commit,
         "round_baseline_seal": round_baseline_seal,
         "candidate_evidence": candidate_evidence,
+        "candidate_evidence_qualification": qualification,
+        "review_completed": qualification["status"] == "eligible",
+        "land_completed": exit_code == RVF_LAND_EXIT_OK,
+        "issues_remain_unresolved": qualification.get("issues_remain_unresolved", False),
+        "user_delegated_elevated_issues": qualification.get("user_delegated_elevated_issues", []),
+        "base_sync_completed": False,
     }
     if committed_paths_outside_stage_set:
         result["reason_code"] = "committed_paths_outside_stage_set"
@@ -1161,7 +1336,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     source.add_argument("--handoff-text-file", help="包含粘贴 handoff 正文的临时文件。")
     source.add_argument("--stdin", action="store_true", help="从 stdin 读 handoff 正文（用单引号 heredoc）。")
     prepare.add_argument("--repo", default=".")
-    prepare.add_argument("--run-dir", help="覆盖从 handoff 推断的 run 目录。")
+    prepare.add_argument("--run-dir", help="显式指定本轮 run 目录，须与 handoff 身份一致。")
     prepare.add_argument("--extra-path", action="append", default=[], help="reviewed scope 之外、确属本次工作的路径。")
     prepare.add_argument(
         "--cross-worktree",
@@ -1187,17 +1362,30 @@ def build_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="同 prepare 的同名开关（prepare 已带上时可省）。",
     )
+    qualification = subparsers.add_parser("check-evidence", help="完整 evidence 资格 dry-run：不 stage、不写 run 或 evidence。")
+    qualification.add_argument("--repo", default=".")
+    qualification.add_argument("--run-dir", required=True)
+    qualification.add_argument("--extra-path", action="append", default=[])
+    qualification.add_argument(LEAVE_UNRELATED_DIRTY_PATHS_FLAG, action="store_true")
+    from supplemental_land_completion import add_argument_parser
+    add_argument_parser(subparsers)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_argument_parser().parse_args(argv)
+    if args.subcommand == "supplemental-completion":
+        from supplemental_land_completion import command
+        return command(args)
     try:
         if args.subcommand == "prepare":
             return command_prepare(args)
+        if args.subcommand == "check-evidence":
+            return command_check_evidence(args)
         return command_commit(args)
     except RvfLandHardGateFailure as failure:
-        print(json.dumps({"status": "refused", **failure.as_payload()}, ensure_ascii=False, indent=2))
+        result = {"status": "refused", **failure.as_payload()}
+        print(json.dumps(result, ensure_ascii=False, indent=2))
         failure_output = failure.details.get("failure_output")
         if failure_output:
             print(failure_output, file=sys.stderr)

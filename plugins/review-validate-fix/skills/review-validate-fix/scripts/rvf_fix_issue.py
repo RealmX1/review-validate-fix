@@ -11,6 +11,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
+from core.review_run_qualification_mutation_lock import guard_review_run_qualification_mutation  # noqa: E402
 import rvf_merge_dispositions  # noqa: E402
 from core.session_scope_allocation import reviewable_unit_diff_tracker  # noqa: E402
 
@@ -122,6 +123,7 @@ def _write_mirror(run_dir: Path, issue_id: str, payload: dict[str, Any]) -> Path
     return path
 
 
+@guard_review_run_qualification_mutation("run_dir")
 def upsert_canonical_issue(
     *,
     run_dir: Path,

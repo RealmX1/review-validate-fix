@@ -366,7 +366,7 @@ def _read_in_flight_accepted_review_run_marker(*, repo: Path, session_id: str | 
       故这里**先查本会话 session 键、再查 task 键**，逐键单独读。
     * **没校验合格性**：过期（``marker_status`` 非 active）的锁、以及
       ``delivered_awaiting_agent_decision`` 这类「trigger 已投递但 agent 尚未接受」的态，都不代表
-      「本会话接受了这一轮」。只认 active 且 state ∈ 已接受态（in_progress / waiting_bootstrap）。
+      「本会话接受了这一轮」。只认 active 且 state ∈ 已接受态（in_progress）。
     """
     try:
         import kanban_followup_lock  # noqa: PLC0415
@@ -374,7 +374,7 @@ def _read_in_flight_accepted_review_run_marker(*, repo: Path, session_id: str | 
         return None
     task_id = _load_decision_cli()._current_kanban_task_id_from_env()
     in_flight_marker_states_with_agent_accepted_run = frozenset(
-        {kanban_followup_lock.STATE_IN_PROGRESS, kanban_followup_lock.STATE_WAITING_BOOTSTRAP}
+        {kanban_followup_lock.STATE_IN_PROGRESS}
     )
     # (task_id, session_id) 逐键查询：本会话 session 键优先，task 键兜底。
     marker_lookup_keys_in_priority_order: list[tuple[str | None, str | None]] = []
@@ -593,8 +593,6 @@ def run_decision_subcommand(subcommand: str, rest: list[str]) -> int:
         subcommand in ("start", "dispatch", "decline")
         and not _argv_names_token(rest)
         and not _argv_asks_for_help(rest)
-        # 撤回本会话的谢绝时没有待表态的 token 可推断——它自己铸新的。
-        and not (subcommand == "start" and "--reopen-own-declined-decision" in rest)
     ):
         token, how = infer_decision_token_for_subcommand(subcommand)
         if token is None:
@@ -1434,9 +1432,6 @@ def run_apply(args: argparse.Namespace) -> int:
 def run_status(args: argparse.Namespace) -> int:
     context = _require_run_context(args.run_dir, args.token)
     handoff_path = context.run_dir / "artifacts" / "handoff.md" if context.run_dir else None
-    intent_status = context.artifact_path(
-        "intent_artifact_status_file", "base-task-intent-reconciliation-status.json"
-    )
     status_path = _dispatch_status_path_for(context)
     dispatch_state: dict[str, Any] | None = None
     if status_path is not None and status_path.is_file():
@@ -1458,7 +1453,6 @@ def run_status(args: argparse.Namespace) -> int:
         "dispatch": dispatch_state,
         "fix_attempts": attempts,
         "handoff_path": str(handoff_path) if handoff_path else None,
-        "intent_artifact_status_file": str(intent_status) if intent_status else None,
         "validation_records": str(context.run_dir / "artifacts" / "validation-records.json") if context.run_dir else None,
     }
     if args.json:
@@ -1466,7 +1460,7 @@ def run_status(args: argparse.Namespace) -> int:
         return EXIT_OK
     print(f"[rvf status] run={payload['run_id']}（{payload['resolution_source']}）")
     for key in ("run_dir", "repo", "decision_token", "decision_token_state", "handoff_path",
-                "intent_artifact_status_file", "validation_records"):
+                "validation_records"):
         if payload.get(key):
             print(f"- {key}: {payload[key]}")
     if dispatch_state:
@@ -1482,12 +1476,8 @@ def run_status(args: argparse.Namespace) -> int:
 def run_handoff(args: argparse.Namespace) -> int:
     context = _require_run_context(args.run_dir)
     handoff_path = context.run_dir / "artifacts" / "handoff.md" if context.run_dir else None
-    intent_status = context.artifact_path(
-        "intent_artifact_status_file", "base-task-intent-reconciliation-status.json"
-    )
     print(f"[rvf handoff] run={context.run_id}")
     print(f"- handoff_path: {handoff_path}")
-    print(f"- intent_artifact_status_file: {intent_status}（照抄其 status 填 `## 状态` 的 intent_artifact_status）")
     coverage_line = _review_scope_coverage_line_for_run_context(context)
     if coverage_line:
         print(f"- 审查覆盖（照抄进 handoff 的「审查覆盖」行；覆盖不全时两行摘要的 Reviewers 行也要带 X/Y）：{coverage_line}")
@@ -1741,8 +1731,8 @@ def run_land(rest: list[str]) -> int:
 # argparse
 # ---------------------------------------------------------------------------
 
-DECISION_PASSTHROUGH_SUBCOMMANDS = ("start", "scope", "dispatch", "decline", "decline-dispatched-review")
-RAW_PASSTHROUGH_SUBCOMMANDS = ("validate", "land")
+DECISION_PASSTHROUGH_SUBCOMMANDS = ("request-review-start-boundary", "start", "scope", "dispatch", "decline", "decline-dispatched-review")
+RAW_PASSTHROUGH_SUBCOMMANDS = ("validate", "land", "elevated-issue-delegation")
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -1824,12 +1814,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "land", add_help=False,
         help="rvf_land.py prepare|commit 透传（commit 缺 --run-dir 时取本仓最近一次 prepare 的 run）",
     )
+    sub.add_parser("elevated-issue-delegation", add_help=False, help="用户委派处置：inspect|record|verify|resume（显式 repo/run）")
     return parser
 
 
 RAW_PASSTHROUGH_SUBCOMMAND_RUNNERS: dict[str, Callable[[list[str]], int]] = {
     "validate": run_validate,
     "land": run_land,
+    "elevated-issue-delegation": lambda rest: subprocess.run(
+        [sys.executable, str(SCRIPTS_DIRECTORY / "rvf_elevated_issue_delegation.py"), *rest], check=False
+    ).returncode,
 }
 
 

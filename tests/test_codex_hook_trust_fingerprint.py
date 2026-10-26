@@ -148,7 +148,7 @@ def test_missing_config_reports_unavailable_not_trusted(tmp_path: Path) -> None:
     )
     assert result["status"] == trust.TRUST_STATUS_UNAVAILABLE, result
     assert result["status"] != trust.TRUST_STATUS_TRUSTED
-    assert "不是" in result["note"]
+    assert result["error_code"] == "configuration_missing"
 
 
 def test_all_mismatched_is_flagged_as_probably_an_algorithm_drift(tmp_path: Path) -> None:

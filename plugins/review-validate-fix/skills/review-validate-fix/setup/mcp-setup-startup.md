@@ -36,8 +36,12 @@
 - `config/alternative-reviewer.claude.json` — Claude Code CLI 模板。
 - `config/alternative-reviewer.codex.json` — Codex CLI 模板。
 - `config/alternative-reviewer.kimi.json` — Kimi Code CLI 模板。**五条腿里唯一不经 stdin 拿 prompt 的一条**：`kimi` 的 `-p/--prompt` 是带值 flag、从不读 stdin，而整份 review packet 塞进 argv 必然 E2BIG（实盘最大 1,522,602 字节 vs `ARG_MAX` 1,048,576）⇒ 走 `prompt_delivery: argv_prompt_flag_with_prompt_file_pointer`，正文照常落盘、argv 只带一段指针指令。
-- `config/alternative-reviewer.oh-my-pi.json` — oh-my-pi（`omp`）模板。**五份里唯一 pin 模型的一份**（`openai-codex/gpt-5.6-sol` + `--thinking xhigh`）：omp 是多 provider 的壳，不 pin 时可能落到与其他腿相同的底层模型，而 SANTA 的价值全部来自模型分歧。代价是它与 codex 腿共用同一 Codex 订阅额度池，选腿层据 `underlying_provider_account_quota_pool_identity` 对这一对做互斥。
+- `config/alternative-reviewer.oh-my-pi.json` — oh-my-pi（`omp`）模板。每次查询 OMP 的默认 model role，再将完整 `openai-codex/…` selector 与 `--thinking xhigh` 用于健康检查及评审。它与 codex 腿共用同一 Codex 订阅额度池，选腿层据 `underlying_provider_account_quota_pool_identity` 对这一对做互斥。
 - `~/.rvf/user-local-data/reviewer-configuration/reviewer-registry.json` — 上述五者的本机注册表，是「本机启用哪些 external reviewer」的唯一事实源；官方 CLI 重装 plugin cache 时不会覆盖。
+
+Kimi 模板声明 `reviewer_model_selection_source: kimi_latest_managed_stable_model`：每次启动短生命周期的 `kimi web` loopback 服务，调用官方 `POST /api/v1/providers:refresh_oauth` 和 `GET /api/v1/models`，从 `managed:kimi-code` 中按数字版本、Pro、上下文窗口排序选择稳定标准模型，排除 Highspeed 和 Preview。服务启动与目录刷新共享最多 10 秒预算，退出时回收服务；刷新失败、目录非法或没有合格模型时明确报错。健康检查与本次评审均显式传入同一个 `--model` alias，不修改全局默认。用户在自定义 reviewer 配置的 `command` 中显式指定 `-m` / `--model` 时保留该模型并同步给健康检查；原生 `--session` / `-S`（含 `--session=<id>`、`-S<id>`）及 `--continue` / `-c` 恢复不触发默认选模：健康检查会用同一恢复参数向该会话发起最小提示，正式评审随后恢复同一会话；未显式覆盖模型时两者均沿用会话模型。恢复时显式指定的模型同样同步给健康检查；两边恢复目标或模型不一致则报错。Kimi 与 OMP 的动态选模路径每次重新 probe，绕过旧模型的健康缓存。官方接口见 [Server API](https://www.kimi.com/code/docs/en/kimi-code-cli/reference/server-api.html)。
+
+同一 `KIMI_CODE_HOME` 的刷新使用 `.kanban-kimi-model-catalog-refresh.lock` 空目录互斥锁，兼容 Kanban 的原子 `mkdir` / `rmdir` 与 mtime heartbeat 协议（15 秒心跳、30 秒 stale）。等锁、启动和 HTTP 响应读取共用上述绝对预算；等锁超时不启动服务。锁持有至本次服务进程组与隔离工作目录均已回收，不同 home 可并行。锁被替换或 mtime 异常时明确失败，旧 holder 不刷新或删除替代锁。
 
 Cursor 模板的命令为 `cursor-agent -p --output-format stream-json --force --trust --sandbox disabled`，几个 flag 的理由：
 

@@ -184,12 +184,15 @@ def rvf_analyze_followup_prompt(analysis: dict[str, str]) -> str:
         f"RVF_ANALYZE_RUN_DIR: {analysis['run_dir']}\n"
         f"RVF_ANALYZE_SUMMARY_MD: {analysis['summary_md_path']}\n"
         f"RVF_ANALYZE_CAUSALITY_JSON: {analysis['causality_json_path']}\n\n"
-        "这是 RVF finalize 在生成 deterministic analysis scaffold 后注入的 "
-        "$rvf-analyze follow-up。只复盘这个已 finalize 的 run：补全 "
+        "这是 RVF finalize 在生成 deterministic analysis scaffold 后派发的后台补全任务。"
+        "当前 scaffold 已存在，直接补全，不要重新执行 rvf_analyze.py 或覆盖确定性事实。"
+        "只复盘这个已 finalize 的 run：补全 "
         "`artifacts/analysis/summary.md`，并在 "
         "`artifacts/analysis/causality.json` 中填写 issue 到 patch call_id "
         "的候选归因。不要启动新的 `$review-validate-fix`，不要修改被审查源码，"
-        "不要生成新的 handoff。"
+        "不要生成新的 handoff。唯一交付目标是上面两份正式文件；原子写入的中间文件也必须"
+        "位于同一 analysis 目录。无法读取或写回时明确报告失败，不得在业务 worktree、"
+        ".rvf-analysis-writeback-pending 或临时目录保存替代稿。"
     )
 
 
@@ -209,8 +212,10 @@ def _merge_summary(ledger: Any, fields: dict[str, Any]) -> None:
     payload = _read_json_dict(path)
     payload.update(fields)
     try:
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    except OSError:
+        from core.run_ledger.review_run_lifecycle import merge_review_run_summary
+
+        merge_review_run_summary(path.parent, {"run_id": payload.get("run_id") or getattr(ledger, "run_id", None) or path.parent.name, **fields})
+    except (OSError, ValueError):
         return
 
 
@@ -244,6 +249,21 @@ def surface_rvf_analyze_advisory(
     if analysis is None:
         return None
 
+    from review_run_terminal_archive import claim_review_run_analysis_launch, record_review_run_analysis_launch
+
+    try:
+        recovery_claim = claim_review_run_analysis_launch(analysis=analysis, event=event)
+    except Exception as exc:
+        fields = {"rvf_analyze_status": "waiting_automatic_recovery", "rvf_analyze_run_dir": analysis["run_dir"],
+                  "analysis_recovery_error": f"{type(exc).__name__}: {exc}"}
+        _merge_summary(ledger, fields)
+        return fields
+    if recovery_claim and recovery_claim["status"] in ("completed", "waiting_for_evidence"):
+        fields = {"rvf_analyze_status": "completed" if recovery_claim["status"] == "completed" else "waiting_automatic_recovery",
+                  "rvf_analyze_run_dir": analysis["run_dir"], "analysis_recovery": recovery_claim}
+        _merge_summary(ledger, fields)
+        return fields
+
     trigger = rvf_analyze_trigger(analysis["run_dir"])
     base_fields: dict[str, Any] = {
         "rvf_analyze_run_dir": analysis["run_dir"],
@@ -268,6 +288,10 @@ def surface_rvf_analyze_advisory(
         }
 
     launch_status = thread_info.get("launch_status")
+    try:
+        record_review_run_analysis_launch(recovery_claim, thread_info)
+    except (OSError, ValueError, KeyError) as exc:
+        thread_info["analysis_recovery_record_error"] = f"{type(exc).__name__}: {exc}"
     launched = launch_status in ("launched", "already_running")
 
     thread_fields: dict[str, Any] = {

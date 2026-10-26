@@ -116,12 +116,13 @@ def _read_json_dict(path: Path) -> dict[str, Any]:
 
 
 @contextmanager
-def _guardian_counter_file_lock(path: Path) -> Iterator[None]:
+def _guardian_counter_file_lock(path: Path, *, require_lock: bool = False) -> Iterator[None]:
     """用旁路 ``.lock`` 文件串行化守护计数 RMW；锁不可用时退化为无锁 best-effort。
 
     正常锁持有区只包含本地 JSON 读写，不包含 detached 派发等外部操作，因此并发者
     只会短暂等待。若目录/锁文件/``flock`` 本身不可用，仍让调用方尝试原有无锁路径；
-    守护可观测性故障不得阻断 Stop/finalize/analyze 主流程。
+    守护可观测性故障不得阻断 Stop/finalize/analyze 主流程。精确 run 完成计数要求
+    ``require_lock=True``，锁不可用时留下未记账状态，不进入无锁认领。
     """
     handle = None
     locked = False
@@ -137,6 +138,8 @@ def _guardian_counter_file_lock(path: Path) -> Iterator[None]:
             except OSError:
                 pass
             handle = None
+        if require_lock:
+            raise
     try:
         yield
     finally:
@@ -214,7 +217,7 @@ def _default_guardian_analysis_dispatcher(
     prompt_path.write_text("\n".join(prompt_lines), encoding="utf-8")
 
     host = select_host({})
-    agent_argv, uses_stdin = build_analyze_command(host)
+    agent_argv, uses_stdin = build_analyze_command(host, analysis_directory=analysis_dir)
     session_name = f"rvf-guardian-{safe_token(f'milestone-{milestone}')}"
     status_path = analysis_dir / ".guardian-analysis.status.json"
     started_at = _coerce_now(None).isoformat().replace("+00:00", "Z")
@@ -248,6 +251,16 @@ def _default_guardian_analysis_dispatcher(
     }
 
 
+def _read_analysis_completion_counter(path: Path) -> dict[str, Any]:
+    """计数记录不可读或损坏时保留原件，不能当作首次计数覆盖。"""
+    if not path.exists():
+        return {}
+    counter = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(counter, dict):
+        raise ValueError("分析完成计数记录必须为对象")
+    return counter
+
+
 def record_analyze_completion(
     *,
     run_dir: str | None = None,
@@ -255,21 +268,29 @@ def record_analyze_completion(
     root: str | Path | None = None,
     guardian_analysis_dispatcher: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """RVF analyze 线程完成后调用:累计数 +1;首达 {1,2,4,8,16} 节点则派发守护分析。
+    """精确 run 只累计一次；首达 {1,2,4,8,16} 节点则派发守护分析。
+
+    缺少非空 run 目录参数时身份仍未知；显式路径按调用时 cwd 正规化后认领。
 
     返回结构化结果(``analyze_completion_count`` / ``milestone_dispatched`` /
     ``guardian_retired`` / ``retirement_prompt``)。**best-effort**:任何异常收敛为
     ``{"status": "guardian_record_failed", ...}``,绝不外抛。
     """
     try:
+        if not isinstance(run_dir, str) or not run_dir.strip():
+            raise ValueError("完成计数缺少精确 run 目录，身份仍未知")
+        run_directory = Path(run_dir).expanduser()
+        run_identity = str(run_directory.resolve())
         current = _coerce_now(now)
         guardian_root = guardian_state_root(root)
         counter_path = guardian_root / ANALYZE_COMPLETION_COUNTER_FILENAME
         # 第一段短 RMW：先原子认领本次 analyze 完成计数。派发放在锁外，避免 tmux
         # 启动等待把并发 Stop/analyze 路径拖住；派发成功后再做第二段合并 RMW。
-        with _guardian_counter_file_lock(counter_path):
-            counter = _read_json_dict(counter_path)
-            count = int(counter.get("analyze_completion_count") or 0) + 1
+        with _guardian_counter_file_lock(counter_path, require_lock=True):
+            counter = _read_analysis_completion_counter(counter_path)
+            counted_runs = dict(counter.get("counted_analysis_run_directories") or {})
+            already_counted = run_identity in counted_runs
+            count = int(counter.get("analyze_completion_count") or 0) + (0 if already_counted else 1)
             dispatched_milestones = sorted(
                 {
                     int(v)
@@ -280,20 +301,25 @@ def record_analyze_completion(
             already_retired = bool(counter.get("guardian_retired")) or (
                 GUARDIAN_RETIREMENT_MILESTONE in dispatched_milestones
             )
-            _atomic_write_json(
-                counter_path,
-                {
+            if not already_counted:
+                counted_runs[run_identity] = {
+                    "first_recorded_at": current.isoformat().replace("+00:00", "Z"),
+                    "analyze_completion_count_when_first_recorded": count,
+                }
+                # 唯一性认领与计数增量在同一个原子 JSON 写入中提交，重启重放不重复累计。
+                _atomic_write_json(counter_path, {
+                    **counter,
                     "schema_version": SCHEMA_VERSION,
                     "analyze_completion_count": count,
+                    "counted_analysis_run_directories": counted_runs,
                     "dispatched_milestones": dispatched_milestones,
                     "guardian_retired": already_retired,
                     "last_recorded_at": current.isoformat().replace("+00:00", "Z"),
-                    "last_run_dir": run_dir,
-                },
-            )
+                    "last_run_dir": run_identity,
+                })
 
         result: dict[str, Any] = {
-            "status": "recorded",
+            "status": "already_recorded" if already_counted else "recorded",
             "analyze_completion_count": count,
             "milestone_dispatched": None,
             "guardian_retired": already_retired,
@@ -328,8 +354,8 @@ def record_analyze_completion(
 
                 # 第二段短 RMW：只在真实/幂等派发成功后合并节点。较高节点吸收所有
                 # 尚未记录的较低 due 节点，避免一次恢复后形成补派风暴。
-                with _guardian_counter_file_lock(counter_path):
-                    latest = _read_json_dict(counter_path)
+                with _guardian_counter_file_lock(counter_path, require_lock=True):
+                    latest = _read_analysis_completion_counter(counter_path)
                     latest_dispatched = {
                         int(v)
                         for v in latest.get("dispatched_milestones") or []
@@ -567,15 +593,15 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     record = sub.add_parser(
         "record-analyze-completion",
-        help="analyze 线程完成回调:计数 +1,节点首达则派发守护分析。",
+        help="按精确 run 幂等记录 analyze 完成，节点首达则派发守护分析。",
     )
-    record.add_argument("--run-dir", default=None, help="完成的 analyze 所属 RVF run dir。")
+    record.add_argument("--run-dir", required=True, help="完成的 analyze 所属 RVF run 目录，显式相对路径按调用时 cwd 正规化。")
     args = parser.parse_args(argv)
 
     if args.command == "record-analyze-completion":
         result = record_analyze_completion(run_dir=args.run_dir)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, default=str))
-        return 0
+        return 1 if result.get("status") == "guardian_record_failed" else 0
     return 2
 
 

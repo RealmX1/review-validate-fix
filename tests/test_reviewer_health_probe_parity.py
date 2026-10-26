@@ -185,7 +185,7 @@ def _check(config_payload: dict, tmp_path: Path) -> subprocess.CompletedProcess:
     config_path.write_text(json.dumps(config_payload), encoding="utf-8")
     isolated_home = tmp_path / "home"
     isolated_home.mkdir(parents=True, exist_ok=True)
-    if config_payload.get("reviewer_model_selection_source"):
+    if config_payload.get("reviewer_model_selection_source") == "oh_my_pi_default_model_role":
         executable = tmp_path / "bin" / "omp"
         executable.parent.mkdir()
         executable.write_text(
@@ -196,6 +196,16 @@ def _check(config_payload: dict, tmp_path: Path) -> subprocess.CompletedProcess:
         executable.chmod(0o755)
         config_payload["command"][0] = str(executable)
         config_payload["health_command"][0] = str(executable)
+        config_path.write_text(json.dumps(config_payload), encoding="utf-8")
+    elif config_payload.get("reviewer_model_selection_source") == "kimi_latest_managed_stable_model":
+        # 此处只测 parity；动态目录协议及无固定模型的整条执行链由独立套件覆盖。
+        executable = tmp_path / "bin" / "kimi"
+        executable.parent.mkdir()
+        executable.write_text(f"#!{sys.executable}\nraise AssertionError('check 不应调用模型')\n")
+        executable.chmod(0o755)
+        config_payload["command"][0] = config_payload["health_command"][0] = str(executable)
+        for field in ("command", "health_command"):
+            config_payload[field][1:1] = ["--model", "kimi-code/k3.1-pro"]
         config_path.write_text(json.dumps(config_payload), encoding="utf-8")
     environment = dict(os.environ)
     # user-local override 按 Path.home() 解析：不隔离就测不到出厂模板本身。

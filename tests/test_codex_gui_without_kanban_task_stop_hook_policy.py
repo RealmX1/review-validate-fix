@@ -186,11 +186,12 @@ def test_core_decision_guard_precedes_in_progress_and_dirty_gates(tmp_path, monk
 
 
 @pytest.mark.parametrize("event_has_cwd", [True, False])
+@pytest.mark.parametrize("marker_run_identity", ["matching", "different", "unknown"])
 @pytest.mark.parametrize("event_session_field", [
     "session_id", "thread_id", "sessionId", "parent_thread_id",
 ])
 def test_handoff_finalizes_idempotently_and_releases_only_this_session_marker(
-    tmp_path, event_has_cwd, event_session_field,
+    tmp_path, event_has_cwd, event_session_field, marker_run_identity,
 ):
     event = desktop_event(tmp_path)
     event.pop("session_id")
@@ -219,12 +220,16 @@ def test_handoff_finalizes_idempotently_and_releases_only_this_session_marker(
     other_marker = marker_paths(task_id=None, session_id=other_session_id, repo=tmp_path)[0]
     parent_task_marker = marker_paths(task_id="parent-task", session_id=None, repo=tmp_path)[0]
     own_marker.parent.mkdir(parents=True, exist_ok=True)
-    own_marker.write_text("{}", encoding="utf-8")
+    marker_identity = {} if marker_run_identity == "unknown" else {
+        "run_id": "manual-run" if marker_run_identity == "matching" else "another-run",
+        "run_dir": str(run_dir),
+    }
+    own_marker.write_text(json.dumps(marker_identity), encoding="utf-8")
     other_marker.write_text("{}", encoding="utf-8")
     parent_task_marker.write_text("{}", encoding="utf-8")
     payload = module.disabled_codex_gui_stop_hook_payload(event, start_run("test-gui-policy"))
     assert payload["continue"] is True
-    assert not own_marker.exists()
+    assert own_marker.exists() is (marker_run_identity != "matching")
     assert other_marker.exists()
     assert parent_task_marker.exists()
     finalized = (artifacts / ".finalize.lock").read_text(encoding="utf-8")
@@ -292,7 +297,7 @@ def test_event_or_transcript_explicit_suppression_preserves_handoff_and_marker(
         pytest.fail("显式 suppress 的会话不得 finalize 或清锁")
     module = policy_module()
     monkeypatch.setattr(module, "finalize_for_handoff", forbidden)
-    monkeypatch.setattr(module, "clear_marker", forbidden)
+    monkeypatch.setattr(module, "clear_markers_belonging_to_handed_off_run", forbidden)
     from core.run_ledger.run_ledger import start_run
     payload = module.disabled_codex_gui_stop_hook_payload(event, start_run("test-gui-policy"))
     assert payload["continue"] is True

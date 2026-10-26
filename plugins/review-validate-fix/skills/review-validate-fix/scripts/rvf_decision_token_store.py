@@ -18,8 +18,8 @@
   * 去重键 ``(worktree, session_id, candidate_fingerprint)``：同键存在活跃（非终态、且 TTL 未过期或
     run 在途可复活）token 时**拒绝重铸并返回既有 token**——这是注入幂等的硬保证（R25）。
     ``candidate_fingerprint`` 对本模块是**不透明字符串**（由 S2 摘要生成器计算，本模块不实现指纹算法）。
-  * declined 指纹冷却表：decline 时把 ``(worktree, candidate_fingerprint)`` 写入冷却表，摘要生成器
-    在再次注入前查表，指纹未变则不再注入（防 decline→Stop→再注入的 nag 循环）。
+  * declined 指纹冷却表：decline 时把 ``(worktree, session_id, candidate_fingerprint)`` 写入冷却表，
+    同会话再次注入前查表，指纹未变则不再注入；parent / fork / 新会话各自判断，不能互相否决。
   * declined 会话级 snooze（闸 2b）：内容指纹逐字节敏感，工作进行中每次 Stop 都是「新候选」，上面
     的冷却表因此挡不住同一会话里的重复谢绝。decline 时另按 ``(worktree, session_id)`` 记一条
     粗粒度的工作范围快照；在出现真正的工作边界（HEAD 变化 / 范围明显扩大 / 硬 TTL）之前，同会话同
@@ -93,6 +93,7 @@ ENV_CIRCUIT_BREAKER_ROOT = "RVF_AGENTIC_INITIATION_CIRCUIT_BREAKER_ROOT"
 
 DECISION_TOKEN_DIRNAME = "agentic-initiation-decision-tokens"
 DECLINED_FINGERPRINT_DIRNAME = "agentic-initiation-declined-fingerprints"
+SESSION_SCOPED_DECLINED_CANDIDATE_FINGERPRINT_SUBDIRNAME = "session-scoped-declined-candidate-fingerprints"
 CIRCUIT_BREAKER_DIRNAME = "agentic-initiation-circuit-breaker-ledger"
 
 # 去重键各字段的分隔符（ASCII Unit Separator，正常字段值不含）。
@@ -101,7 +102,7 @@ _KEY_FIELD_SEPARATOR = "\x1e"
 # declined 会话级 snooze（闸 2b）的落盘位置：**declined 冷却根下的子目录**。刻意不另立一个根 /
 # 环境变量——它与冷却表同属「agent 谢绝过什么」这一族状态，挂在冷却根下就自动继承冷却根的全部
 # 隔离手段（显式 ``cooldown_root`` / 专用 env / ``$RVF_HOME``），不会出现「测试注入了冷却根、
-# snooze 却写进真实 ~/.rvf」的漏网。冷却表只在根目录顶层放 ``<hash>.json``，子目录与它互不相干。
+# snooze 却写进真实 ~/.rvf」的漏网。会话指纹冷却与 snooze 分别存放在独立子目录。
 # 目录结构：``<snooze 根>/<sha(session_id)>/<sha(worktree)>.json``——按会话分目录，UPS 在开发者
 # 发来真实 prompt 时按会话整目录**重置各 snooze 的「范围扩大」对比基线**（不解除 snooze，见下方
 # 方向 C 的 EXPERIMENT_NODE），无需知道 Stop 侧用的 worktree 字符串。
@@ -508,6 +509,8 @@ class MintResult:
     record: DecisionTokenRecord | None = None
     circuit_breaker: CircuitBreakerStatus | None = None
     message: str | None = None
+    # 仅冷却拒铸时携带命中的本会话记录，供 Stop 日志追溯谢绝来源。
+    session_scoped_declined_candidate_fingerprint_record: dict[str, Any] | None = None
     # 事实一（告知类）：「用户显式推翻了 agent 早前的谢绝」。仅在
     # ``initiated_by_explicit_user_request=True`` 且本次铸造确实**命中**了一条既有 declined 冷却
     # 记录时为 True——命中即已证成，与冷却记录能否被物理删除**无关**。调用方据此把该事实如实告知
@@ -743,7 +746,7 @@ def _digest(*parts: str) -> str:
 # （``reconcile_stranded_decision_point_delivery_intents``）把一份**确实送达且已被 agent 看到**
 # 的横幅判成搁浅并 ``mark_withdrawn``，``rvf-agent start`` 硬失败。**直接破坏 INV-A。**
 #
-# 互斥用 token 文件旁的独立 flock 锁文件（形状照抄 ``_with_bootstrap_replay_takeover_lock``）。
+# 互斥用 token 文件旁的独立 flock 锁文件。
 # 锁文件名以 ``.`` 开头且以 ``.lock`` 结尾，故 ``sweep_stale_decision_tokens`` 的 ``*.json``
 # 扫描与测试里的 token 计数都看不见它。铁律：**读与写必须在同一把锁内**——只调换语句顺序不构成
 # 互斥，只锁住写入同样不构成互斥（陈旧副本仍会被整份写回去）。
@@ -1125,7 +1128,7 @@ def _dedup_active_lookup(
 #
 # **陈旧回收：不需要，且这是刻意选型。** 互斥由 ``flock`` 提供，锁的所有权绑在「打开文件描述」上
 # ——持有者中途崩溃 / 被硬杀 / 进程退出时内核自动释放，不存在「崩溃后残留把同键铸造永久堵死」的
-# 形态，故既不需要 TTL 窗口也不需要接管逻辑（与 ``claim_bootstrap_replay_in_flight`` 那种 O_EXCL
+# 形态，故既不需要 TTL 窗口也不需要接管逻辑（与文件占位
 # 占位 sidecar 相反：那种占位靠文件**存在性**互斥，才必须自带过窗接管）。磁盘上留下的只是一个空
 # 锁文件，下一次同键铸造直接复用同一个 inode。
 DEDUP_INDEX_MINT_CLAIM_LOCK_SUFFIX = ".dedup-index-mint-claim.lock"
@@ -1352,30 +1355,38 @@ def _register_mint_request_and_check_breaker(
 # declined 指纹冷却表
 # ---------------------------------------------------------------------------
 
-def _declined_fingerprint_path(worktree: str, candidate_fingerprint: str, root: str | Path | None) -> Path:
-    key_hash = _digest(worktree, candidate_fingerprint)
-    return declined_fingerprint_root(root) / f"{key_hash}.json"
+def _session_scoped_declined_candidate_fingerprint_path(
+    worktree: str, session_id: str, candidate_fingerprint: str, root: str | Path | None
+) -> Path | None:
+    if not isinstance(session_id, str) or not session_id.strip():
+        return None
+    key_hash = _digest(worktree, session_id, candidate_fingerprint)
+    return declined_fingerprint_root(root) / SESSION_SCOPED_DECLINED_CANDIDATE_FINGERPRINT_SUBDIRNAME / f"{key_hash}.json"
 
 
 def record_declined_fingerprint(
     *,
     worktree: str,
+    session_id: str,
     candidate_fingerprint: str,
     reason: str | None = None,
     token: str | None = None,
     now: datetime | None = None,
     cooldown_root: str | Path | None = None,
-) -> Path:
-    """把 ``(worktree, candidate_fingerprint)`` 写入 declined 冷却表（decline 时调用，幂等覆盖）。
+) -> Path | None:
+    """按 ``(worktree, session_id, candidate_fingerprint)`` 幂等保存本会话的谢绝。
 
-    冷却语义为「指纹未变即持续冷却」：无 TTL，直到候选文件集变化导致指纹变化才不再命中。
+    同会话指纹未变即持续冷却，无 TTL。缺会话身份不落盘，禁止退回全局或共享空身份。
     """
-    path = _declined_fingerprint_path(worktree, candidate_fingerprint, cooldown_root)
+    path = _session_scoped_declined_candidate_fingerprint_path(worktree, session_id, candidate_fingerprint, cooldown_root)
+    if path is None:
+        return None
     _atomic_write_json(
         path,
         {
             "schema_version": SCHEMA_VERSION,
             "worktree": worktree,
+            "session_id": session_id,
             "candidate_fingerprint": candidate_fingerprint,
             "declined_at": format_timestamp(_coerce_now(now)),
             "reason": reason,
@@ -1388,38 +1399,51 @@ def record_declined_fingerprint(
 def is_fingerprint_in_declined_cooldown(
     *,
     worktree: str,
+    session_id: str,
     candidate_fingerprint: str,
     cooldown_root: str | Path | None = None,
 ) -> bool:
-    """查询 ``(worktree, candidate_fingerprint)`` 是否处于 declined 冷却中（供摘要生成器「指纹未变不再注入」）。"""
-    return _declined_fingerprint_path(worktree, candidate_fingerprint, cooldown_root).is_file()
+    """仅查询当前会话的指纹冷却；缺会话身份或记录不可信时不命中。"""
+    return read_declined_fingerprint(
+        worktree=worktree, session_id=session_id, candidate_fingerprint=candidate_fingerprint,
+        cooldown_root=cooldown_root,
+    ) is not None
 
 
 def read_declined_fingerprint(
     *,
     worktree: str,
+    session_id: str,
     candidate_fingerprint: str,
     cooldown_root: str | Path | None = None,
 ) -> dict[str, Any] | None:
-    """读取 declined 冷却记录的完整 payload（不存在或损坏返回 None）。"""
-    path = _declined_fingerprint_path(worktree, candidate_fingerprint, cooldown_root)
-    if not path.is_file():
+    """读取并核对本会话冷却身份；旧全局记录不再参与判定，也不改写历史。"""
+    path = _session_scoped_declined_candidate_fingerprint_path(worktree, session_id, candidate_fingerprint, cooldown_root)
+    if path is None:
         return None
     try:
         parsed = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
-    return parsed if isinstance(parsed, dict) else None
+    if not isinstance(parsed, dict) or any(
+        parsed.get(key) != value
+        for key, value in (("worktree", worktree), ("session_id", session_id), ("candidate_fingerprint", candidate_fingerprint))
+    ):
+        return None
+    return parsed
 
 
 def clear_declined_fingerprint(
     *,
     worktree: str,
+    session_id: str,
     candidate_fingerprint: str,
     cooldown_root: str | Path | None = None,
 ) -> bool:
-    """从冷却表移除某指纹（返回是否真的删除了文件）。"""
-    path = _declined_fingerprint_path(worktree, candidate_fingerprint, cooldown_root)
+    """仅清除当前会话对应指纹的冷却，返回是否真的删除了记录。"""
+    path = _session_scoped_declined_candidate_fingerprint_path(worktree, session_id, candidate_fingerprint, cooldown_root)
+    if path is None:
+        return False
     try:
         path.unlink()
         return True
@@ -1953,17 +1977,12 @@ def consult_declined_session_scope_snooze(
 # 「用户显式推翻 agent 谢绝」这一类铸造的来源（落进 token payload 的
 # ``explicit_user_request_provenance``，回执与遥测据此区分两条入口）：
 #   * 开发者在 prompt 里手动触发 RVF 主 skill（UPS manual 分支）；
-#   * 开发者口头要求开审，agent 用 ``rvf start --reopen-own-declined-decision`` 撤回自己的谢绝。
 EXPLICIT_USER_REQUEST_PROVENANCE_DEVELOPER_MANUAL_TRIGGER_VIA_USER_PROMPT_SUBMIT = (
     "developer_manual_trigger_via_user_prompt_submit"
-)
-EXPLICIT_USER_REQUEST_PROVENANCE_AGENT_REOPENED_OWN_DECLINED_DECISION_ON_DEVELOPER_VERBAL_REQUEST = (
-    "agent_reopened_own_declined_decision_on_developer_verbal_request"
 )
 EXPLICIT_USER_REQUEST_PROVENANCES = frozenset(
     {
         EXPLICIT_USER_REQUEST_PROVENANCE_DEVELOPER_MANUAL_TRIGGER_VIA_USER_PROMPT_SUBMIT,
-        EXPLICIT_USER_REQUEST_PROVENANCE_AGENT_REOPENED_OWN_DECLINED_DECISION_ON_DEVELOPER_VERBAL_REQUEST,
     }
 )
 # :func:`mint_decision_token` 自己写进 token payload 的显式请求两键。调用方的
@@ -2335,12 +2354,13 @@ def mint_decision_token(
     initiated_by_explicit_user_request: bool = False,
     explicit_user_request_provenance: str | None = None,
     extra_token_payload_fields: Mapping[str, Any] | None = None,
+    agent_requested_deferred_reconsideration_token: str | None = None,
 ) -> MintResult:
     """铸造一枚决策 token（Stop hook 侧唯一入口），依次经三道闸：
 
     1. **去重（注入幂等硬保证，R25）**：``(worktree, session_id, candidate_fingerprint)`` 同键存在活跃
        token 时不重铸、直接返回既有 token（``outcome=deduplicated``；过期可复活者就地复活）。
-    2. **declined 冷却**：指纹处于 declined 冷却中则拒铸（``outcome=declined_cooldown``），防 nag 循环。
+    2. **declined 冷却**：本会话的指纹处于冷却中则拒铸（``outcome=declined_cooldown``），防 nag 循环。
     2b. **declined 会话级 snooze**：本会话在本 worktree 上谢绝过、且尚未出现工作边界（HEAD 变化 /
        范围明显扩大 / 硬 TTL；开发者真实 prompt 只重置「范围扩大」基线）则拒铸（``outcome=declined_session_scope_snooze``）。
        它补的是闸二的盲区——内容一直在变的「边做边停」会话。放在闸二之后、闸三之前：两种 transport
@@ -2372,7 +2392,7 @@ def mint_decision_token(
 
     * 闸二不适用：declined 冷却的语义是「agent 谢绝过就别再骚扰 agent」，而用户显式触发本身就是
       *推翻 agent 的谢绝*。命中冷却时不再拒铸，而是调 :func:`clear_declined_fingerprint`
-      **清掉**那条记录再往下铸。清除而非仅本次绕过：用户既已推翻谢绝，这批改动就该整体重回可审
+      **清掉**本会话那条记录再往下铸。清除而非仅本次绕过：用户既已推翻谢绝，本会话就该重回可审
       状态，否则会出现「手动审得了、后续自动 Stop 仍被同一条陈旧 decline 挡着」的语义割裂。
       **命中与清除是两件事**，分别由两个字段回报：``explicit_user_request_overrode_agent_
       declined_cooldown``（命中即 True，供调用方告知用户与 agent）与
@@ -2391,8 +2411,8 @@ def mint_decision_token(
     默认 ``False`` ⇒ 自动路径（Stop hook）行为完全不变。
 
     ``initiated_by_explicit_user_request=True`` 时必须同时给出 ``explicit_user_request_provenance``
-    （:data:`EXPLICIT_USER_REQUEST_PROVENANCES` 之一），落进 token payload：豁免语义两条入口一致，但
-    「开发者自己触发」与「agent 按开发者口头要求撤回自己的谢绝」是两件事，回执与遥测都要能分开。
+    （仅 manual UPS 来源），落进 token payload；真正的用户消息由开审 gate 另行核验，
+    Agent 自填 reason 不得升级为显式用户请求。
     ``extra_token_payload_fields`` 原样并入新铸 token 的 payload（不得覆盖既有字段）。
     """
     if initiated_by_explicit_user_request and (
@@ -2422,25 +2442,29 @@ def mint_decision_token(
         # 结论去指导后面怎么写：本次读在锁外、且铸造还没发生，结论到写索引那一刻早已可能过时。
         # 占坑与否一律由下方锁内的那次重读裁决。
 
-    # 闸二：declined 冷却（指纹未变不再注入）。用户显式触发不适用——那正是在推翻 agent 的谢绝，
-    # 此时把冷却记录清掉再往下铸，让这批改动整体重回可审状态。
+    # 闸二：本会话 declined 冷却（指纹未变不再注入）。用户显式触发不适用——那正是在推翻本会话的
+    # 谢绝，只清掉本会话对应记录；parent / fork / 新会话的谢绝互不影响。
     # 这里有**两个互不相干的事实**，必须分开记：**命中**冷却即已证成「用户推翻了 agent 的谢绝」
     # （告知用户与 agent 的唯一依据），而 unlink 成败只决定「这条陈旧冷却是否还会挡住后续自动
     # 路径」。若压成同一个布尔，一次 I/O 失败就会静默吞掉本该必发的推翻告知。
     overrode_agent_declined_cooldown = False
     declined_cooldown_record_still_blocks_automatic_path = False
-    if is_fingerprint_in_declined_cooldown(
-        worktree=worktree, candidate_fingerprint=candidate_fingerprint, cooldown_root=cooldown_root
-    ):
+    declined_fingerprint_record = read_declined_fingerprint(
+        worktree=worktree, session_id=session_id,
+        candidate_fingerprint=candidate_fingerprint, cooldown_root=cooldown_root,
+    )
+    if declined_fingerprint_record is not None:
         if not initiated_by_explicit_user_request:
             return MintResult(
                 outcome=MINT_OUTCOME_DECLINED_COOLDOWN,
-                message="候选指纹处于 declined 冷却中，跳过铸造（指纹未变不再注入）。",
+                message="本会话曾谢绝开审且候选未变，跳过铸造（同会话指纹冷却）。",
+                session_scoped_declined_candidate_fingerprint_record=declined_fingerprint_record,
             )
         overrode_agent_declined_cooldown = True
         # clear 吞掉 OSError 返回 False；删不掉只意味着自动路径仍被挡，不改变「已被推翻」这一事实。
         declined_cooldown_record_still_blocks_automatic_path = not clear_declined_fingerprint(
-            worktree=worktree, candidate_fingerprint=candidate_fingerprint, cooldown_root=cooldown_root
+            worktree=worktree, session_id=session_id,
+            candidate_fingerprint=candidate_fingerprint, cooldown_root=cooldown_root,
         )
 
     # 闸 2b：declined 会话级 snooze（粗粒度工作范围，补闸二「内容一直在变」的盲区）。用户显式触发
@@ -2532,6 +2556,15 @@ def mint_decision_token(
             candidate_summary=candidate_summary,
             cooldown_root=cooldown_root,
         )
+        # 自主条件判断只释放延后重问门，不伪装用户请求、不跳过结构性谢绝或铸造熔断。
+        if agent_requested_deferred_reconsideration_token:
+            deferred_record = deferred_consultation.deferred_record
+            if deferred_record and deferred_record.get("token") == agent_requested_deferred_reconsideration_token:
+                deferred_consultation = DeferredUntilConditionDeclineConsultation(
+                    still_awaiting_turn_boundary=False,
+                    release_reason="agent_requested_deferred_condition_reconsideration",
+                    deferred_record=deferred_record,
+                )
         if deferred_consultation.still_awaiting_turn_boundary:
             deferred_record = deferred_consultation.deferred_record or {}
             return MintResult(
@@ -3212,185 +3245,21 @@ def attach_run_anchor(
     return DecisionTokenRecord(token=record.token, path=record.path, payload=payload)
 
 
-def attach_bootstrap_gate(
-    token: str,
-    *,
-    gate: Mapping[str, Any] | None,
-    root: str | Path | None = None,
-    now: datetime | None = None,
-    ttl_seconds: int = DEFAULT_DECISION_TOKEN_TTL_SECONDS,
-) -> DecisionTokenRecord:
-    """把 pre-review local-base bootstrap 的等待 gate 挂到 token 上（``gate=None`` 即摘除）。
-
-    形状照抄 ``attach_run_anchor``：状态不变、只落盘一枚子记录，仅活跃非终态可挂。gate 让
-    ``start`` 撞上 bootstrap 时不再表现为「一次泛化失败」——token 保持 acknowledged、可
-    ``--retry``，恢复时先按 gate 重验证 base/receipt 身份，验证通过才重放**同一** run 的 prepare。
-    gate 本身由 ``rvf_bootstrap_gate.build_bootstrap_gate`` 按白名单构造，本函数不做二次加工。
-    """
-    now_dt = _coerce_now(now)
-    with _with_decision_token_payload_mutation_lock(
-        _decision_token_path_for_payload_mutation_lock(token, root)
-    ):
-        record = _load_active_record(token, root=root, now=now_dt, ttl_seconds=ttl_seconds)
-        if record.state not in ACTIVE_NONTERMINAL_STATES:
-            raise DecisionTokenStateError(
-                f"只能在活跃非终态挂载 bootstrap gate，当前={record.state}（token={record.token}）"
-            )
-        payload = dict(record.payload)
-        if gate is None:
-            payload.pop("bootstrap_gate", None)
-        else:
-            payload["bootstrap_gate"] = dict(gate)
-        _atomic_write_json(record.path, payload)
-    return DecisionTokenRecord(token=record.token, path=record.path, payload=payload)
-
-
-# ---------------------------------------------------------------------------
-# bootstrap 恢复重放的**进程外原子占位**（入口 A 的 claim 对偶）
-# ---------------------------------------------------------------------------
-#
-# 入口 B（kanban follow-up）已经把「起 prepare 重放之前先原子 claim」认定为真缺陷并加了
-# sidecar + ``O_EXCL`` 抢占（`kanban_followup_lock.claim_bootstrap_replay_in_flight`）。入口 A 是
-# 同一条 contract 的另一半：两个并发的 ``rvf-agent start --retry`` 会各自 reconcile 出
-# ``receipt_valid``，然后各自带**同一个** ``resume_run_id``/``resume_run_dir`` 调
-# ``start_run(run_id=X, run_dir=X)`` —— 同一个 run 目录被并发写，并可能分配出第二条 tracker
-# lease，违反「恢复不得产生重复 lease / reviewer」。
-#
-# 占位刻意**不写进 token payload**：payload 的每个写侧（``attach_bootstrap_gate`` /
-# ``attach_run_anchor`` / ``record_start_failure``）都是「读-改-写整份 payload」。这些写侧现在
-# 已由 ``_with_decision_token_payload_mutation_lock`` 串行化（不再互相抹掉），但**占位本身仍然
-# 必须是 O_EXCL 创建**：占位要回答的是「谁抢到了这一轮重放」，那是一个 test-and-set，不是一次
-# 字段更新——用「先拿锁再读 payload 判断」实现它，等于把内核级的原子抢占降级成一段可被锁降级
-# （best-effort 无锁回退）影响的临界区。故继续用 token 文件旁的独立 sidecar + ``O_EXCL``。
-# 文件名以 ``.`` 开头且不以 ``.json`` 结尾，故 ``sweep_stale_decision_tokens`` 的 ``*.json``
-# 扫描与测试里的 token 计数都看不见它。
-BOOTSTRAP_REPLAY_CLAIM_SUFFIX = ".bootstrap-replay-claim"
-# 默认占位寿命上界：正常路径由 ``release_bootstrap_replay_in_flight`` 在 prepare 收尾后立刻释放，
-# 这个窗口只覆盖「持有者被硬杀、来不及释放」的残留，过窗即可被下一次 start 接手。
-DEFAULT_BOOTSTRAP_REPLAY_CLAIM_WINDOW_SECONDS = 300.0
-
-
-def bootstrap_replay_claim_path(token: str, root: str | Path | None = None) -> Path:
-    """给定 token 的重放占位 sidecar 路径。"""
-    path = decision_token_path(token, root)
-    return path.with_name(f".{path.name}{BOOTSTRAP_REPLAY_CLAIM_SUFFIX}")
-
-
-def _bootstrap_replay_claim_age_seconds(claim_path: Path, *, now: datetime) -> float | None:
-    """占位已持有多久（秒）。文件不在 / 内容坏了一律 None = 「没有可信的在途占位」。"""
-    try:
-        payload = json.loads(claim_path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    raw = payload.get("claimed_at")
-    if not isinstance(raw, str) or not raw.strip():
-        return None
-    try:
-        claimed_at = parse_timestamp(raw)
-    except ValueError:
-        return None
-    return max(0.0, (now - claimed_at).total_seconds())
-
-
 @contextmanager
-def _with_bootstrap_replay_takeover_lock(claim_path: Path):
-    """接手一枚过窗占位时的互斥锁（避免两个进程同时判定「已过期」而双双接手）。"""
-    lock_path = claim_path.with_name(f"{claim_path.name}.takeover.lock")
-    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
-    handle = os.fdopen(fd, "w", encoding="utf-8")
-    try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        yield
-    finally:
+def exclusive_review_start(token: str, *, root: str | Path | None = None):
+    """同一 token 只允许一个启动调用准备 run；进程退出即释放。"""
+    path = decision_token_path(token, root).with_suffix(".review-start.lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as lock:
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except OSError:
-            pass
-        handle.close()
-
-
-def claim_bootstrap_replay_in_flight(
-    token: str,
-    *,
-    window_seconds: float = DEFAULT_BOOTSTRAP_REPLAY_CLAIM_WINDOW_SECONDS,
-    root: str | Path | None = None,
-    now: datetime | None = None,
-) -> tuple[bool, float | None]:
-    """**起 prepare 重放之前**的原子占位，返回 ``(claimed, in_flight_age_seconds)``。
-
-    ``claimed=True`` = 本进程抢到了这一轮重放，调用方可以起 prepare；``claimed=False`` = 已有
-    另一个进程在窗口内持有占位（``in_flight_age_seconds`` 是它的年龄），本轮**不得**再起第二次
-    ——否则同一个 ``resume_run_id`` / run 目录会被并发重复 prepare、并可能分配出第二条 lease。
-
-    抢占用 ``O_EXCL`` 建 sidecar（内核级互斥），**不是**「先读再写」：后者两个并发进程会同时读到
-    「无在途占位」并各自进入重放。占位超过 ``window_seconds`` 视为持有者已死，在 takeover flock
-    下重新校验后接手，一个被杀的进程不会永久堵死这枚 token。
-
-    best-effort：文件系统报错一律放行（返回 ``True``），记账永不阻断决策。
-    """
-    now_dt = _coerce_now(now)
-    claim_path = bootstrap_replay_claim_path(token, root)
-    encoded = (
-        json.dumps(
-            {"claimed_at": format_timestamp(now_dt), "claimed_by_pid": os.getpid()},
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        + "\n"
-    )
-
-    def _create_exclusive() -> None:
-        fd = os.open(str(claim_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(encoded)
-        except Exception:
-            try:
-                claim_path.unlink()
-            except OSError:
-                pass
-            raise
-
-    try:
-        _ensure_parent_dir(claim_path)
-        _create_exclusive()
-        return True, None
-    except FileExistsError:
-        pass
-    except OSError:
-        return True, None
-
-    age = _bootstrap_replay_claim_age_seconds(claim_path, now=now_dt)
-    if age is not None and age < window_seconds:
-        return False, age
-    try:
-        with _with_bootstrap_replay_takeover_lock(claim_path):
-            age = _bootstrap_replay_claim_age_seconds(claim_path, now=now_dt)
-            if age is not None and age < window_seconds:
-                return False, age
-            try:
-                claim_path.unlink()
-            except FileNotFoundError:
-                pass
-            try:
-                _create_exclusive()
-            except FileExistsError:
-                return False, age
-            return True, age
-    except OSError:
-        return True, age
-
-
-def release_bootstrap_replay_in_flight(token: str, root: str | Path | None = None) -> bool:
-    """释放重放占位（prepare 已收尾 / 已确定失败，允许下一次 ``start --retry`` 立刻再试）。绝不抛。"""
-    claim_path = bootstrap_replay_claim_path(token, root)
-    try:
-        claim_path.unlink()
-    except (FileNotFoundError, OSError):
-        return False
-    return True
+            yield True
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def mark_dispatched(
@@ -3428,7 +3297,7 @@ def mark_declined(
     ``decline_kind`` 必填，取 :data:`DECLINE_KINDS` 之一，决定谢绝之后多久再问：
 
     * ``structural_not_needed``（R24 / 在途 run、琐碎、非本会话、开发者明确不要审）：把
-      ``(worktree, candidate_fingerprint)`` 写入 declined 冷却表——指纹未变即不再注入；并按
+      ``(worktree, session_id, candidate_fingerprint)`` 写入本会话冷却表——指纹未变即不再注入；并按
       ``(worktree, session_id)`` 写一份会话级 snooze 快照（闸 2b）——内容变了但工作范围没变也不再注入。
       snooze 写入是 best-effort（见 :func:`record_declined_session_scope_snooze`），失败不影响 decline。
     * ``deferred_until_condition``（现在不审，条件满足后再审）：冷却与 snooze **都不写**，只记一条
@@ -3470,6 +3339,7 @@ def mark_declined(
     )
     record_declined_fingerprint(
         worktree=str(updated.payload.get("worktree")),
+        session_id=declined_session_id,
         candidate_fingerprint=str(updated.payload.get("candidate_fingerprint")),
         reason=reason,
         token=updated.token,

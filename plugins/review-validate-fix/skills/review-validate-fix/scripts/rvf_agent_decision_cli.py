@@ -42,23 +42,31 @@ accessor ``legacy_codex_rvf_env``（为任务 #11 env 迁移预留单点）。
 """
 from __future__ import annotations
 
+from functools import wraps
+
 import argparse
 import hashlib
 import json
 import os
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401 — 把 pyroot 上 sys.path，供 core.* / 兄弟脚本 import
+from core.review_run_qualification_mutation_lock import guard_review_run_qualification_mutation, run_directory_for_qualification_artifact
+from core.session_scope_allocation.committed_round_detection import (  # noqa: E402
+    frozen_committed_round_base_exclusion_ref,
+)
 
 import agentic_initiation_review_scope_coverage_and_agent_explicit_path_claim as review_scope_coverage_and_claim  # noqa: E402
-import rvf_bootstrap_gate  # noqa: E402
+import rvf_automatic_closeout_bridge  # noqa: E402
 import rvf_decision_token_store as token_store  # noqa: E402
+from review_start_boundary_gate import require_review_start_boundary, require_prepared_run_review_start_boundary, bind_review_start_boundary_to_one_run  # noqa: E402
+from core.review_start_boundary.review_start_boundary_verification import ReviewStartBoundaryNotVerified  # noqa: E402
 import rvf_prep_file  # noqa: E402
 import rvf_dispatch_prompts  # noqa: E402 — scope-of-work stub 模板与 stub 标记（与 prepare 同源）
 import review_reopen_marker  # noqa: E402 — 失败再入（$rvf-reopen）在 allocate 前的消费，与 Stop hook 同源
@@ -92,13 +100,6 @@ EXIT_USAGE = 2  # argparse 用法错误（缺参 / 非法子命令）
 EXIT_TOKEN_STATE = 3  # token 缺失 / 已终态 / 非 acknowledged 态等**非可重试**决策错误
 EXIT_START_FAILED = 4  # start 前置校验 / prepare 失败：token 回退保持 acknowledged，**可 --retry**
 EXIT_DISPATCH_FAILED = 5  # dispatch 派发失败
-# start 撞上 pre-review local-base bootstrap 门：**不是失败**，而是一个可恢复的等待态。token 保持
-# acknowledged、gate 落盘、run 锚点挂上；agent 跑完同步 skill 后 `start --retry` 原地接续同一轮。
-EXIT_BOOTSTRAP_REQUIRED = 6
-# decline-dispatched-review 的**部分生效**：谢绝理由已落盘，但豁免 / 释放 lease / 清锁里至少一步
-# 没按预期完成。刻意与 EXIT_OK 分开：这条命令的三步副作用全是 best-effort，历史实现却固定返回
-# ok，DB/文件写失败时用户看到的是「谢绝成功」而实际 scope 与锁可能仍生效（谎报成功）。调用方按
-# 非 0 即「不要把本轮当作已谢绝」处理；detail.failed_steps 给出逐步实况。
 EXIT_DECLINE_DISPATCHED_REVIEW_INCOMPLETE = 7
 # dispatch 撞上「有 reviewer 返回 kind: request」：**待处理终态**，既非故障也非完成态 review。
 # 与 EXIT_DISPATCH_FAILED 分开的理由与 dispatch_reviewers 的专用码 3 完全同源：混同成失败会把
@@ -121,14 +122,12 @@ EXIT_NO_UNREVIEWED_SCOPE = 10
 # dispatch 被覆盖闸拦下：session-owned 口径下有候选路径既没进正式审查、也没被认领 / 排除 / include。
 # token 仍在 acknowledged；认领、排除，或带 ``--accept-uncovered "<理由>"`` 重跑 dispatch（08ac4）。
 EXIT_UNCOVERED_CANDIDATE_PATHS_NEED_AGENT_DECISION = 11
+EXIT_REVIEW_START_BOUNDARY_NOT_VERIFIED = 12
 
 # ``default_prepare_pipeline`` 在「无未审单元」时的提前返回状态。刻意不复用 ``failed``：
 # 这一轮什么都没坏，只是没东西可审；混进 failed 会让 `--retry` 看起来像修复手段。
 PREPARE_STATUS_NO_UNREVIEWED_SCOPE = "no_unreviewed_scope"
 
-# bootstrap 恢复重放的占位窗口 = prepare 预算 + 这段余量。占位在 prepare 收尾时立刻释放，余量只
-# 覆盖「持有者被硬杀、来不及释放」的残留：过窗后下一次 `start --retry` 可接手，不会被永久堵死。
-BOOTSTRAP_REPLAY_CLAIM_GRACE_SECONDS = 60.0
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +256,7 @@ def _ensure_parent_dir(path: Path) -> None:
         pass
 
 
+@guard_review_run_qualification_mutation(lambda arguments: run_directory_for_qualification_artifact(arguments["path"]))
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     _ensure_parent_dir(path)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -568,8 +568,6 @@ class CommandResult:
         "worktree_bootstrap",
         "origin_metadata",
         "handoff_path",
-        # handoff `## 状态` 的 intent_artifact_status 要照抄它；不渲染出来 agent 就得去翻 JSON。
-        "intent_artifact_status_file",
     )
 
     def render(self) -> str:
@@ -1145,7 +1143,7 @@ def _release_agentic_initiation_tracker_lease(
 ) -> dict[str, Any] | None:
     """把本轮刚分配的 lease 还回去（units 从 ``assigned`` 翻回 ``available``），best-effort。
 
-    调用点只有一个语义：**这一轮没能进 review**（prepare 失败 / 超时 / 撞 bootstrap 等待 / 抛异常）。
+    调用点只有一个语义：**这一轮没能进 review**（prepare 失败 / 超时 / 抛异常）。
     不还的话那批 unit 在整个 TTL 里都是 ``assigned``，而候选查询只收 ``available`` ⇒ 下一次
     ``start --retry`` 会开一个**新 run** 再分配一次，必然拿到 ``empty`` 而静默降级——修复反倒制造了
     一个只在重试路径上发作的新盲区。
@@ -1217,30 +1215,17 @@ def default_prepare_pipeline(
     transcript_path: str | None,
     now: datetime,
     timeout_seconds: float = 60.0,
-    resume_run_id: str | None = None,
-    resume_run_dir: str | None = None,
-    parent_attempt_run_id: str | None = None,
-    parent_attempt_run_dir: str | None = None,
     force_full_rescope: bool = False,
 ) -> dict[str, Any]:
-    """默认重量级准备流水线：分配 run + 写 dispatch prep + 跑 ``prepare_run_from_prep_file`` 全套。
-
-    这正是从 UPS ``_run_shared_workflow`` 退役至 CLI 的职能（本切片不改 UPS，只在此重新实现）。
-    committed-round baseline（B1）从 token 的候选摘要透传，使「已提交但未审」也能按
-    ``git diff <baseline>`` 渲染（避免 clean-worktree scope 退化家族）。返回归一化 dict：
-    ``{status, run_id, run_dir, artifacts, error, prep_token, bootstrap_gate,
-    initiation_run_id, initiation_run_dir}``。
-
-    ``resume_run_id`` / ``resume_run_dir`` 在场时**复用同一个 run**（不新开）：这是
-    「bootstrap 等待结束后恢复本轮」的落点，保证一轮 RVF 从头到尾只有一个 run / 一条 lease /
-    一次 reviewer。仅当上一轮工件确实丢失、不得不重开时才由调用方改传 ``parent_attempt_*``，
-    把旧 run 显式记成 parent（而不是把恢复伪装成第二轮独立 RVF）。
-    """
+    """按分界固定的候选与比较坐标分配范围、构建 packet，并绑定唯一 run。"""
     import prepare_review_run  # noqa: PLC0415 - 重量级，惰性 import
     from core.run_ledger.run_ledger import start_run  # noqa: PLC0415
 
     worktree = repo
     candidate_summary = token_record.payload.get("candidate_summary")
+    verified_boundary_receipt = require_review_start_boundary(
+        token_payload=token_record.payload, repo=repo, session_id=session_id, transcript_path=transcript_path,
+    )
     committed_baseline = None
     committed_base_ref = None
     if isinstance(candidate_summary, Mapping):
@@ -1249,15 +1234,30 @@ def default_prepare_pipeline(
         cbr = candidate_summary.get("committed_round_base_ref")
         committed_base_ref = cbr.strip() if isinstance(cbr, str) and cbr.strip() else None
 
+    boundary_run_id, boundary_run_directory = bind_review_start_boundary_to_one_run(
+        receipt=verified_boundary_receipt, run_id=None, run_dir=None,
+    )
     ledger = start_run(
         "agentic-initiation-start",
         repo=worktree,
         cwd=worktree,
-        run_id=resume_run_id or None,
-        run_dir=Path(resume_run_dir).expanduser() if resume_run_dir else None,
+        run_id=boundary_run_id,
+        run_dir=boundary_run_directory,
     )
     artifacts_dir = ledger.artifacts_dir
     artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+    from core.run_ledger.review_run_lifecycle import record_review_run_phase  # noqa: PLC0415
+
+    record_review_run_phase(
+        ledger.run_dir, run_id=ledger.run_id, phase="prepare",
+        observed_at=token_record.payload.get("acknowledged_at") or now.isoformat().replace("+00:00", "Z"),
+        starts_review_run=True, start_evidence_source="decision_acknowledged",
+    )
+    from core.run_ledger.review_run_lifecycle import merge_review_run_summary
+
+    merge_review_run_summary(ledger.run_dir, {"run_id": ledger.run_id, "repo": worktree,
+                            "session_id": session_id, "origin_transcript_path": transcript_path})
 
     # tracker review scope 分配：必须排在写 prep payload **之前**——三个 tracker 字段是 prep 的
     # 输入，prepare 只是把它们透传给 scope contract。见本文件上方「发起侧 tracker review scope
@@ -1269,7 +1269,10 @@ def default_prepare_pipeline(
         run_id=ledger.run_id,
         output_scope_path=artifacts_dir / "tracker-scope.json",
         committed_baseline=committed_baseline,
-        committed_base_ref=committed_base_ref,
+        committed_base_ref=frozen_committed_round_base_exclusion_ref(
+            Path(repo), verified_boundary_receipt.get("comparison_base_ref"),
+            verified_boundary_receipt.get("comparison_base_ref_tip"),
+        ),
         force_full_rescope=force_full_rescope,
     )
     ledger.event(
@@ -1324,9 +1327,6 @@ def default_prepare_pipeline(
             "artifacts": {},
             "error": None,
             "prep_token": None,
-            "bootstrap_gate": None,
-            "initiation_run_id": ledger.run_id,
-            "initiation_run_dir": str(ledger.run_dir),
             "tracker_scope_allocation": tracker_scope_allocation,
         }
 
@@ -1357,6 +1357,9 @@ def default_prepare_pipeline(
         "scope_of_work_candidate_paths": _initial_auto_scope_paths(candidate_summary, None),
         "rvf_run": {
             "run_id": ledger.run_id,
+            "review_candidate_snapshot": verified_boundary_receipt,
+            "review_start_boundary_receipt": verified_boundary_receipt.get("native_review_start_boundary_receipt"),
+            "automatic_closeout_eligibility": verified_boundary_receipt["automatic_closeout_eligibility"],
             "run_dir": str(ledger.run_dir),
             "artifacts_dir": str(artifacts_dir),
             "scope_contract_path": str(artifacts_dir / "inputs" / "scope.contract.json"),
@@ -1398,24 +1401,17 @@ def default_prepare_pipeline(
             ledger=ledger,
         )
         raise
-    gate = rvf_bootstrap_gate.gate_of(state)
-    if gate is not None and parent_attempt_run_id and not gate.get("parent_attempt_run_id"):
-        gate = {
-            **gate,
-            "parent_attempt_run_id": parent_attempt_run_id,
-            "parent_attempt_run_dir": parent_attempt_run_dir,
-        }
     if state.get("status") != "completed":
-        # 失败 / 超时 / bootstrap 等待都归这一支。**等待态也要还**：等待期间 agent 会去吸收
-        # local base，工作树随之改变；留着一份分配于吸收之前的 scope，恢复时审的就是另一批东西
-        # （正是 union_with_prior_scope 那条注释记录的「口径被悄悄换掉」事故）。恢复重放时重新
-        # 分配，拿到的才是当时工作树的真实口径。
+        # 准备未完成时归还范围，允许后续重试重新分配。
         _record_tracker_lease_release_on_unfinished_prepare(
             worktree=worktree,
             tracker_scope_allocation=tracker_scope_allocation,
             prepare_status=str(state.get("status")),
             ledger=ledger,
         )
+    if record.path.is_file():
+        # 正式 run 的清理与交接证据熬过重启，不依赖临时目录或额外延长 TTL。
+        ledger.artifact("prepared-review-inputs-snapshot.json", record.path.read_bytes())
     return {
         "status": state.get("status"),
         "run_id": state.get("run_id"),
@@ -1426,13 +1422,6 @@ def default_prepare_pipeline(
         # prep 文件的落盘路径：``start`` 的 execution_handoff 要把它交给 agent（历史上这条信息
         # 只经祈使句 prompt 的 ``$RVF_PREP_FILE`` 提示传递，现改为从返回值读）。
         "prep_file": str(record.path),
-        "bootstrap_gate": gate,
-        # bootstrap 等待路径上 prepare_run 在 start_run **之前**就抛了，故 state 里没有
-        # run_id/run_dir；发起侧 ledger 的 run 目录才是该 token 唯一可锚的在途工件。没有它，
-        # token 过 900s TTL 后 revive_decision_token 找不到锚点 → 一次大 base 吸收必然把整轮
-        # 决策熬死（入口 A 的可恢复性硬缺口）。
-        "initiation_run_id": ledger.run_id,
-        "initiation_run_dir": str(ledger.run_dir),
         # 本轮 scope 口径的实况（allocated / 各种 degraded_*）。``run_start`` 把它同时写进遥测、
         # 回执 detail 与人类可读正文——降级必须有人看得见，不能只躺在 ledger 里。
         "tracker_scope_allocation": tracker_scope_allocation,
@@ -1499,6 +1488,8 @@ def build_execution_handoff(
         "kanban_task_id": kanban_task_id,
         "run_id": run_id,
         "run_dir": run_dir,
+        # EXPERIMENT_NODE: 多阶段 base 吸收及活动量阈值待 REA-34 对照实验，当前仅最终整合。
+        "base_absorption_policy": "final_integration_only",
         "prep_file": prep_file_path,
         # prepare 产出的全套输入工件（缺失的键保持 None，不静默丢字段）。
         "review_env": artifacts.get("review_env"),
@@ -1509,9 +1500,6 @@ def build_execution_handoff(
         "scope_of_work": artifacts.get("scope_of_work"),
         "session_manifest": artifacts.get("session_manifest"),
         "worktree_bootstrap": artifacts.get("worktree_bootstrap"),
-        # N5/K4：intent artifact 的消费结局工件。agent 照抄它填 handoff `## 状态` 的
-        # `intent_artifact_status`，不要自己判断——「标注」必须是机器事实而非 agent 自觉。
-        "intent_artifact_status_file": artifacts.get("intent_artifact_status_file"),
         "origin_metadata": str(run_dir_path / "artifacts" / "origin.json") if run_dir_path else None,
         "handoff_path": str(run_dir_path / "artifacts" / "handoff.md") if run_dir_path else None,
         "handoff_contract": (
@@ -1525,6 +1513,8 @@ def build_execution_handoff(
             "就地执行：在**当前会话、当前 worktree** 里调用 `$review-validate-fix` skill，按 "
             "SKILL.md 走 review → merge → validate/fix → handoff。不要新建 Kanban task、"
             "不要 fork 新会话；上面这些路径就是本轮 run 的全部输入，不需要重新 prepare。"
+            "保持本轮候选、HEAD 与比较 OID 固定；计划后、实现后与 RVF 前均不自动吸收 base，"
+            "base 的吸收与冲突解决由最终 base-branch-sync 或未来 PR 合并阶段负责。"
         ),
     }
 
@@ -1591,6 +1581,27 @@ def arm_accepted_review_run_in_flight_receipt(
     return {"status": ACCEPTED_REVIEW_RUN_RECEIPT_ARMED, "marker_path": str(marker_path)}
 
 
+def _serialize_review_start(operation):
+    @wraps(operation)
+    def serialized(*args, **kwargs):
+        token = kwargs["token"]
+        roots = kwargs.get("roots") or AgentDecisionRoots()
+        try:
+            token_store.validate_token(token)
+        except token_store.DecisionTokenError:
+            # 非法 token 没有可锁的身份，沿用原入口的结构化错误回执。
+            return operation(*args, **kwargs)
+        with token_store.exclusive_review_start(token, root=roots.token_root) as acquired:
+            if not acquired:
+                return CommandResult(
+                    command="start", status="start_in_flight", exit_code=EXIT_START_FAILED,
+                    token=token, message="同一 token 的启动仍在进行，请等待该调用返回。",
+                )
+            return operation(*args, **kwargs)
+    return serialized
+
+
+@_serialize_review_start
 def run_start(
     *,
     token: str,
@@ -1626,16 +1637,70 @@ def run_start(
     )
     provider_health_runner = provider_health_runner or _default_provider_health_runner
 
-    # ① token → acknowledged（非终态；retry 再走一轮 acknowledge，递增 start_attempt_count）。
-    # 先探一次 TTL 状态：acknowledge 内部会把「过期但 run 在途」的 token 就地复活，复活后就再也
-    # 看不出它曾经过期了。而这正是 bootstrap 等待期的常态（900s TTL ≪ 一次大 base 吸收），
-    # 需要据此把等待态命名为 `bootstrap_interrupted_retryable`。
-    store_expired_before_start = (
-        getattr(
-            token_store.read_decision_token(token, root=roots.token_root, now=now_dt), "status", None
-        )
-        == "expired"
-    )
+    # 原生捕获只准备可选自动恢复；普通候选 gate 独立裁决，捕获阶段不激活自动收尾等待。
+    automatic_closeout_receipt = None
+    native_boundary_capture_failure = None
+    lookup_before_start = token_store.read_decision_token(token, root=roots.token_root, now=now_dt)
+    before_payload = getattr(lookup_before_start, "payload", None)
+    if isinstance(before_payload, Mapping):
+        candidate = before_payload.get("candidate_summary")
+        resolved_transcript, _ = resolve_start_transcript_path(explicit_transcript_path=transcript_path, candidate_summary=candidate)
+        try:
+            automatic_closeout_receipt = rvf_automatic_closeout_bridge.capture_before_start(before_payload, transcript_path=resolved_transcript, task_id=_current_kanban_task_id_from_env())
+        except Exception as exc:
+            native_boundary_capture_failure = exc
+
+    # 分界 gate 必须先于 acknowledge、reopen 消费、run 创建与 lease 分配。
+    if lookup_before_start.payload is not None and lookup_before_start.state in ("minted", "injected", "acknowledged"):
+        try:
+            review_start_snapshot = require_review_start_boundary(
+                token_payload=lookup_before_start.payload,
+                repo=repo or str(lookup_before_start.payload.get("worktree") or ""),
+                session_id=session_id, transcript_path=transcript_path,
+                native_boundary_capture_failure=native_boundary_capture_failure,
+            )
+            # 已绑定快照不可被重试改写；本次捕获失败仍不能借缓存资格发起新的自动注册。
+            automatic_closeout_receipt = (
+                review_start_snapshot.get("native_review_start_boundary_receipt")
+                if native_boundary_capture_failure is None else None
+            )
+        except ReviewStartBoundaryNotVerified as exc:
+            return CommandResult(
+                command="start", status=exc.status, exit_code=EXIT_REVIEW_START_BOUNDARY_NOT_VERIFIED,
+                token=token, token_state=lookup_before_start.state, message=exc.reason,
+                detail={"reason_code": exc.reason_code, "recovery_action": exc.recovery_action},
+                next_steps=(
+                    [f'{_rvf()} request-review-start-boundary --decision-token {token} --reason "<自主判断理由>"']
+                    if exc.recovery_action == "request_new_boundary_after_turn_completion" else []
+                ),
+            )
+
+    prepared = None
+    prepared_overlay = None
+    if lookup_before_start.state == token_store.STATE_ACKNOWLEDGED:
+        existing_overlay = read_scope_adjustment(token, root=roots.scope_adjustment_root)
+        cached_result = (existing_overlay or {}).get("completed_start_command_result")
+        cached_prepared = (existing_overlay or {}).get("completed_prepare_pipeline_result")
+        has_completed_start = isinstance(cached_result, dict) and cached_result.get("token") == token and cached_result.get("status") == "ok"
+        has_completed_prepare = isinstance(cached_prepared, dict) and cached_prepared.get("status") == "completed"
+        if has_completed_start or has_completed_prepare:
+            artifacts = existing_overlay.get("prepare_artifacts") or {}
+            try:
+                require_prepared_run_review_start_boundary(
+                    repo=repo or str(before_payload.get("worktree") or ""),
+                    scope_contract=artifacts.get("scope_contract"),
+                    run_id=existing_overlay.get("run_id"), run_dir=existing_overlay.get("run_dir"),
+                )
+            except ReviewStartBoundaryNotVerified as exc:
+                return CommandResult(command="start", status=exc.status,
+                    exit_code=EXIT_REVIEW_START_BOUNDARY_NOT_VERIFIED,
+                    token=token, token_state=lookup_before_start.state, message=exc.reason)
+            if has_completed_start:
+                return CommandResult(**cached_result)
+            prepared = cached_prepared
+            prepared_overlay = existing_overlay
+
+    # 接受决策后再准备审查。
     try:
         record = token_store.acknowledge_decision_token(token, root=roots.token_root, now=now_dt)
     except token_store.DecisionTokenError as exc:
@@ -1694,162 +1759,6 @@ def run_start(
             detail=detail,
         )
 
-    def _bootstrap_waiting(
-        gate: Mapping[str, Any],
-        reconciliation: rvf_bootstrap_gate.BootstrapGateReconciliation,
-        *,
-        run_anchor_dir: str | None,
-    ) -> CommandResult:
-        """撞上（或仍卡在）pre-review local-base bootstrap 门：**持久化等待态**，不是失败。
-
-        token 保持 acknowledged（非终态、保留 ``--retry`` 权利与去重身份），gate 落进 token
-        payload，run 锚点补齐——三者合起来让「跑同步 skill 期间 agent 退出 / token 过 TTL /
-        host 重启」之后，同一枚 token 仍能复活并恢复**同一轮**，而不是被当成一轮已完结或
-        不可恢复的失败。next_steps 是给模型看的确定性 self-injection checkpoint。
-        """
-        stamped = rvf_bootstrap_gate.attach_origin_decision_token(gate, token)
-        try:
-            token_store.attach_bootstrap_gate(
-                token, gate=stamped, root=roots.token_root, now=now_dt
-            )
-        except token_store.DecisionTokenError:
-            pass
-        if run_anchor_dir:
-            try:
-                token_store.attach_run_anchor(
-                    token, run_dir=run_anchor_dir, root=roots.token_root, now=now_dt
-                )
-            except token_store.DecisionTokenError:
-                pass
-        append_decision_telemetry(
-            token=token, event="start_bootstrap_waiting", worktree=worktree,
-            session_id=tok_session_id, now=now_dt, root=roots.telemetry_root,
-            detail={"retry": retry, **reconciliation.to_dict()},
-        )
-        resume_command = f"{_rvf()} start --token {token} --retry --reason <bootstrap 完成后恢复本轮>"
-        return CommandResult(
-            command="start",
-            status="bootstrap_required",
-            exit_code=EXIT_BOOTSTRAP_REQUIRED,
-            token=token,
-            token_state=token_store.STATE_ACKNOWLEDGED,
-            message=reconciliation.diagnostic,
-            next_steps=[
-                *rvf_bootstrap_gate.bootstrap_waiting_agent_steps(stamped, reconciliation),
-                f"④ {resume_command}",
-            ],
-            detail={
-                "phase": reconciliation.phase,
-                "bootstrap_outcome": reconciliation.outcome,
-                "bootstrap_reason": reconciliation.reason,
-                "bootstrap_gate": dict(stamped),
-                "run_anchor_dir": run_anchor_dir,
-                **(
-                    {"conflict_paths": list(reconciliation.conflict_paths)}
-                    if reconciliation.conflict_paths
-                    else {}
-                ),
-            },
-        )
-
-    def _bootstrap_replay_in_flight(
-        gate: Mapping[str, Any],
-        reconciliation: rvf_bootstrap_gate.BootstrapGateReconciliation,
-        *,
-        in_flight_age_seconds: float | None,
-        window_seconds: float,
-    ) -> CommandResult:
-        """并发的另一次 `start --retry` 已抢到本轮重放占位：返回**可重试的等待态**，不起第二次。
-
-        与 `_bootstrap_waiting` 刻意分开：那条文案让 agent 去跑同步 skill，而此刻 base 早已吸收、
-        receipt 也已校验通过，只差 prepare 收尾。再跑一次同步 skill 会产出**另一份** receipt，
-        下一轮按 digest 判 tampered。故这里复用「别再动它、等一下再 --retry」的定向文案。
-        """
-        age_text = f"{in_flight_age_seconds:.0f}" if in_flight_age_seconds is not None else "0"
-        resume_command = f"{_rvf()} start --token {token} --retry --reason <稍后重试，等在途 prepare 收尾>"
-        append_decision_telemetry(
-            token=token, event="start_bootstrap_replay_in_flight", worktree=worktree,
-            session_id=tok_session_id, now=now_dt, root=roots.telemetry_root,
-            detail={
-                "retry": retry,
-                "in_flight_age_seconds": in_flight_age_seconds,
-                "in_flight_window_seconds": window_seconds,
-                **reconciliation.to_dict(),
-            },
-        )
-        return CommandResult(
-            command="start",
-            status="bootstrap_replay_in_flight",
-            exit_code=EXIT_BOOTSTRAP_REQUIRED,
-            token=token,
-            token_state=token_store.STATE_ACKNOWLEDGED,
-            message=(
-                "本轮 bootstrap 的 prepare 重放已由另一次 start 在途"
-                f"（已在途 {age_text}s / 去重窗口 {window_seconds:.0f}s）；"
-                "为避免同一个 run 目录被并发重复写入、并分配出第二条 lease，本次不再起第二次重放。"
-            ),
-            next_steps=[
-                rvf_bootstrap_gate.bootstrap_replay_pending_reengage_reason(
-                    gate, reconciliation, resume_hint=f"③ {resume_command}"
-                ),
-            ],
-            detail={
-                "phase": rvf_bootstrap_gate.PHASE_BOOTSTRAP_INTERRUPTED_RETRYABLE,
-                "bootstrap_outcome": rvf_bootstrap_gate.OUTCOME_STILL_WAITING,
-                "bootstrap_reason": "bootstrap_replay_in_flight",
-                "in_flight_age_seconds": in_flight_age_seconds,
-                "in_flight_window_seconds": window_seconds,
-            },
-        )
-
-    # ①b 既有 bootstrap 等待 gate 的恢复判定（`start --retry` 的主路径）。
-    # 仍在等 / 冲突未解 / 证据不可信 → 原地维持等待，**不重跑 prepare、不新开 run**；
-    # receipt 有效 → 带着原 run 身份重放 prepare；工件丢失 → 显式记 parent 血缘后重开。
-    resume_run_id: str | None = None
-    resume_run_dir: str | None = None
-    parent_attempt_run_id: str | None = None
-    parent_attempt_run_dir: str | None = None
-    resume_reconciliation: rvf_bootstrap_gate.BootstrapGateReconciliation | None = None
-    existing_gate = rvf_bootstrap_gate.gate_of(record.payload)
-    if rvf_bootstrap_gate.is_waiting_gate(existing_gate):
-        assert existing_gate is not None  # narrow for readers
-        reconciliation = rvf_bootstrap_gate.reconcile_bootstrap_gate(
-            existing_gate, store_expired=store_expired_before_start
-        )
-        if reconciliation.holds_gate:
-            anchored = record.payload.get("run_anchor_dir")
-            return _bootstrap_waiting(
-                existing_gate,
-                reconciliation,
-                run_anchor_dir=reconciliation.resume_run_dir
-                or (anchored if isinstance(anchored, str) else None),
-            )
-        if reconciliation.outcome == rvf_bootstrap_gate.OUTCOME_RECEIPT_VALID:
-            resume_run_id = reconciliation.resume_run_id
-            resume_run_dir = reconciliation.resume_run_dir
-            resume_reconciliation = reconciliation
-            # 把校验通过的 receipt 路径/digest 盖回 token payload 里的 gate。下面的 prepare 可能
-            # 失败（此时 token 保持 acknowledged、gate 继续被持有），没有这一步，`--retry` 的每
-            # 一轮都只做身份校验：`bootstrap_receipt_digest_changed` 那条篡改判据在真实路径上
-            # 永远不可达，一份被替换但仍能通过身份校验的 receipt 会被照单全收。
-            existing_gate = rvf_bootstrap_gate.gate_with_verified_receipt(
-                existing_gate, reconciliation
-            )
-            try:
-                token_store.attach_bootstrap_gate(
-                    token, gate=existing_gate, root=roots.token_root, now=now_dt
-                )
-            except token_store.DecisionTokenError:
-                pass
-        else:  # artifact_lost：只能重开，但把上一轮 run 显式记成 parent attempt
-            parent_attempt_run_id = existing_gate.get("rvf_run_id")
-            parent_attempt_run_dir = existing_gate.get("rvf_run_dir")
-        append_decision_telemetry(
-            token=token, event="start_bootstrap_reconciled", worktree=worktree,
-            session_id=tok_session_id, now=now_dt, root=roots.telemetry_root,
-            detail=reconciliation.to_dict(),
-        )
-
     # ② backend/launch 前置校验。
     backend = resolve_agent_initiation_backend()
     ok, preflight_reason = launch_preflight(backend=backend, repo=repo)
@@ -1867,90 +1776,40 @@ def run_start(
             phase="provider_health", extra={"backend": backend, "provider_health": failed},
         )
 
-    # ④ prepare_review_run 全套。
-    # ④a 恢复路径先原子 claim（入口 B `claim_bootstrap_replay_in_flight` 的对偶）：两个并发的
-    # `start --retry` 会各自 reconcile 出 receipt_valid，再各自带**同一个** resume_run_id/dir 去
-    # `start_run(run_id=X, run_dir=X)` —— 同一个 run 目录被并发写，并可能分配出第二条 tracker
-    # lease，违反「恢复不得产生重复 lease / reviewer」。抢不到 = 另一个进程正在推进本轮 prepare，
-    # 本次返回可重试的等待态（仍是 EXIT_BOOTSTRAP_REQUIRED，token 保持 acknowledged）。
-    replay_claim_held = False
-    replay_claim_window = max(float(prepare_timeout_seconds), 0.0) + BOOTSTRAP_REPLAY_CLAIM_GRACE_SECONDS
-    if resume_run_id or resume_run_dir:
-        claimed, in_flight_age = token_store.claim_bootstrap_replay_in_flight(
-            token, window_seconds=replay_claim_window, root=roots.token_root, now=now_dt
-        )
-        if not claimed:
-            assert existing_gate is not None and resume_reconciliation is not None
-            return _bootstrap_replay_in_flight(
-                existing_gate,
-                resume_reconciliation,
-                in_flight_age_seconds=in_flight_age,
-                window_seconds=replay_claim_window,
-            )
-        replay_claim_held = True
-
-    def _release_replay_claim() -> None:
-        """本轮 prepare 已收尾（成功 / 失败 / 仍在等待）→ 交还占位，下一次 retry 可立刻再试。"""
-        if replay_claim_held:
-            token_store.release_bootstrap_replay_in_flight(token, roots.token_root)
-
+    # 准备审查输入与范围。
     # ④b 失败再入（``$rvf-reopen``）：必须在 prepare→allocate **之前**把上一轮实现 run 的
     #    reviewed units 翻回 available，本轮才拿得到「实现 ∪ fix」全量。历史上这一步只在 Stop
     #    hook 的派发路径里做；P1 把默认发起改成 agent 就地 start 之后，不在这里补一次，
     #    ``$rvf-reopen`` 在默认路径上就整个失效了（marker 永不被消费、范围永不重开）。
     #    刻意放在**接受之后**：谢绝一轮不该顺手把用户武装的重开意图消费掉。
-    review_reopen_consumption = _consume_review_reopen_marker_before_allocate(
-        session_id=tok_session_id, repo=repo
-    )
-    if review_reopen_consumption.get("outcome") != review_reopen_marker.REVIEW_REOPEN_CONSUMPTION_NO_MARKER:
-        append_decision_telemetry(
-            token=token, event="start_review_reopen_consumed", worktree=worktree,
-            session_id=tok_session_id, now=now_dt, root=roots.telemetry_root,
-            detail=review_reopen_consumption,
+    if prepared is None:
+        review_reopen_consumption = _consume_review_reopen_marker_before_allocate(
+            session_id=tok_session_id, repo=repo
         )
-
-    # 只在**显式**要求重审时才把这个 kwarg 递下去：``prepare_pipeline`` 是可注入的，测试与
-    # bootstrap 夹具里的 stub 都写死了参数列表。默认路径一个字节都不变，就不会因为多一个关键字
-    # 参数把一堆既有注入点变成 TypeError。
-    forced_rescope_kwargs = {"force_full_rescope": True} if force_full_rescope else {}
-    try:
-        prepared = prepare_pipeline(
-            token_record=record, repo=repo, session_id=tok_session_id,
-            transcript_path=transcript_path, now=now_dt, timeout_seconds=prepare_timeout_seconds,
-            resume_run_id=resume_run_id, resume_run_dir=resume_run_dir,
-            parent_attempt_run_id=parent_attempt_run_id,
-            parent_attempt_run_dir=parent_attempt_run_dir,
-            **forced_rescope_kwargs,
-        )
-    except Exception as exc:  # prepare 抛异常 → 回退可 retry，不吞决策
-        _release_replay_claim()
-        return _fail(f"prepare_review_run 异常：{type(exc).__name__}: {exc}", phase="prepare")
-
-    # prepare 判定「task worktree 还没吸收 local base」：这不是失败，走等待态（见 _bootstrap_waiting）。
-    # 必须排在下面的泛化 != completed 分支**之前**，否则会被当成一次不带恢复语义的 start 失败。
-    if prepared.get("status") == rvf_bootstrap_gate.WAITING_STATUS:
-        _release_replay_claim()
-        fresh_gate = prepared.get("bootstrap_gate")
-        if not isinstance(fresh_gate, Mapping):
-            return _fail(
-                "prepare 报告需要 local-base bootstrap，但未产出可恢复的 gate 记录。",
-                phase="prepare", extra={"prepare_status": prepared.get("status")},
+        if review_reopen_consumption.get("outcome") != review_reopen_marker.REVIEW_REOPEN_CONSUMPTION_NO_MARKER:
+            append_decision_telemetry(
+                token=token, event="start_review_reopen_consumed", worktree=worktree,
+                session_id=tok_session_id, now=now_dt, root=roots.telemetry_root,
+                detail=review_reopen_consumption,
             )
-        return _bootstrap_waiting(
-            fresh_gate,
-            rvf_bootstrap_gate.reconcile_bootstrap_gate(fresh_gate),
-            run_anchor_dir=(
-                prepared.get("initiation_run_dir")
-                if isinstance(prepared.get("initiation_run_dir"), str)
-                else None
-            ),
-        )
+
+        # 只在**显式**要求重审时才把这个 kwarg 递下去：``prepare_pipeline`` 是可注入的，测试与
+        # 测试夹具里的 stub 使用固定参数列表，默认调用不增加额外关键字
+        # 参数把一堆既有注入点变成 TypeError。
+        forced_rescope_kwargs = {"force_full_rescope": True} if force_full_rescope else {}
+        try:
+            prepared = prepare_pipeline(
+                token_record=record, repo=repo, session_id=tok_session_id,
+                transcript_path=transcript_path, now=now_dt, timeout_seconds=prepare_timeout_seconds,
+                **forced_rescope_kwargs,
+            )
+        except Exception as exc:  # prepare 抛异常 → 回退可 retry，不吞决策
+            return _fail(f"prepare_review_run 异常：{type(exc).__name__}: {exc}", phase="prepare")
 
     # 「本会话名下没有未审单元」：不是失败，是「没东西可审」。必须排在下面的泛化 != completed
     # 分支**之前**，否则会被 _fail 当成一次 prepare 失败——那会把一个正常结论渲染成故障，还会诱导
     # agent 去 --retry 一个重试多少次都一样的状态。
     if prepared.get("status") == PREPARE_STATUS_NO_UNREVIEWED_SCOPE:
-        _release_replay_claim()
         allocation = prepared.get("tracker_scope_allocation")
         degradation_reason = (
             allocation.get("degradation_reason") if isinstance(allocation, Mapping) else None
@@ -1993,7 +1852,6 @@ def run_start(
         )
 
     if prepared.get("status") != "completed":
-        _release_replay_claim()
         return _fail(
             f"prepare_review_run 未完成（status={prepared.get('status')}）：{prepared.get('error') or ''}".strip(),
             phase="prepare", extra={"prepare_status": prepared.get("status"), "prepare_error": prepared.get("error")},
@@ -2010,30 +1868,9 @@ def run_start(
         except token_store.DecisionTokenError:
             pass
 
-    # ⑤b prepare 真正成功 = 进入 REVIEWING，bootstrap 等待态退场：摘掉 gate，回落常规流程。
-    if existing_gate is not None:
-        try:
-            token_store.attach_bootstrap_gate(token, gate=None, root=roots.token_root, now=now_dt)
-        except token_store.DecisionTokenError:
-            pass
-        append_decision_telemetry(
-            token=token, event="start_bootstrap_resolved", worktree=worktree,
-            session_id=tok_session_id, now=now_dt, root=roots.telemetry_root,
-            detail={
-                "phase": rvf_bootstrap_gate.PHASE_REVIEWING,
-                "resumed_run_id": resume_run_id,
-                "parent_attempt_run_id": parent_attempt_run_id,
-                "run_id": run_id,
-            },
-        )
-
-    # ⑤c 本轮 prepare 已收尾且 gate 已退场 → 释放恢复占位（放在摘 gate **之后**：这样并发的另一次
-    # start 在 gate 还挂着的窗口里也无法起第二次重放）。
-    _release_replay_claim()
-
-    # ⑥ 自动 scope 产出（落盘，供 scope 子命令编辑）。
+    # prepare 成功即持久保存；后续失败重试复用同一工件和 lease，保留已有 scope 调整。
     auto_scope_paths = _initial_auto_scope_paths(candidate_summary, artifacts)
-    overlay = {
+    overlay = prepared_overlay if prepared_overlay is not None else {
         "schema_version": SCOPE_ADJUSTMENT_SCHEMA_VERSION,
         "token": token,
         "worktree": worktree,
@@ -2052,8 +1889,17 @@ def run_start(
         "claims": [],
         "transcript_path": transcript_path,
         "prepare_artifacts": dict(artifacts),
+        "completed_prepare_pipeline_result": dict(prepared),
     }
     scope_artifact_path = write_scope_adjustment(overlay, token=token, root=roots.scope_adjustment_root)
+    auto_scope_paths = overlay["auto_scope_paths"]
+
+    automatic_closeout_registration = rvf_automatic_closeout_bridge.register_optional_automatic_closeout(
+        automatic_closeout_receipt, Path(run_dir), run_id=run_id, decision_token=token,
+    )
+    overlay["automatic_closeout_registration"] = automatic_closeout_registration
+    write_scope_adjustment(overlay, token=token, root=roots.scope_adjustment_root)
+
     review_scope_coverage = _review_scope_coverage_of_overlay(overlay)
 
     # ⑦ 在途凭证（INV-5）：接受之后的后续 Stop 不得把同一批改动重新征询一遍。就地接受没有
@@ -2103,6 +1949,19 @@ def run_start(
         ),
         kanban_task_id=_current_kanban_task_id_from_env(),
     )
+    source_token = record.payload.get("boundary_request_source_token")
+    if isinstance(source_token, str) and isinstance(run_dir, str):
+        try:
+            source_record = token_store.read_decision_token(source_token, root=roots.token_root, now=now_dt)
+            source_run_dir = (source_record.payload or {}).get("run_anchor_dir")
+            if isinstance(source_run_dir, str):
+                from review_run_terminal_archive import record_review_run_successor
+
+                execution_handoff["predecessor_review_run_link"] = record_review_run_successor(
+                    source_run_dir=Path(source_run_dir), successor_run_dir=Path(run_dir), session_id=tok_session_id or "",
+                )
+        except Exception as exc:
+            execution_handoff["predecessor_review_run_link"] = {"status": "unavailable", "error": f"{type(exc).__name__}: {exc}"}
 
     scope_mode_note = (
         f"审查准备就绪（候选 {len(auto_scope_paths)} 路径；tracker scope 已分配，"
@@ -2119,7 +1978,9 @@ def run_start(
     )
     # 如实报告正式审查覆盖了多少候选（08ac4：回执原先只报候选数，覆盖不全时 agent 多数不告诉用户）。
     scope_mode_note += " " + _render_review_scope_coverage_line(review_scope_coverage, token=token)
-    return CommandResult(
+    if automatic_closeout_registration["status"] != "registered":
+        scope_mode_note += " 本轮自动回退与收尾不可用；继续 review/fix/handoff，交接后人工 land/base 同步。"
+    completed_result = CommandResult(
         command="start", status="ok", exit_code=EXIT_OK, token=token,
         token_state=token_store.STATE_ACKNOWLEDGED,
         message=scope_mode_note,
@@ -2139,8 +2000,12 @@ def run_start(
             "transcript_path_source": transcript_path_source,
             "tracker_scope_allocation": dict(tracker_scope_allocation),
             "review_scope_coverage": review_scope_coverage,
+            "automatic_closeout_registration": automatic_closeout_registration,
         },
     )
+    overlay["completed_start_command_result"] = asdict(completed_result)
+    write_scope_adjustment(overlay, token=token, root=roots.scope_adjustment_root)
+    return completed_result
 
 
 def _suggested_strictness_tier_from_candidate_summary(candidate_summary: Mapping[str, Any] | None) -> str:
@@ -2976,6 +2841,12 @@ def run_dispatch(
 
     worktree = str(overlay.get("worktree") or record.payload.get("worktree") or "")
 
+    try:
+        require_prepared_run_review_start_boundary(repo=worktree, scope_contract=artifacts.get("scope_contract"), run_id=overlay.get("run_id"), run_dir=overlay.get("run_dir"))
+    except ReviewStartBoundaryNotVerified as exc:
+        return CommandResult(command="dispatch", status=exc.status, exit_code=EXIT_REVIEW_START_BOUNDARY_NOT_VERIFIED,
+                             token=token, token_state=record.state, message=exc.reason)
+
     # ①a contract gate：reviewer 会读到的那份 scope-of-work 还不能审就**拒派**。
     stub_gate = _scope_of_work_stub_gate(artifacts)
     if stub_gate is not None:
@@ -3182,8 +3053,9 @@ def run_decline(
     """``decline`` 子命令：mark_declined（终态 + 按 ``decline_kind`` 分流）+ 理由落 append-only ledger。
 
     结构性谢绝：回执如实报告会话级 snooze 是否落盘（读回磁盘，而非假设 mark_declined 一定写成）：
-    落盘了就告诉 agent「本会话内这片工作范围不会再弹横幅，直到提交 / 范围明显扩大」；没落盘（无
-    session_id、候选摘要缺工作范围身份、I/O 失败）就只承诺内容指纹冷却。延后型谢绝：如实告诉 agent
+    落盘了就告诉 agent「本会话内这片工作范围不会再弹横幅，直到提交 / 范围明显扩大」；没落盘（候选
+    摘要缺工作范围身份、I/O 失败）就只承诺已读回的本会话指纹冷却；缺有效 session_id 时不建立
+    指纹冷却，也不声称 snooze 已生效。延后型谢绝：如实告诉 agent
     下一次在什么时候重新征询（同样读回磁盘上的延后记录，没落盘就说「下一次 Stop 即重新征询」）。
 
     理由持久化的落点是**磁盘上的 append-only ledger**（``~/.rvf`` 下，路径可注入），刻意在
@@ -3214,6 +3086,20 @@ def run_decline(
         )
 
     fingerprint = str(declined.payload.get("candidate_fingerprint") or "")
+    terminal_archive_result = None
+    prepared_run_directory = (lookup.payload or {}).get("run_anchor_dir")
+    if isinstance(prepared_run_directory, str) and (Path(prepared_run_directory) / "summary.json").is_file():
+        try:
+            from review_run_terminal_archive import request_review_run_terminal_archive
+
+            source_summary = (lookup.payload or {}).get("candidate_summary") or {}
+            terminal_archive_result = request_review_run_terminal_archive(
+                run_dir=Path(prepared_run_directory), decision_kind="declined", reason=reason,
+                event={"cwd": worktree, "session_id": session_id,
+                       "transcript_path": source_summary.get("origin_transcript_path")},
+            )
+        except Exception as exc:
+            terminal_archive_result = {"status": "waiting_for_evidence", "error": f"{type(exc).__name__}: {exc}"}
     # INTEGRATION-POINT(R7/R12 rewind-on-decline)：理由落 append-only 磁盘 ledger，rewind
     # 不可抹；未来 rewind-on-decline 编排（不在本 repo 实现，Linear 跟踪)会读本 ledger
     # 决定「decline 后回退到决策点前的上下文」——本切片只落盘 + 标注。
@@ -3235,10 +3121,10 @@ def run_decline(
         now=now_dt, root=roots.telemetry_root,
         detail={"reason": reason, "decline_kind": decline_kind, "candidate_fingerprint": fingerprint},
     )
-    reopen_own_declined_decision_next_step = (
-        "开发者之后口头要求开审时，不必请他手动触发："
-        f'{_rvf()} start --reopen-own-declined-decision --reason "<开发者原话>"'
-        "（只能撤回本会话最近一次谢绝）"
+    deferred_review_boundary_next_step = (
+        f'{_rvf()} request-review-start-boundary --deferred-decision-token {token} --reason "<条件满足的自主判断>"'
+        if decline_kind == token_store.DECLINE_KIND_DEFERRED_UNTIL_CONDITION
+        else '结构性谢绝保持生效；用户可在新的独立消息中明确提交 /review-validate-fix。'
     )
     if decline_kind == token_store.DECLINE_KIND_DEFERRED_UNTIL_CONDITION:
         deferred_until_condition_decline_recorded = (
@@ -3262,12 +3148,13 @@ def run_decline(
         return CommandResult(
             command="decline", status="ok", exit_code=EXIT_OK, token=token, token_state=declined.state,
             message=message,
-            next_steps=[reopen_own_declined_decision_next_step],
+            next_steps=[deferred_review_boundary_next_step],
             detail={
                 "declined_reason_ledger": str(ledger_path),
                 "candidate_fingerprint": fingerprint,
                 "decline_kind": decline_kind,
                 "deferred_until_condition_decline_recorded": deferred_until_condition_decline_recorded,
+                "terminal_archive": terminal_archive_result,
             },
         )
     declined_session_scope_snooze_recorded = (
@@ -3278,7 +3165,18 @@ def run_decline(
         )
         is not None
     )
-    message = "已谢绝本次审查发起（结构性谢绝）；理由已持久化（rewind 不可抹），候选指纹已入 declined 冷却表（指纹未变不再注入）"
+    session_scoped_declined_candidate_fingerprint_recorded = (
+        token_store.read_declined_fingerprint(
+            worktree=worktree, session_id=session_id or "", candidate_fingerprint=fingerprint,
+            cooldown_root=roots.cooldown_root,
+        ) is not None
+    )
+    message = "已谢绝本次审查发起（结构性谢绝）；理由已持久化（rewind 不可抹）"
+    message += (
+        "，已建立本会话指纹冷却（本会话候选未变不再注入，不影响其他会话）"
+        if session_scoped_declined_candidate_fingerprint_recorded
+        else "，未建立本会话指纹冷却（缺少有效会话身份或冷却记录不可读），后续 Stop 仍可能重新征询"
+    )
     message += (
         "；本会话已 snooze 这片工作范围——直到提交或范围明显扩大（开发者发来新 prompt 后以那一刻为新基线），自动 Stop 不再为它弹横幅。"
         if declined_session_scope_snooze_recorded
@@ -3287,244 +3185,15 @@ def run_decline(
     return CommandResult(
         command="decline", status="ok", exit_code=EXIT_OK, token=token, token_state=declined.state,
         message=message,
-        next_steps=[reopen_own_declined_decision_next_step],
+        next_steps=[deferred_review_boundary_next_step],
         detail={
             "declined_reason_ledger": str(ledger_path),
             "candidate_fingerprint": fingerprint,
             "decline_kind": decline_kind,
+            "session_scoped_declined_candidate_fingerprint_recorded": session_scoped_declined_candidate_fingerprint_recorded,
             "declined_session_scope_snooze_recorded": declined_session_scope_snooze_recorded,
+            "terminal_archive": terminal_archive_result,
         },
-    )
-
-
-# ---------------------------------------------------------------------------
-# start --reopen-own-declined-decision：agent 按开发者口头要求撤回自己的谢绝（D2）
-#
-# 回溯里 agent 误读 / 外推开发者指令而谢绝的情形仍在（例：把「调查期不跑真实 RVF」外推到真正的
-# 源码修复）。开发者随后口头说「审一下」时，agent 只能回答「token 已终态，请你手动触发」——它没有
-# 任何入口推翻自己的谢绝。这里给它一个：语义与开发者手动触发**完全一致**（复用
-# ``initiated_by_explicit_user_request`` 的豁免：清指纹冷却、清会话 snooze、清延后记录、跳过熔断），
-# 但只许撤回**本会话最近一枚** token、且它必须是 declined；token payload 与遥测记下来源与开发者原话，
-# 与真正的手动触发区分开。
-# ---------------------------------------------------------------------------
-
-def _git_toplevel_of_directory(directory: Path) -> Path | None:
-    try:
-        completed = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            cwd=str(directory), capture_output=True, text=True, check=False,
-        )
-    except (FileNotFoundError, OSError):
-        return None
-    output = completed.stdout.strip()
-    return Path(output).resolve() if completed.returncode == 0 and output else None
-
-
-def _paths_name_same_directory(left: Any, right: Path) -> bool:
-    if not isinstance(left, str) or not left:
-        return False
-    try:
-        return Path(left).expanduser().resolve() == right
-    except OSError:
-        return False
-
-
-def find_newest_decision_token_of_session_on_worktree(
-    *, worktree: Path, session_id: str, root: str | Path | None = None
-) -> dict[str, Any] | None:
-    """本会话在本 worktree 上铸出的**最近一枚**决策 token 的 payload（任意状态；按 ``minted_at``）。"""
-    try:
-        token_paths = sorted(token_store.decision_token_root(root).glob("*.json"))
-    except OSError:
-        return None
-    newest: dict[str, Any] | None = None
-    for token_path in token_paths:
-        try:
-            payload = json.loads(token_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(payload, dict) or payload.get("session_id") != session_id:
-            continue
-        if not _paths_name_same_directory(payload.get("worktree"), worktree):
-            continue
-        if newest is None or str(payload.get("minted_at") or "") > str(newest.get("minted_at") or ""):
-            newest = payload
-    return newest
-
-
-def _default_candidate_summary_builder_for_reopen(event: dict[str, Any], worktree: str) -> dict[str, Any]:
-    import stop_decision_candidate_summary  # noqa: PLC0415 - 惰性：只有撤回谢绝才需要现算候选
-
-    summary = stop_decision_candidate_summary.build_candidate_summary(
-        event=event, cwd=worktree, repo=worktree, ledger=None
-    )
-    try:
-        import stop_review_validate_fix as stop_hook  # noqa: PLC0415
-
-        stop_hook.stamp_origin_transcript_path_on_candidate_summary(summary, event)
-    except Exception:  # noqa: BLE001 - 加料失败退化成「无 transcript」，由 start 侧显式降级承接
-        pass
-    return summary
-
-
-def run_start_reopening_own_declined_decision_on_developer_verbal_request(
-    *,
-    developer_verbal_request: str,
-    repo: str | None = None,
-    session_id: str | None = None,
-    transcript_path: str | None = None,
-    force_full_rescope: bool = False,
-    roots: AgentDecisionRoots | None = None,
-    now: datetime | None = None,
-    candidate_summary_builder: Callable[[dict[str, Any], str], dict[str, Any]] | None = None,
-    start_runner: Callable[..., CommandResult] | None = None,
-) -> CommandResult:
-    """``start --reopen-own-declined-decision --reason "<开发者原话>"``：撤回本会话最近一次谢绝并开审。
-
-    前置（任一不满足就拒绝、什么都不改）：解析得出当前会话身份；本会话在本 worktree 上最近一枚
-    token 是 ``declined``；现算的候选非空。满足后以「用户显式请求」铸一枚新 token（来源
-    ``agent_reopened_own_declined_decision_on_developer_verbal_request``），再对它走常规 ``start``。
-    """
-    roots = roots or AgentDecisionRoots()
-    now_dt = _coerce_now(now)
-    candidate_summary_builder = candidate_summary_builder or _default_candidate_summary_builder_for_reopen
-    start_runner = start_runner or run_start
-    command = "start"
-
-    def _refuse(message: str, **detail: Any) -> CommandResult:
-        return CommandResult(
-            command=command, status="error", exit_code=EXIT_TOKEN_STATE, message=message,
-            detail={"reopen_own_declined_decision_refused": True, **detail},
-        )
-
-    if not developer_verbal_request.strip():
-        return _refuse("--reason 必须是开发者要求开审的原话（会写进回执与遥测），不能为空。")
-    if session_id is None:
-        from core.host_adapter.current_agent_session_identity_from_environment import (  # noqa: PLC0415
-            resolve_current_agent_session_id_from_environment,
-        )
-
-        session_id = resolve_current_agent_session_id_from_environment()
-    if not session_id:
-        return _refuse(
-            "解析不出当前会话身份，无法确认「最近一次谢绝是本会话做的」，拒绝撤回。"
-            "请显式传 --session-id，或请开发者手动触发 RVF。"
-        )
-    worktree_path = (
-        Path(repo).expanduser().resolve() if repo else _git_toplevel_of_directory(Path.cwd())
-    )
-    if worktree_path is None:
-        return _refuse("cwd 不在 git worktree 内；请传 --repo 指明要撤回谢绝的 worktree。")
-    newest = find_newest_decision_token_of_session_on_worktree(
-        worktree=worktree_path, session_id=session_id, root=roots.token_root
-    )
-    if newest is None or newest.get("state") != token_store.STATE_DECLINED:
-        newest_description = (
-            "本会话在这个 worktree 上没有任何决策 token"
-            if newest is None
-            else f"本会话最近一枚决策 token {newest.get('token')} 的状态是 {newest.get('state')}，不是 declined"
-        )
-        return _refuse(
-            f"{newest_description}。--reopen-own-declined-decision 只能撤回本会话**最近一次**的谢绝；"
-            "若横幅还在等你表态，直接 start 那枚 token。",
-            newest_decision_token_of_session=(newest or {}).get("token"),
-            newest_decision_token_state=(newest or {}).get("state"),
-        )
-    declined_token = str(newest.get("token"))
-    declined_summary = newest.get("candidate_summary") if isinstance(newest.get("candidate_summary"), dict) else {}
-    if transcript_path is None:
-        try:
-            import stop_review_validate_fix as stop_hook  # noqa: PLC0415
-
-            stamped_transcript_path = declined_summary.get(
-                stop_hook.CANDIDATE_SUMMARY_ORIGIN_TRANSCRIPT_PATH_KEY
-            )
-        except Exception:  # noqa: BLE001
-            stamped_transcript_path = None
-        transcript_path = stamped_transcript_path if isinstance(stamped_transcript_path, str) else None
-    worktree = str(newest.get("worktree") or worktree_path)
-    event: dict[str, Any] = {"cwd": worktree, "session_id": session_id}
-    if transcript_path:
-        event["transcript_path"] = transcript_path
-    summary = candidate_summary_builder(event, worktree)
-    candidate_count = int(summary.get("candidate_path_count") or 0)
-    if candidate_count <= 0:
-        return _refuse(
-            "这个 worktree 现在没有可审的候选改动（自上次 review 以来无改动，或都已审过），没有可撤回重开的东西。",
-            reopened_declined_decision_token=declined_token,
-        )
-    try:
-        mint = token_store.mint_decision_token(
-            worktree=str(summary.get("repo") or worktree),
-            session_id=session_id,
-            candidate_fingerprint=str(summary.get("candidate_fingerprint") or ""),
-            candidate_summary=summary,
-            now=now_dt,
-            root=roots.token_root,
-            cooldown_root=roots.cooldown_root,
-            initiated_by_explicit_user_request=True,
-            explicit_user_request_provenance=(
-                token_store.EXPLICIT_USER_REQUEST_PROVENANCE_AGENT_REOPENED_OWN_DECLINED_DECISION_ON_DEVELOPER_VERBAL_REQUEST
-            ),
-            extra_token_payload_fields={
-                "reopened_declined_decision_token": declined_token,
-                "developer_verbal_request_that_reopened_declined_decision": developer_verbal_request,
-            },
-        )
-    except token_store.DecisionTokenError as exc:
-        return _refuse(f"重新铸造决策 token 失败：{exc}", reopened_declined_decision_token=declined_token)
-    if not mint.token:
-        return _refuse(
-            f"重新铸造决策 token 未成功（outcome={mint.outcome}）：{mint.message or ''}",
-            reopened_declined_decision_token=declined_token,
-        )
-    reopen_detail = {
-        "explicit_user_request_provenance": (
-            token_store.EXPLICIT_USER_REQUEST_PROVENANCE_AGENT_REOPENED_OWN_DECLINED_DECISION_ON_DEVELOPER_VERBAL_REQUEST
-        ),
-        "reopened_declined_decision_token": declined_token,
-        "reopened_declined_decision_kind": newest.get("decline_kind"),
-        "developer_verbal_request_that_reopened_declined_decision": developer_verbal_request,
-        "reopened_decision_token": mint.token,
-        "reopened_decision_token_mint_outcome": mint.outcome,
-        "explicit_user_request_overrode_agent_declined_cooldown": (
-            mint.explicit_user_request_overrode_agent_declined_cooldown
-        ),
-        "explicit_user_request_overrode_agent_declined_session_scope_snooze": (
-            mint.explicit_user_request_overrode_agent_declined_session_scope_snooze
-        ),
-        "explicit_user_request_overrode_agent_deferred_until_condition_decline": (
-            mint.explicit_user_request_overrode_agent_deferred_until_condition_decline
-        ),
-    }
-    append_decision_telemetry(
-        token=mint.token, event="agent_reopened_own_declined_decision_on_developer_verbal_request",
-        worktree=worktree, session_id=session_id, now=now_dt, root=roots.telemetry_root,
-        detail=reopen_detail,
-    )
-    started = start_runner(
-        token=mint.token,
-        reason=f"开发者口头要求开审，撤回本会话的谢绝 {declined_token}：{developer_verbal_request}",
-        repo=repo,
-        session_id=session_id,
-        transcript_path=transcript_path,
-        roots=roots,
-        now=now_dt,
-        force_full_rescope=force_full_rescope,
-    )
-    return CommandResult(
-        command=started.command,
-        status=started.status,
-        exit_code=started.exit_code,
-        token=started.token,
-        token_state=started.token_state,
-        message=(
-            f"已按开发者口头要求撤回本会话的谢绝（token {declined_token}），以新 token {mint.token} 开审"
-            "（与开发者手动触发同样豁免冷却 / snooze / 熔断；来源记为「agent 按开发者口头要求撤回」）。"
-            + (" " + started.message if started.message else "")
-        ),
-        next_steps=list(started.next_steps),
-        detail={**dict(started.detail), **reopen_detail},
     )
 
 
@@ -3922,6 +3591,19 @@ def run_decline_dispatched_review(
             next_steps=next_steps, detail=detail,
         )
 
+    run_directory = rvf_run.get("run_dir")
+    if isinstance(run_directory, str) and (Path(run_directory) / "summary.json").is_file():
+        try:
+            from review_run_terminal_archive import request_review_run_terminal_archive
+
+            detail["terminal_archive"] = request_review_run_terminal_archive(
+                run_dir=Path(run_directory), decision_kind="declined", reason=reason,
+                event={"cwd": repo, "session_id": session_id,
+                       "transcript_path": payload.get("origin_transcript_path")},
+            )
+        except Exception as exc:
+            detail["terminal_archive"] = {"status": "waiting_for_evidence", "error": f"{type(exc).__name__}: {exc}"}
+
     if review_not_required_declared:
         message = (
             "已谢绝本轮自动 RVF，并把本轮 scope 的 diff 声明为「不需审核」"
@@ -3978,18 +3660,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
     p_start = sub.add_parser("start", help="token→acknowledged + 前置校验 + prepare 全套 + 自动 scope 产出")
     p_start.add_argument(
-        "--token", default=None, help="注入 prompt 里拿到的决策 token（显式回传；与 --reopen-own-declined-decision 二选一）"
+        "--token", default=None, help="注入 prompt 里拿到的决策 token（显式回传）"
     )
-    p_start.add_argument(
-        "--reopen-own-declined-decision",
-        action="store_true",
-        help=(
-            "开发者口头要求开审、而你本会话最近一次表态是谢绝时用：撤回那次谢绝并直接开审"
-            "（与开发者手动触发同样豁免冷却 / snooze / 熔断）。此时 --reason 写开发者的原话。"
-            "只能撤回本会话最近一枚 token，且它必须是 declined"
-        ),
-    )
-    p_start.add_argument("--reason", required=True, help="简析后开启审查的理由（--reopen-own-declined-decision 时写开发者原话）")
+    p_start.add_argument("--reason", required=True, help="自主决定开审的理由，不作为用户来源证据")
     p_start.add_argument("--repo", default=None, help="目标 worktree（默认取 token 记录的 worktree）")
     p_start.add_argument("--session-id", default=None, help="覆盖 session id（默认取 token 记录）")
     p_start.add_argument(
@@ -4011,6 +3684,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "只在确知有 tracker 归属看不见的新工作（例如在非 Kanban 单任务 worktree 里经不透明脚本写入的文件）时用"
         ),
     )
+
+    p_boundary = sub.add_parser("request-review-start-boundary", help="自主请求独立开审消息，仅投递、不准备或派发")
+    boundary_source = p_boundary.add_mutually_exclusive_group(required=True)
+    boundary_source.add_argument("--decision-token")
+    boundary_source.add_argument("--deferred-decision-token")
+    p_boundary.add_argument("--reason", required=True, help="当前条件满足的自主判断，不冒充开发者原话")
 
     p_scope = sub.add_parser("scope", help="改动自动 scope（annotate / exclude / include / claim），仅 acknowledged 态")
     scope_sub = p_scope.add_subparsers(dest="scope_action", required=True)
@@ -4103,16 +3782,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_argument_parser()
     args = parser.parse_args(argv)
 
-    if args.command == "start" and args.reopen_own_declined_decision:
-        if args.token or args.retry:
-            parser.error("--reopen-own-declined-decision 不能与 --token / --retry 同用（它会自己铸新 token）")
-        result = run_start_reopening_own_declined_decision_on_developer_verbal_request(
-            developer_verbal_request=args.reason, repo=args.repo, session_id=args.session_id,
-            transcript_path=args.transcript_path, force_full_rescope=args.force_full_rescope,
+    if args.command == "request-review-start-boundary":
+        from rvf_review_start_boundary_request import run_request_review_start_boundary
+        result = run_request_review_start_boundary(
+            decision_token=args.decision_token, deferred_decision_token=args.deferred_decision_token, reason=args.reason,
         )
     elif args.command == "start":
         if not args.token:
-            parser.error("start 需要 --token（或用 --reopen-own-declined-decision 撤回本会话最近一次谢绝）")
+            parser.error("start 需要 --token")
         result = run_start(
             token=args.token, reason=args.reason, repo=args.repo,
             session_id=args.session_id, transcript_path=args.transcript_path, retry=args.retry,
@@ -4157,7 +3834,8 @@ def main(argv: list[str] | None = None) -> int:
 
 __all__ = [
     "EXIT_OK", "EXIT_USAGE", "EXIT_TOKEN_STATE", "EXIT_START_FAILED", "EXIT_DISPATCH_FAILED",
-    "EXIT_BOOTSTRAP_REQUIRED", "EXIT_DECLINE_DISPATCHED_REVIEW_INCOMPLETE",
+    "EXIT_REVIEW_START_BOUNDARY_NOT_VERIFIED",
+    "EXIT_DECLINE_DISPATCHED_REVIEW_INCOMPLETE",
     "LOCK_IDENTITY_MATCHES_THIS_DISPATCH", "LOCK_IDENTITY_BELONGS_TO_ANOTHER_DISPATCH",
     "LOCK_IDENTITY_UNVERIFIABLE_LEGACY_MARKER",
     "KANBAN_FOLLOWUP_MARKER_CLEARED", "KANBAN_FOLLOWUP_MARKER_ALREADY_ABSENT",
@@ -4172,8 +3850,8 @@ __all__ = [
     "append_decision_telemetry", "record_scope_exception_and_maybe_file_issue",
     "compute_effective_primary_files", "load_strictness_preset", "finalize_scope_contract",
     "resolve_agent_initiation_backend", "default_launch_preflight", "default_provider_health_requirements",
-    "run_start", "run_start_reopening_own_declined_decision_on_developer_verbal_request",
-    "find_newest_decision_token_of_session_on_worktree", "run_scope_annotate", "run_scope_exclude", "run_scope_include",
+    "run_start",
+    "run_scope_annotate", "run_scope_exclude", "run_scope_include",
     "run_scope_claim", "EXIT_UNCOVERED_CANDIDATE_PATHS_NEED_AGENT_DECISION", "run_dispatch", "run_decline",
     "run_decline_dispatched_review",
     "build_argument_parser", "main",

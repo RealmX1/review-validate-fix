@@ -45,6 +45,12 @@ decision token 状态、以及目标会话 UserPromptSubmit 观测到 `RVF_DECIS
 
 这是版本控制内的持续策略，没有 TTL；重启、redeploy、会话级 on 或 channel 切换都不能解除。只有用户明确要求恢复后才修改源码策略。GUI 身份未知时维持原行为，不把 `source="vscode"` 或 worktree 路径推断成 GUI 或 task 绑定。
 
+### 0.3 备用消费对账不是 RVF 续跑理由
+
+备用路线核验原 run 已被消费后，不再为该 run 输出未 handoff 续跑提示；后续 HEAD 改变不撤销历史消费。Stop 在 nudge、过期续期与 pending 重投之前按精确 run／operation／worktree 对账，清理失败也不能再催原 run。其他在途 run 继续遵守既有预算。
+
+当前候选是否仍被覆盖另行核验：候选相同走 `developer_only` 静默跳过；新内容走现有候选决策。缺证据先沿同 operation 的持久完成记录有界补证，分页进度与缺口落盘，后续 Stop 自动接续。尚有下一页时用独立的 `independent_backup_route_candidate_verification_pending` 静默等待，不把尚未查尽当作未覆盖；另一正常在途 run 仍先经过既有预算判断。仍为 `unknown` 时只暂停依赖该证据的动作，诊断出口始终 `developer_only`；不得把未知包装成完成或用它唤起 agent。HostAdapter 的各宿主通道不变。详见 [备用路线契约](independent-backup-route-contract.md)。
+
 ## 1. Claude Code 的 Stop hook 有**三**条出口
 
 | 出口 | transcript 形态 | 驱动 agent 再跑一回合 | 开发者呈现 |
@@ -214,8 +220,7 @@ return StopDecision(
 ```
 
 - `audience` 由**构造决策的调用点显式声明**，不靠 `reason_code` 白名单反查。
-  （`reengage_decision` 的 `reason_code` 既有默认值、也有 `f"kanban_followup_bootstrap_{…}"`
-  这样**动态生成**的取值，任何静态清单都必漏。）
+  `reason_code` 用于诊断归因，受众由当前出口承担的职责决定。
 - `developer_visible_notice` **不是可选装饰**：历史上 90/92 条阻塞注入不带 `systemMessage`，
   开发者在终端里没法把它与「hook 真崩了」区分开。gate 会红。
 - `developer_only` 的正文放 `payload`（`{"continue": True, "systemMessage": …}` 形状，或

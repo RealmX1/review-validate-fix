@@ -12,7 +12,6 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import kanban_followup_lock
-import rvf_bootstrap_gate
 import rvf_prep_file
 import rvf_withdrawn_dispatch_tombstone
 import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
@@ -23,14 +22,11 @@ from core.rvf_shared_runtime_constants.rvf_shared_runtime_constants import (  # 
 )
 from session_label import text_from_message_payload
 
-try:
-    # 纯文本 handoff 识别复用：`RVF_RUN_RE`（run id 谓词）+ `parse_sections`
-    # （markdown 章节切分，无 IO）。仅用这两个无副作用函数判定「粘贴的是 handoff
-    # 正文」，**绝不**调 `build_payload`（它可能跑 git subprocess）。顶层 import
-    # 只引 stdlib，无 IO，可安全用于 UPS 检测热路径。缺省时降级为不做 handoff 识别。
-    import rvf_handoff_intake
-except Exception:  # pragma: no cover - handoff 识别可缺省降级
-    rvf_handoff_intake = None
+from core.review_start_boundary.explicit_manual_review_command_recognition import (
+    RVF_MANUAL_TRIGGER_RE,
+    RVF_SIBLING_TRIGGER_RE,
+    looks_like_rvf_handoff_body,
+)
 
 try:
     # Vendored single-file copy (see its header). Gives a structured "which skill
@@ -56,43 +52,6 @@ DISPATCH_ORIGIN_MARKERS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("kanban-followup", re.compile(rf"\b{re.escape(KANBAN_FOLLOWUP_MARKER)}\b")),
 )
 RVF_MANUAL_TRIGGERS = ("$review-validate-fix", "/review-validate-fix", ":review-validate-fix")
-# Match a manual trigger only at line start or after whitespace, and only
-# when the trailing token boundary is clean (\b). This avoids accidentally
-# triggering on quoted/embedded literals that appear inside review packets,
-# transcript excerpts, error stacks, or normal prose like
-# "please document the /review-validate-fix tool".
-# 负向先行断言 `(?!:rvf-)`：在检测层就区分主 skill 与 `rvf-*` 姊妹子 skill。所有
-# 姊妹 skill 的命名空间形态都是 `…:rvf-<name>`（如 `/review-validate-fix:rvf-land`、
-# `/review-validate-fix:rvf-local-deploy`），调用它们不应启动新 review；而主 skill
-# 的裸形态 `/review-validate-fix` 与命名空间形态
-# `/review-validate-fix:review-validate-fix`（后缀是 `:review-` 而非 `:rvf-`）仍命中。
-# 本断言位置无关，根因级修复「子 skill 出现在 prompt 句中时误触发 manual review」。
-RVF_MANUAL_TRIGGER_RE = re.compile(
-    r"(?:^|\s)[\$/:]review-validate-fix(?!:rvf-)\b",
-    re.MULTILINE,
-)
-# 前导姊妹命令抑制（位置锚定 prompt 开头，容忍前导空白）。`rvf-land` /
-# `rvf-handoff-intake` / `rvf-reopen` / `rvf-analyze` 等姊妹 skill 明确「不启动新
-# review」，却常把含 `review-validate-fix` 字面量的 handoff 正文作为参数粘贴进来。
-# 主 skill 名是 `review-validate-fix`（不以 `rvf-` 开头），故本正则永不误吞真触发。
-# 容忍命名空间前缀 `rvf:` / `review-validate-fix:`。
-RVF_SIBLING_TRIGGER_RE = re.compile(
-    r"\s*[\$/:](?:rvf:|review-validate-fix:)?rvf-[a-z0-9][a-z0-9-]*\b",
-)
-# handoff/finalization 正文里高度独有的 markdown 章节标题（归一化为小写后做子串
-# 匹配）。与 RVF run id 共现时判定为「粘贴的 handoff 正文」。这些短语在「普通要求
-# 跑一次 review」的 prompt 里几乎不会作为章节标题出现，叠加 run id 共现可避免误伤
-# 只顺嘴提了个 run id 的合法 review 请求。
-RVF_HANDOFF_SECTION_MARKERS = (
-    "handoff intake hints",
-    "deterministic intake hints",
-    "validate/fix",
-    "处理结果",
-    "repo delta",
-    "继续指引",
-    "升级事项",
-    "本次 review",
-)
 # manual 触发可内联指定 review scope：`/review-validate-fix scope: a.py b.py`。
 # 取首个 `scope:`（行首或空白前缀，避免命中 `telescope:` 之类）之后直到行尾的
 # 内容作为 primary 文件清单。大小写不敏感；建议把 `scope:` 放在该行末尾。
@@ -241,27 +200,8 @@ def _leading_sibling_command(text: str | None) -> bool:
 
 
 def _looks_like_handoff_body(text: str | None) -> bool:
-    """prompt 是否「看起来是粘贴的 RVF handoff/finalization 正文」（位置无关，纯文本）。
-
-    判据：含 RVF run id（``rvf_handoff_intake.RVF_RUN_RE``）**且** 含至少一个 handoff
-    独有的 markdown 章节标题（经 ``parse_sections`` 切出的 heading 命中
-    :data:`RVF_HANDOFF_SECTION_MARKERS`）。两条件叠加，避免误伤只顺嘴提了个 run id 的
-    合法 review 请求。只用 stdlib-only、无 IO 的两个函数；``rvf_handoff_intake`` 缺省时
-    直接返回 False（降级为不做识别）。
-    """
-    if rvf_handoff_intake is None or not text:
-        return False
-    try:
-        if not rvf_handoff_intake.RVF_RUN_RE.search(text):
-            return False
-        sections = rvf_handoff_intake.parse_sections(text)
-    except Exception:  # pragma: no cover - 识别失败永不阻断，按「非 handoff」处理
-        return False
-    for heading in sections:
-        normalized = heading.strip().lower()
-        if any(marker in normalized for marker in RVF_HANDOFF_SECTION_MARKERS):
-            return True
-    return False
+    """与开审分界复用纯文本 handoff 抑制规则，不把交接引用当作新命令。"""
+    return looks_like_rvf_handoff_body(text)
 
 
 def _codex_sibling_skill_invoked(event: dict[str, Any]) -> bool:
@@ -906,76 +846,6 @@ def arm_kanban_followup_lock_on_delivery(
     return marker_str
 
 
-def stamp_kanban_followup_bootstrap_gate(
-    event: dict[str, Any],
-    record: rvf_prep_file.PrepFileRecord,
-    result_state: dict[str, Any] | None,
-    *,
-    prep_root: str | Path | None = None,
-) -> str | None:
-    """prepare 判定「等 local base bootstrap」时，把 gate 就地盖进刚 arm 的 in-progress 锁。
-
-    借的是本 hook 的时序：锁在**同一个进程**里先 arm（投递确认）、prepare 才跑（见
-    ``inspect_user_prompt_submit``），所以 prepare 一返回就能把等待态写回同一把锁——不必新开
-    marker 族、也不必让 Stop 读侧去反查 prep 文件。锁的 ``state`` 同时从 ``in_progress`` 改成
-    ``waiting_bootstrap``，Stop 读侧据此改发定向指令（跑同步 skill）而不是通用「去收尾 handoff」。
-
-    best-effort：无锁 / 无 gate / 写失败一律返回 None，绝不阻断本次 prompt。
-    """
-    gate = rvf_bootstrap_gate.gate_of(result_state)
-    if gate is None:
-        return None
-    payload = record.payload
-    task_id = payload.get("target_kanban_task_id")
-    task_id = task_id.strip() if isinstance(task_id, str) and task_id.strip() else None
-    session_id = payload.get("origin_session_id") or event.get("session_id")
-    session_id = session_id if isinstance(session_id, str) and session_id.strip() else None
-    try:
-        marker = kanban_followup_lock.read_marker(
-            task_id=task_id,
-            session_id=session_id,
-            # 锁 key 含仓身份（``kanban_followup_lock.marker_paths``）：锚点取 prep payload 的
-            # origin_repo / origin_cwd，与同进程刚 arm 那次写侧同源，故必然解析到同一 identity。
-            repo=payload.get("origin_repo") or payload.get("origin_cwd") or event.get("cwd"),
-        )
-        if marker is None:
-            return None
-        # 锁刚在同一进程 arm 成 ``delivered_awaiting_agent_decision``（agent 还没被确认收到这条
-        # trigger）。此时**只盖 gate、不改 state**：改成 waiting_bootstrap 会把「收没收到」这一
-        # 维信息抹掉，读侧于是又会对一个从未看到 prompt 的 agent 发定向 re-engage。真正的升格由
-        # Stop 读侧在确认 trigger 仍在 transcript 祖先链上时做（届时按有无 gate 落到
-        # waiting_bootstrap / in_progress）。
-        keep_awaiting = (
-            kanban_followup_lock.marker_state(marker)
-            == kanban_followup_lock.STATE_DELIVERED_AWAITING_AGENT_DECISION
-        )
-        if not kanban_followup_lock.stamp_bootstrap_gate(
-            marker,
-            gate=gate,
-            state=None if keep_awaiting else kanban_followup_lock.STATE_WAITING_BOOTSTRAP,
-        ):
-            return None
-        marker_path = marker.get("_marker_path")
-    except Exception:  # best-effort：绝不阻断 prompt
-        return None
-    try:
-        rvf_prep_file.append_diagnostic(
-            root=prep_root,
-            token=record.token,
-            record={
-                "event": "user_prompt_submit_kanban_followup_bootstrap_gate_stamped",
-                "status": kanban_followup_lock.marker_state(marker),
-                "kanban_task_id": task_id,
-                "marker_path": marker_path,
-                "bootstrap_phase": gate.get("phase"),
-                "required_sync_skill": gate.get("required_sync_skill"),
-            },
-        )
-    except (OSError, rvf_prep_file.PrepFileError):
-        pass
-    return marker_path if isinstance(marker_path, str) else None
-
-
 def _run_artifacts_present(payload: dict[str, Any]) -> bool:
     """best-effort：prep payload 指向的 run artifacts（``rvf_run.run_dir``）是否仍在磁盘。
 
@@ -1066,26 +936,6 @@ def _dispatch_prep_revive_staleness_veto(
     return None
 
 
-def _bootstrap_waiting_additional_context_text(gate: dict[str, Any]) -> str:
-    """bootstrap 等待态注入的 ``additionalContext`` 正文（model-facing，喂进主 agent 上下文）。
-
-    这是入口 B 的 self-injection checkpoint：Stop 侧的 ``reengage_decision`` 要等 agent 干停
-    才能送达，而这里在 follow-up trigger 落地的**同一个 turn** 就把指引交给 agent，省掉一整轮
-    空转。步骤文案与入口 A 共用 ``rvf_bootstrap_gate.bootstrap_waiting_agent_steps``（单一来源）。
-    """
-    steps = rvf_bootstrap_gate.bootstrap_waiting_agent_steps(gate)
-    return "\n".join(
-        [
-            "=== RVF: 本轮 review 尚未开始（等 local base bootstrap）===",
-            f"local base `{gate.get('local_base_ref')}` 还没被吸收进本 task worktree，"
-            "RVF 已把本轮挂起为**可恢复的等待态**（run 与 scope 均未创建、reviewer 未派发）。",
-            *steps,
-            "④ 完成后本轮会自动接续 prepare 并进入 review——请**不要**输出 handoff、"
-            "也不要另开一轮 RVF。",
-        ]
-    )
-
-
 def _manual_decision_additional_context_text(
     *,
     summary: dict[str, Any],
@@ -1125,7 +975,7 @@ def _manual_decision_additional_context_text(
         )
     if overrode_agent_declined_cooldown or overrode_agent_declined_session_scope_snooze:
         overridden_decline_description = (
-            "你早前对**同一批改动**谢绝过一次 RVF"
+            "你早前在**本会话**对**同一批改动**谢绝过一次 RVF"
             if overrode_agent_declined_cooldown
             else "你早前已在**本会话**对这片工作范围谢绝过 RVF（此后改动还在继续）"
         )
@@ -1191,7 +1041,7 @@ def _handle_manual_decision_point(
 
     **闸二/闸三对本路径不适用**：铸造时传 ``initiated_by_explicit_user_request=True``——命中 declined
     冷却即视为「用户推翻 agent 早前的谢绝」并照常铸（该告知与冷却记录能否清除无关；清除成功还会把
-    这批改动整体放回可审状态，清除失败则仅剩后续自动路径仍被挡，文案如实分叉），铸造
+    本会话放回可审状态，清除失败则仅剩本会话后续自动路径仍被挡，文案如实分叉），铸造
     频率熔断整段跳过（它防的是 agent 递归自发起，手动触发按定义来自用户）。因此本函数不再有
     ``declined_cooldown`` / ``circuit_breaker_tripped`` 分支；除已知 outcome 外一律走 mint anomaly 兜底。
 
@@ -2677,23 +2527,6 @@ def inspect_user_prompt_submit(
 
     payload["workflow_started"] = result_state.get("status") == "completed"
     payload["shared_workflow_state"] = result_state
-    # prepare 卡在 pre-review local-base bootstrap 门：把等待 gate 写回本进程刚 arm 的
-    # in-progress 锁（state → waiting_bootstrap），使 Stop 读侧能区分「等 bootstrap」与
-    # 「正在 review」，并在锁 TTL 到期时复活本轮而不是清锁重开。
-    waiting_gate = rvf_bootstrap_gate.gate_of(result_state)
-    waiting_marker_path = stamp_kanban_followup_bootstrap_gate(
-        event, record, result_state, prep_root=prep_root
-    )
-    if waiting_marker_path:
-        payload["kanban_followup_waiting_bootstrap_marker_path"] = waiting_marker_path
-    if waiting_gate is not None:
-        # 模型可见的 self-injection checkpoint（``additionalContext``，非 user-only 的
-        # ``systemMessage``）：本轮 review 还没开始，agent 需要先跑同步 skill 把 local base
-        # 吸收进本 worktree、解决冲突、拿到 receipt，之后本轮会自动接续。
-        payload["hookSpecificOutput"] = {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": _bootstrap_waiting_additional_context_text(waiting_gate),
-        }
     try:
         rvf_prep_file.append_diagnostic(
             root=prep_root,
@@ -2715,7 +2548,6 @@ def inspect_user_prompt_submit(
     payload["systemMessage"] = _trigger_system_message(
         kind={
             "completed": "success",
-            rvf_bootstrap_gate.WAITING_STATUS: "waiting_local_base_bootstrap",
         }.get(str(_state_status), "failed"),
         dispatch_origin=dispatch_origin,
         token=record.token,
@@ -2800,15 +2632,6 @@ def _trigger_system_message(
         return notice(status_value=status or "completed", message="派发已就绪")
     if kind == "failed":
         return notice(status_value=status or "—", message="派发已跑但未就绪")
-    if kind == "waiting_local_base_bootstrap":
-        return notice(
-            status_value=status or rvf_bootstrap_gate.WAITING_STATUS,
-            message=(
-                "本轮 review 尚未开始：task worktree 还没吸收 local base，"
-                "已进入可恢复的 bootstrap 等待态（agent 已收到同步指引）"
-            ),
-            extra_fields=detail_fields,
-        )
     if kind == "already_completed":
         return notice(
             status_value="already_completed",

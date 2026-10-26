@@ -74,6 +74,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import json
 import sqlite3
 import subprocess
@@ -85,6 +86,9 @@ from typing import Any, Callable, Mapping, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401 — 把 pyroot 上 sys.path，供 core.* import
+from core.session_scope_allocation.committed_round_detection import (  # noqa: E402
+    frozen_committed_round_base_exclusion_ref,
+)
 
 import review_strictness_reference_calculator as strictness_calculator  # noqa: E402
 from review_scope_excluded_path_prefixes import (  # noqa: E402
@@ -342,6 +346,7 @@ def _run_git(repo_path: Path, args: list[str]) -> str | None:
         result = subprocess.run(
             ["git", *args],
             cwd=str(repo_path),
+            env={key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
             capture_output=True,
             text=True,
             check=False,
@@ -358,6 +363,7 @@ def _run_git_bytes(repo_path: Path, args: list[str]) -> bytes | None:
         result = subprocess.run(
             ["git", *args],
             cwd=str(repo_path),
+            env={key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
             capture_output=True,
             check=False,
         )
@@ -757,6 +763,7 @@ def build_candidate_summary(
     reviewed_committed_paths_resolver: Callable[[Path, str | None, set[str], Path | None], set[str]] | None = None,
     dirty_reviewed_change_resolver: Callable[[Path, str | None, Sequence[str], Path | None], Mapping[str, Any]] | None = None,
     strictness_rule_parameters: Mapping[str, Any] | None = None,
+    fixed_committed_round_base_tip: str | None = None,
 ) -> dict[str, Any]:
     """构造 Stop hook 注入用的候选摘要（结构见返回 dict / 模块 docstring）。
 
@@ -810,7 +817,11 @@ def build_candidate_summary(
     committed_paths: list[str] = []
     if baseline:
         try:
-            committed_paths = _list_committed_round_changed_paths(repo_path, baseline, base_ref)
+            committed_paths = _list_committed_round_changed_paths(
+                repo_path, baseline,
+                frozen_committed_round_base_exclusion_ref(repo_path, base_ref, fixed_committed_round_base_tip)
+                if fixed_committed_round_base_tip else base_ref,
+            )
         except Exception:  # pragma: no cover
             committed_paths = []
     try:

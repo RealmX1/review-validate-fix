@@ -10,6 +10,7 @@ import tempfile
 from pathlib import Path
 
 from _rvf_test_support.repo import templated_repo
+from test_reviewed_task_candidate_evidence import create_completed_run, rewrite_contract
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -87,6 +88,9 @@ def create_valid_reviewed_candidate_evidence_fixture(
     command_digest_character: str,
     environment_digest_character: str,
 ) -> tuple[Path, dict[str, object], Path]:
+    # 有效证据必须绑定真实双 reviewer 结果及完成 handoff，不能只自报 no_issues。
+    run_dir = create_completed_run(tmp_path, repo, run_name=f"rvf-handoff-intake-{cache_key_character}")
+    contract = rewrite_contract(run_dir, primary_files=["scoped.txt"], fix_allowlist=["scoped.txt"])
     git_dir = Path(run(["git", "rev-parse", "--absolute-git-dir"], cwd=repo).stdout.strip())
     common_dir = Path(
         run(
@@ -109,6 +113,8 @@ def create_valid_reviewed_candidate_evidence_fixture(
             str(repo),
             "--name",
             f"targeted-{cache_key_character}",
+            "--rvf-run-dir",
+            str(run_dir),
             "--",
             sys.executable,
             "-c",
@@ -130,29 +136,9 @@ def create_valid_reviewed_candidate_evidence_fixture(
     environment_digest = record["environment_fingerprint_sha256"]
 
     head_oid = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
-    run_id = f"rvf-handoff-intake-{cache_key_character}"
-    canonical_scope = {
-        "version": 3,
-        "review_kind": "implementation",
-        "base_ref": "main",
-        "remote_name": "origin",
-    }
-    scope_digest = hashlib.sha256(
-        json.dumps(
-            canonical_scope, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        ).encode()
-    ).hexdigest()
-    contract = {
-        **canonical_scope,
-        "run_id": run_id,
-        "scope_hash": scope_digest,
-        "canonical_scope": canonical_scope,
-    }
-    contract_path = tmp_path / f"scope-{cache_key_character}.contract.json"
-    contract_path.write_text(
-        json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-        encoding="utf-8",
-    )
+    run_id = contract["run_id"]
+    scope_digest = contract["scope_hash"]
+    contract_path = run_dir / "artifacts/inputs/scope.contract.json"
     contract_digest = hashlib.sha256(
         json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
@@ -472,6 +458,8 @@ def test_handoff_intake_uses_candidate_evidence_before_nested_markdown_validatio
     )
     handoff = tmp_path / "handoff.md"
     handoff.write_text(
+        f"- run id: `{evidence['review']['run_id']}`\n"
+        f"- scope contract: `{evidence['scope']['contract_path']}`\n\n"
         "## 验证\n\n### Scoped verification (in-contract)\n\n"
         "- `pytest tests/test_example.py::test_case[param-id]` -> passed\n",
         encoding="utf-8",
@@ -552,6 +540,47 @@ def test_handoff_intake_does_not_reuse_same_content_evidence_from_another_run(
     assert payload["validation_commands"] == ["npm test"]
 
 
+def test_handoff_intake_does_not_reuse_valid_evidence_from_another_scope(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    _evidence_path, evidence, _record_path = create_valid_reviewed_candidate_evidence_fixture(
+        tmp_path,
+        repo,
+        cache_key_character="d",
+        command_digest_character="e",
+        environment_digest_character="f",
+    )
+    scope = evidence["scope"]
+    assert isinstance(scope, dict)
+    another_contract = tmp_path / "another-scope.contract.json"
+    another_contract.write_bytes(Path(scope["contract_path"]).read_bytes())
+    handoff = tmp_path / "handoff.md"
+    handoff.write_text(f"- run id: {evidence['review']['run_id']}\n- scope contract: {another_contract}\n\n## 验证\n\n- `npm test` -> passed\n", encoding="utf-8")
+    payload = json.loads(run([sys.executable, str(SCRIPT), "--handoff", str(handoff), "--repo", str(repo)]).stdout)
+    assert payload["candidate_evidence_status"] == "foreign_scope"
+    assert payload["validation_evidence_source"] == "foreign_scope_candidate_evidence"
+    assert payload["validation_records"] == []
+    assert payload["validation_commands"] == ["npm test"]
+
+
+def test_handoff_intake_requires_run_and_scope_binding_before_reusing_evidence(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    _evidence_path, evidence, _record_path = create_valid_reviewed_candidate_evidence_fixture(
+        tmp_path, repo, cache_key_character="d", command_digest_character="e", environment_digest_character="f",
+    )
+    handoff = tmp_path / "handoff.md"
+    validation = "## 验证\n\n- `npm test` -> passed\n"
+    for identity, expected_status in (
+        ("", "unbound_run"),
+        (f"- run id: `{evidence['review']['run_id']}`\n", "unbound_scope"),
+    ):
+        handoff.write_text(identity + validation, encoding="utf-8")
+        payload = json.loads(run([sys.executable, str(SCRIPT), "--handoff", str(handoff), "--repo", str(repo)]).stdout)
+        assert payload["candidate_evidence_status"] == expected_status
+        assert payload["validation_records"] == []
+        assert payload["validation_commands"] == ["npm test"]
+        assert payload["candidate_evidence_identity_recovery_condition"]
+
+
 def test_handoff_intake_treats_incomplete_candidate_evidence_as_invalid_not_stale(
     tmp_path: Path,
 ) -> None:
@@ -588,8 +617,8 @@ def test_handoff_intake_treats_incomplete_candidate_evidence_as_invalid_not_stal
 def test_candidate_evidence_fixture_does_not_write_into_ambient_rvf_run_directory(
     tmp_path: Path,
 ) -> None:
-    # 回归：validation_result_cache 的 --rvf-run-dir 曾缺省回退到 RVF_RUN_DIR；fixture 不传该参数，
-    # 在活 run shell 里跑测试会把 targeted-* 记录写进活 run。源头与 clean_test_environment 两层都挡。
+    # 回归：validation_result_cache 曾回退使用活 RVF_RUN_DIR；fixture 现显式绑定隔离 run，
+    # 并继续剥离环境中的活 run，防止测试记录污染真实账本。
     ambient_run_directory = tmp_path / "ambient-rvf-run-directory-must-stay-untouched"
     ambient_run_directory.mkdir()
     repo = init_repo(tmp_path / "repo")

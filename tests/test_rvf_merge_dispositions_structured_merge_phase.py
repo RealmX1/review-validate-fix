@@ -26,6 +26,7 @@ from test_reviewed_task_candidate_evidence import (  # noqa: E402
     WRITE_CANDIDATE_EVIDENCE,
     clean_test_environment,
     create_completed_run,
+    record_terminal_fix_attempt,
     repository,
 )
 from test_rvf_land_single_step_prepare_and_commit import (  # noqa: E402
@@ -603,10 +604,11 @@ def test_evidence_refuses_handoff_count_that_disagrees_with_dispositions(tmp_pat
     repo, run_dir = _run_with_reviewer_issues(tmp_path)
     assert _write_dispositions(run_dir, _adopt_merge_drop_decisions()).returncode == 0
     assert _upsert(tmp_path, repo, run_dir, _canonical_issue_file(tmp_path, "RVF-001")).returncode == 0
+    record_terminal_fix_attempt(run_dir, "RVF-001")
     _handoff(run_dir, "共 2 条，2 真实修复 / 0 误报 / 0 升级", "- **[fixed]** a\n- **[fixed]** b\n")
     refused = _run_evidence_writer(repo, run_dir)
     assert refused.returncode == 2
-    assert "disagrees with merge dispositions (1 fix-issues)" in refused.stderr
+    assert "does not match completed outcomes" in refused.stderr
     _handoff(run_dir, "共 1 条，1 真实修复 / 0 误报 / 0 升级", "- **[fixed]** `tracked.txt:1` - RVF-001\n")
     written = _run_evidence_writer(repo, run_dir)
     assert written.returncode == 0, written.stderr

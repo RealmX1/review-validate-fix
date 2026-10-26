@@ -4245,6 +4245,59 @@ def lease_participant_finish(
             conn.close()
 
 
+def read_tracker_lease_reconciliation_evidence_for_exact_run(
+    *,
+    repo: str | Path,
+    run_id: str,
+    expected_lease_id: str | None = None,
+    log_root_override: Path | None = None,
+) -> dict[str, Any]:
+    """只读核验精确 run 的 lease 归属和终态，供清理前补证；读失败保持 unknown。
+
+    原 run artifact 丢失时可从原生账本恢复 lease 身份；artifact 若指向别的 run 则拒绝释放。
+    当前工作树必须持有该 lease 的全部 unit，不能因同仓／同名 run 就释放另一 worktree 的 lease。
+    """
+    connection: sqlite3.Connection | None = None
+    try:
+        repo_resolved = Path(repo).expanduser().resolve()
+        common_dir = git_common_dir(repo_resolved)
+        if common_dir is None:
+            return {"status": "unknown", "reason": "tracker_repository_identity_unavailable"}
+        base = log_root_override if log_root_override is not None else log_root()
+        db_path = tracker_dir(base, repo_key(common_dir)) / SQLITE_FILENAME
+        try:
+            db_path.stat()
+        except FileNotFoundError:
+            if expected_lease_id:
+                return {"status": "unknown", "reason": "expected_tracker_lease_database_missing"}
+            return {"status": "verified", "reason": "no_tracker_database", "leases": []}
+        connection = sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True, timeout=0.25)
+        connection.row_factory = sqlite3.Row
+        connection.execute("BEGIN")
+        if expected_lease_id:
+            expected = connection.execute("SELECT run_id FROM leases WHERE lease_id=?", (expected_lease_id,)).fetchone()
+            if expected is None or expected["run_id"] != run_id:
+                return {"status": "unknown", "reason": "tracker_lease_exact_run_identity_mismatch",
+                        "lease_id": expected_lease_id, "run_id": run_id}
+        rows = connection.execute("SELECT lease_id, run_id, state FROM leases WHERE run_id=?", (run_id,)).fetchall()
+        for row in rows:
+            worktrees = connection.execute(
+                "SELECT DISTINCT u.worktree_key FROM lease_units lu JOIN units u ON u.unit_id=lu.unit_id WHERE lu.lease_id=?",
+                (row["lease_id"],),
+            ).fetchall()
+            if any(item["worktree_key"] != _worktree_key(str(repo_resolved)) for item in worktrees):
+                return {"status": "unknown", "reason": "tracker_lease_worktree_identity_mismatch",
+                        "lease_id": row["lease_id"], "run_id": run_id}
+        return {"status": "verified", "reason": "native_tracker_exact_run_checked",
+                "run_id": run_id, "leases": [dict(row) for row in rows]}
+    except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+        return {"status": "unknown", "reason": "native_tracker_exact_run_query_failed",
+                "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        if connection is not None:
+            connection.close()
+
+
 def lease_release(
     *,
     repo: str | Path,

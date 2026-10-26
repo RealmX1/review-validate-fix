@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+from independent_backup_route import guard_normal_mutation, tracked_subprocess_run
+
 import argparse
+import hashlib
 import json
 import os
 import secrets
@@ -16,11 +19,13 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
+from core.review_run_qualification_mutation_lock import guard_review_run_qualification_mutation  # noqa: E402
 import rvf_fix_issue  # noqa: E402
-from core.session_scope_allocation import reviewable_unit_diff_tracker  # noqa: E402
-from review_scope_excluded_path_prefixes import (  # noqa: E402
-    BUILTIN_DEVELOPER_TOOL_MANAGED_PATH_PREFIXES_EXCLUDED_FROM_REVIEW_SCOPE,
+from fix_attempt_scope_expansion_classification import (  # noqa: E402
+    canonical_issue_authorized_fix_paths, classify_fix_attempt_scope_expansion,
 )
+from validation_result_cache import canonical_json_bytes  # noqa: E402
+from core.session_scope_allocation import reviewable_unit_diff_tracker  # noqa: E402
 
 FIX_ATTEMPT_STOP_STATUS_VALIDATED_AND_SUBMITTED_TO_KANBAN_BACKLOG = (
     reviewable_unit_diff_tracker.RVF_ATTEMPT_STATUS_VALIDATED_AND_SUBMITTED_TO_KANBAN_BACKLOG
@@ -59,7 +64,7 @@ def _run(
     check: bool = True,
     text: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    completed = subprocess.run(
+    completed = tracked_subprocess_run(
         ["git", *args],
         cwd=str(repo),
         capture_output=True,
@@ -134,20 +139,7 @@ def _safe_relative_paths(paths: list[str]) -> list[str]:
 
 
 def _issue_paths(issue: dict[str, Any]) -> list[str]:
-    paths: list[str] = []
-    for key in ("path", "file"):
-        value = issue.get(key)
-        if isinstance(value, str) and value.strip():
-            paths.append(value.strip())
-    raw_paths = issue.get("paths")
-    if isinstance(raw_paths, list):
-        paths.extend(item.strip() for item in raw_paths if isinstance(item, str) and item.strip())
-    refs = issue.get("artifact_refs")
-    if isinstance(refs, list):
-        for ref in refs:
-            if isinstance(ref, dict) and isinstance(ref.get("path"), str) and ref["path"].strip():
-                paths.append(ref["path"].strip())
-    return _safe_relative_paths(paths)
+    return canonical_issue_authorized_fix_paths(issue)
 
 
 def _scope_contract_path(run_dir: Path) -> Path | None:
@@ -184,7 +176,24 @@ def _scope_contract(run_dir: Path) -> dict[str, Any]:
     path = _scope_contract_path(run_dir)
     if path is None:
         return {}
-    return _read_json(path)
+    contract = _read_json(path)
+    history = contract.get("landing_restamp")
+    if not history:
+        return contract
+    reviewed_path = path.parent / "scope.contract.reviewed.json"
+    digest_path = Path(str(reviewed_path) + ".sha256")
+    if (not isinstance(history, list) or not isinstance(history[0], dict)
+        or reviewed_path.is_symlink() or digest_path.is_symlink()
+        or not reviewed_path.is_file() or not digest_path.is_file()):
+        raise ValueError("落地后缺少绑定的原始冻结合同")
+    reviewed = _read_json(reviewed_path)
+    encoded = canonical_json_bytes(reviewed)
+    digest = hashlib.sha256(encoded).hexdigest()
+    if (reviewed_path.read_bytes() != encoded or digest_path.read_text().strip() != digest
+        or digest != history[0].get("reviewed_contract_sha256")
+        or reviewed.get("run_id") != contract.get("run_id")):
+        raise ValueError("原始冻结合同的摘要或身份不一致")
+    return reviewed
 
 
 def _scope_list(contract: dict[str, Any], key: str) -> list[str]:
@@ -341,6 +350,7 @@ def _commit_all(repo: Path, message: str) -> str:
     return _run(repo, ["rev-parse", "HEAD"], check=True).stdout.strip()
 
 
+@guard_review_run_qualification_mutation("run_dir")
 def prepare_fix_attempt(
     *,
     run_dir: Path,
@@ -365,6 +375,9 @@ def prepare_fix_attempt(
     if worktree.exists():
         raise ValueError(f"attempt worktree already exists: {worktree}")
     attempt_dir.mkdir(parents=True, exist_ok=True)
+    from core.run_ledger.review_run_lifecycle import observe_bound_review_run_component_phase
+
+    observe_bound_review_run_component_phase(run_dir, phase="validate_fix")
     _run(repo, ["worktree", "add", "--detach", str(worktree), base_head])
     # 观察面 = 真实工作区：全部 dirty / untracked 都物化进 attempt（不再只叠 boundary 内的），
     # 修改权仍由 stop 时的 boundary / 声明 / 确认三档控制。baseline 提交含全部 WIP，
@@ -431,6 +444,7 @@ def command_prepare(args: argparse.Namespace) -> int:
     return 0
 
 
+@guard_review_run_qualification_mutation("run_dir")
 def mark_fix_attempt_started(
     *,
     run_dir: Path,
@@ -467,6 +481,7 @@ FIX_ATTEMPT_SUBAGENT_AWAITING_MARKER_DISPATCHER = "rvf fix prepare（validate/fi
 ATTEMPT_FIELD_MAIN_AGENT_SESSION_ID_AWAITING_FIX_SUBAGENT = "main_agent_session_id_awaiting_fix_subagent"
 
 
+@guard_review_run_qualification_mutation("run_dir")
 def arm_fix_attempt_subagent_awaiting_marker(
     *, run_dir: Path, attempt_id: str, main_agent_session_id: str
 ) -> Path | None:
@@ -593,64 +608,16 @@ def _changed_paths(repo: Path, paths: list[str]) -> list[dict[str, str]]:
 
 
 def _scope_expansion_metadata(
-    *,
-    changed: list[dict[str, str]],
-    boundary_paths: list[str],
-    declared_paths: list[str],
-    acknowledged_protected_or_background_paths: list[str],
-    reason: str | None,
-    scope_contract: dict[str, Any],
+    *, changed: list[dict[str, str]], boundary_paths: list[str], declared_paths: list[str],
+    acknowledged_protected_or_background_paths: list[str], reason: str | None,
+    scope_contract: dict[str, Any], canonical_issue: dict[str, Any],
 ) -> dict[str, Any]:
-    """把 attempt 的改动按「护栏而非闸门」三档分类。
-
-    - boundary 内的普通路径：直接改；
-    - boundary 外的普通路径：stop 时声明（``--scope-expansion-path``）+ 理由，记 warning、apply 照常；
-    - background / protected / 用户声明的 excluded（**含 boundary 内**——issue 路径恰好落在别的会话
-      WIP 上时同样算）：fixer 显式确认（``--acknowledged-protected-or-background-path-modification``）+
-      理由后 stop 接受，apply 前还要主会话核对后确认；
-    - 内置工具托管前缀（``.serena/``）：编辑工具生成的状态从来不是有效修复，保持硬拒。"""
-    boundary = set(boundary_paths)
-    changed_paths = list(dict.fromkeys(item["path"] for item in changed))
-    builtin_managed_prefixes = list(BUILTIN_DEVELOPER_TOOL_MANAGED_PATH_PREFIXES_EXCLUDED_FROM_REVIEW_SCOPE)
-    user_declared_excluded_prefixes = [
-        prefix for prefix in _scope_list(scope_contract, "excluded_path_prefixes")
-        if prefix.rstrip("/") + "/" not in builtin_managed_prefixes
-    ]
-    protected_patterns = _scope_list(scope_contract, "protected_files") + _scope_list(scope_contract, "background_files")
-    builtin_tool_managed_paths_modified = [path for path in changed_paths if _prefix_matches(path, builtin_managed_prefixes)]
-    protected_or_background_paths_modified = [
-        path
-        for path in changed_paths
-        if path not in builtin_tool_managed_paths_modified
-        and (
-            path in set(protected_patterns)
-            or _prefix_matches(path, protected_patterns)
-            or _prefix_matches(path, user_declared_excluded_prefixes)
-        )
-    ]
-    acknowledged = set(acknowledged_protected_or_background_paths)
-    declared = set(declared_paths)
-    ordinary_paths_outside_boundary = [
-        path
-        for path in changed_paths
-        if path not in boundary
-        and path not in builtin_tool_managed_paths_modified
-        and path not in protected_or_background_paths_modified
-    ]
-    return {
-        "expanded_paths": [path for path in ordinary_paths_outside_boundary if path in declared],
-        "declared_paths": declared_paths,
-        "undeclared_paths": [path for path in ordinary_paths_outside_boundary if path not in declared],
-        "acknowledged_protected_or_background_paths": [
-            path for path in protected_or_background_paths_modified if path in acknowledged
-        ],
-        "unacknowledged_protected_or_background_paths": [
-            path for path in protected_or_background_paths_modified if path not in acknowledged
-        ],
-        # 只剩内置工具托管前缀仍是硬拒；键名沿用 blocked_paths。
-        "blocked_paths": builtin_tool_managed_paths_modified,
-        "reason": (reason or "").strip(),
-    }
+    return classify_fix_attempt_scope_expansion(
+        changed_paths=[item["path"] for item in changed], boundary_paths=boundary_paths,
+        declared_paths=declared_paths,
+        acknowledged_protected_or_background_paths=acknowledged_protected_or_background_paths,
+        reason=reason, scope_contract=scope_contract, canonical_issue=canonical_issue,
+    )
 
 
 def _validate_scope_expansion(status: str, metadata: dict[str, Any], *, attempt_id: str) -> None:
@@ -685,7 +652,7 @@ def _validate_scope_expansion(status: str, metadata: dict[str, Any], *, attempt_
             f"agent will verify and confirm before apply: `rvf fix stop --attempt-id {attempt_id} ... {flags} "
             "--scope-expansion-reason <why>`; otherwise revert them"
         )
-    if (expanded_paths or acknowledged_paths) and not reason:
+    if (expanded_paths or acknowledged_paths or metadata.get("requires_explicit_scope_expansion_reason")) and not reason:
         joined = ", ".join([*expanded_paths, *acknowledged_paths])
         raise ValueError(
             "fixed attempt expands validate/fix scope but no reason was provided; "
@@ -741,6 +708,18 @@ def _load_kanban_backlog_findings_before_any_write(args: argparse.Namespace) -> 
     return backlog_submission.load_out_of_scope_findings_file(Path(raw).expanduser().resolve())
 
 
+def _qualification_run_directory_for_stop(arguments):
+    args = arguments["args"]
+    inferred = infer_run_dir_and_attempt_id_from_attempt_worktree_path(Path.cwd())
+    if args.attempt_id is None and inferred is None:
+        # 参数不足时交回原命令报告缺失 attempt ID；此前不会产生资格写入。
+        return None
+    if args.run_dir or os.environ.get("RVF_RUN_DIR"):
+        return _required_path(args.run_dir, "RVF_RUN_DIR", "--run-dir")
+    return inferred[0] if inferred is not None else _required_path(None, "RVF_RUN_DIR", "--run-dir")
+
+
+@guard_review_run_qualification_mutation(_qualification_run_directory_for_stop)
 def command_stop(args: argparse.Namespace) -> int:
     inferred = infer_run_dir_and_attempt_id_from_attempt_worktree_path(Path.cwd())
     if args.attempt_id is None:
@@ -770,6 +749,11 @@ def command_stop(args: argparse.Namespace) -> int:
         )
     _intent_to_add_untracked(worktree, [])
     all_changed = _changed_paths(worktree, [])
+    canonical_issue = _issue_payload(run_dir, attempt["issue_id"])
+    if (canonical_issue.get("run_id") != attempt["run_id"]
+        or canonical_issue.get("issue_id") != attempt["issue_id"]
+        or set(_issue_paths(canonical_issue)) != set(attempt.get("issue_paths", []))):
+        raise ValueError("canonical issue 与 prepare 时的路径或身份不一致")
     scope_expansion = _scope_expansion_metadata(
         changed=all_changed,
         boundary_paths=boundary_paths,
@@ -779,12 +763,14 @@ def command_stop(args: argparse.Namespace) -> int:
         ),
         reason=args.scope_expansion_reason,
         scope_contract=_scope_contract(run_dir),
+        canonical_issue=canonical_issue,
     )
     patch_paths = list(
         dict.fromkeys(
             [
                 *boundary_paths,
                 *scope_expansion["expanded_paths"],
+                *scope_expansion["declared_paths_outside_attempt_boundary"],
                 *scope_expansion["acknowledged_protected_or_background_paths"],
             ]
         )
@@ -856,7 +842,8 @@ def command_stop(args: argparse.Namespace) -> int:
     baseline_commit = str(attempt.get("baseline_commit") or "HEAD")
     baseline_git_blob_id_by_expansion_path = {
         path: _blob_id_at_commit(worktree, baseline_commit, path)
-        for path in [*scope_expansion["expanded_paths"], *scope_expansion["acknowledged_protected_or_background_paths"]]
+        for path in [*scope_expansion["expanded_paths"], *scope_expansion["declared_paths_outside_attempt_boundary"],
+                     *scope_expansion["acknowledged_protected_or_background_paths"]]
     }
     warnings: list[str] = []
     if status in {"false_positive", "elevated", "failed"} and all_changed:
@@ -864,8 +851,11 @@ def command_stop(args: argparse.Namespace) -> int:
             f"attempt stopped as {status} but modified files; these changes are not applied: "
             + ", ".join(item["path"] for item in all_changed)
         )
-    if scope_expansion["expanded_paths"]:
-        warnings.append("declared allowlist-external changes: " + ", ".join(scope_expansion["expanded_paths"]))
+    declared_or_frozen_scope_expansion_paths = list(dict.fromkeys([
+        *scope_expansion["expanded_paths"], *scope_expansion["declared_paths_outside_attempt_boundary"],
+    ]))
+    if declared_or_frozen_scope_expansion_paths:
+        warnings.append("declared allowlist-external changes: " + ", ".join(declared_or_frozen_scope_expansion_paths))
     result = {
         "schema_version": 1,
         "attempt_id": args.attempt_id,
@@ -1017,6 +1007,14 @@ def _ownership_classification_for_acknowledged_path(path: str, scope_contract: d
     return "合同未登记"
 
 
+def _backup_route_fix_attempt_target(arguments):
+    attempt = _load_attempt(arguments["run_dir"], arguments["attempt_id"])
+    return _optional_repo(arguments.get("target_repo_override"), attempt)
+
+
+@guard_normal_mutation(_backup_route_fix_attempt_target, "apply-fix-attempt", "run_dir")
+@guard_review_run_qualification_mutation("run_dir")
+
 def apply_fix_attempt(
     *,
     run_dir: Path,
@@ -1045,7 +1043,10 @@ def apply_fix_attempt(
     expanded_paths = _safe_relative_paths(scope_expansion.get("expanded_paths", []))
     acknowledged_paths = _safe_relative_paths(scope_expansion.get("acknowledged_protected_or_background_paths", []))
     recorded_blobs = attempt.get("baseline_git_blob_id_by_expansion_path")
-    guarded_paths = [*expanded_paths, *acknowledged_paths]
+    guarded_paths = list(dict.fromkeys([
+        *expanded_paths, *_safe_relative_paths(scope_expansion.get("declared_paths_outside_attempt_boundary", [])),
+        *acknowledged_paths,
+    ]))
     if isinstance(recorded_blobs, dict):
         drifted_paths = [
             path for path in guarded_paths if _current_working_tree_blob_id(repo, path) != recorded_blobs.get(path)

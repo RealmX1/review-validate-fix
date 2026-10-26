@@ -34,7 +34,11 @@ double-review 的一腿。它只：
 """
 from __future__ import annotations
 
+from contextvars import copy_context
+from independent_backup_route import durable_json, guard_normal_mutation, tracked_subprocess_run
+
 import argparse
+import hashlib
 from datetime import datetime, timezone
 import json
 import os
@@ -49,8 +53,14 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 core.* import
+from core.review_run_qualification_mutation_lock import guard_review_run_qualification_mutation, run_directory_for_qualification_artifact
+from review_start_boundary_gate import require_prepared_run_review_start_boundary
+from core.review_start_boundary.review_start_boundary_verification import ReviewStartBoundaryNotVerified
 import harness_limit_cooldown
 from core.run_ledger.run_ledger import safe_token, start_run
+from core.host_adapter.current_agent_session_identity_from_environment import (
+    CURRENT_AGENT_SESSION_ID_ENVIRONMENT_VARIABLE_NAMES,
+)
 from rvf_detached_thread import (
     LAUNCH_FAILED,
     LAUNCH_LAUNCHED,
@@ -830,6 +840,7 @@ def _resume_plan_for_review_request_legs(
     return plan, indices
 
 
+@guard_review_run_qualification_mutation(lambda arguments: run_directory_for_qualification_artifact(arguments["artifacts_dir"] / "reviewers/reviewer-plan.json"))
 def _rotate_review_request_leg_artifacts(
     plan: dict[str, Any], indices: list[int], artifacts_dir: Path
 ) -> list[str]:
@@ -859,6 +870,29 @@ def _rotate_review_request_leg_artifacts(
     return rotated
 
 
+@guard_review_run_qualification_mutation(lambda arguments: run_directory_for_qualification_artifact(arguments["path"]))
+def write_canonical_reviewer_plan(path: Path, plan: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _backup_route_dispatch_repository(arguments):
+    # 原有开审资格核验先于接管登记；非仓库或未开审输入仍按原契约拒绝。
+    supplemental_qualification = arguments.get("supplemental_review_qualification_path")
+    if supplemental_qualification is not None:
+        from supplemental_land_completion import require_supplemental_review_dispatch_qualification
+        require_supplemental_review_dispatch_qualification(
+            supplemental_qualification, review_packet_path=arguments.get("review_packet"),
+            **{name: arguments.get(name) for name in ("repo", "scope_contract", "run_id", "run_dir")},
+        )
+    else:
+        require_prepared_run_review_start_boundary(
+            **{name: arguments.get(name) for name in ("repo", "scope_contract", "run_id", "run_dir")}
+        )
+    return arguments.get("repo")
+
+
+@guard_normal_mutation(_backup_route_dispatch_repository, "dispatch-reviewers", "run_dir")
 def execute_plan(
     plan: dict[str, Any],
     *,
@@ -874,6 +908,8 @@ def execute_plan(
     available: list[str] | None = None,
     max_fallback_rounds: int = 2,
     initial_dispatch_indices: list[int] | None = None,
+    reviewer_command_output_directory: Path | None = None,
+    supplemental_review_qualification_path: Path | None = None,
 ) -> dict[str, Any]:
     """派发 plan 的两路 external reviewer，回填 returncode / result path / status。
 
@@ -934,7 +970,21 @@ def execute_plan(
                 run_dir=run_dir,
             )
             try:
-                completed = subprocess.run(cmd)
+                if reviewer_command_output_directory is None:
+                    completed = tracked_subprocess_run(cmd)
+                else:
+                    reviewer_command_output_directory.mkdir(parents=True, exist_ok=True)
+                    output_stem = reviewer_command_output_directory / reviewer["reviewer_id"]
+                    # 嵌入机器 JSON 接口时保留各腿原始输出，避免子进程 stdout 混入调用方协议。
+                    with Path(str(output_stem) + ".stdout.log").open("ab") as stdout_log, Path(str(output_stem) + ".stderr.log").open("ab") as stderr_log:
+                        completed = tracked_subprocess_run(cmd, stdout=stdout_log, stderr=stderr_log)
+                    receipt = {"schema": "rvf-reviewer-command-execution-result", "schema_version": 1,
+                               "run_id": run_id, "repo": repo, "reviewer_id": reviewer["reviewer_id"],
+                               "packet_sha256": hashlib.sha256(Path(review_packet).read_bytes()).hexdigest(),
+                               "returncode": completed.returncode, "completed_at": datetime.now(timezone.utc).isoformat()}
+                    receipt_bytes = json.dumps(receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+                    durable_json(reviewer_command_output_directory / "execution-results" / (hashlib.sha256(receipt_bytes).hexdigest() + ".json"), receipt)
+                    durable_json(Path(str(output_stem) + ".execution-result.json"), receipt)
                 local_results[index] = completed.returncode
             except OSError as exc:  # pragma: no cover - 启动失败
                 local_results[index] = 1
@@ -944,7 +994,7 @@ def execute_plan(
             for index in indices:
                 _run(index)
         else:
-            threads = [threading.Thread(target=_run, args=(index,)) for index in indices]
+            threads = [threading.Thread(target=copy_context().run, args=(_run, index)) for index in indices]
             for thread in threads:
                 thread.start()
             for thread in threads:
@@ -1368,6 +1418,7 @@ def launch_detached_dispatch(
     （failed→1、``blocked_on_reviewer_request``→``DISPATCH_BLOCKED_ON_REVIEWER_REQUEST_EXIT_CODE``），
     线程已死时锁会被判陈旧并重夺，主会话处置完 reviewer request 后能经同一入口重派。
     """
+    prepared_boundary = require_prepared_run_review_start_boundary(repo=repo, scope_contract=scope_contract, run_id=ledger.run_id if ledger else None, run_dir=ledger.run_dir if ledger else None)
     reviewers_dir.mkdir(parents=True, exist_ok=True)
     status_path = reviewers_dir / DISPATCH_STATUS_FILENAME
     log_path = reviewers_dir / DISPATCH_LOG_FILENAME
@@ -1387,6 +1438,8 @@ def launch_detached_dispatch(
     status_payload = {
         "schema_version": DISPATCH_STATUS_SCHEMA_VERSION,
         "kind": "dispatch",
+        "repo": repo,
+        "session_id": (prepared_boundary or {}).get("session_id"),
         "run_id": ledger.run_id,
         "run_dir": str(ledger.run_dir),
         "run_name": run_name,
@@ -1401,6 +1454,18 @@ def launch_detached_dispatch(
         "error": None,
     }
 
+    # 已有 tmux server 不会继承 client 的当前环境。所有受支持身份字段都须在内层覆盖；
+    # 父进程缺失的字段写空，防止 server 残留的任务／会话／harness 信号改变 marker 分键。
+    detached_dispatch_environment_exports = {
+        name: os.environ.get(name, "")
+        for name in (
+            "KANBAN_TASK_ID", "CLINE_KANBAN_TASK_ID", "KANBAN_HOOK_TASK_ID",
+            *CURRENT_AGENT_SESSION_ID_ENVIRONMENT_VARIABLE_NAMES,
+            "CLAUDECODE", "CURSOR_AGENT", "CODEX_RVF_CLINE_KANBAN_AGENT_ID", "AI_AGENT",
+        )
+    }
+    detached_dispatch_environment_exports.update(ledger.env())
+
     result = launch_detached(
         session_name=session_name,
         argv=child_argv,
@@ -1408,15 +1473,12 @@ def launch_detached_dispatch(
         status_path=status_path,
         lock_path=lock_path,
         status_payload=status_payload,
-        # 把 RVF env 显式写进 tmux 内层 shell 的 `export X=Y;` 行，让 detached
-        # reviewer 子进程稳定读到 CODEX_RVF_LOG_ROOT 等——不再依赖 tmux server 是否
-        # 预存在的 env 继承（既有 tmux server 会让 new-session 继承 server 的 env，
-        # 丢掉这里 launch_env 传入的值）。否则 reviewer 的 diff-tracker DB 落到默认
-        # state 目录、与 prepare 写 lease 的库分叉 → lease_not_found。
-        exports=ledger.env(),
-        launch_env={**os.environ, **ledger.env()},
+        # run 日志根与当前身份一并写进内层 shell，保持 prepare 的 tracker 库与任务基线。
+        exports=detached_dispatch_environment_exports,
+        launch_env={**os.environ, **detached_dispatch_environment_exports},
         idempotency_key=f"rvf-dispatch:{run_name}",
         total_timeout_seconds=args.total_timeout,
+        require_actual_dispatcher_writer_execution_evidence=True,
     )
 
     ledger.event(
@@ -1577,6 +1639,15 @@ def main() -> int:
         or os.environ.get("RVF_SESSION_CONTEXT")
     )
     scope_contract = args.scope_contract or os.environ.get("RVF_SCOPE_CONTRACT")
+
+    if args.execute:
+        try:
+            boundary_contract = json.loads(Path(scope_contract).read_text()) if scope_contract else {}
+            args.rvf_run_id = args.rvf_run_id or os.environ.get("RVF_RUN_ID") or boundary_contract.get("run_id")
+            require_prepared_run_review_start_boundary(repo=repo, scope_contract=scope_contract, run_id=args.rvf_run_id, run_dir=args.rvf_run_dir)
+        except (ReviewStartBoundaryNotVerified, OSError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 4
 
     try:
         registry = load_registry(Path(args.registry))
@@ -1752,7 +1823,7 @@ def main() -> int:
 
     reviewers_dir.mkdir(parents=True, exist_ok=True)
     plan_path = reviewers_dir / "reviewer-plan.json"
-    plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    write_canonical_reviewer_plan(plan_path, plan)
     print(str(plan_path))
 
     if plan["status"] == "failed":
@@ -1769,4 +1840,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from dispatcher_writer_execution_evidence import run_actual_dispatcher_with_writer_execution_evidence
+
+    raise SystemExit(run_actual_dispatcher_with_writer_execution_evidence(main, dispatcher_script_path=Path(__file__).resolve()))
