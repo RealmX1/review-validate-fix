@@ -26,8 +26,8 @@ REQUIRED_PLUGIN_RELATIVE_PATHS = (
     Path("core/__init__.py"),
     Path("adapters/__init__.py"),
     Path("skills/review-validate-fix/SKILL.md"),
-    Path("skills/review-validate-fix/scripts/stop_hook_router.py"),
-    Path("skills/review-validate-fix/scripts/rvf_user_prompt_submit.py"),
+    Path("skills/review-validate-fix/scripts/task_snapshot_review_hook.py"),
+    Path("skills/review-validate-fix/scripts/task_snapshot_review_hook.py"),
     Path("skills/rvf-local-deploy/SKILL.md"),
 )
 
@@ -266,87 +266,18 @@ def _default_command_runner(command: list[str]) -> subprocess.CompletedProcess[s
     )
 
 
-def _run_synthetic_installed_hook_smoke(
-    *,
-    active_plugin_root: Path,
-    deployment_source_worktree: Path,
-    home_directory: Path,
-    user_local_data_root: Path,
-) -> dict[str, Any]:
-    stop_router = (
-        active_plugin_root
-        / "skills/review-validate-fix/scripts/stop_hook_router.py"
-    )
-    stop_dispatcher = (
-        active_plugin_root
-        / "skills/review-validate-fix/scripts/stop_hook_dispatcher.py"
-    )
-    prompt_hook = (
-        active_plugin_root
-        / "skills/review-validate-fix/scripts/rvf_user_prompt_submit.py"
-    )
-    synthetic_environment = {
-        **os.environ,
-        "HOME": str(home_directory),
-        "RVF_USER_LOCAL_DATA_ROOT": str(user_local_data_root),
-        "CODEX_RVF_LOG_ROOT": str(user_local_data_root / "run-logs"),
-        "CODEX_RVF_STATE_DIR": str(user_local_data_root / "runtime-state"),
-        "CODEX_RVF_INSTALLED_SKILL_DIR": str(
-            active_plugin_root / "skills/review-validate-fix"
-        ),
-        "CODEX_RVF_SESSION_HOOK_STATE_DIR": str(
-            user_local_data_root / "runtime-state/session-hook"
-        ),
-        "CODEX_RVF_STABLE_STOP_HOOK": str(stop_dispatcher),
-        "CODEX_RVF_DEV_SYNC": "0",
-        "RVF_SUPPRESS": "1",
-        "RVF_SUPPRESS_STOP_HOOK": "1",
-    }
-    smoke_cases = (
-        (
-            "codex_stop_router",
-            stop_router,
-            {
-                "hook_event_name": "Stop",
-                "cwd": str(deployment_source_worktree),
-                "session_id": "rvf-local-deploy-synthetic-smoke",
-                "last_user_message": "RVF local deploy synthetic hook smoke",
-            },
-        ),
-        (
-            "codex_user_prompt_submit",
-            prompt_hook,
-            {
-                "hook_event_name": "UserPromptSubmit",
-                "cwd": str(deployment_source_worktree),
-                "session_id": "rvf-local-deploy-synthetic-smoke",
-                "prompt": "RVF local deploy synthetic hook smoke",
-            },
-        ),
-    )
-    evidence: dict[str, Any] = {}
-    for label, script_path, event in smoke_cases:
-        completed = subprocess.run(
-            [sys.executable, str(script_path)],
-            input=json.dumps(event),
-            cwd=deployment_source_worktree,
-            env=synthetic_environment,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=30,
-        )
-        detail = completed.stderr.strip() or completed.stdout.strip()
-        _require(
-            completed.returncode == 0,
-            f"{label} synthetic hook smoke 失败: {detail}",
-        )
-        evidence[label] = {
-            "status": "ok",
-            "script": str(script_path),
-            "returncode": completed.returncode,
-            "stdout_emitted": bool(completed.stdout.strip()),
-        }
+def _run_synthetic_installed_hook_smoke(*, active_plugin_root: Path, deployment_source_worktree: Path, home_directory: Path, user_local_data_root: Path) -> dict[str, Any]:
+    hook = active_plugin_root / "skills/review-validate-fix/scripts/task_snapshot_review_hook.py"
+    synthetic_environment = {**os.environ, "HOME":str(home_directory),
+        "CODEX_HOME":str(home_directory / ".codex"), "CODEX_SQLITE_HOME":str(home_directory / ".codex-sqlite"),
+        "RVF_USER_LOCAL_DATA_ROOT":str(user_local_data_root), "RVF_SUPPRESS_STOP_HOOK":"1"}
+    evidence = {}
+    for event_name in ("Stop", "UserPromptSubmit"):
+        result = subprocess.run([sys.executable,str(hook),"--event",event_name,"--host","codex"],
+            input=json.dumps({"cwd":str(deployment_source_worktree),"prompt":"安装隔离验收"}),
+            env=synthetic_environment,capture_output=True,text=True,timeout=15)
+        _require(result.returncode == 0, f"{event_name} hook 隔离验收失败: {result.stderr}")
+        evidence[event_name] = {"status":"ok","script":str(hook),"returncode":result.returncode,"stdout_emitted":bool(result.stdout.strip())}
     return evidence
 
 
@@ -495,8 +426,8 @@ def verify_local_deploy(
     hooks = _read_json(hooks_path)
     stop_commands = _hook_commands_for_event(hooks, "Stop")
     prompt_commands = _hook_commands_for_event(hooks, "UserPromptSubmit")
-    stop_router = active_plugin_root / "skills/review-validate-fix/scripts/stop_hook_router.py"
-    prompt_hook = active_plugin_root / "skills/review-validate-fix/scripts/rvf_user_prompt_submit.py"
+    stop_router = active_plugin_root / "skills/review-validate-fix/scripts/task_snapshot_review_hook.py"
+    prompt_hook = active_plugin_root / "skills/review-validate-fix/scripts/task_snapshot_review_hook.py"
     _require(
         any(_command_targets_script(command, stop_router) for command in stop_commands),
         "Stop hook 未精确指向 active marketplace router",
@@ -505,14 +436,7 @@ def verify_local_deploy(
         any(_command_targets_script(command, prompt_hook) for command in prompt_commands),
         "UserPromptSubmit hook 未精确指向 active marketplace detector",
     )
-    required_environment_paths = {
-        "RVF_USER_LOCAL_DATA_ROOT": user_local_data_root,
-        "CODEX_RVF_LOG_ROOT": run_logs_root,
-        "CODEX_RVF_STATE_DIR": runtime_state_root,
-        "CODEX_RVF_INSTALLED_SKILL_DIR": (
-            active_plugin_root / "skills/review-validate-fix"
-        ),
-    }
+    required_environment_paths = {"RVF_USER_LOCAL_DATA_ROOT": user_local_data_root}
     for event_name, commands in (
         ("Stop", stop_commands),
         ("UserPromptSubmit", prompt_commands),

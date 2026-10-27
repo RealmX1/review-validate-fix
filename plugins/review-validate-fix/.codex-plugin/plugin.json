@@ -1,7 +1,7 @@
 {
   "name": "review-validate-fix",
   "version": "0.1.0",
-  "description": "Run a post-work double-review, validate/fix, and handoff loop for Codex workspaces.",
+  "description": "固定任务快照、独立双审与匿名验证修复；主会话直接收尾。",
   "author": {
     "name": "Bomin Zhang",
     "email": "30303853+RealmX1@users.noreply.github.com",

@@ -12,68 +12,15 @@
     "--thinking",
     "xhigh"
   ],
-  "_comment_prompt_delivery_is_not_stdin_here": [
-    "【这条是端到端实跑逼出来的，不是设计推导】`omp -p` 【不读 stdin】。喂进去的整份 prompt",
-    "会被静默丢弃，而进程 exit 0、stderr 全空、stdout 只有一行 session、零 turn ——",
-    "从退出码和产物都看不出任何异常，只有「没有 review-result.json」这一个下游症状。",
-    "这比 kimi 那条（stdin 喂进去至少 exit 1 报 argument missing）更难发现。",
-    "",
-    "改走 argv_positional_prompt_file_reference：argv 追加 `@<绝对路径>`，omp 的原生 @ 语法",
-    "会把文件内容展开进 prompt。它比 kimi 的指针形态【更强】——展开发生在 omp 进程内部，",
-    "不依赖模型自觉去读文件，送达性与 stdin 等价；argv 里也只有一个短路径，不碰 ARG_MAX。",
-    "所以这两条腿虽然都不走 stdin，投递可靠性并不同级，排查产出率时别把它们混为一谈。"
-  ],
   "prompt_delivery": "argv_positional_prompt_file_reference",
   "run_directory_grant_flag": "--add-dir",
-  "_comment_no_extensions_is_the_recursion_guard": [
-    "`--no-extensions` 等价于 codex 腿的 `--disable hooks`：omp 的 Stop 语义完全活在进程内的 TS",
-    "extension 里，评审子进程一旦加载它们，就会在评审腿里再起一轮 RVF。RVF_SUPPRESS_STOP_HOOK=1",
-    "是第二道保险，不是它的替代品。",
-    "`--no-session` 对齐 codex 的 `--ephemeral`；`--auto-approve` 是 reviewer 写 $RVF_REVIEW_RESULT",
-    "的授权来源（注意 yolo 不是无条件 allow——用户自己配的 bash.patterns deny 仍然生效）。",
-    "",
-    "【递归防护这条是实测的，不是照抄 flag 描述】：在隔离 PI_CODING_AGENT_DIR 的",
-    "<agent-dir>/extensions/ 里放一个加载即写哨兵文件的 extension，其余 argv 逐字相同、",
-    "只切换本 flag——不带它哨兵被写、带它哨兵不被写，两次都 exit=0 且模型真实应答",
-    "（后半句是必需的：第一次对照跑忘了注入凭证，进程 exit=1 直接死在 API key 校验上，",
-    "哨兵当然也没写，差点把这个假阴性读成「防护成立」）。",
-    "官方描述只说 disable extension **discovery**，措辞上留有余地，所以必须实测到这一步。",
-    "顺带证伪一个像反例的现象：探针输出里的 `{\"source\":\"xdev\"}` mount notice 与 extension",
-    "discovery 无关（xdev 是 omp 内置能力），它出现不代表防护失效。",
-    "",
-    "【隔离测试的连带事实】omp 的 openai-codex 凭证存在 <agent-dir>/agent.db 的 auth_credentials",
-    "表里，不在 ~/.codex ⇒ 一旦隔离 PI_CODING_AGENT_DIR 就同时切断鉴权，隔离用例必须自带凭证",
-    "（sqlite3 backup 只读拷贝，用完即删）。"
-  ],
-  "allow_repo_cwd": true,
-  "idle_timeout_seconds": 300,
-  "activity_check_interval_seconds": 5,
-  "activity_probe_command": null,
-  "activity_probe_timeout_seconds": 10,
-  "activity_probe_failure_threshold": 3,
-  "max_runtime_seconds": null,
-  "health_timeout_seconds": 50,
-  "pre_run_health": true,
   "output_format": "oh_my_pi_json",
-  "_comment_anthropic_api_key_is_deliberately_kept": [
-    "不 unset ANTHROPIC_API_KEY；运行时先校验默认模型 provider 为 openai-codex，避免误选其他后端。",
-    "PI_SMOL_MODEL / PI_SLOW_MODEL / PI_PLAN_MODEL 会替换子角色，PI_CODING_AGENT_DIR 会改会话配置位置，必须清掉以使查询、健康检查与正式评审配置一致。"
-  ],
   "env_unset": [
     "PI_SMOL_MODEL",
     "PI_SLOW_MODEL",
     "PI_PLAN_MODEL",
     "PI_CODING_AGENT_DIR",
     "PI_TIMING"
-  ],
-  "_comment_health_command_must_share_the_real_dispatch_entrypoint": [
-    "与其余四份同一条纪律。prompt 走位置参数：run_health 调 subprocess.run 时不喂 stdin，",
-    "而派发路径下 omp 的 prompt 是经管道 stdin 送达的，照搬会让探针挂到超时。",
-    "",
-    "health_timeout_seconds 比 kimi/cursor 宽（50s < --probe-timeout 默认 60s）：omp 冷启动含",
-    "插件根预加载与 skill/extension 发现。【已按实测回填】：本机 --preflight 端到端 10.91s，",
-    "其中模型侧 ttft 3.86s / duration 4.01s ⇒ omp 自身启动开销约 6.9s，50s 留约 4.6× 余量。",
-    "样本 n=1（热缓存），冷启动未测——若线上出现 probe 超时，先怀疑这个数而不是 omp 挂了。"
   ],
   "health_command": [
     "omp",
@@ -87,12 +34,6 @@
     "xhigh",
     "Reply with exactly: OK"
   ],
-  "_comment_default_model_source_and_provider_boundary": [
-    "正式评审与健康检查在运行时共同读取 omp config get modelRoles --json 的 default，不固定模型版本。",
-    "默认模型必须是明确限定 openai-codex 的单一 selector，以保持 Codex 订阅额度池身份与双评审互斥规则正确。",
-    "默认模型缺失、查询失败或 provider 不符时，本腿明确不可用，不静默回退到旧模型。",
-    "reasoning effort 仍由独立的 --thinking xhigh 指定。"
-  ],
   "reviewer_model_selection_source": "oh_my_pi_default_model_role",
-  "reviewer_harness_id": "oh_my_pi"
+  "timeout_seconds": 900
 }

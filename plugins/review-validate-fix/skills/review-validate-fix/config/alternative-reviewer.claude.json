@@ -14,47 +14,9 @@
     "--tools",
     "Bash,Read"
   ],
-  "allow_repo_cwd": true,
-  "idle_timeout_seconds": 300,
-  "activity_check_interval_seconds": 5,
-  "activity_probe_command": null,
-  "activity_probe_timeout_seconds": 10,
-  "activity_probe_failure_threshold": 3,
-  "max_runtime_seconds": null,
-  "health_timeout_seconds": 30,
-  "pre_run_health": true,
   "output_format": "claude_stream_json",
   "env_unset": [
     "ANTHROPIC_API_KEY"
   ],
-  "_comment_health_command_must_share_the_real_dispatch_entrypoint": [
-    "为什么 health_command 是一次真实的 `-p` 调用、而不是 `claude auth status`：",
-    "旁路的 auth 查询命令与真正发起评审的那条命令走的不是同一条路径——它可以在评审腿其实起不来的",
-    "情况下退 0，把不可用的 harness 判成可用、选进两腿，那一腿派出去立刻失败、不产出 review-result，",
-    "本轮实际只剩单路评审结论。同型故障已在 cursor 上实盘发生过一次（run rvf-20260811T170157Z）。",
-    "",
-    "prompt 必须走【位置参数】而不是 stdin：run_health 调 subprocess.run 时既不传 input= 也不设",
-    "stdin=，裸 `-p`（读 stdin 的形态）会让探针阻塞到 health_timeout_seconds 超时。",
-    "",
-    "下方只需列出与 command 相同的那组 flag；`--verbose` / `--disable-slash-commands` 由",
-    "normalise_health_command_for_output_format 与派发命令同源补齐，不需要在这里再抄一遍。",
-    "",
-    "health_timeout_seconds 须小于 dispatch_reviewers.py 的 --probe-timeout（默认 60s），",
-    "否则外层会先超时、把健康的 harness 误判为不可用。"
-  ],
-  "health_command": [
-    "claude",
-    "-p",
-    "--output-format",
-    "stream-json",
-    "--include-hook-events",
-    "--include-partial-messages",
-    "--no-session-persistence",
-    "--permission-mode",
-    "bypassPermissions",
-    "--tools",
-    "Bash,Read",
-    "Reply with exactly: OK"
-  ],
-  "reviewer_harness_id": "claude_code"
+  "timeout_seconds": 900
 }

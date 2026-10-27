@@ -1,0 +1,55 @@
+"""Hook 只提供一次发起决策；机器等待、诊断和清理不唤醒 Agent。"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+from pathlib import Path
+
+from core.rvf_user_local_data_paths import resolved_rvf_user_local_data_paths
+from core.stop_hook_output_audience import (
+    AgentDirectiveStopHookOutput, render_stop_hook_payload,
+    STOP_HOOK_OUTPUT_AUDIENCE_AGENT_MUST_ACT_NOW,
+)
+from .persistent_artifacts import exclusive_lock, git, git_text, read_json, repository_identity, write_json
+
+
+def handle_hook(event: dict, *, event_name: str, host_adapter) -> dict | None:
+    if os.environ.get("RVF_SUPPRESS_STOP_HOOK") == "1":
+        return None
+    if event_name == "UserPromptSubmit":
+        prompt = event.get("prompt", "")
+        if not isinstance(prompt, str) or not re.match(r"^\s*(?:\$|/|:)review-validate-fix(?:\s|$)", prompt):
+            return None
+        return host_adapter.user_prompt_context_payload(
+            "本次用户明确调用 RVF。读取 review-validate-fix skill，使用固定任务基线和显式范围运行 "
+            "rvf review-task-snapshot；复用已有精确 run 时使用 rvf resume-task-review。主会话直接验证与提交。")
+    if event_name != "Stop" or not (os.environ.get("KANBAN_TASK_ID") or os.environ.get("CLINE_KANBAN_TASK_ID")):
+        return None
+    repo = Path(event.get("cwd") or os.getcwd())
+    identity = repository_identity(repo)
+    repo = Path(identity["repo"])
+    if not git(repo, "status", "--porcelain", "--untracked-files=all"):
+        return None
+    changes = git(repo, "diff", "--binary", "--full-index", "--no-ext-diff", "HEAD")
+    untracked = git(repo, "ls-files", "--others", "--exclude-standard", "-z")
+    for value in untracked.decode().split("\0"):
+        if value:
+            path = repo / value
+            changes += value.encode() + b"\0" + (os.readlink(path).encode() if path.is_symlink() else path.read_bytes())
+    fingerprint = hashlib.sha256(git(repo, "rev-parse", "HEAD") + changes).hexdigest()
+    session = str(event.get("session_id") or event.get("sessionId") or os.environ.get("KANBAN_TASK_ID"))
+    key = hashlib.sha256((identity["git_directory"] + "\0" + session).encode()).hexdigest()
+    state = resolved_rvf_user_local_data_paths().runtime_state_root / "task-review-decisions" / f"{key}.json"
+    with exclusive_lock(state.with_suffix(".lock")):
+        if state.exists() and read_json(state).get("candidate_fingerprint") == fingerprint:
+            return None
+        write_json(state, {"candidate_fingerprint":fingerprint})
+    return render_stop_hook_payload(
+        audience=STOP_HOOK_OUTPUT_AUDIENCE_AGENT_MUST_ACT_NOW,
+        agent_directive=AgentDirectiveStopHookOutput(
+            agent_directive_body="本任务存在改动。依据任务授权、风险及已有评审决定是否运行 RVF；需要时使用固定基线、明确任务路径和需求文件执行 rvf review-task-snapshot。已有 run 只接续缺失部分。保留背景 WIP；不需要评审时直接说明依据并完成当前交付。",
+            developer_visible_notice="RVF：任务评审发起决策。"),
+        developer_only_payload=None,
+        agent_directive_channel=host_adapter.stop_hook_agent_directive_channel())

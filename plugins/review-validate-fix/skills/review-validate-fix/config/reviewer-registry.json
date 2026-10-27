@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "RVF santa-method 双 review 的 external reviewer harness 注册表。dispatch_reviewers.py 据此 probe 可用 harness 并路由出恰好两路 external_cli reviewer。config_path 相对 skill 根目录解析。underlying_provider_account_quota_pool_identity 声明这条腿最终消耗谁的额度：同值的两条腿共享账号额度、会被同一次额度耗尽一起打掉，选腿层据此互斥（core/reviewer_harness_selection）。取额度池而非模型名，是因为各腿模型跟随 CLI 配置；OMP 默认选模限定 openai-codex，因此它与 Codex 的订阅额度池身份保持一致。",
+  "description": "按可用 CLI 与额度池优先选择两路独立进程，缺失腿有界改用其他配置。",
   "harnesses": {
     "cursor": {
       "harness_id": "cursor",
