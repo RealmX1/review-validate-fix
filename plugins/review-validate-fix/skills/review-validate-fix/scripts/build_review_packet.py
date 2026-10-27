@@ -356,9 +356,26 @@ def validate_session_manifest(manifest: dict[str, Any] | None, root: Path, path:
         raise ValueError(f"session manifest has no owned paths; refusing to build empty Session-Owned scope: {path}")
 
 
-def diff_for_paths(repo: Path, paths: list[str], exclude_prefixes: list[str], base_ref: str = "HEAD", frozen_candidate_source: FrozenCandidatePacketGitSource | None = None) -> str:
+def diff_for_paths(repo: Path, paths: list[str], exclude_prefixes: list[str], base_ref: str = "HEAD", frozen_candidate_source: FrozenCandidatePacketGitSource | None = None,
+                   committed_content_projection: dict[str, str] | None = None) -> str:
     if not paths:
         return ""
+    if committed_content_projection:
+        projection = committed_content_projection
+        # committed 从 manifest 固定对象读取；dirty 仍从真实 HEAD 到冻结候选或当前工作树读取。
+        arguments = ["diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+                     projection["baseline_commit"], projection["projected_tree"], "--",
+                     *[":(literal)" + path for path in paths], *exclude_pathspecs(exclude_prefixes)]
+        if frozen_candidate_source:
+            omitted_paths = (frozen_candidate_source.frozen_added_paths_with_omitted_contents
+                             | frozen_candidate_source.frozen_packet_context_only_paths
+                             | frozen_candidate_source.frozen_added_paths_outside_review_scope)
+            arguments.extend(":(exclude,literal)" + path for path in sorted(omitted_paths))
+            committed_diff = frozen_candidate_source.render_raw_diff_from_immutable_git_objects(arguments).rstrip()
+        else:
+            committed_diff = run_git(repo, arguments).rstrip()
+        dirty_diff = diff_for_paths(repo, paths, exclude_prefixes, projection["head_commit"], frozen_candidate_source)
+        return "\n".join(chunk for chunk in (committed_diff, dirty_diff) if chunk)
     if frozen_candidate_source and base_ref == "HEAD":
         base_ref = frozen_candidate_source.frozen_origin_worktree_head_commit_sha
     args = ["diff", "--find-renames", base_ref]
@@ -422,14 +439,15 @@ def filter_diff_for_hunk_headers(diff_text: str, allowed_headers: set[str], *, r
     return "\n".join(output).rstrip()
 
 
-def diff_for_tracker_scope(repo: Path, tracker_scope: dict[str, Any], exclude_prefixes: list[str], base_ref: str = "HEAD", frozen_candidate_source: FrozenCandidatePacketGitSource | None = None) -> str:
+def diff_for_tracker_scope(repo: Path, tracker_scope: dict[str, Any], exclude_prefixes: list[str], base_ref: str = "HEAD", frozen_candidate_source: FrozenCandidatePacketGitSource | None = None,
+                           committed_content_projection: dict[str, str] | None = None) -> str:
     paths = [path for path in tracker_scope.get("paths", []) if isinstance(path, str)]
     if not paths:
         return ""
     # 真正跨已提交基线时，原始 hunk 坐标可能合并或重新编号，按已分配路径投影。
     # 纯 dirty 的 HEAD 即使已固定为 OID，也必须保持 hunk 过滤并完整核对授权区间。
     is_frozen_head_base = frozen_candidate_source is not None and base_ref == frozen_candidate_source.frozen_origin_worktree_head_commit_sha
-    if base_ref != "HEAD" and not is_frozen_head_base:
+    if base_ref != "HEAD" and not is_frozen_head_base and not committed_content_projection:
         chunks = [diff_for_paths(repo, [path], exclude_prefixes, base_ref, frozen_candidate_source) for path in paths]
         return "\n".join(chunk for chunk in chunks if chunk).rstrip()
     hunk_headers_by_path: dict[str, set[str]] = {}
@@ -453,10 +471,10 @@ def diff_for_tracker_scope(repo: Path, tracker_scope: dict[str, Any], exclude_pr
         ):
             continue
         if path in path_level_paths or path not in hunk_headers_by_path:
-            chunk = diff_for_paths(repo, [path], exclude_prefixes, base_ref, frozen_candidate_source)
+            chunk = diff_for_paths(repo, [path], exclude_prefixes, base_ref, frozen_candidate_source, committed_content_projection)
         else:
             chunk = filter_diff_for_hunk_headers(
-                diff_for_paths(repo, [path], exclude_prefixes, base_ref, frozen_candidate_source),
+                diff_for_paths(repo, [path], exclude_prefixes, base_ref, frozen_candidate_source, committed_content_projection),
                 hunk_headers_by_path[path],
                 require_complete_projection=frozen_candidate_source is not None,
             )
@@ -506,12 +524,20 @@ def build_packet(
     )
     if frozen_source and owned_diff_base_ref == "HEAD":
         owned_diff_base_ref = frozen_source.frozen_origin_worktree_head_commit_sha
+    committed_projection = session_manifest.get("committed_round_content_projection") if session_manifest else None
+    if committed_projection:
+        expected_head = frozen_source.frozen_origin_worktree_head_commit_sha if frozen_source else run_git(root, ["rev-parse", "HEAD"]).strip()
+        if (committed_projection.get("head_commit") != expected_head
+                or committed_projection.get("baseline_commit") != run_git(root, ["rev-parse", owned_diff_base_ref + "^{commit}"]).strip()):
+            raise ValueError("committed 内容投影与 packet 的固定 HEAD 或窗口起点不一致")
     generated = datetime.now(timezone.utc).isoformat()
     status_args = ["status", "--short", "-uall"]
     diff_args = ["diff", "--find-renames", "HEAD", "--"]
     if frozen_source:
         status_args = ["diff", "--no-ext-diff", "--no-textconv", "--name-status", owned_diff_base_ref, frozen_source.frozen_candidate_commit_sha]
-        diff_args = ["diff", "--no-ext-diff", "--no-textconv", "--find-renames", owned_diff_base_ref, frozen_source.frozen_candidate_commit_sha, "--"]
+        diff_args = ["diff", "--no-ext-diff", "--no-textconv", "--find-renames",
+                     frozen_source.frozen_origin_worktree_head_commit_sha if committed_projection else owned_diff_base_ref,
+                     frozen_source.frozen_candidate_commit_sha, "--"]
     if all_exclude_prefixes:
         status_args.extend(["--", ".", *exclude_pathspecs(all_exclude_prefixes)])
         diff_args.extend([".", *exclude_pathspecs(all_exclude_prefixes)])
@@ -625,9 +651,9 @@ def build_packet(
     ] if tracker_scope is not None else sorted(set(owned_dirty_paths) | set(owned_committed_round_paths))
     owned_path_set = set(owned_diff_paths)
     if tracker_scope is not None:
-        owned_diff = diff_for_tracker_scope(root, tracker_scope, all_exclude_prefixes, owned_diff_base_ref, frozen_source)
+        owned_diff = diff_for_tracker_scope(root, tracker_scope, all_exclude_prefixes, owned_diff_base_ref, frozen_source, committed_projection)
     else:
-        owned_diff = diff_for_paths(root, owned_diff_paths, all_exclude_prefixes, owned_diff_base_ref, frozen_source) if session_manifest is not None else ""
+        owned_diff = diff_for_paths(root, owned_diff_paths, all_exclude_prefixes, owned_diff_base_ref, frozen_source, committed_projection) if session_manifest is not None else ""
     owned_untracked = [path for path in untracked if path in owned_path_set]
     background_untracked = [path for path in untracked if path not in owned_path_set]
     metadata["session_owned_diff_paths"] = owned_diff_paths

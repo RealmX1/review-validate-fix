@@ -107,6 +107,9 @@ from core.session_scope_allocation.layered_session_write_attribution_for_unattri
     WEAK_SESSION_WRITE_ATTRIBUTION_EVIDENCE_LABELS,
 )
 from core.session_scope_allocation.reviewable_unit_diff_tracker import (  # noqa: E402
+    CommittedContentProjectionUnavailable,
+    committed_round_content_projection,
+    pending_committed_content_projection_evidence,
     SQLITE_FILENAME,
     _disabled as _tracker_disabled,
     _list_committed_round_changed_paths,
@@ -239,6 +242,8 @@ def _default_committed_base_ref_resolver(repo_path: Path) -> str | None:
 def _default_reviewed_committed_paths_resolver(
     repo_path: Path, session_id: str | None, candidate_committed_paths: set[str], log_root_override: Path | None,
     *, committed_baseline: str | None = None,
+    committed_base_ref: str | None = None,
+    committed_scope_evidence: Mapping[str, Any] | None = None,
 ) -> set[str]:
     """# OBSERVATION-WINDOW(R9) —— 委托给中性核 tracker 的 review_state「已审」过滤器。
 
@@ -256,6 +261,8 @@ def _default_reviewed_committed_paths_resolver(
             candidate_paths=candidate_committed_paths,
             log_root_override=log_root_override,
             committed_baseline=committed_baseline,
+            committed_base_ref=committed_base_ref,
+            committed_scope_evidence=committed_scope_evidence,
         )
     except Exception:  # pragma: no cover - 过滤器永不阻断摘要
         return set()
@@ -826,8 +833,18 @@ def build_candidate_summary(
         committed_round_window_seed_source = str(committed_scope_evidence["stable_start_source"])
 
     # ③ 枚举：committed（种子..工作树，含 committed-but-unreviewed）∪ uncommitted（dirty）。
+    committed_projection = None
+    projection_unavailable = False
+    if baseline and committed_scope_evidence and committed_scope_evidence.get("status") == "verified":
+        try:
+            committed_projection = committed_round_content_projection(
+                repo_path, baseline, base_ref, committed_scope_evidence=committed_scope_evidence,
+            )
+        except CommittedContentProjectionUnavailable as error:
+            committed_scope_evidence = pending_committed_content_projection_evidence(committed_scope_evidence, error)
+            projection_unavailable = True
     committed_paths: list[str] = []
-    if baseline:
+    if baseline and not projection_unavailable:
         try:
             committed_paths = _list_committed_round_changed_paths(
                 repo_path, baseline,
@@ -851,7 +868,9 @@ def build_candidate_summary(
     # 三处「已审」裁决同源。lower_bound_source 字段口径随之从窗口种子 SHA 切到 review_state 权威。
     reviewed_committed_paths = reviewed_committed_paths_resolver(
         repo_path, session_id, committed_set, log_root_override,
-        **({"committed_baseline": baseline} if reviewed_committed_paths_resolver is _default_reviewed_committed_paths_resolver else {}),
+        **({"committed_baseline": baseline, "committed_base_ref": base_ref,
+            "committed_scope_evidence": committed_scope_evidence}
+           if reviewed_committed_paths_resolver is _default_reviewed_committed_paths_resolver else {}),
     )
     review_state_filtered_committed_paths = sorted(committed_set & reviewed_committed_paths)
     committed_set = committed_set - reviewed_committed_paths
@@ -864,7 +883,7 @@ def build_candidate_summary(
     review_scope_excluded_path_prefixes = _load_review_scope_excluded_path_prefixes_best_effort(repo_path)
     untracked = _untracked_paths(repo_path)
     ownership_labels = _read_tracker_ownership(repo_path, session_id, log_root_override)
-    diff_base = baseline if baseline else None
+    diff_base = baseline if baseline and not projection_unavailable else None
 
     # ③.6 dirty 侧「已审」只读观测（committed 侧 ③.5 的对偶，但**只影响规模数字，不影响候选集**）。
     # 只喂未提交路径：纯 committed 路径的已审剔除已在 ③.5 按路径做完，剩下的 committed 工作按定义
@@ -899,9 +918,21 @@ def build_candidate_summary(
         else:
             candidate_set_exclusion_reason = None
         included = candidate_set_exclusion_reason is None
-        added, deleted = _added_deleted_for_path(
-            repo_path, diff_base, path, path in untracked
-        )
+        if committed_projection:
+            # committed 与 dirty 使用各自固定起点，避免同路径外部 base 内容进入规模估算。
+            committed_diff = _run_git(repo_path, [
+                "diff", "--no-color", "--no-renames", committed_projection["baseline_commit"],
+                committed_projection["projected_tree"], "--", path,
+            ]) if in_committed else ""
+            added, deleted = _parse_unified_diff_added_deleted(committed_diff or "")
+            if in_uncommitted:
+                dirty_added, dirty_deleted = _added_deleted_for_path(repo_path, None, path, path in untracked)
+                added.extend(dirty_added)
+                deleted.extend(dirty_deleted)
+        else:
+            added, deleted = _added_deleted_for_path(
+                repo_path, diff_base, path, path in untracked
+            )
         path_observation = dirty_reviewed_observations.get(path)
         # 整路径扣减即将生效时，先核验被扣的 delta 是不是纯 dirty：有 committed-round 下界时
         # ``_added_deleted_for_path`` 给的是 baseline→工作树的合并 delta，而整路径已审证据只覆盖

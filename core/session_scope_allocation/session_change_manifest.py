@@ -1075,6 +1075,16 @@ def build_manifest(
     root = git_root(repo)
     records = parse_jsonl(transcript)
     session_id = session_id_from_records(records)
+    committed_content_projection = None
+    projection_unavailable = False
+    if committed_baseline and committed_scope_evidence and committed_scope_evidence.get("status") == "verified":
+        try:
+            committed_content_projection = reviewable_unit_diff_tracker.committed_round_content_projection(
+                root, committed_baseline, committed_base_ref, committed_scope_evidence=committed_scope_evidence,
+            )
+        except reviewable_unit_diff_tracker.CommittedContentProjectionUnavailable as error:
+            committed_scope_evidence = reviewable_unit_diff_tracker.pending_committed_content_projection_evidence(committed_scope_evidence, error)
+            projection_unavailable = True
     try:
         ownership_base_ref = committed_base_ref or _resolve_committed_round_base_ref(root)
     except Exception:
@@ -1120,7 +1130,7 @@ def build_manifest(
     # empty/inert whenever committed_baseline is None, so the no-commit path is
     # byte-identical to prior behaviour.
     committed_round_set: set[str] = set()
-    if committed_baseline:
+    if committed_baseline and not projection_unavailable:
         try:
             committed_round_set = set(
                 reviewable_unit_diff_tracker._list_committed_round_changed_paths(
@@ -1475,12 +1485,23 @@ def build_manifest(
     # `no_session_owned_dirty` leak this closes).
     committed_round_owned: list[str] = []
     has_verified_task_scope = bool(committed_scope_evidence and committed_scope_evidence.get("status") == "verified")
-    previously_session_owned_paths = reviewable_unit_diff_tracker.strong_session_owned_paths(
+    requires_current_session_ownership_proof = committed_scope_evidence is not None
+    previously_session_owned_unit_paths = reviewable_unit_diff_tracker.strong_session_owned_unit_paths(
         repo=root, session_id=session_id, log_root_override=tracker_log_root,
-    ) if has_verified_task_scope else set()
+    ) if requires_current_session_ownership_proof else {}
+    previously_session_owned_paths = set(previously_session_owned_unit_paths.values())
+    has_unknown_task_scope = (committed_scope_evidence is not None
+                              and committed_scope_evidence.get("status") not in {"verified", "unborn_head"})
     for path in sorted(committed_round_set):
-        if path in dirty_set:
+        if path in dirty_set and not has_verified_task_scope:
             continue
+        if has_unknown_task_scope:
+            current_ids = {spec.unit_id for spec in reviewable_unit_diff_tracker._specs_from_observation(
+                reviewable_unit_diff_tracker._classify_committed_path(root, path, committed_baseline), path,
+            )}
+            if not current_ids or not current_ids <= previously_session_owned_unit_paths.keys():
+                # unknown 只沿用已证明的精确身份；同路径的另一会话或外部新 hunk 不继承归属。
+                continue
         if path in round_window_apply_patch_paths:
             evidence = "apply_patch"
         elif path in round_window_claude_write_paths:
@@ -1488,10 +1509,15 @@ def build_manifest(
         elif path in round_window_exec_paths:
             evidence = "exec_command"
         else:
-            if has_verified_task_scope and path not in previously_session_owned_paths:
-                # task 自有只证明候选资格；没有本 session 工具证据或强归属，不能自动认领。
+            if requires_current_session_ownership_proof and path not in previously_session_owned_paths:
+                # verified 或 unknown 均不授予 session 所有权；缺少工具证据或强归属时不认领。
                 continue
-            evidence = "committed_round_git"
+            evidence = (reviewable_unit_diff_tracker.EVIDENCE_EXISTING_STRONG_SESSION_PATH_OWNERSHIP
+                        if requires_current_session_ownership_proof else "committed_round_git")
+        committed_round_owned.append(path)
+        # 同一路径的 dirty 归属仍由原有精确单元提供；register_claims 另登记 committed 投影。
+        if path in dirty_set and any(owned_unit.path == path for owned_unit, _ in deduped_live_units):
+            continue
         key = (path, "path", "")
         if key in seen_live_units:
             continue
@@ -1499,7 +1525,6 @@ def build_manifest(
         deduped_live_units.append(
             (reviewable_unit_diff_tracker.OwnedUnit(path=path, unit="path", hunk_anchor=None), evidence)
         )
-        committed_round_owned.append(path)
     committed_round_owned_set = set(committed_round_owned)
 
     owned_dirty = sorted({owned_unit.path for owned_unit, _evidence in deduped_live_units if owned_unit.path in dirty_set})
@@ -1567,6 +1592,8 @@ def build_manifest(
             log_root_override=tracker_log_root,
             committed_paths=committed_round_owned_set,
             committed_baseline=committed_baseline,
+            committed_base_ref=committed_base_ref,
+            committed_scope_evidence=committed_scope_evidence,
         )
         tracker_payload = result.to_dict()
         tracker_payload["session_id"] = register_session_id
@@ -1621,6 +1648,7 @@ def build_manifest(
         "schema_drift_suspected": schema_drift_suspected,
         "owned_committed_round_paths": committed_round_owned,
         "committed_round_baseline": committed_baseline,
+        "committed_round_content_projection": committed_content_projection,
         "committed_scope_evidence": dict(committed_scope_evidence) if committed_scope_evidence is not None else None,
         "unattributed_dirty_paths": unattributed_dirty,
         # 主循环之后分层补判出的归属（子代理写工具 / 命令文本 / agent 认领 / 时间窗），逐条带证据。

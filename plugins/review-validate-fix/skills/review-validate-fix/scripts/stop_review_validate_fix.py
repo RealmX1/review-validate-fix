@@ -165,6 +165,8 @@ from rvf_awaiting_dispatched_agent_marker import (
 )
 from core.session_scope_allocation.session_change_manifest import build_manifest
 from core.session_scope_allocation.reviewable_unit_diff_tracker import (
+    CommittedContentProjectionUnavailable,
+    pending_committed_content_projection_evidence,
     LEGACY_REASON_NO_SESSION_OWNED_DIRTY,
     LEGACY_REASON_SESSION_OWNED_DIRTY,
     REASON_NO_UNASSIGNED_REVIEW_SCOPE,
@@ -8736,6 +8738,12 @@ def maybe_route_committed_round_scope(
             base_ref,
             committed_scope_evidence=scope_evidence,
         )
+    except CommittedContentProjectionUnavailable as error:
+        return skip_decision(
+            "自有提交与外部 base 内容暂时无法安全隔离，保留候选未知状态。",
+            ledger, "committed_candidate_evidence_pending", repo=repo, cwd=cwd,
+            committed_scope_evidence=pending_committed_content_projection_evidence(scope_evidence, error),
+        )
     except Exception:
         committed_paths = []
     if not committed_paths:
@@ -8759,6 +8767,8 @@ def maybe_route_committed_round_scope(
             session_id=session_hook_id_from_event(event),
             candidate_paths=committed_paths,
             committed_baseline=baseline,
+            committed_base_ref=base_ref,
+            committed_scope_evidence=scope_evidence,
         )
     except Exception:
         reviewed_committed_paths = set()

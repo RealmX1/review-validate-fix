@@ -15,6 +15,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -65,6 +66,7 @@ DISABLE_ENV = "RVF_TRACKER_DISABLE"
 # this commit" escape hatch that complements the default-on attribution of
 # `_list_committed_round_changed_paths`.
 RVF_SKIP_REVIEW_COMMIT_TRAILER = "RVF-Skip-Review"
+EVIDENCE_EXISTING_STRONG_SESSION_PATH_OWNERSHIP = "existing_strong_session_path_ownership"
 
 # Slice 3 reason-code rename (with one-release alias). The new names belong to
 # the `allocate_review_scope` path; the legacy names stay live in the
@@ -850,7 +852,11 @@ def _specs_from_observation(observation: _PathObservation | None, path: str) -> 
     ]
 
 
-def _classify_committed_path(repo: Path, path: str, baseline: str, *, head_ref: str = "HEAD") -> _PathObservation | None:
+def _classify_committed_path(
+    repo: Path, path: str, baseline: str, *, head_ref: str = "HEAD",
+    committed_base_ref: str | None = None,
+    committed_scope_evidence: Mapping[str, Any] | None = None,
+) -> _PathObservation | None:
     """Committed-round sibling of `_classify_path`. Where `_classify_path`
     reads worktree state (`git status`, the on-disk file) to classify a *dirty*
     change, this classifies the *net committed* change for `path` across the
@@ -863,6 +869,11 @@ def _classify_committed_path(repo: Path, path: str, baseline: str, *, head_ref: 
 
     Returns None when there is no net committed change for the path (e.g. it was
     committed and then reverted within the round, leaving the trees equal)."""
+    if committed_scope_evidence and committed_scope_evidence.get("status") == "verified":
+        projection = committed_round_content_projection(
+            repo, baseline, committed_base_ref, committed_scope_evidence=committed_scope_evidence,
+        )
+        baseline, head_ref = projection["baseline_commit"], projection["projected_tree"]
     spec_diff = f"{baseline}..{head_ref}"
     try:
         name_status = _run_git(
@@ -1034,6 +1045,92 @@ def _list_round_skip_review_commit_shas(
     return skip
 
 
+class CommittedContentProjectionUnavailable(RuntimeError):
+    """自有提交无法安全独立投影；调用方应保留 unknown，并继续独立 dirty 工作。"""
+
+
+def pending_committed_content_projection_evidence(
+    evidence: Mapping[str, Any], error: CommittedContentProjectionUnavailable,
+) -> dict[str, Any]:
+    return {**evidence, "status": "unknown", "diagnostic": str(error),
+            "content_projection_recheck_condition": "HEAD、窗口起点或可审提交集合变化后重新投影"}
+
+
+@lru_cache(maxsize=64)
+def _project_reviewable_commits_onto_baseline_tree(
+    repo_path: str, baseline_commit: str, head_commit: str, reviewable_commit_shas: tuple[str, ...],
+) -> str:
+    """仅写不可变 Git 对象，不修改 worktree、index 或 refs；缓存键全部是固定身份。"""
+    repo = Path(repo_path)
+    baseline_tree = _run_git(repo, ["rev-parse", baseline_commit + "^{tree}"]).strip()
+    projected_tree = baseline_tree
+    for commit in reviewable_commit_shas:
+        parent = _run_git(repo, ["rev-parse", commit + "^"]).strip()
+        parent_tree = _run_git(repo, ["rev-parse", parent + "^{tree}"]).strip()
+        if projected_tree == parent_tree:
+            projected_tree = _run_git(repo, ["rev-parse", commit + "^{tree}"]).strip()
+        else:
+            # 三方重放保留该提交的净内容，排除父树中只是被吸收的外部 base 内容。
+            # 无法独立重放时保留真实失败，不回退为整路径认领。
+            try:
+                projected_tree = _run_git(
+                    repo, ["merge-tree", "--write-tree", "--no-messages", "--merge-base=" + parent,
+                           projected_tree, commit],
+                ).strip()
+            except RuntimeError as error:
+                raise CommittedContentProjectionUnavailable(
+                    "无法独立于外部 base 内容投影自有提交：" + commit,
+                ) from error
+    head_tree = _run_git(repo, ["rev-parse", head_commit + "^{tree}"]).strip()
+    if projected_tree in {baseline_tree, head_tree}:
+        return projected_tree
+    try:
+        # 先从真实 HEAD 中逆向移除自有净改动，再把仍存活的自有内容移回原 baseline。
+        # 因而外部 revert 不会复活旧 hunk，外部覆写自有内容也不会被冒认为本 session 的工作。
+        external_only_tree = _run_git(
+            repo, ["merge-tree", "--write-tree", "--no-messages", "--merge-base=" + projected_tree,
+                   baseline_tree, head_commit],
+        ).strip()
+        return _run_git(
+            repo, ["merge-tree", "--write-tree", "--no-messages", "--merge-base=" + external_only_tree,
+                   baseline_tree, head_commit],
+        ).strip()
+    except RuntimeError as error:
+        raise CommittedContentProjectionUnavailable("自有净改动与外部 base 内容重叠，无法安全确定存活内容") from error
+
+
+def committed_round_content_projection(
+    repo: Path, baseline: str, base_ref: str | None = None,
+    *, committed_scope_evidence: Mapping[str, Any],
+) -> dict[str, str]:
+    """按冻结来源把可审提交重放到窗口起点，供所有 committed 内容消费者共用。"""
+    from core.session_scope_allocation.committed_candidate_scope_evidence import task_owned_commits_in_review_window
+    from core.session_scope_allocation.committed_round_detection import frozen_committed_round_base_exclusion_ref
+    owned_commits = task_owned_commits_in_review_window(repo, baseline, committed_scope_evidence)
+    if committed_scope_evidence.get("status") != "verified":
+        raise ValueError("committed 内容投影需要已核验的冻结来源证据")
+    base_ref = frozen_committed_round_base_exclusion_ref(
+        repo, committed_scope_evidence.get("base_ref"), committed_scope_evidence.get("base_tip_commit"),
+    )
+    order = _run_git(repo, ["rev-list", "--reverse", "--topo-order", f"{baseline}..HEAD"]).splitlines()
+    own_first_parent = _run_git(
+        repo, ["rev-list", "--first-parent", "--no-merges", f"{baseline}..HEAD", *_base_ref_exclude_revs(repo, base_ref)],
+    ).splitlines()
+    skip_commits = _list_round_skip_review_commit_shas(
+        repo, baseline, base_ref, committed_scope_evidence=committed_scope_evidence,
+    )
+    eligible = (set(owned_commits) | set(own_first_parent)) - skip_commits
+    baseline_commit = _run_git(repo, ["rev-parse", baseline + "^{commit}"]).strip()
+    return {
+        "baseline_commit": baseline_commit,
+        "head_commit": str(committed_scope_evidence["head_commit"]),
+        "projected_tree": _project_reviewable_commits_onto_baseline_tree(
+            str(repo.resolve()), baseline_commit, str(committed_scope_evidence["head_commit"]),
+            tuple(commit for commit in order if commit in eligible),
+        ),
+    }
+
+
 def _list_committed_round_changed_paths(
     repo: Path, baseline: str, base_ref: str | None = None,
     *, committed_scope_evidence: Mapping[str, Any] | None = None,
@@ -1075,6 +1172,15 @@ def _list_committed_round_changed_paths(
     net_paths = sorted({item for item in net.split("\0") if item})
     if not net_paths:
         return []
+    if committed_scope_evidence and committed_scope_evidence.get("status") == "verified":
+        projection = committed_round_content_projection(
+            repo, baseline, base_ref, committed_scope_evidence=committed_scope_evidence,
+        )
+        projected_paths = set(filter(None, _run_git(
+            repo, ["diff", "--no-renames", "--name-only", "-z",
+                   projection["baseline_commit"], projection["projected_tree"]],
+        ).split("\0")))
+        return [path for path in net_paths if path in projected_paths]
     from core.session_scope_allocation.committed_candidate_scope_evidence import task_owned_commits_in_review_window
     task_owned_commits = task_owned_commits_in_review_window(repo, baseline, committed_scope_evidence)
     skip_shas = _list_round_skip_review_commit_shas(
@@ -1147,6 +1253,8 @@ def _unit_specs_for_owned(
     repo: Path,
     owned_unit: OwnedUnit,
     committed_baseline: str | None = None,
+    committed_base_ref: str | None = None,
+    committed_scope_evidence: Mapping[str, Any] | None = None,
 ) -> list[_UnitSpec]:
     if committed_baseline:
         # Committed-round ownership: classify against the net committed diff so
@@ -1157,7 +1265,10 @@ def _unit_specs_for_owned(
         # (committed owned hints are always path-level, so hunk anchors are
         # moot here).
         return _specs_from_observation(
-            _classify_committed_path(repo, owned_unit.path, committed_baseline),
+            _classify_committed_path(
+                repo, owned_unit.path, committed_baseline, committed_base_ref=committed_base_ref,
+                committed_scope_evidence=committed_scope_evidence,
+            ),
             owned_unit.path,
         )
     observation = _classify_path(repo, owned_unit.path)
@@ -2749,6 +2860,8 @@ def register_claims(
     log_root_override: Path | None = None,
     committed_paths: set[str] | None = None,
     committed_baseline: str | None = None,
+    committed_base_ref: str | None = None,
+    committed_scope_evidence: Mapping[str, Any] | None = None,
 ) -> RegisterResult:
     # `committed_paths` are owned paths whose round work lives in committed
     # history (clean at HEAD); for them ownership is classified against
@@ -2757,6 +2870,10 @@ def register_claims(
     # the committed observation walk. Empty/None => identical to prior behaviour.
     committed_path_set = {p for p in (committed_paths or set()) if isinstance(p, str)}
     repo_resolved = repo.resolve()
+    committed_and_dirty_paths = (
+        committed_path_set & set(_list_dirty_paths(repo_resolved))
+        if committed_path_set and committed_scope_evidence and committed_scope_evidence.get("status") == "verified" else set()
+    )
 
     if _disabled():
         return RegisterResult(status="disabled", repo_key="", tracker_dir=None)
@@ -2836,9 +2953,15 @@ def register_claims(
                     repo_resolved,
                     owned_unit,
                     committed_baseline=committed_baseline if is_committed else None,
+                    committed_base_ref=committed_base_ref,
+                    committed_scope_evidence=committed_scope_evidence,
                 )
-                spec_observed_state = "committed" if is_committed else "dirty"
-                for spec in specs:
+                spec_observations = [(spec, "committed" if is_committed else "dirty") for spec in specs]
+                if is_committed and owned_unit.path in committed_and_dirty_paths:
+                    spec_observations.extend((spec, "dirty") for spec in _unit_specs_for_owned(repo_resolved, owned_unit))
+                # 沿用既有强归属时让 COALESCE 保留原始证据，不能覆盖成派生标签而破坏重启补证。
+                registration_evidence = None if evidence == EVIDENCE_EXISTING_STRONG_SESSION_PATH_OWNERSHIP else evidence
+                for spec, spec_observed_state in spec_observations:
                     _upsert_unit(
                         conn, spec, branch_key, worktree_key, now, observed_state=spec_observed_state
                     )
@@ -2849,7 +2972,7 @@ def register_claims(
                         run_id=run_id,
                         branch=branch_value,
                         worktree=worktree_value,
-                        evidence=evidence,
+                        evidence=registration_evidence,
                         now=now,
                     )
                     new_claim_ids.append(spec.unit_id)
@@ -2864,10 +2987,17 @@ def register_claims(
                                 "run_id": run_id,
                                 "path": spec.path,
                                 "kind": spec.kind,
-                                "evidence": evidence,
+                                "evidence": registration_evidence,
                             },
                         )
 
+            if committed_scope_evidence and committed_scope_evidence.get("status") not in {"verified", "unborn_head"}:
+                # 未知窗口不能把暂缓的旧 committed 归属当成已消失；后续证据恢复后再正常回收。
+                current_unit_ids.update(row[0] for row in conn.execute(
+                    "SELECT u.unit_id FROM units u JOIN session_units s ON s.unit_id=u.unit_id "
+                    "WHERE s.session_id=? AND u.worktree_key=? AND u.observed_state='committed'",
+                    (session_id, worktree_key),
+                ))
             dropped_stale: list[str] = []
             for orphan_unit_id in existing_unit_ids - current_unit_ids:
                 conn.execute(
@@ -5419,7 +5549,10 @@ def _observe_and_upsert_units_in_txn(
         for path in _list_committed_round_changed_paths(
             repo, committed_baseline, committed_base_ref, committed_scope_evidence=committed_scope_evidence,
         ):
-            observation = _classify_committed_path(repo, path, committed_baseline)
+            observation = _classify_committed_path(
+                repo, path, committed_baseline, committed_base_ref=committed_base_ref,
+                committed_scope_evidence=committed_scope_evidence,
+            )
             if observation is None:
                 continue
             for spec in _specs_from_observation(observation, path):
@@ -5783,27 +5916,45 @@ def _empty_allocate_result(
     }
 
 
-def strong_session_owned_paths(
+def _strong_session_owned_unit_paths_in_txn(
+    connection: sqlite3.Connection, *, session_id: str, worktree_key: str,
+) -> dict[str, str]:
+    """只承认明确写入或显式认领；Git 观察、task 默认归属和 allocator 不证明 session 所有权。"""
+    from core.session_scope_allocation.layered_session_write_attribution_for_unattributed_dirty_paths import (
+        LAYERED_SESSION_WRITE_ATTRIBUTION_EVIDENCE_LABELS,
+        WEAK_SESSION_WRITE_ATTRIBUTION_EVIDENCE_LABELS,
+    )
+    strong_evidence_labels = sorted(
+        (LAYERED_SESSION_WRITE_ATTRIBUTION_EVIDENCE_LABELS - WEAK_SESSION_WRITE_ATTRIBUTION_EVIDENCE_LABELS)
+        | {"apply_patch", "claude_write", "exec_command", "agent_explicit_declaration"}
+    )
+    placeholders = ",".join("?" for _ in strong_evidence_labels)
+    return {row[0]: row[1] for row in connection.execute(
+        "SELECT u.unit_id, u.path FROM units u JOIN session_units s ON s.unit_id=u.unit_id "
+        "WHERE u.worktree_key=? AND u.is_tombstoned=0 AND s.session_id=? "
+        "AND s.assignment_kind IN ('owned','takeover') "
+        f"AND s.evidence IN ({placeholders})",
+        (worktree_key, session_id, *strong_evidence_labels),
+    )}
+
+
+def strong_session_owned_unit_paths(
     *, repo: Path, session_id: str | None, log_root_override: Path | None = None,
-) -> set[str]:
-    """只读取得本 worktree 中本会话已证明归属的路径，不按 task 批量认领。"""
+) -> dict[str, str]:
+    """只读取本 worktree 中本会话有强归属的精确单元及路径，不按 task 或路径批量认领。"""
     common = git_common_dir(repo)
     if not common or not session_id or _disabled():
-        return set()
+        return {}
     database = tracker_dir(log_root_override or log_root(), repo_key(common)) / SQLITE_FILENAME
     if not database.exists():
-        return set()
+        return {}
     try:
         with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as connection:
-            return {row[0] for row in connection.execute(
-                "SELECT DISTINCT u.path FROM units u JOIN session_units s ON s.unit_id=u.unit_id "
-                "WHERE u.worktree_key=? AND u.is_tombstoned=0 AND s.session_id=? "
-                "AND s.assignment_kind IN ('owned','takeover') "
-                "AND s.evidence NOT IN ('file_change_time_window','kanban_task_worktree')",
-                (_worktree_key(str(repo.resolve())), session_id),
-            )}
+            return _strong_session_owned_unit_paths_in_txn(
+                connection, session_id=session_id, worktree_key=_worktree_key(str(repo.resolve())),
+            )
     except sqlite3.Error:
-        return set()
+        return {}
 
 
 def select_committed_paths_reviewed_by_session(
@@ -5813,6 +5964,8 @@ def select_committed_paths_reviewed_by_session(
     candidate_paths: Iterable[str],
     log_root_override: Path | None = None,
     committed_baseline: str | None = None,
+    committed_base_ref: str | None = None,
+    committed_scope_evidence: Mapping[str, Any] | None = None,
 ) -> set[str]:
     """# OBSERVATION-WINDOW(R9) —— review_state「已审/未审」真相源过滤器（R9 真相源迁移落点）。
 
@@ -5913,7 +6066,10 @@ def select_committed_paths_reviewed_by_session(
         reviewed_paths = {
             path for path in reviewed_paths
             if (current_ids := {spec.unit_id for spec in _specs_from_observation(
-                _classify_committed_path(repo, path, committed_baseline), path,
+                _classify_committed_path(
+                    repo, path, committed_baseline, committed_base_ref=committed_base_ref,
+                    committed_scope_evidence=committed_scope_evidence,
+                ), path,
             )}) and current_ids <= reviewed_ids
         }
     return reviewed_paths
@@ -6337,6 +6493,16 @@ def allocate_review_scope(
     ttl_seconds = _lease_ttl_seconds(lease_ttl_seconds)
     holder_kind_value = holder_kind if holder_kind in {"reviewer", "validate-fix", "manual"} else "reviewer"
 
+    projection_unavailable = False
+    if committed_baseline and committed_scope_evidence and committed_scope_evidence.get("status") == "verified":
+        try:
+            committed_round_content_projection(
+                repo_resolved, committed_baseline, committed_base_ref, committed_scope_evidence=committed_scope_evidence,
+            )
+        except CommittedContentProjectionUnavailable as error:
+            committed_scope_evidence = pending_committed_content_projection_evidence(committed_scope_evidence, error)
+            projection_unavailable = True
+
     conn: sqlite3.Connection | None = None
     try:
         conn = _open_conn(db_path)
@@ -6370,7 +6536,7 @@ def allocate_review_scope(
                 branch_value=branch_value,
                 worktree_value=worktree_value,
                 now_iso=now_iso,
-                committed_baseline=committed_baseline,
+                committed_baseline=None if projection_unavailable else committed_baseline,
                 committed_base_ref=committed_base_ref,
                 committed_scope_evidence=committed_scope_evidence,
             )
@@ -6426,8 +6592,20 @@ def allocate_review_scope(
                 prior_scope_unit_ids=union_with_prior_scope_unit_ids,
             )
             if committed_scope_evidence and committed_scope_evidence.get("status") not in {"verified", "unborn_head"}:
-                # unknown 时保留旧记录供恢复，但只分配当前能实际观测到的独立工作。
-                observable = observation["observed_unit_ids"] | observation["committed_observed_unit_ids"]
+                # unknown 时保留旧记录；committed 的当前观察还必须有本 session 的独立强归属。
+                strongly_owned_ids = set(_strong_session_owned_unit_paths_in_txn(
+                    conn, session_id=session_id, worktree_key=worktree_key,
+                ))
+                committed_observed = observation["committed_observed_unit_ids"]
+                current_committed_unit_paths = {row[0]: row[1] for row in conn.execute(
+                    "SELECT unit_id, path FROM units WHERE worktree_key=? AND observed_state='committed' AND is_tombstoned=0",
+                    (worktree_key,),
+                ) if row[0] in committed_observed}
+                unproven_committed_paths = {path for unit_id, path in current_committed_unit_paths.items() if unit_id not in strongly_owned_ids}
+                # 未核验来源不能借整路径 packet 投影夹带其他单元；混合路径暂缓，独立 dirty 不受影响。
+                proven_committed = {unit_id for unit_id, path in current_committed_unit_paths.items()
+                                    if unit_id in strongly_owned_ids and path not in unproven_committed_paths}
+                observable = observation["observed_unit_ids"] | proven_committed
                 candidates = [unit_id for unit_id in candidates if unit_id in observable]
             candidate_unit_count = len(candidates)
 

@@ -46,7 +46,7 @@ BOOTSTRAP_RECEIPT=VERIFIED
 
 ## 自动补证与恢复
 
-provenance 不足时，依次读取当前 task 的首轮 checkpoint、tracker 强归属的逐单元内容匹配、同一原生会话中具有明确 cwd 的提交工具回执。checkpoint 使用父提交作为创建锚点，不把 checkpoint commit 本身当作 HEAD 祖先。历史改写只接受两侧唯一的 stable patch-id 映射；歧义、错误 incarnation、不可达锚点及身份不匹配保留 unknown。
+provenance 不足时，依次读取当前 task 的首轮 checkpoint、tracker 强归属的逐单元内容匹配、同一原生会话中具有明确 cwd 的提交工具回执。首轮 checkpoint 的父提交可能是捕获时 HEAD，只有独立创建记录能证明它是起点时，才用作创建锚点；不把 checkpoint commit 本身当作 HEAD 祖先。历史改写只接受两侧唯一的 stable patch-id 映射；歧义、错误 incarnation、不可达锚点及身份不匹配保留 unknown。
 
 补证观察、诊断及恢复条件保存到 task absolute git-dir 的 `rvf-committed-candidate-evidence/`。记录采用原子替换并 fsync 文件和父目录。同一来源观察只尝试一次；来源、HEAD、checkpoint、tracker 或原生会话输入变化后重验。真实 prompt 的 round-baseline `captured_at` 也能解除 unknown，因此相同文字的下一条真实 prompt 仍会有界补证。
 
@@ -69,7 +69,7 @@ unknown 不转换成“无候选”。空观察返回 `committed_candidate_evide
 
 正式测试见 `tests/test_kanban_committed_candidate_provenance.py`，并已登记到 `scripts/check_skill_contracts.sh`。覆盖 task→base ff/merge、较早高水位、base→task ff/merge/rebase、唯一 patch-id、非 main base、skip、缺失/损坏/错误 provenance、checkpoint 与 tracker/原生回执恢复、跨重启缓存、相同真实 prompt 补证、跨 session 归属、追加 hunk、冻结后 main 前移、证据篡改、unborn HEAD、Stop detection、manifest、allocator 与正式 packet 一致性。
 
-相关 pytest 分组通过 270 项；旧 runner 的 committed/candidate/allocator 相关 38 项通过。最终新增回归 **26 项通过**，事故矩阵 **29 项断言通过**，4 项 Stop 带外投递回归逐项通过。完整结果随本次交付持久保存。
+首次实施提交 `983bd86` 的相关 pytest 分组通过 270 项，旧 runner 的 committed/candidate/allocator 相关 38 项通过；当时新增回归 26 项通过，事故矩阵 29 项断言通过，4 项 Stop 带外投递回归逐项通过。这些数量只记录初版实施，不代表下述 strict RVF 后的最终候选；后续验证独立保存在精确 run 中。
 
 完整 `check_skill_contracts.sh` 已实际运行，未全绿。固定 `fa7e2c6` 的干净 worktree 对照确认以下 3 项为已有失败：
 
@@ -78,6 +78,21 @@ unknown 不转换成“无候选”。空观察返回 `committed_candidate_evide
 3. `alternative_reviewer_cursor_autodetects_stream_json`：相同 HOME 解析错误。
 
 完整套件也发现了本次引入的 unborn HEAD 回归；已修复，并将原先失败的 4 项 Stop 带外投递测试逐项重跑通过。未把 baseline 失败写成通过，未修改这些无关测试来消除红测。
+
+## 后续 strict RVF 的修正
+
+决策 token 为 `2d0ee3e0e596b50f`，唯一 run 为 `rvf-review-start-2d0ee3e0e596b50f`。双评审完成，正式覆盖原候选 20/20 个路径，发现以下 4 项范围内缺口；它们分别经过独立 validate/fix attempt，结果及合回记录见该 run 的交接文件。
+
+- `RVF-001`：合法但过期或不完整的 provenance 不能证明当前 HEAD 的完整归属。分别核验创建锚点、当前快照覆盖和提交身份集合，缺口用 tracker/原生会话补证。零自有提交还须有连续 HEAD reflog 证明只有从固定本地 base 进行的 fast-forward；未知不会被写成完整空候选。
+- `RVF-002`：路径恢复不足以隔离同文件的外部 hunk。将可审提交按拓扑顺序重放到固定窗口起点，tracker、manifest、summary 和 packet 共同使用累计净内容投影。无法安全分离外部覆写时保留 unknown 和恢复条件，独立 dirty 工作继续。packet 消费点通过显式 ordinary scope expansion 纳入修复，不冒充初始双评审已覆盖的路径。
+- `RVF-003`：verified 和 unknown 都不授予当前 session 所有权。未知窗口只沿用本 session 的精确强归属单元；同路径出现未经证明的新 hunk 时暂缓该 committed 路径，保留旧证据供恢复。manifest 刷新保留原始强证据，避免重启后 tracker 补证退化。
+- `RVF-004`：live discovery 的观察身份包含实际本地 base ref/OID 及不可用状态。仅 base 前移或缺失的 ref 恢复也会有界重验；冻结后的消费者继续使用已保存的 SHA。
+
+两批组合验证发现投影测试在吸收外部工作后仍持有旧快照。测试补齐当前 HEAD 的来源观察，保持原自有 SHA 集合，并显式核验 verified/完整发现；没有放宽来源门禁或把外部提交标成自有。早期红测、修复后结果及修改前对照均保留。
+
+主工作区最终验证按 `handoff-validation-001`（来源、快照、packet、开审和 Stop 相关 pytest）、`handoff-validation-002`（38 项既有 runner 回归）、`handoff-validation-003`（固定事故来源的 29 项矩阵）登记。实际状态、命令、cwd 和候选绑定以精确 run 的结构化验证记录及 [handoff](/Users/bominzhang/.rvf/user-local-data/run-logs/runs/rvf-review-start-2d0ee3e0e596b50f/artifacts/handoff.md) 为准，未重跑无关的全量红测。
+
+后续 RVF 的持久证据根为 `/Users/bominzhang/.cline/kanban/cross-task-handoff-artifacts/review-validate-fix/c3b26/rvf-review-2d0ee3e0e596b50f/`。原始历史断言、10 月 19 日捕获原件及首次实施证据均保留。RVF 修复由正式 `rvf apply` 合回当前 task worktree；本轮交付 handoff，不自动 handback、push 或部署。
 
 ## 并行任务边界
 

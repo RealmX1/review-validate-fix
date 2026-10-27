@@ -115,6 +115,25 @@ def update_isolated_kanban_provenance(repository: Path, *, initial: str | None =
         entry["incarnations"][-1]["observedTaskCommits"].append({
             "commitSha": additional_commit, "stablePatchId": _stable_patch_id(repository, additional_commit),
         })
+    if ASSERTION_MODE == "fix-acceptance" and not captured_entry:
+        from adapters.cline_kanban.committed_candidate_provenance import (
+            _map_owned_commit_identities, _stable_patch_id, commit_is_ancestor,
+        )
+        head = run_git(repository, "rev-parse", "HEAD")
+        base_tip = run_git(repository, "rev-parse", entry["baseRef"])
+        current_incarnation = entry["incarnations"][-1]
+        mapped_owned, _ = _map_owned_commit_identities(repository, current_incarnation["initialBaseCommit"],
+                                                      current_incarnation["observedTaskCommits"])
+        entry["lastWorkspaceGitSnapshot"] = {
+            "path": str(repository), "headCommit": head, "baseRefTipCommit": base_tip,
+            "commitsAheadOfBaseRef": int(run_git(repository, "rev-list", "--count", f"{base_tip}..HEAD")),
+            "commitsBehindBaseRef": int(run_git(repository, "rev-list", "--count", f"HEAD..{base_tip}")),
+            "taskCommitsIntegratedIntoBaseRef": sum(commit_is_ancestor(repository, sha, base_tip) for sha in mapped_owned),
+            "taskOwnedNonMergeCommitsReachableFromLastKnownTaskHead": [
+                {"commitSha": sha, "stablePatchId": _stable_patch_id(repository, sha)} for sha in mapped_owned],
+            "isDetached": not bool(run_git(repository, "branch", "--show-current")),
+            "observedAt": current_incarnation["startedAt"] + 1,
+        }
     write_json(path, {"schemaVersion": 1, "tasks": {task_id: entry}})
     write_json(directory / "sessions.json", {task_id: {"taskId": task_id, "workspacePath": str(repository)}})
     write_json(directory / "board.json", {"columns": [{"cards": [{"id": task_id, "baseRef": "main"}]}]})
@@ -263,6 +282,8 @@ def run_synthetic_matrix(output: Path) -> list[dict]:
                     run_git(repository, "merge", "-q", "--no-ff", "main", "-m", "test: 吸收 base")
                 else:
                     run_git(repository, "rebase", "main")
+                if ASSERTION_MODE == "fix-acceptance":
+                    update_isolated_kanban_provenance(repository)
                 capture_baseline(event)
                 results.append(summarize_case(case_directory, topology, event, 1))
             elif topology == "main-direct":
