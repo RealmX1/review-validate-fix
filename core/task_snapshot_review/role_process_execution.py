@@ -40,6 +40,31 @@ def role_environment(request: dict) -> dict:
     return environment
 
 
+def _role_redactions(request: dict, environment: dict) -> dict:
+    return {name: environment[name] for name in request["config"].get("credential_environment_variable_names", [])
+            if environment.get(name)}
+
+
+def _redact_role_artifacts(attempt_directory: Path, request: dict, redactions: dict) -> None:
+    # 成功、失败及恢复都清理同一组原始文件，不能只脱敏 stdout。
+    paths = {attempt_directory / "stdout.txt", attempt_directory / "stderr.txt",
+             attempt_directory / "result.json", Path(request["result_file"])}
+    for path in paths:
+        if path.exists():
+            original = path.read_text(errors="replace")
+            redacted = cli.redact_configured_environment_variable_values_in_json_lines(original, redactions)
+            if redacted != original:
+                write_bytes(path, redacted.encode())
+    outcome_file = attempt_directory / "outcome.json"
+    if outcome_file.exists():
+        outcome = read_json(outcome_file)
+        if isinstance(outcome.get("error"), str):
+            redacted = cli.redact_configured_environment_variable_values(outcome["error"], redactions)
+            if redacted != outcome["error"]:
+                outcome["error"] = redacted
+                write_json(outcome_file, outcome)
+
+
 def extract_role_result(output: str, output_format: str) -> dict:
     extractors = {"text": lambda value: value, "codex_json": cli.extract_codex_json_result,
                   "claude_stream_json": cli.extract_claude_stream_result,
@@ -58,6 +83,8 @@ def extract_role_result(output: str, output_format: str) -> dict:
 
 
 def validate_role_result(payload: dict, role: str, expected_findings: list[dict]) -> None:
+    if not isinstance(payload, dict):
+        raise ValueError("角色结果必须是 JSON object")
     if payload.get("status") not in ("completed", "incomplete"):
         raise ValueError("角色结果缺少 completed/incomplete 状态")
     if role == "reviewer":
@@ -67,6 +94,8 @@ def validate_role_result(payload: dict, role: str, expected_findings: list[dict]
         for finding in findings:
             if not isinstance(finding, dict) or not isinstance(finding.get("message"), str) or not finding["message"].strip():
                 raise ValueError("每条 finding 需要可复核的问题说明")
+            if "problem_key" in finding and not isinstance(finding["problem_key"], str):
+                raise ValueError("finding problem_key 必须是字符串")
         if payload.get("requests") and payload["status"] == "completed":
             raise ValueError("仍有未解决请求的 reviewer 不能算完成")
     else:
@@ -85,9 +114,11 @@ def validate_role_result(payload: dict, role: str, expected_findings: list[dict]
         for finding in new_findings:
             if not isinstance(finding, dict) or not isinstance(finding.get("message"), str) or not finding["message"].strip():
                 raise ValueError("每条新 finding 需要可复核的问题说明")
+            if "problem_key" in finding and not isinstance(finding["problem_key"], str):
+                raise ValueError("新 finding problem_key 必须是字符串")
 
 
-def _validated_role_payload(request: dict, raw_output: str) -> dict:
+def _validated_role_payload(request: dict, raw_output: str, redactions: dict) -> dict:
     result_path = Path(request["result_file"])
     artifact_payload = read_json(result_path) if result_path.exists() else None
     output_format = request["config"].get("output_format", "text")
@@ -106,25 +137,29 @@ def _validated_role_payload(request: dict, raw_output: str) -> dict:
             extracted_payload = None
         payload = artifact_payload if artifact_payload is not None else extracted_payload
     validate_role_result(payload, request["role"], request.get("findings", []))
-    return payload
+    return cli.redact_configured_environment_variable_values_in_json_value(payload, redactions)
 
 
 def reconcile_completed_role_attempt(attempt_directory: Path) -> None:
     outcome_file = attempt_directory / "outcome.json"
     reconciliation_file = attempt_directory / "reconciled-native-completion.json"
     result_file = attempt_directory / "result.json"
-    if not outcome_file.exists() or (reconciliation_file.exists() and result_file.exists()):
-        return
-    outcome = read_json(outcome_file)
-    if outcome.get("returncode") != 0 or (outcome.get("status") == "completed" and result_file.exists()):
-        return
     request_file = attempt_directory / "request.json"
     stdout_file = attempt_directory / "stdout.txt"
-    if not request_file.exists() or not stdout_file.exists():
+    if not outcome_file.exists() or not request_file.exists():
         return
     request = read_json(request_file)
     try:
-        payload = _validated_role_payload(request, stdout_file.read_text(errors="replace"))
+        redactions = _role_redactions(request, role_environment(request))
+        _redact_role_artifacts(attempt_directory, request, redactions)
+        outcome = read_json(outcome_file)
+        if reconciliation_file.exists() and result_file.exists():
+            return
+        if outcome.get("returncode") != 0 or (outcome.get("status") == "completed" and result_file.exists()):
+            return
+        if not stdout_file.exists():
+            return
+        payload = _validated_role_payload(request, stdout_file.read_text(errors="replace"), redactions)
         if request["role"] == "reviewer":
             workspace = Path(request["workspace"])
             if git(workspace, "status", "--porcelain", "--untracked-files=all") or git_text(workspace, "rev-parse", "HEAD") != request["candidate_commit"]:
@@ -153,12 +188,12 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
         outcome = {"status": "failed", "started_at": started_at}
         active_process=None
         cancellation_requested=False
+        environment = os.environ
         def cancel_role(signum,frame):
             nonlocal cancellation_requested
             cancellation_requested=True
             outcome.update({'status':'cancelled','retryable':True})
             if active_process is not None and active_process.poll() is None:
-                os.killpg(active_process.pid,signal.SIGTERM)
                 raise InterruptedError('已取消角色执行')
         signal.signal(signal.SIGTERM,cancel_role)
         signal.signal(signal.SIGINT,cancel_role)
@@ -199,17 +234,11 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
                     returncode = 124
             raw_output = (attempt_directory / "stdout.txt").read_text(errors="replace")
             raw_error = (attempt_directory / "stderr.txt").read_text(errors="replace")
-            for secret in (environment.get(name) for name in config.get('credential_environment_variable_names',[])):
-                if secret:
-                    raw_output = raw_output.replace(secret, "[REDACTED]")
-                    raw_error = raw_error.replace(secret, "[REDACTED]")
-            write_bytes(attempt_directory / "stdout.txt", raw_output.encode())
-            write_bytes(attempt_directory / "stderr.txt", raw_error.encode())
             outcome["returncode"] = returncode
             if returncode:
                 outcome["retryable"] = not bool(cli.looks_like_usage_limit(raw_output + raw_error))
                 raise ValueError(f"角色进程退出码 {returncode}；参见原始 stdout/stderr")
-            payload = _validated_role_payload(request, raw_output)
+            payload = _validated_role_payload(request, raw_output, _role_redactions(request, environment))
             if request["role"] == "reviewer" and (git(workspace, "status", "--porcelain", "--untracked-files=all") or git_text(workspace,"rev-parse","HEAD") != request["candidate_commit"]):
                 raise ValueError("reviewer 修改了独立候选工作树；该腿不计完成")
             write_json(attempt_directory / "result.json", payload)
@@ -227,6 +256,13 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
                 except subprocess.TimeoutExpired:
                     os.killpg(active_process.pid,signal.SIGKILL)
                     active_process.wait()
+            redactions = _role_redactions(request, environment)
+            try:
+                _redact_role_artifacts(attempt_directory, request, redactions)
+            except (OSError, ValueError) as error:
+                outcome.update({"status": "failed", "error": str(error), "retryable": False})
+            if "error" in outcome:
+                outcome["error"] = cli.redact_configured_environment_variable_values(outcome["error"], redactions)
             outcome["finished_at"] = time.time()
             write_json(attempt_directory / "outcome.json", outcome)
 

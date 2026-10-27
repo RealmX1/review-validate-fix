@@ -23,7 +23,7 @@ def main(argv=None) -> int:
     signal.signal(signal.SIGTERM,interrupted)
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    review = commands.add_parser("review-task-snapshot", help="固定显式任务范围并运行独立双审")
+    review = commands.add_parser("review-task-snapshot", help="固定显式任务范围并运行独立评审")
     review.add_argument("--repo", type=Path, default=Path.cwd())
     review.add_argument("--base-ref", required=True, help="解析一次的本地基线 ref 或 commit")
     review.add_argument("--scope", action="append", required=True, help="可重复的仓内相对路径；全仓范围显式使用 .")
@@ -31,6 +31,7 @@ def main(argv=None) -> int:
     review.add_argument("--run-directory", type=Path)
     review.add_argument("--prepare-only", action="store_true")
     review.add_argument("--reviewer-config", type=Path, action="append")
+    review.add_argument("--reviewer-count", type=int, default=2, help="正式 reviewer 数量，至少 2；接续沿用此数量")
     resume = commands.add_parser("resume-task-review", help="复用精确 run，接续未完成评审、修复及验证")
     resume.add_argument("--run-dir", type=Path, required=True)
     resume.add_argument("--reviewer-config", type=Path, action="append")
@@ -56,8 +57,9 @@ def main(argv=None) -> int:
         if arguments.command == "review-task-snapshot":
             run = arguments.run_directory or root / "task-snapshot-reviews" / f"task-review-{uuid.uuid4().hex}"
             record = create_snapshot(arguments.repo, base_ref=arguments.base_ref, scope_paths=arguments.scope,
-                                     requirements=arguments.requirements_file.read_bytes(), run_directory=run)
-            result = {"status":record["status"],"run_directory":str(run.resolve())}
+                                     requirements=arguments.requirements_file.read_bytes(), run_directory=run,
+                                     reviewer_count=arguments.reviewer_count)
+            result = {"status":record["status"],"run_directory":str(run.resolve()),"reviewer_count":record["reviewer_count"]}
             if not arguments.prepare_only:
                 result = resume_review(run, reviewer_configs=[load_reviewer_configuration(path) for path in arguments.reviewer_config] if arguments.reviewer_config else None)
         elif arguments.command == "resume-task-review":

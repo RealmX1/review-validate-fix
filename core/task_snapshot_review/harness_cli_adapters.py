@@ -60,6 +60,13 @@ def redact_configured_environment_variable_values_in_json_value(json_value: Any,
     if isinstance(json_value, str):
         if containing_field_name in STRUCTURED_REVIEWER_OUTPUT_PROTOCOL_CONTROL_FIELD_NAMES:
             return json_value
+        # 结构化事件的正文也可能是序列化 JSON，先解析再脱敏，不能替换其中的数字或协议。
+        try:
+            nested_value = json.loads(json_value)
+        except json.JSONDecodeError:
+            nested_value = None
+        if isinstance(nested_value, (dict, list)):
+            return json.dumps(redact_configured_environment_variable_values_in_json_value(nested_value, configured_environment_variables), ensure_ascii=False)
         return redact_configured_environment_variable_values(json_value, configured_environment_variables)
     if isinstance(json_value, list):
         return [redact_configured_environment_variable_values_in_json_value(item, configured_environment_variables, containing_field_name=containing_field_name) for item in json_value]
@@ -70,6 +77,14 @@ def redact_configured_environment_variable_values_in_json_value(json_value: Any,
 def redact_configured_environment_variable_values_in_json_lines(text: str, configured_environment_variables: dict[str, str]) -> str:
     if not configured_environment_variables:
         return text
+    # 结果文件可以是多行 JSON；不能把缩进后的每一行误当作普通文本替换。
+    try:
+        parsed_value = json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    else:
+        redacted_text = json.dumps(redact_configured_environment_variable_values_in_json_value(parsed_value, configured_environment_variables), ensure_ascii=False)
+        return redacted_text + ('\n' if text.endswith(('\n', '\r')) else '')
     redacted_lines: list[str] = []
     for line in text.splitlines():
         try:

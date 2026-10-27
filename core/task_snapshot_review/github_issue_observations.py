@@ -116,15 +116,57 @@ def _may_retry_unknown_write(entry: dict) -> bool:
     return len(observations) >= 2
 
 
+def _related_entries(entry_path: Path, entry: dict) -> list[tuple[Path, dict]]:
+    """在已有仓库锁内，按问题别名与已知 Issue 绑定共享原始投递记录。"""
+    repository = entry["report"]["repository"].lower()
+    candidates = []
+    for path in sorted(entry_path.parent.glob("*.json")):
+        candidate = entry if path == entry_path else read_json(path)
+        if candidate["report"]["repository"].lower() == repository:
+            candidates.append((path, candidate))
+    related = []
+    keys = {entry["report"]["problem_key"], *entry["report"].get("problem_key_aliases", [])}
+    number = entry.get("issue_number") or entry["report"].get("issue_number")
+    numbers = {number} if number else set()
+    while candidates:
+        remaining = []
+        for path, candidate in candidates:
+            report = candidate["report"]
+            candidate_keys = {report["problem_key"], *report.get("problem_key_aliases", [])}
+            number = candidate.get("issue_number") or report.get("issue_number")
+            if keys.intersection(candidate_keys) or (number and number in numbers):
+                related.append((path, candidate))
+                keys.update(candidate_keys)
+                if number:
+                    numbers.add(number)
+            else:
+                remaining.append((path, candidate))
+        if len(remaining) == len(candidates):
+            break
+        candidates = remaining
+    return related
+
+
 def _deliver(entry_path: Path, entry: dict, api) -> dict:
     report = entry["report"]
     repository = report["repository"]
     endpoint = f"repos/{repository}/issues"
     try:
+        related = _related_entries(entry_path, entry)
         # 所有写入（包括未知结果恢复）之前查询实际远端状态。
         issues = list_repository_issues(repository, api=api)
-        markers = [problem_marker(key) for key in [report["problem_key"], *report.get("problem_key_aliases", [])]]
+        keys = {key for _, candidate in related for key in
+                [candidate["report"]["problem_key"], *candidate["report"].get("problem_key_aliases", [])]}
+        markers = [problem_marker(key) for key in keys]
         issue_number = entry.get("issue_number") or report.get("issue_number")
+        if not issue_number:
+            numbers = {candidate.get("issue_number") or candidate["report"].get("issue_number")
+                       for _, candidate in related}
+            numbers.discard(None)
+            if len(numbers) > 1:
+                entry["recovery_condition"] = "发现多个同身份 Issue；主 Agent 合并问题归属并指定 issue_number 后接续"
+                return entry
+            issue_number = next(iter(numbers), None)
         matches = [issue for issue in issues if issue.get("number") == issue_number] if issue_number else [
             issue for issue in issues if any(marker in (issue.get("body") or "") for marker in markers)]
         if not matches and not issue_number and issues:
@@ -138,23 +180,36 @@ def _deliver(entry_path: Path, entry: dict, api) -> dict:
         if issue_number and not matches:
             raise ValueError("指定的 Issue 未在完整仓库列表中找到，不自动新建替代问题")
         if not matches:
-            # 旧人工 Issue 的语义匹配由统一收集的主 Agent 完成，可显式绑定 issue_number。
-            if entry.get("write_intent") == "create_issue" and not _may_retry_unknown_write(entry):
-                entry["recovery_condition"] = "创建结果未知且完整查询未命中；60 秒后再次可达查询确认，随后自动接续"
-                return entry
-            entry["write_intent"] = "create_issue"
-            write_json(entry_path, entry)
-            issue = api.request("POST", endpoint, {"title": report["title"], "body": _issue_body(report)})
+            # 未知创建只由原始记录持有；新观察共用查询与 60 秒恢复窗口，不另起创建。
+            intents = [(path, candidate) for path, candidate in related
+                       if candidate.get("write_intent") == "create_issue"]
+            intent_path, intent = min(intents, key=lambda item: (item[1]["created_at"], str(item[0]))) if intents else (entry_path, entry)
+            if intents:
+                may_retry = _may_retry_unknown_write(intent)
+                write_json(intent_path, intent)
+                if not may_retry:
+                    entry["recovery_condition"] = "创建结果未知且完整查询未命中；60 秒后再次可达查询确认，随后自动接续"
+                    return entry
+            intent["write_intent"] = "create_issue"
+            intent.pop("absent_remote_result_checks", None)
+            write_json(intent_path, intent)
+            original_report = intent["report"]
+            issue = api.request("POST", endpoint, {"title": original_report["title"], "body": _issue_body(original_report)})
             issue_number = issue["number"]
         else:
             issue = matches[0]
             issue_number = issue["number"]
-        entry["issue_number"] = issue_number
-        entry["issue_url"] = issue.get("html_url")
-        if entry.get("write_intent") == "create_issue":
-            entry.pop("absent_remote_result_checks", None)
-            entry.pop("write_intent", None)
-        write_json(entry_path, entry)
+        # 只补充投递状态，保留每条原始报告；flush 的文件顺序不改变共享归属。
+        for path, candidate in related:
+            number = candidate.get("issue_number") or candidate["report"].get("issue_number")
+            if number and number != issue_number:
+                continue
+            candidate["issue_number"] = issue_number
+            candidate["issue_url"] = issue.get("html_url")
+            if candidate.get("write_intent") == "create_issue":
+                candidate.pop("absent_remote_result_checks", None)
+                candidate.pop("write_intent", None)
+            write_json(path, candidate)
         comments_endpoint = f"{endpoint}/{issue_number}/comments"
         comments = _all_pages(api, comments_endpoint)
         marker = observation_marker(report["observation_id"])

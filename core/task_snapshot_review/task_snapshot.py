@@ -50,7 +50,10 @@ def capture_worktree_tree(repo: Path, scope_paths: list[str], artifacts: Path, *
         capture_index.with_suffix(".index.lock").unlink(missing_ok=True)
 
 
-def create_snapshot(repo: Path, *, base_ref: str, scope_paths: list[str], requirements: bytes, run_directory: Path) -> dict:
+def create_snapshot(repo: Path, *, base_ref: str, scope_paths: list[str], requirements: bytes, run_directory: Path,
+                    reviewer_count: int = 2) -> dict:
+    if type(reviewer_count) is not int or reviewer_count < 2:
+        raise ValueError("reviewer 数量必须是至少为 2 的整数")
     scope_paths = normalized_scope_paths(scope_paths)
     identity = repository_identity(repo)
     repo = Path(identity["repo"])
@@ -80,6 +83,7 @@ def create_snapshot(repo: Path, *, base_ref: str, scope_paths: list[str], requir
         "base_commit": baseline, "original_head": original_head,
         "candidate_commit": candidate_commit, "snapshot_reference": snapshot_reference,
         "scope_paths": scope_paths, "changed_paths": [path for path in changed_paths if path],
+        "reviewer_count": reviewer_count,
         "requirements_sha256": hashlib.sha256(requirements).hexdigest(),
         "patch_sha256": hashlib.sha256(patch).hexdigest(), "status": "review_pending",
     }

@@ -29,8 +29,10 @@ def default_reviewer_configurations() -> list[dict]:
     registry = read_json(resolved_rvf_reviewer_registry_path(directory / "config/reviewer-registry.json"))
     available = []
     for item in sorted(registry["harnesses"].values(), key=lambda item: -item.get("priority_default", 0)):
+        if not item.get("enabled"):
+            continue
         config = load_reviewer_configuration(directory / item["config_path"])
-        if item.get("enabled") and config.get("enabled", True) and shutil.which(config["command"][0]):
+        if config.get("enabled", True) and shutil.which(config["command"][0]):
             available.append((item.get("underlying_provider_account_quota_pool_identity"), config))
     # 优先不同额度池；每个角色仍使用独立新进程与工作树。
     if len(available) > 1:
@@ -63,24 +65,31 @@ def configuration_digest(config: dict) -> str:
     return hashlib.sha256(json.dumps(persistent_configuration(config), sort_keys=True).encode()).hexdigest()
 
 
-def _role_result(role_directory: Path, *, latest: bool = False) -> dict | None:
+def _role_attempt_status(attempt: Path) -> str | None:
+    reconcile_completed_role_attempt(attempt)
+    outcome_file = attempt / "outcome.json"
+    if not outcome_file.exists():
+        return None
+    reconciliation_file = attempt / "reconciled-native-completion.json"
+    # 补证状态用于接续，原始失败记录保持不变。
+    if reconciliation_file.exists():
+        return read_json(reconciliation_file).get("status")
+    return read_json(outcome_file).get("status")
+
+
+def _role_result(role_directory: Path, *, latest: bool = False, include_incomplete: bool = False) -> dict | None:
     partial_findings = []
     attempts = sorted(role_directory.glob("attempt-*"), reverse=latest)
     for attempt in attempts:
-        reconcile_completed_role_attempt(attempt)
-        outcome_file = attempt / "outcome.json"
-        if not outcome_file.exists():
+        status = _role_attempt_status(attempt)
+        if status is None:
             continue
-        outcome = read_json(outcome_file)
-        reconciliation_file = attempt / "reconciled-native-completion.json"
-        reconciled = read_json(reconciliation_file) if reconciliation_file.exists() else {}
-        completed = outcome.get("status") == "completed" or reconciled.get("status") == "completed"
-        if completed and (attempt / "result.json").exists():
+        if (status == "completed" or include_incomplete and status == "incomplete") and (attempt / "result.json").exists():
             result = read_json(attempt / "result.json")
             if not latest and "findings" in result:
                 result["findings"] = partial_findings + result["findings"]
             return {"attempt_directory": str(attempt), "result": result}
-        if latest:
+        if latest and not include_incomplete:
             return None
         if (attempt / "result.json").exists():
             partial_findings.extend(read_json(attempt / "result.json").get("findings", []))
@@ -102,11 +111,17 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
             write_json(attempt/'outcome.json',{'status':'failed','retryable':True,'error':'执行中断，原进程已经结束但结果未知；保留原始输出并补跑此腿'})
     chosen = None
     candidate_commit = record.get("validated_candidate_commit", record["candidate_commit"]) if role == "fixer" else record["candidate_commit"]
+    if role == "fixer":
+        progress = _role_result(role_directory, latest=True, include_incomplete=True)
+        if progress:
+            candidate_commit = _snapshot_fixer_progress(run_directory, record, progress)["after"]
     for config in configurations:
         identity = configuration_digest(config)
         matching = [attempt for attempt in attempts if (attempt / "request.json").exists()
                     and read_json(attempt / "request.json")["configuration_digest"] == identity
-                    and read_json(attempt / "request.json")["candidate_commit"] == candidate_commit
+                    and (read_json(attempt / "request.json")["candidate_commit"] == candidate_commit
+                         or ((attempt / "outcome.json").exists()
+                             and read_json(attempt / "outcome.json").get("status") == "incomplete"))
                     and read_json(attempt / "request.json").get("findings", []) == findings
                     and read_json(attempt/'request.json').get('context_response_sha256') == record.get('context_response_sha256')
                     and not ((attempt/'outcome.json').exists() and read_json(attempt/'outcome.json').get('status')=='cancelled')]
@@ -126,7 +141,7 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
         "workspace": str(workspace), "input_file": str(attempt_directory / "request.json"),
         "repository": record['repo'],
         "result_file": str(result_file), "findings": findings,
-        "candidate_commit": record.get("validated_candidate_commit", record["candidate_commit"]) if role == "fixer" else record["candidate_commit"],
+        "candidate_commit": candidate_commit,
         "context_response_sha256": record.get('context_response_sha256'),
         "context_response_file": str(run_directory/'context-response.md') if record.get('context_response_sha256') else None,
     }
@@ -138,6 +153,10 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
             inputs+='本腿先前发现与缺口：'+', '.join(str(path) for path in partials)+'；保留发现并接续未完成检查。\n'
     else:
         inputs = f"\n需求原文：{run_directory / 'requirements.md'}\n匿名发现：{run_directory / 'findings.json'}\n"
+        partials = [attempt / "result.json" for attempt in attempts if (attempt / "result.json").exists()]
+        if partials:
+            request["previous_result_files"] = [str(path) for path in partials]
+            inputs += "先前验证修复处置：" + ", ".join(str(path) for path in partials) + "；当前工作树已保留此前修复，逐条接续未完成问题。\n"
     if record.get('context_response_sha256'):
         inputs+=f"通用补证：{run_directory/'context-response.md'}；不改变冻结需求与范围，不包含另一腿的结论。\n"
     prompt = template.strip() + "\n" + inputs + f"\n结果可写入 {result_file}，或在最终回复中只输出结果 JSON。\n"
@@ -148,11 +167,11 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
 
 def _run_roles(run_directory: Path, record: dict, roles: list[tuple[str, str, list[dict]]], findings: list[dict], *, force_new: bool = False) -> list[dict | None]:
     active = {}
-    for name, role, configs in roles:
-        _, process = _start_role(run_directory, record, run_directory / name, role, configs, findings, force_new=force_new)
-        if process:
-            active[name] = process
     try:
+        for name, role, configs in roles:
+            _, process = _start_role(run_directory, record, run_directory / name, role, configs, findings, force_new=force_new)
+            if process:
+                active[name] = process
         while active:
             for name, process in list(active.items()):
                 try:
@@ -162,6 +181,10 @@ def _run_roles(run_directory: Path, record: dict, roles: list[tuple[str, str, li
                 del active[name]
                 role_directory = run_directory / name
                 role_config = next(item for item in roles if item[0] == name)
+                progress = _role_result(role_directory, latest=True, include_incomplete=True) if role_config[1] == "fixer" else None
+                if (progress and progress["result"]["status"] == "incomplete"
+                        and Path(progress["attempt_directory"]) == sorted(role_directory.glob("attempt-*"))[-1]):
+                    continue
                 if _role_result(role_directory, latest=role_config[1] == "fixer") is None:
                     _, replacement = _start_role(run_directory, record, role_directory, role_config[1], role_config[2], findings)
                     if replacement:
@@ -205,7 +228,7 @@ def _matches_tree(repo: Path, expected: str, paths: list[str], run_directory: Pa
     return not git(repo, "diff", "--name-only", expected, current_tree, "--", *paths)
 
 
-def _prepare_and_apply_fix(run_directory: Path, record: dict, result: dict) -> bool:
+def _snapshot_fixer_progress(run_directory: Path, record: dict, result: dict) -> dict:
     repo = Path(record["repo"])
     attempt_directory = Path(result["attempt_directory"])
     intent_file = attempt_directory / "fix-application.json"
@@ -216,10 +239,10 @@ def _prepare_and_apply_fix(run_directory: Path, record: dict, result: dict) -> b
         intent["applied"] = False
     else:
         request = read_json(attempt_directory / "request.json")
-        before = request["candidate_commit"]
+        before = record.get("validated_candidate_commit", record["candidate_commit"])
         workspace = attempt_directory / "workspace"
         fixed_tree = capture_worktree_tree(workspace, ["."], run_directory)
-        fixed_commit = git_text(repo, "commit-tree", fixed_tree, "-p", before, input_bytes=b"RVF validated fixes\n", environment={
+        fixed_commit = git_text(repo, "commit-tree", fixed_tree, "-p", request["candidate_commit"], input_bytes=b"RVF validated fixes\n", environment={
             "GIT_AUTHOR_NAME": "RVF Fixes", "GIT_AUTHOR_EMAIL": "fixes@rvf.local",
             "GIT_COMMITTER_NAME": "RVF Fixes", "GIT_COMMITTER_EMAIL": "fixes@rvf.local"})
         git(repo, "update-ref", record["snapshot_reference"] + "-fix", fixed_commit)
@@ -228,6 +251,17 @@ def _prepare_and_apply_fix(run_directory: Path, record: dict, result: dict) -> b
         write_bytes(patch_file, patch)
         intent = {"before": before, "after": fixed_commit, "paths": paths, "applied": False}
     intent["requires_changes"] = requires_changes
+    write_json(intent_file, intent)
+    return intent
+
+
+def _prepare_and_apply_fix(run_directory: Path, record: dict, result: dict) -> bool:
+    repo = Path(record["repo"])
+    attempt_directory = Path(result["attempt_directory"])
+    intent_file = attempt_directory / "fix-application.json"
+    patch_file = attempt_directory / "fixer.patch"
+    intent = _snapshot_fixer_progress(run_directory, record, result)
+    requires_changes = intent["requires_changes"]
     if not intent["paths"]:
         intent["applied"] = not requires_changes
         if requires_changes:
@@ -248,6 +282,24 @@ def _prepare_and_apply_fix(run_directory: Path, record: dict, result: dict) -> b
     return intent["applied"]
 
 
+def _merge_fixer_findings(run_directory: Path, findings: list[dict]) -> None:
+    additional_file = run_directory / "fixer-new-findings.json"
+    existing = read_json(additional_file)["findings"] if additional_file.exists() else []
+    reported = []
+    for attempt in sorted((run_directory / "fixer").glob("attempt-*")):
+        if _role_attempt_status(attempt) not in {"completed", "incomplete"} or not (attempt / "result.json").exists():
+            continue
+        reported.extend(item for item in read_json(attempt / "result.json").get("new_findings", [])
+                        if item.get("scope_relation") != "outside_task_scope")
+    current = anonymous_findings([{"result": {"findings": reported}}])
+    merged = {item["finding_id"]: item for item in [*existing, *current]}
+    if merged:
+        write_json(additional_file, {"findings": list(merged.values())})
+    known = {item["finding_id"] for item in findings}
+    findings.extend(item for key, item in merged.items() if key not in known)
+    write_json(run_directory / "findings.json", {"findings": findings})
+
+
 def _validate(run_directory: Path, record: dict, commands: list[list[str]], lock_handle) -> dict:
     if not commands or any(not isinstance(command, list) or not command or not all(isinstance(value, str) for value in command) for command in commands):
         raise ValueError("最终验证命令必须是非空 argv 数组列表")
@@ -256,6 +308,9 @@ def _validate(run_directory: Path, record: dict, commands: list[list[str]], lock
     scope = record.get("effective_scope_paths", record["scope_paths"])
     if not _matches_tree(repo, candidate, scope, run_directory):
         return {"status": "candidate_changed", "returncode": None}
+    # 只将任务路径叠加到当前 HEAD；范围外 WIP 不参与最终候选验证。
+    head = git_text(repo, "rev-parse", "HEAD")
+    tested_tree = capture_worktree_tree(repo, scope, run_directory, head=head)
     prior = run_directory / "validation.json"
     old = read_json(prior) if prior.exists() else {}
     history_root = run_directory / "final-validation"
@@ -263,10 +318,24 @@ def _validate(run_directory: Path, record: dict, commands: list[list[str]], lock
     attempt_directory = history_root / f"attempt-{len(list(history_root.glob('attempt-*'))) + 1:03d}"
     attempt_directory.mkdir()
     validation = {"status": "running", "candidate_commit": candidate, "commands": commands, "completed_commands": 0,
-                  "attempt_directory": str(attempt_directory)}
-    if old.get("status") in {"running", "interrupted"} and old.get("candidate_commit") == candidate and old.get("commands") == commands:
+                  "tested_tree": tested_tree, "tested_head": head, "attempt_directory": str(attempt_directory)}
+    previous_workspace = Path(old["workspace"]) if old.get("workspace") else None
+    if (old.get("status") in {"running", "interrupted"} and old.get("candidate_commit") == candidate
+            and old.get("tested_tree") == tested_tree and old.get("commands") == commands
+            and previous_workspace and previous_workspace.exists()
+            and not git(previous_workspace, "diff", "--name-only", old["tested_commit"])):
+        workspace = previous_workspace
+        tested_commit = old["tested_commit"]
         validation["completed_commands"] = old.get("completed_commands", 0)
         validation["resumed_from"] = old.get("attempt_directory")
+    else:
+        tested_commit = git_text(repo, "commit-tree", tested_tree, "-p", head,
+            input_bytes=b"RVF final validation snapshot\n", environment={
+                "GIT_AUTHOR_NAME": "RVF Validation", "GIT_AUTHOR_EMAIL": "validation@rvf.local",
+                "GIT_COMMITTER_NAME": "RVF Validation", "GIT_COMMITTER_EMAIL": "validation@rvf.local"})
+        workspace = attempt_directory / "workspace"
+        git(repo, "worktree", "add", "--detach", str(workspace), tested_commit)
+    validation.update({"workspace": str(workspace), "tested_commit": tested_commit})
     def save_validation():
         write_json(attempt_directory / "validation.json", validation)
         write_json(prior, validation)
@@ -275,7 +344,7 @@ def _validate(run_directory: Path, record: dict, commands: list[list[str]], lock
         logs = attempt_directory / f"command-{i + 1:03d}"
         logs.mkdir()
         with (logs / "stdout.txt").open("wb") as stdout, (logs / "stderr.txt").open("wb") as stderr:
-            process = subprocess.Popen(commands[i], cwd=repo, stdout=stdout, stderr=stderr, pass_fds=(lock_handle.fileno(),), start_new_session=True)
+            process = subprocess.Popen(commands[i], cwd=workspace, stdout=stdout, stderr=stderr, pass_fds=(lock_handle.fileno(),), start_new_session=True)
             try:
                 returncode = process.wait()
             except KeyboardInterrupt:
@@ -298,7 +367,10 @@ def _validate(run_directory: Path, record: dict, commands: list[list[str]], lock
         validation["completed_commands"] = i + 1
         save_validation()
     else:
-        validation["status"] = "passed" if _matches_tree(repo, candidate, scope, run_directory) else "candidate_changed"
+        unchanged = (not git(workspace, "diff", "--name-only", tested_commit)
+                     and _matches_tree(repo, candidate, scope, run_directory)
+                     and capture_worktree_tree(repo, scope, run_directory) == tested_tree)
+        validation["status"] = "passed" if unchanged else "candidate_changed"
     save_validation()
     return validation
 
@@ -334,19 +406,19 @@ def resume_review(run_directory: Path, *, reviewer_configs: list[dict] | None = 
         else:
             reviewer_configs = default_reviewer_configurations()
             write_json(configurations_file, {"configurations": [persistent_configuration(config) for config in reviewer_configs]})
-        roles = [("reviewer-1", "reviewer", [reviewer_configs[0], reviewer_configs[1], *reviewer_configs[2:]]),
-                 ("reviewer-2", "reviewer", [reviewer_configs[1], reviewer_configs[0], *reviewer_configs[2:]])]
+        reviewer_count = record["reviewer_count"]
+        roles = []
+        for reviewer_index in range(reviewer_count):
+            primary_index = reviewer_index % len(reviewer_configs)
+            configurations = [reviewer_configs[primary_index], *reviewer_configs[:primary_index], *reviewer_configs[primary_index + 1:]]
+            roles.append((f"reviewer-{reviewer_index + 1}", "reviewer", configurations))
         results = _run_roles(run_directory, record, roles, [])
         if any(result is None for result in results):
             record["status"] = "review_incomplete"
             record["recovery_condition"] = "等待在运行的角色进程结束，或提供修复后的 CLI 配置；已完成的腿不会重跑"
         else:
             findings = anonymous_findings(results)
-            additional_findings_file = run_directory / "fixer-new-findings.json"
-            if additional_findings_file.exists():
-                known = {item["finding_id"] for item in findings}
-                findings.extend(item for item in read_json(additional_findings_file)["findings"] if item["finding_id"] not in known)
-            write_json(run_directory / "findings.json", {"findings": findings})
+            _merge_fixer_findings(run_directory, findings)
             record["finding_count"] = len(findings)
             record["status"] = "ready_for_fix" if findings else "ready_for_validation"
             fixer_result = _role_result(run_directory / "fixer", latest=True)
@@ -362,19 +434,16 @@ def resume_review(run_directory: Path, *, reviewer_configs: list[dict] | None = 
                 if not fixer_result or needs_new_fix:
                     configs = [fixer_config] if fixer_config else reviewer_configs
                     fixer_result = _run_roles(run_directory, record, [("fixer", "fixer", configs)], findings, force_new=needs_new_fix)[0]
+                _merge_fixer_findings(run_directory, findings)
+                record["finding_count"] = len(findings)
                 if not fixer_result:
                     record["status"] = "fix_incomplete"
+                    progress = _role_result(run_directory / "fixer", latest=True, include_incomplete=True)
+                    if progress:
+                        _snapshot_fixer_progress(run_directory, record, progress)
                 else:
                     new_findings = fixer_result["result"].get("new_findings", [])
                     in_scope_new = anonymous_findings([{"result": {"findings": [item for item in new_findings if item.get("scope_relation") != "outside_task_scope"]}}])
-                    if in_scope_new:
-                        existing_new = read_json(additional_findings_file)["findings"] if additional_findings_file.exists() else []
-                        merged_new = {item["finding_id"]: item for item in [*existing_new, *in_scope_new]}
-                        write_json(additional_findings_file, {"findings": list(merged_new.values())})
-                        known = {item["finding_id"] for item in findings}
-                        findings.extend(item for item in in_scope_new if item["finding_id"] not in known)
-                        write_json(run_directory / "findings.json", {"findings": findings})
-                        record["finding_count"] = len(findings)
                     if not _prepare_and_apply_fix(run_directory, record, fixer_result):
                         application = read_json(run_directory / "fix-application.json")
                         if application.get("requires_changes") and not application.get("paths"):
@@ -394,19 +463,24 @@ def resume_review(run_directory: Path, *, reviewer_configs: list[dict] | None = 
                     validation = read_json(run_directory / "validation.json")
                     if validation.get("candidate_commit") != current_candidate:
                         validation = {}
-                    elif validation.get("status") in {"running", "interrupted"}:
+                    elif (validation.get("status") in {"running", "interrupted"}
+                          or validation.get("tested_tree") != capture_worktree_tree(
+                              repo, record.get("effective_scope_paths", record["scope_paths"]), run_directory)):
                         validation = _validate(run_directory, record, validation["commands"], lock_handle)
                 else:
                     validation = {}
                 if validation.get("status") == "passed":
                     expected = record.get("validated_candidate_commit", record["candidate_commit"])
                     scope = record.get("effective_scope_paths", record["scope_paths"])
-                    if not _matches_tree(repo, expected, scope, run_directory):
+                    if (not _matches_tree(repo, expected, scope, run_directory)
+                            or validation.get("tested_tree") != capture_worktree_tree(repo, scope, run_directory)):
                         record["status"] = "candidate_changed"
                     else:
                         record["status"] = "ready_to_commit"
                         head = git_text(repo, "rev-parse", "HEAD")
-                        if git(repo, "diff", "--name-only", record["base_commit"], head, "--", *scope) and not git(repo, "diff", "--name-only", expected, head, "--", *scope):
+                        if (git_text(repo, "rev-parse", "HEAD^{tree}") == validation["tested_tree"]
+                                and git(repo, "diff", "--name-only", record["base_commit"], head, "--", *scope)
+                                and not git(repo, "diff", "--name-only", expected, head, "--", *scope)):
                             git(repo, "merge-base", "--is-ancestor", record["original_head"], head)
                             record.update({"status": "completed", "commit": head})
                 elif validation:
@@ -420,7 +494,7 @@ def resume_review(run_directory: Path, *, reviewer_configs: list[dict] | None = 
             'ready_to_commit':'主会话依据授权精确暂存并提交，再接续原 run 核对实际提交',
             'fix_application_pending':f'读取 {run_directory/"fixer.patch"} 并核对目标文件的并发改动；原补丁保留',
         }
-        return {"run_directory": str(run_directory), "status": record["status"],
+        return {"run_directory": str(run_directory), "status": record["status"], "reviewer_count": reviewer_count,
                 "finding_count": record.get("finding_count", 0), **({"commit": record["commit"]} if record.get("commit") else {}),
                 **({'next_action':next_actions[record['status']]} if record['status'] in next_actions else {}),
                 **({"recovery_condition": record["recovery_condition"]} if record.get("recovery_condition") else {})}
