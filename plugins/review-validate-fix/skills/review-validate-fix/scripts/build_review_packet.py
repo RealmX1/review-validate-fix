@@ -18,6 +18,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
 from compact_path_tree_rendering import render_compact_path_tree_block  # noqa: E402
 from core.session_scope_allocation import reviewable_unit_diff_tracker  # noqa: E402
+from core.session_scope_allocation.frozen_review_unit_evidence import (  # noqa: E402
+    verify_frozen_unit_evidence, write_frozen_evidence_file, project_tracked_hunk_by_content_identity,
+)
 from core.review_start_boundary.review_start_boundary_verification import repository_git_environment  # noqa: E402
 from review_scope_excluded_path_prefixes import (  # noqa: E402
     REVIEW_VALIDATE_FIX_REPO_LOCAL_IGNORE_FILE_NAME,
@@ -465,6 +468,208 @@ def diff_for_tracker_scope(repo: Path, tracker_scope: dict[str, Any], exclude_pr
     return "\n".join(chunks).rstrip()
 
 
+def build_frozen_scope_packet(source: FrozenCandidatePacketGitSource, scope: dict[str, Any] | None,
+                              metadata: dict[str, Any], context: str, owned_paths: list[str],
+                              untracked: list[str], max_file_bytes: int, base_ref: str,
+                              excluded_prefixes: list[str], evidence_directory: Path | None,
+                              history_diff: str) -> tuple[str, dict[str, Any]]:
+    """正文只含正式分配内容；完整代码及机器审计索引留在持久文件。"""
+    candidate = source.frozen_candidate_commit_sha
+    origin = source.frozen_origin_worktree_head_commit_sha
+    units = []
+    chunks = []
+    gaps = []
+    frozen_blob_descriptors: dict[str, dict[str, Any]] = {}
+    frozen_blob_text_edges: dict[str, str] = {}
+    index: dict[str, Any] = {"schema_version": 1, "candidate_commit": candidate,
+        "origin_head_commit": origin, "scope_hash": scope.get("scope_hash") if scope else None,
+        "unit_ids": list(scope.get("unit_ids", [])) if scope else [],
+        "tracker_lease_id": scope.get("lease_id") if scope else None, "units": units}
+
+    def persist(name: str, content: bytes) -> dict[str, Any]:
+        if evidence_directory is None:
+            return {"sha256": hashlib.sha256(content).hexdigest(), "bytes": len(content)}
+        return write_frozen_evidence_file(evidence_directory, name, content)
+
+    def blob_descriptor(blob: str | None) -> dict[str, Any] | None:
+        if not blob:
+            return None
+        if blob in frozen_blob_descriptors:
+            return frozen_blob_descriptors[blob]
+        content = subprocess.check_output(["git", "cat-file", "blob", blob], cwd=source.repository_root,
+                                          env=repository_git_environment())
+        descriptor = {"git_object_id": blob, **persist("blob", content)}
+        frozen_blob_descriptors[blob] = descriptor
+        frozen_blob_text_edges[blob] = (content[:4096] + content[-4096:]).decode("utf-8", "replace")
+        return descriptor
+
+    def generated_source_relationship(path: str, after: dict[str, Any] | None) -> dict[str, Any]:
+        if after is None:
+            return {"status": "unknown"}
+        edges = frozen_blob_text_edges[after["git_object_id"]]
+        match = re.search(r"sourceMappingURL=([^\s*]+)", edges)
+        if match and not re.match(r"[a-zA-Z]+:", match[1]):
+            map_path = posixpath.normpath(posixpath.join(posixpath.dirname(path), match[1]))
+            if map_path != ".." and not map_path.startswith(("../", "/")):
+                entry = source.read_frozen_tree_entry(map_path)
+                if entry and entry[1] == "blob":
+                    return {"status": "known", "source_map_path": map_path,
+                            "source_map_evidence": blob_descriptor(entry[2]),
+                            "review_options": ["source_semantics", "build_consistency", "raw_artifact"]}
+        match = re.search(r"(?:Generated|generated) from\s+([^\s*]+)", edges)
+        if match:
+            source_path = posixpath.normpath(match[1])
+            if source_path != ".." and not source_path.startswith(("../", "/")):
+                entry = source.read_frozen_tree_entry(source_path)
+                if entry and entry[1] == "blob":
+                    return {"status": "known", "declared_source_path": source_path,
+                            "source_evidence": blob_descriptor(entry[2]),
+                            "review_options": ["source_semantics", "build_consistency", "raw_artifact"]}
+        return {"status": "unknown"}
+
+    entries = [entry for entry in (scope or {}).get("hunks", []) if isinstance(entry, dict)]
+    entries_by_unit = {entry.get("unit_id"): entry for entry in entries}
+    if scope:
+        entries = [entries_by_unit.get(uid, {"unit_id": uid}) for uid in scope["unit_ids"]]
+    else:
+        entries = [{"unit_id": None, "path": path} for path in owned_paths]
+
+    for entry in entries:
+        path = entry.get("path")
+        if isinstance(path, str) and (any(path.startswith(prefix) for prefix in excluded_prefixes)
+                                     or path in source.frozen_packet_context_only_paths):
+            continue
+        unit_id = entry.get("unit_id")
+        descriptor: dict[str, Any] = {"unit_id": unit_id, "path": path, "evidence_status": "verified"}
+        patch = ""
+        record = entry.get("frozen_evidence")
+        try:
+            if scope and (not isinstance(unit_id, str) or not re.fullmatch(r"[0-9a-f]{64}", unit_id)):
+                raise ValueError("已分配 unit 内容身份无效")
+            if not isinstance(path, str) or not path or path in source.frozen_packet_context_only_paths:
+                raise ValueError("已分配 unit 缺少可核验的代码路径")
+            if isinstance(record, dict):
+                descriptor["before"] = blob_descriptor(record.get("preimage_blob"))
+                descriptor["after"] = blob_descriptor(record.get("postimage_blob"))
+                verify_frozen_unit_evidence(record, unit_id, path, source,
+                    resolved_postimage_content_sha256=(descriptor["after"] or {}).get("sha256"))
+                descriptor.update({key: value for key, value in record.items() if key not in {"hunk_patch"}})
+                if record.get("hunk_patch"):
+                    patch = (f"diff --git a/{path} b/{path}\n"
+                             f"--- a/{path}\n+++ b/{path}\n" + record["hunk_patch"])
+                else:
+                    target = candidate if record["source"] == "dirty" else record["target_commit"]
+                    patch = source.render_raw_diff_from_immutable_git_objects([
+                        "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--full-index",
+                        record["baseline_commit"], target, "--", ":(literal)" + path])
+            else:
+                header = entry.get("hunk_header")
+                selected = []
+                selected_blob_pair = None
+                for baseline, target, label in ((origin, candidate, "dirty"), (base_ref, origin, "committed")):
+                    if baseline == target:
+                        continue
+                    rendered = source.render_raw_diff_from_immutable_git_objects([
+                        "diff", "--no-ext-diff", "--no-textconv", "--find-renames", "--full-index",
+                        baseline, target, "--", ":(literal)" + path])
+                    before_blob = reviewable_unit_diff_tracker._resolve_blob_at_ref(source.repository_root, baseline, path)
+                    after_blob = reviewable_unit_diff_tracker._resolve_blob_at_ref(source.repository_root, target, path)
+                    if not header and unit_id:
+                        after = blob_descriptor(after_blob)
+                        identities = {reviewable_unit_diff_tracker._canonical_hash_path_only(path)}
+                        if after and not before_blob:
+                            identities.add(reviewable_unit_diff_tracker._canonical_hash_added(path, after["sha256"]))
+                        if before_blob and not after_blob:
+                            identities.add(reviewable_unit_diff_tracker._canonical_hash_deleted(path, before_blob))
+                        if after:
+                            identities.add(reviewable_unit_diff_tracker._canonical_hash_binary(path, before_blob or "", after["sha256"]))
+                        if unit_id not in identities:
+                            continue
+                    if header and rendered:
+                        rendered = project_tracked_hunk_by_content_identity(rendered, path=path, unit_id=unit_id) or ""
+                        if not any(line.startswith("@@") for line in rendered.splitlines()):
+                            continue
+                    if rendered:
+                        selected.append(rendered)
+                        descriptor.setdefault("sources", []).append({"source": label, "baseline_commit": baseline, "target_commit": target})
+                        selected_blob_pair = (before_blob, after_blob)
+                        if unit_id:
+                            break
+                if not selected and unit_id:
+                    raise ValueError("冻结候选无法完整投影已分配的 hunk 或文件 unit 范围")
+                patch = "\n".join(selected)
+                before_blob = selected_blob_pair[0] if selected_blob_pair else reviewable_unit_diff_tracker._resolve_blob_at_ref(source.repository_root, base_ref, path)
+                after_blob = selected_blob_pair[1] if selected_blob_pair else reviewable_unit_diff_tracker._resolve_blob_at_ref(source.repository_root, candidate, path)
+                descriptor["before"] = blob_descriptor(before_blob)
+                descriptor["after"] = blob_descriptor(after_blob)
+            descriptor["patch"] = persist("patch", patch.encode())
+            descriptor["generated_source_relationship"] = generated_source_relationship(path, descriptor.get("after"))
+            if len(patch.encode()) <= max_file_bytes:
+                chunks.append(patch.rstrip())
+            else:
+                chunks.append(f"路径 `{path}` 的内容改为引用读取，仍属于完整 Scope：{descriptor['patch']}")
+        except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
+            # 新分配证据有缺口时保持 unknown；不把整条路径误当作同一 unit 的替代证明。
+            descriptor.update(evidence_status="unverified", evidence_gap=str(exc))
+            if isinstance(record, dict):
+                descriptor["unverified_unit_evidence_snapshot"] = persist("unverified-unit-evidence.json",
+                    json.dumps(record, ensure_ascii=False, sort_keys=True).encode())
+                if isinstance(record.get("hunk_patch"), str):
+                    descriptor["patch"] = persist("patch", record["hunk_patch"].encode())
+            gaps.append(descriptor)
+        units.append(descriptor)
+
+    # 路径级范围可保留 Git 的重命名展示，正文依旧只有一份；hunk 级范围始终逐 unit 投影。
+    if not scope and all(len(chunk.encode()) <= max_file_bytes for chunk in chunks):
+        pathspecs = [":(literal)" + path for path in owned_paths if path not in source.frozen_packet_context_only_paths
+                     and not any(path.startswith(prefix) for prefix in excluded_prefixes)]
+        chunks = [source.render_raw_diff_from_immutable_git_objects([
+            "diff", "--no-ext-diff", "--no-textconv", "--find-renames", base_ref, candidate, "--", *pathspecs])] if pathspecs else []
+
+    index["evidence_complete"] = not gaps
+    index["history_diff"] = persist("repository-history.diff", history_diff.encode())
+    if evidence_directory is not None:
+        evidence_directory.mkdir(parents=True, exist_ok=True)
+        index_descriptor = write_frozen_evidence_file(evidence_directory, "frozen-review-evidence-index.json",
+            (json.dumps(index, ensure_ascii=False, indent=2) + "\n").encode())
+        metadata["frozen_evidence_index"] = index_descriptor["file"]
+        metadata["frozen_evidence_index_sha256"] = index_descriptor["sha256"]
+    metadata["frozen_evidence_complete"] = not gaps
+    metadata["frozen_evidence_gaps"] = gaps
+    metadata["frozen_evidence_units"] = units
+    metadata["untracked_files"] = []
+    for path in untracked:
+        if path not in set(owned_paths):
+            continue
+        _, info = source.read_frozen_blob_text_and_metadata(path, max_file_bytes)
+        metadata["untracked_files"].append({"path": path, **info})
+    metadata["inlined_untracked_count"] = sum(not item.get("omitted") for item in metadata["untracked_files"])
+    metadata["omitted_untracked_count"] = sum(bool(item.get("omitted")) for item in metadata["untracked_files"])
+    lines = ["# Review Packet", "", f"冻结候选：`{candidate}`。两位 reviewer 各自负责全部正式 Scope。", "",
+             "按需选择阅读路径、工具与验证方法；生成物、二进制和大文件仍属于原 Scope。", ""]
+    if context:
+        lines.extend(["## Session Context", "", context, ""])
+    if scope:
+        lines.extend(["## Tracker Scope", "", f"Scope：`{scope['scope_hash']}`；lease：`{scope['lease_id']}`；unit_ids：", *[f"- `{uid}`" for uid in scope["unit_ids"]], ""])
+    if metadata["session_manifest_provided"]:
+        lines.extend(["## Session Manifest", "", f"归属与机器审计按需读取：{metadata['session_manifest_file']}", ""])
+    lines.extend(["## Excluded Paths", "", *[f"- {prefix}" for prefix in excluded_prefixes], ""])
+    conflicts = metadata.get("cross_session_conflicts") or []
+    if conflicts:
+        sessions = sorted({item["other_session_id"] for item in conflicts})
+        lines.extend(["## Cross-Session Conflicts", "",
+            f"发现 {len(conflicts)} 项并行归属或资源争用，涉及会话：{', '.join(sessions)}。详情见 Session Manifest 及 packet metadata。",
+            "优先使用隔离资源或既有命令锁，并继续不依赖争用资源的审查。", ""])
+    lines.extend(["## Allocated Git Diff" if scope else "## Session-Owned Git Diff" if metadata["session_manifest_provided"] else "## Git Diff HEAD", "",
+                  *chunks, "", "## 冻结证据入口", "", str(metadata.get("frozen_evidence_index", "证据索引由 packet 调用方持久保存。")), "",
+                  f"使用 `{Path(__file__).resolve().with_name('read_frozen_review_evidence.py')}` 按索引读取；默认每页 32768 字节，offset 按字节推进，支持超长行和二进制。", ""])
+    if gaps:
+        lines.extend(["未核验的证据缺口：", json.dumps(gaps, ensure_ascii=False), ""])
+    packet = "\n".join(lines).rstrip() + "\n"
+    metadata["packet_bytes"] = len(packet.encode())
+    return packet, metadata
+
+
 def build_packet(
     repo: Path,
     session_context: Path | None,
@@ -477,6 +682,7 @@ def build_packet(
     base_ref_override: str | None = None,
     frozen_candidate_commit: str | None = None,
     frozen_packet_context_only_paths: list[str] | None = None,
+    evidence_directory: Path | None = None,
 ) -> tuple[str, dict[str, Any]]:
     root = git_root(repo)
     frozen_source = FrozenCandidatePacketGitSource(root, frozen_candidate_commit) if frozen_candidate_commit else None
@@ -624,7 +830,7 @@ def build_packet(
         path for path in metadata["tracker_scope_paths"] if isinstance(path, str)
     ] if tracker_scope is not None else sorted(set(owned_dirty_paths) | set(owned_committed_round_paths))
     owned_path_set = set(owned_diff_paths)
-    if tracker_scope is not None:
+    if tracker_scope is not None and frozen_source is None:
         owned_diff = diff_for_tracker_scope(root, tracker_scope, all_exclude_prefixes, owned_diff_base_ref, frozen_source)
     else:
         owned_diff = diff_for_paths(root, owned_diff_paths, all_exclude_prefixes, owned_diff_base_ref, frozen_source) if session_manifest is not None else ""
@@ -634,6 +840,16 @@ def build_packet(
     metadata["owned_diff_base_ref"] = owned_diff_base_ref
     metadata["owned_untracked_count"] = len(owned_untracked) if session_manifest is not None else len(untracked)
     metadata["background_untracked_count"] = len(background_untracked) if session_manifest is not None else 0
+
+    if frozen_source is not None:
+        return build_frozen_scope_packet(
+            frozen_source, tracker_scope, metadata, session_context_text,
+            owned_diff_paths if session_manifest is not None else sorted(set(primary_files) or set(
+                run_git(root, ["diff", "--name-only", "--no-renames", owned_diff_base_ref, frozen_source.frozen_candidate_commit_sha]).splitlines())),
+            untracked, max_file_bytes, owned_diff_base_ref, all_exclude_prefixes, evidence_directory, diff,
+        )
+    if evidence_directory is not None:
+        metadata["repository_diff_evidence"] = write_frozen_evidence_file(evidence_directory, "repository-history.diff", diff.encode())
 
     lines: list[str] = [
         "# Review Packet",
@@ -866,14 +1082,6 @@ def build_packet(
                 allocated_body,
                 "```",
                 "",
-                "## Full Git Diff HEAD (Evidence Only)",
-                "",
-                "This full dirty diff may include other sessions' work. Use it only as supporting evidence for direct dependencies from session-owned changes.",
-                "",
-                "```diff",
-                diff or "(no tracked diff)",
-                "```",
-                "",
             ]
         )
     elif session_manifest is not None:
@@ -885,14 +1093,6 @@ def build_packet(
                 "",
                 "```diff",
                 owned_diff or "(no tracked diff for session-owned paths)",
-                "```",
-                "",
-                "## Full Git Diff HEAD (Evidence Only)",
-                "",
-                "This full dirty diff may include other sessions' work. Use it only as supporting evidence for direct dependencies from session-owned changes.",
-                "",
-                "```diff",
-                diff or "(no tracked diff)",
                 "```",
                 "",
             ]
@@ -988,6 +1188,7 @@ def main() -> int:
             args.base_ref,
             args.frozen_candidate_commit,
             args.frozen_packet_context_only_path,
+            Path(args.output).expanduser().resolve().parent / "frozen-review-evidence" if args.output else None,
         )
         if args.max_packet_bytes and metadata["packet_bytes"] > args.max_packet_bytes:
             raise ValueError(

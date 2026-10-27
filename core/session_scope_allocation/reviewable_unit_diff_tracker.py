@@ -38,6 +38,10 @@ from core.run_ledger.run_ledger import (  # noqa: E402
     safe_token,
     utc_now,
 )
+from core.session_scope_allocation.frozen_review_unit_evidence import (  # noqa: E402
+    freeze_observed_unit_evidence, tracked_hunk_content_identity,
+    read_worktree_path_git_blob_input, write_worktree_path_git_normalized_blob,
+)
 
 
 SCHEMA_VERSION = 6
@@ -418,16 +422,8 @@ def _sha256_hex(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _canonical_payload_for_hunk(hunk_lines: list[str]) -> bytes:
-    """Pure hunk content (context + +/- lines), stripped of @@ header. Joining
-    with a newline keeps line-internal whitespace intact while staying
-    independent of which specific @@ -A,B +C,D @@ git emitted."""
-    return ("\n".join(hunk_lines)).encode("utf-8")
-
-
 def _canonical_hash_tracked_hunk(path: str, change_type: str, hunk_lines: list[str]) -> str:
-    parts = [b"hunk", path.encode("utf-8"), change_type.encode("utf-8"), _canonical_payload_for_hunk(hunk_lines)]
-    return _sha256_hex(b"\0".join(parts))
+    return tracked_hunk_content_identity(path, change_type, hunk_lines)
 
 
 def _canonical_hash_added(path: str, content_sha: str) -> str:
@@ -493,9 +489,12 @@ class _PathObservation:
     kind: str                                 # see units.kind enum
     change_type: str                          # add/modify/delete
     preimage_blob: str | None
-    postimage_hash: str | None
+    postimage_hash: str | None                 # Git 规范化 blob 内容的 SHA-256
     old_path: str | None
     hunks: tuple[_ObservedHunk, ...] = ()     # only for tracked_hunk
+    observed_worktree_content_sha256: str | None = None
+    observed_worktree_path_is_symbolic_link: bool | None = None
+    git_normalized_postimage_blob: str | None = None
 
 
 def _resolve_blob_at_ref(repo: Path, ref: str, path: str) -> str | None:
@@ -515,29 +514,13 @@ def _resolve_blob_at_head(repo: Path, path: str) -> str | None:
 
 
 def _blob_content_sha_at_ref(repo: Path, ref: str, path: str) -> str | None:
-    """sha256 of the bytes of `path` at `ref`, matching `_file_content_sha`'s
-    digest so a binary/postimage observed first on the dirty side (worktree
-    bytes) and later on the committed side (HEAD blob bytes) hash identically
-    and dedup by unit_id. Returns None when the path is absent at `ref`."""
+    """对 Git blob 内容求摘要，与 dirty 侧经过 clean 规范化的内容身份一致。
+    路径不存在时返回 None；工作区原始字节摘要独立用于漂移核验。"""
     try:
         out = _run_git_bytes(repo, ["cat-file", "-p", f"{ref}:{path}"])
     except RuntimeError:
         return None
     return hashlib.sha256(out).hexdigest()
-
-
-def _file_content_sha(file_path: Path) -> str | None:
-    try:
-        with file_path.open("rb") as handle:
-            digest = hashlib.sha256()
-            while True:
-                chunk = handle.read(65536)
-                if not chunk:
-                    break
-                digest.update(chunk)
-            return digest.hexdigest()
-    except OSError:
-        return None
 
 
 def _is_binary_blob(repo: Path, sha: str) -> bool:
@@ -606,8 +589,7 @@ def _parse_tracked_hunks(repo: Path, path: str, base_ref: str = "HEAD") -> list[
             continue
         if not in_hunk or pending_header is None:
             continue
-        if raw_line.startswith("+++") or raw_line.startswith("---"):
-            continue
+        # 文件头只出现在首个 @@ 之前；进入 hunk 后的 +++/--- 都是合法正文。
         body_lines.append(raw_line)
         if not (raw_line.startswith("+") or raw_line.startswith("-")):
             if len(context_lines) < 3:
@@ -633,21 +615,7 @@ def _classify_path(repo: Path, path: str) -> _PathObservation | None:
     code_x = entry[0] if len(entry) >= 1 else " "
     code_y = entry[1] if len(entry) >= 2 else " "
 
-    abs_file = (repo / path).resolve() if not Path(path).is_absolute() else Path(path)
-
-    # Untracked.
-    if code_x == "?" and code_y == "?":
-        content_sha = _file_content_sha(abs_file)
-        if content_sha is None:
-            return None
-        return _PathObservation(
-            path=path,
-            kind="untracked_file",
-            change_type="add",
-            preimage_blob=None,
-            postimage_hash=content_sha,
-            old_path=None,
-        )
+    abs_file = repo / path
 
     # Deletion (in worktree or staged).
     if code_x == "D" or code_y == "D":
@@ -661,6 +629,33 @@ def _classify_path(repo: Path, path: str) -> _PathObservation | None:
             preimage_blob=preimage,
             postimage_hash=None,
             old_path=None,
+        )
+
+    try:
+        is_symbolic_link = abs_file.is_symlink()
+        raw_content = read_worktree_path_git_blob_input(abs_file)
+        postimage_blob = write_worktree_path_git_normalized_blob(repo, path, raw_content,
+            is_symbolic_link=is_symbolic_link)
+        postimage_content_sha256 = hashlib.sha256(_run_git_bytes(
+            repo, ["cat-file", "blob", postimage_blob])).hexdigest()
+    except (OSError, RuntimeError, subprocess.CalledProcessError):
+        return None
+    observed_worktree_identity_fields = {
+        "observed_worktree_content_sha256": hashlib.sha256(raw_content).hexdigest(),
+        "observed_worktree_path_is_symbolic_link": is_symbolic_link,
+        "git_normalized_postimage_blob": postimage_blob,
+    }
+
+    # Untracked.
+    if code_x == "?" and code_y == "?":
+        return _PathObservation(
+            path=path,
+            kind="untracked_file",
+            change_type="add",
+            preimage_blob=None,
+            postimage_hash=postimage_content_sha256,
+            old_path=None,
+            **observed_worktree_identity_fields,
         )
 
     # Rename detection deliberately omitted: callers always pass a single
@@ -687,16 +682,14 @@ def _classify_path(repo: Path, path: str) -> _PathObservation | None:
     if numstat:
         cols = numstat.split("\t", 2)
         if len(cols) >= 2 and cols[0] == "-" and cols[1] == "-":
-            postimage_sha = _file_content_sha(abs_file) or ""
-            if preimage_blob is None and postimage_sha == "":
-                return None
             return _PathObservation(
                 path=path,
                 kind="binary_file",
                 change_type="modify" if preimage_blob else "add",
                 preimage_blob=preimage_blob,
-                postimage_hash=postimage_sha or None,
+                postimage_hash=postimage_content_sha256,
                 old_path=None,
+                **observed_worktree_identity_fields,
             )
 
     hunks = _parse_tracked_hunks(repo, path)
@@ -706,8 +699,9 @@ def _classify_path(repo: Path, path: str) -> _PathObservation | None:
             kind="tracked_hunk",
             change_type="modify" if preimage_blob else "add",
             preimage_blob=preimage_blob,
-            postimage_hash=_file_content_sha(abs_file),
+            postimage_hash=postimage_content_sha256,
             old_path=None,
+            **observed_worktree_identity_fields,
             hunks=tuple(hunks),
         )
 
@@ -723,8 +717,9 @@ def _classify_path(repo: Path, path: str) -> _PathObservation | None:
             kind="tracked_hunk",
             change_type="add",
             preimage_blob=None,
-            postimage_hash=_file_content_sha(abs_file),
+            postimage_hash=postimage_content_sha256,
             old_path=None,
+            **observed_worktree_identity_fields,
             hunks=(),
         )
 
@@ -1612,6 +1607,10 @@ def _open_conn(db_path: Path) -> sqlite3.Connection:
                     backoff = min(backoff * 2, 0.2)
         conn.execute("PRAGMA foreign_keys = ON")
         _ensure_schema(conn)
+        conn.execute("""CREATE TABLE IF NOT EXISTS unit_frozen_review_evidence (
+            unit_id TEXT PRIMARY KEY REFERENCES units(unit_id) ON DELETE CASCADE,
+            frozen_evidence_json TEXT NOT NULL
+        )""")
     except BaseException:
         try:
             conn.close()
@@ -5420,23 +5419,45 @@ def _observe_and_upsert_units_in_txn(
     worktree_key = _upsert_worktree(conn, worktree_value, branch_key, None, now_iso)
 
     committed_observed_unit_ids: set[str] = set()
+    try:
+        observed_head_commit = _run_git(repo, ["rev-parse", "--verify", "HEAD"]).strip()
+    except RuntimeError:
+        # 尚无首次提交时仍保留既有候选枚举；正式冻结前不能宣称已绑定原始 HEAD。
+        observed_head_commit = ""
+
+    def record_observation(observation: _PathObservation, specs: list[_UnitSpec], source: str) -> None:
+        baseline_commit = _run_git(repo, ["rev-parse", committed_baseline]).strip() if source == "committed" else observed_head_commit
+        for evidence in freeze_observed_unit_evidence(
+            repo, observation, specs, source=source, baseline_commit=baseline_commit,
+            target_commit=observed_head_commit,
+        ):
+            conn.execute("""INSERT INTO unit_frozen_review_evidence VALUES (?, ?)
+                ON CONFLICT(unit_id) DO UPDATE SET frozen_evidence_json=excluded.frozen_evidence_json""",
+                (evidence["unit_id"], json.dumps(evidence, ensure_ascii=False)))
+
     if committed_baseline:
         for path in _list_committed_round_changed_paths(repo, committed_baseline, committed_base_ref):
             observation = _classify_committed_path(repo, path, committed_baseline)
             if observation is None:
                 continue
-            for spec in _specs_from_observation(observation, path):
+            specs = _specs_from_observation(observation, path)
+            for spec in specs:
                 _upsert_unit(
                     conn, spec, branch_key, worktree_key, now_iso, observed_state="committed"
                 )
                 committed_observed_unit_ids.add(spec.unit_id)
+            record_observation(observation, specs, "committed")
 
     dirty_paths = _list_dirty_paths(repo)
     observed_unit_ids: set[str] = set()
     for path in dirty_paths:
-        for spec in _specs_from_observation(_classify_path(repo, path), path):
+        observation = _classify_path(repo, path)
+        specs = _specs_from_observation(observation, path)
+        for spec in specs:
             _upsert_unit(conn, spec, branch_key, worktree_key, now_iso)
             observed_unit_ids.add(spec.unit_id)
+        if observation is not None:
+            record_observation(observation, specs, "dirty")
 
     # Mark units whose change no longer appears in either observed set (file got
     # committed past the baseline / reverted) as `superseded` so they don't show
@@ -5737,10 +5758,10 @@ def _collect_paths_and_hunks_in_txn(
     placeholders = ",".join("?" for _ in unit_ids)
     rows = conn.execute(
         f"""
-        SELECT unit_id, path, hunk_header
-          FROM units
-         WHERE unit_id IN ({placeholders})
-         ORDER BY path, hunk_header IS NULL, hunk_header, unit_id
+        SELECT u.unit_id, u.path, u.hunk_header, e.frozen_evidence_json
+          FROM units u LEFT JOIN unit_frozen_review_evidence e ON e.unit_id=u.unit_id
+         WHERE u.unit_id IN ({placeholders})
+         ORDER BY u.path, u.hunk_header IS NULL, u.hunk_header, u.unit_id
         """,
         tuple(unit_ids),
     ).fetchall()
@@ -5755,6 +5776,7 @@ def _collect_paths_and_hunks_in_txn(
                 "unit_id": row["unit_id"],
                 "path": path,
                 "hunk_header": row["hunk_header"],
+                "frozen_evidence": json.loads(row["frozen_evidence_json"]) if row["frozen_evidence_json"] else None,
             }
         )
     return (sorted(paths_set), hunks)

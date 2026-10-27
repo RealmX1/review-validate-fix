@@ -12,9 +12,8 @@
 
 **index 起点与 superseded 结果**：``index`` 从 1 起编号（``reviewer_issue_index_base: 1``），与
 ``rvf wait`` / ``rvf results`` 摘要里每腿 issue 的编号一致，指向该腿**当前 canonical**
-``review-result.json`` 的 ``issues[index-1]``。reviewer 结果并非 append-only：
-``--redispatch-review-request-legs-only`` 会把旧 canonical 轮转进 ``superseded-review-result-artifacts/``。
-因此本工件只覆盖写入时刻的 canonical 结果，并逐腿记下它的 ``review_result_sha256``；superseded
+``review-result.json`` 的 ``issues[index-1]``。同腿续跑保留并追加 findings，请求历史和尝试检查点
+另存供审计。本工件只覆盖写入时刻的 canonical 结果，并逐腿记下它的 ``review_result_sha256``；历史
 代际一律不覆盖。canonical 结果事后变了（重派、手改），``check`` 以哈希不一致判本工件过期，
 必须重新 ``write``。
 
@@ -631,6 +630,7 @@ def check_merge_dispositions(
             excluded_path_prefixes=excluded_path_prefixes_for_run(run_dir),
         )
     )
+    errors.extend(_contract_gate_errors_for_legs(run_dir, legs))
     reviewer_sourced, non_reviewer = _fix_issue_ids_by_source(payload)
     source_markers = reviewer_source_markers_for_legs(legs)
     if require_fix_issue_cross_reference:
@@ -721,11 +721,18 @@ def _contract_gate_errors_for_legs(run_dir: Path, legs: list[CanonicalReviewerLe
             errors.append(f"reviewer {leg.reviewer_id}: {leg.read_error}")
             continue
         classified = check_review_result.classify(leg.review_result_path, scope_contract=scope_contract)
-        if not classified.get("valid") or classified.get("kind") not in ("issues", "no_issues"):
+        if not classified.get("valid") or not classified.get("review_complete"):
             details = "; ".join(str(item) for item in classified.get("errors") or []) or f"kind={classified.get('kind')}"
             errors.append(
                 f"reviewer {leg.reviewer_id}: canonical review-result is not a completed issues/no_issues result ({details})"
             )
+    if not errors:
+        # 写入和再次检查共享候选覆盖的完成事实，合法 findings 不能代替两腿正常退出。
+        from reviewed_candidate_completion_facts import completed_reviewer_legs
+        try:
+            completed_reviewer_legs(run_dir)
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            errors.append(f"双评审完成事实尚未核验：{exc}")
     return errors
 
 

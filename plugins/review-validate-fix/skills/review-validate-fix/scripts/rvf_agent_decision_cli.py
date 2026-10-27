@@ -103,17 +103,12 @@ EXIT_DISPATCH_FAILED = 5  # dispatch 派发失败
 EXIT_DECLINE_DISPATCHED_REVIEW_INCOMPLETE = 7
 # dispatch 撞上「有 reviewer 返回 kind: request」：**待处理终态**，既非故障也非完成态 review。
 # 与 EXIT_DISPATCH_FAILED 分开的理由与 dispatch_reviewers 的专用码 3 完全同源：混同成失败会把
-# agent 引向「修一修再重跑 dispatch」，而正确处置是先走 Contract Gate 处理那条 request，再用
-# `--redispatch-review-request-legs-only` 经同一入口**只重派那条 request 腿**
-#（见 REVIEW_REQUEST_REDISPATCH_FLAG）。
+# agent 引向无条件重跑；普通恢复入口先补证，再按精确计划续跑未完成腿。
 # ⚠ 默认的 detached 派发里 dispatch 在 reviewer 跑完之前就返回，所以**这个码实际不会出现**：
 # request 终态由 `rvf wait` 的摘要（plan_status=blocked_on_reviewer_request）报出。只有同步返回
 # 结果的 dispatcher（测试注入 / 未来的同步模式）才可能走到这里。
 EXIT_DISPATCH_BLOCKED_ON_REVIEWER_REQUEST = 8
-# dispatch 的 contract gate：scope-of-work 仍是 hook 生成的 stub（未被 agent 覆盖）。**不是故障**，
-# 而是「还差一步没做」。与 EXIT_DISPATCH_FAILED 分开的理由：派了也白派——reviewer 的 contract
-# gate 会当场把这一轮退回成 `kind: request`，而那是个同轮内转不回 issues 的死结（实测废掉整轮
-# codex 评审、白跑约 13 分钟）。在派发**之前**拦住，比派完再退回便宜一个数量级。
+# scope-of-work 仍是 hook 生成的 stub 时，先要求写明目标，避免 reviewer 为同一材料缺口重复补证。
 EXIT_SCOPE_OF_WORK_STILL_STUB = 9
 # start 探到「本会话名下一个未审单元都没有」：这批 diff 就是上一轮 review 的产物。**不是失败**，
 # 也不是成功——是一次「没东西可审」的诚实回执。token 保持 acknowledged，agent 可以 decline，也可以
@@ -2531,23 +2526,8 @@ DISPATCH_OUTCOME_OK = "ok"
 DISPATCH_OUTCOME_BLOCKED_ON_REVIEWER_REQUEST = "blocked_on_reviewer_request"
 DISPATCH_OUTCOME_FAILED = "failed"
 
-# ``blocked_on_reviewer_request`` 终态下**唯一正确**的重派形态（单一事实源：next_steps 与
-# SKILL.md / references/review-merge-policy.md 都必须与它一致，见
-# tests/test_reviewer_result_artifact_lifecycle.py 的 LIFE-6 契约测试）。
-#
-# 为什么不是「带同一 --selection-seed 整盘重跑」：那条指引在真实入口上等于没修 bug。整盘重派
-# 会把**健康且已完成**的那条腿也重跑一遍，新一轮结果原地覆写掉旧的（实测一条 cursor 腿跑了三轮
-# 2/4/3 条 issue，只留最后一轮）。``--redispatch-review-request-legs-only`` 直接复用上一轮
-# reviewer-plan.json，只重跑停在 ``kind: request`` 的腿。
-#
-# 为什么该模式下**不需要** ``--selection-seed``：seed 的用途是让 ``route()`` 复现同一对
-# reviewer；重派模式根本不调 ``route()``（plan 与 reviewer_id 直接复用），传了也不生效。
-# ``--selection-seed`` 只在整盘重派时才有意义。
-#
-# 为什么保持**显式 flag** 而不是让它在该终态下隐式生效：``dispatch_reviewers.py`` 同一入口也
-# 服务全新一轮派发，且该 flag 在没有上一轮 plan 时是 fail-closed 抛错的；隐式翻转会让「开新一轮」
-# 与「续上一轮」两种意图无法区分。
-REVIEW_REQUEST_REDISPATCH_FLAG = "--redispatch-review-request-legs-only"
+# 普通入口复用精确 run 的 reviewer-plan.json 与原 reviewer 身份，只恢复未完成腿。
+# 已完成腿及原始结果保留；新 run 才重新选路，恢复不需要额外 flag 或记忆 selection seed。
 
 # detached 派发 launch 的两行 stdout 契约（``dispatch_reviewers.launch_detached_dispatch``）。
 DETACHED_DISPATCH_STATUS_PATH_STDOUT_PREFIX = "RVF_DISPATCH_STATUS="
@@ -2596,12 +2576,8 @@ def default_reviewer_dispatcher(
     本函数是**所有**发起的必经之路，那条路在 Claude 里必被砍断。改为立即返回 status.json 路径，
     由 agent 按 SKILL.md「Review」节用 ``rvf wait`` 等终态（等法按 host 分流，不轮询）。
 
-    **``returncode`` 不是判据**：它只说派发进程怎么退出。判「本轮 double-review 是否成立」一律
-    看 ``plan_status``（见 SKILL.md「Review」节）。特别地退出码 ``3`` =
-    ``blocked_on_reviewer_request``，是**待处理终态**，既非故障也非完成 —— 历史实现把它归到
-    ``failed``，agent 多半会盲目重跑 dispatch，而正确处置是先走 Contract Gate 处理那条
-    ``kind: request``、再用 ``--redispatch-review-request-legs-only`` 只重派那条腿
-    （见 ``REVIEW_REQUEST_REDISPATCH_FLAG``）。
+    dispatcher 的退出码只描述派发状态；双审完成还必须联合核对 plan、每腿 canonical
+    结果、请求处理和正常退出。退出码 ``3`` 表示补证未完成；由普通恢复入口补证并续跑未完成腿。
     """
     dispatch_script = Path(__file__).resolve().parent / "dispatch_reviewers.py"
     argv = [sys.executable, str(dispatch_script)]
@@ -2645,6 +2621,8 @@ def default_reviewer_dispatcher(
     result.update(_parse_detached_dispatch_launch_output(stdout))
     if completed.returncode == dispatch_reviewers.DISPATCH_BLOCKED_ON_REVIEWER_REQUEST_EXIT_CODE:
         result["status"] = DISPATCH_OUTCOME_BLOCKED_ON_REVIEWER_REQUEST
+    elif completed.returncode == dispatch_reviewers.DISPATCH_WAITING_FOR_REVIEWER_PROBE_EVIDENCE_EXIT_CODE:
+        result["status"] = "waiting_for_reviewer_probe_evidence"
     elif completed.returncode == 0:
         result["status"] = DISPATCH_OUTCOME_OK
     else:
@@ -2730,7 +2708,7 @@ def _scope_of_work_stub_gate(artifacts: Mapping[str, Any]) -> dict[str, Any] | N
 
 _SCOPE_OF_WORK_GATE_WHY_IT_MATTERS = (
     "派了也白派：reviewer 的 contract gate 会当场把这一轮退回成 `kind: request`，"
-    "而 request 在同一 run 内转不回 issues。"
+    "在补证解决之前，仍不能证明完整 Scope 已完成。"
 )
 
 
@@ -2921,11 +2899,7 @@ def run_dispatch(
         preset=preset,
         dry_run=dry_run,
     )
-    # ②a ``blocked_on_reviewer_request`` 是**待处理终态**，既不是故障也不是完成态 review。
-    #    绝不能报成 dispatch_failed —— 那会把 agent 引向「修一修再重跑 dispatch」，而正确处置
-    #    是先按 references/review-merge-policy.md 的 Contract Gate 满足/驳回那条 ``kind:
-    #    request``，再用 ``REVIEW_REQUEST_REDISPATCH_FLAG`` 经同一入口只重派那条 request 腿
-    #    （整盘重派会把健康腿的结果一并覆写掉）。
+    # 补证等待保留独立状态，普通入口按精确计划处理请求并恢复未完成腿。
     if dispatch_result.get("status") == DISPATCH_OUTCOME_BLOCKED_ON_REVIEWER_REQUEST:
         append_decision_telemetry(
             token=token, event="dispatch_blocked_on_reviewer_request", worktree=worktree,
@@ -2940,21 +2914,28 @@ def run_dispatch(
             token_state=record.state,
             message=(
                 "有 reviewer 返回 `kind: request`（待处理终态，不是故障、也不是完成态 review）。"
-                "先按 references/review-merge-policy.md 的 Contract Gate 满足或驳回该 request，"
+                "runner 会先补齐可自动取得的证据，并持久保存等待条件；按 references/review-merge-policy.md 记录补证响应，"
                 "再对**同一** run 重派；request 不得进入 merge table。"
             ),
             next_steps=[
                 f"`{_rvf()} results{_explicit_run_dir_argument_when_current_session_unresolvable(overlay.get('run_dir'))}`"
                 " 打印各腿摘要（含 request 正文），处置那条 request。",
-                f"处置完对**同一 run** 跑 `{_rvf()} redispatch-reviewers --review-request-legs-only"
+                f"处置完对**同一 run** 跑 `{_rvf()} redispatch-reviewers"
                 f"{_explicit_run_dir_argument_when_current_session_unresolvable(overlay.get('run_dir'))}`"
-                f"（= dispatch_reviewers `--execute --detached {REVIEW_REQUEST_REDISPATCH_FLAG}`，自动带当前"
-                " run 目录）：它复用上一轮 plan、只重派停在 `kind: request` 的腿，健康且已完成的腿保留结果、"
+                "（= dispatch_reviewers `--execute --detached`，自动带当前"
+                " run 目录）：它复用上一轮 plan、自动只续跑未完成的腿，健康且已完成的腿保留结果、"
                 "不重跑也不被覆写。该模式不调用 route()，因此**不需要** `--selection-seed`"
                 "（reviewer 身份直接来自上一轮 plan）。",
             ],
             detail={"dispatch_result": dispatch_result, "strictness": strictness},
         )
+
+    if dispatch_result.get("status") == "waiting_for_reviewer_probe_evidence":
+        return CommandResult(command="dispatch", status="waiting_for_reviewer_probe_evidence", exit_code=5,
+            token=token, token_state=record.state,
+            message="健康探针证据仍在等待；原因与恢复条件已持久保存，不视为 harness 不可用。",
+            next_steps=[f"条件变化后普通 `{_rvf()} redispatch-reviewers` 入口会自动重验并接续同一 run。"],
+            detail={"dispatch_result": dispatch_result, "strictness": strictness})
 
     if dispatch_result.get("status") not in (DISPATCH_OUTCOME_OK, "completed"):
         append_decision_telemetry(

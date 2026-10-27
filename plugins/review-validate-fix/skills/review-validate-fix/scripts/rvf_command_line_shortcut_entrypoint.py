@@ -13,7 +13,7 @@ token / 脚本绝对路径、``--help`` 摸索一个 PATH 上根本不存在的 
   等待期间登记 awaiting-dispatched-agent marker，让 Stop 不在正常等待里发续跑提示（见
   ``awaiting_dispatched_reviewers_marker_armed_while_waiting``）。
 * ``results``：不等待，直接打印同一份摘要。
-* ``redispatch-reviewers [--review-request-legs-only]``：对**当前** run 重派（自动带
+* ``redispatch-reviewers``：对**当前** run 重派（自动带
   ``--rvf-run-dir``，修掉「不 source env 就静默新建一个 run」的缝）。
 * ``fix prepare <issue.json>…``：upsert + prepare + start 一步完成，输出可复制的子代理派发参数块
   （含带 ``cd`` / ``--attempt-id`` / ``--run-dir`` 的完整收尾命令），并按 attempt 登记 awaiting marker。
@@ -116,7 +116,6 @@ REVIEWER_WAIT_TERMINATION_SIGNALS_THAT_MUST_STILL_CLEAR_AWAITING_MARKER = (signa
 
 DISPATCH_STATUS_FILENAME = ".dispatch-thread.status.json"
 REVIEWER_PLAN_FILENAME = "reviewer-plan.json"
-REVIEW_REQUEST_REDISPATCH_FLAG = "--redispatch-review-request-legs-only"
 
 
 def _rvf_invocation() -> str:
@@ -664,6 +663,7 @@ def summarize_reviewer_legs_from_canonical_results(
                 {
                     "kind": classified.get("kind"),
                     "valid": bool(classified.get("valid")),
+                    "review_complete": bool(classified.get("review_complete")),
                     "issues": classified.get("issues") or [],
                     "requests": classified.get("requests") or [],
                     "audit_summary": classified.get("audit_summary"),
@@ -711,7 +711,7 @@ def evaluate_dual_review_establishment_from_canonical_legs(summary: dict[str, An
     ``reviewer-plan.json`` 缓存的 status / effective_reviewer_count 只是 runner 当时的结论；canonical
     ``review-result.json`` 事后缺失或损坏时它不会更新。因此「成立」必须**同时**满足：plan completed、
     有效腿数与腿数一致且 ≥2、且**当前**每腿 canonical 结果都 valid 且 kind ∈ {issues, no_issues}。
-    任一不满足即 fail-close 为不成立。returncode 不参与判定。"""
+    还必须没有待解决请求、冻结证据可核验，且执行正常退出；任一不满足即不成立。"""
     reasons: list[str] = []
     status = summary.get("plan_status")
     if status != "completed":
@@ -724,10 +724,13 @@ def evaluate_dual_review_establishment_from_canonical_legs(summary: dict[str, An
         reasons.append(f"canonical 腿数={len(legs)}（少于 2）")
     for leg in legs:
         kind = leg.get("kind")
-        if not leg.get("valid") or kind not in REVIEWER_LEG_KINDS_ELIGIBLE_FOR_ESTABLISHED_DUAL_REVIEW:
+        if (not leg.get("valid") or not leg.get("review_complete")
+                or type(leg.get("returncode")) is not int or leg["returncode"] != 0
+                or kind not in REVIEWER_LEG_KINDS_ELIGIBLE_FOR_ESTABLISHED_DUAL_REVIEW):
             reasons.append(
                 f"腿 {leg.get('reviewer_id')} 当前 canonical review-result 不是合法的 issues / no_issues"
-                f"（valid={bool(leg.get('valid'))}, kind={kind}）"
+                f" 完成事实（valid={bool(leg.get('valid'))}, kind={kind}, "
+                f"review_complete={bool(leg.get('review_complete'))}, returncode={leg.get('returncode')}）"
             )
     return (not reasons, reasons)
 
@@ -800,6 +803,9 @@ def render_reviewer_results_summary(
                 if isinstance(request, dict):
                     detail = {k: v for k, v in request.items() if k != "type"}
                     lines.append(f"      - [{request.get('type')}] {json.dumps(detail, ensure_ascii=False)}")
+            if leg.get("issues"):
+                lines.append(f"      已发现 {len(leg['issues'])} 条，补证未完成：")
+                lines.extend(_render_issue_line(index, issue) for index, issue in enumerate(leg["issues"], 1))
         else:
             errors = "; ".join(str(e) for e in (leg.get("errors") or [])) or "无 review-result.json"
             lines.append(f"{title}: 无合法结果（{errors}）")
@@ -836,9 +842,11 @@ def render_reviewer_results_summary(
     elif status == "blocked_on_reviewer_request":
         lines.append(
             "- 判定：有腿返回 kind: request（待处理终态）。按 Contract Gate 满足或驳回后，"
-            f"`{invocation} redispatch-reviewers --review-request-legs-only{run_dir_argument}` 只重派 request 腿"
+            f"`{invocation} redispatch-reviewers{run_dir_argument}` 只重派 request 腿"
             "（健康腿结果保留、不重跑）。"
         )
+    elif status == "waiting_for_reviewer_probe_evidence":
+        lines.append(f"- 判定：等待健康探针证据；条件变化后 `{invocation} redispatch-reviewers{run_dir_argument}` 自动重验。")
     elif summary.get("needs_last_resort_fallback"):
         lines.append(
             "- 判定：0 个 external reviewer 可用，按 "
@@ -847,7 +855,7 @@ def render_reviewer_results_summary(
     else:
         lines.extend(f"- 不成立原因：{reason}" for reason in not_established_reasons)
         lines.append(
-            "- 判定：双评审**不成立**（看 plan_status 与每腿当前 canonical 结果，不看 returncode）。读上面的 stderr 排障，"
+            "- 判定：双评审**不成立**（共同核对 plan、canonical 结果、请求处理和正常退出）。读上面的 stderr 排障，"
             f"处置后 `{invocation} redispatch-reviewers{run_dir_argument}` 对同一 run 重派。"
         )
     return "\n".join(lines)
@@ -1018,7 +1026,7 @@ def _run_results_with_optional_wait(
 # ---------------------------------------------------------------------------
 
 def build_redispatch_reviewers_argv(
-    context: ResolvedRvfRunContext, *, review_request_legs_only: bool, dry_run: bool,
+    context: ResolvedRvfRunContext, *, dry_run: bool,
     selection_seed: int | None,
 ) -> list[str]:
     argv = [sys.executable, str(SCRIPTS_DIRECTORY / "dispatch_reviewers.py")]
@@ -1039,8 +1047,6 @@ def build_redispatch_reviewers_argv(
     preset = (context.scope_adjustment_overlay or {}).get("dispatched_preset")
     if isinstance(preset, dict) and int(preset.get("external_reviewer_count_target") or 0) >= 2:
         argv.append("--require-external")
-    if review_request_legs_only:
-        argv.append(REVIEW_REQUEST_REDISPATCH_FLAG)
     if selection_seed is not None:
         argv += ["--selection-seed", str(selection_seed)]
     return argv
@@ -1049,7 +1055,7 @@ def build_redispatch_reviewers_argv(
 def run_redispatch_reviewers(args: argparse.Namespace) -> int:
     context = _require_run_context(args.run_dir)
     argv = build_redispatch_reviewers_argv(
-        context, review_request_legs_only=args.review_request_legs_only, dry_run=args.dry_run,
+        context, dry_run=args.dry_run,
         selection_seed=args.selection_seed,
     )
     print(f"[rvf redispatch-reviewers] run={context.run_id}（{context.resolution_source}）")
@@ -1762,10 +1768,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
     p_redispatch = sub.add_parser("redispatch-reviewers", help="对当前 run 重派 reviewer（自动带 --rvf-run-dir）")
     p_redispatch.add_argument("--run-dir", default=None)
-    p_redispatch.add_argument(
-        "--review-request-legs-only", action="store_true",
-        help=f"只重派停在 kind: request 的腿（= dispatch_reviewers {REVIEW_REQUEST_REDISPATCH_FLAG}）",
-    )
     p_redispatch.add_argument("--dry-run", action="store_true")
     p_redispatch.add_argument("--selection-seed", type=int, default=None)
 

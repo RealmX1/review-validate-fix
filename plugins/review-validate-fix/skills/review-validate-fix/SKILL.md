@@ -135,7 +135,7 @@ rvf dispatch --token <decision-token> --strictness <light|standard|strict> [--ac
 
 `dispatch` 之后由**你自己**在当前会话调用 `$review-validate-fix` skill，按本文件就地走 review → merge → validate/fix → handoff。不要新建 Kanban task，也不要 fork 新会话；上面那些路径就是本轮 run 的全部输入，**不需要重新 prepare**。
 
-`dispatch` 的退出码：`0` = 已派发（detached，接着按下面「Review」节等待）；`5` = 真派发失败，token 仍在 `acknowledged`，可修复后重试；`9` = scope-of-work 仍是 stub（先覆盖再 `rvf scope rerender-scope-of-work`）；`11` = 候选里有既没进正式审查、也没被认领 / 排除的路径（`scope claim` / `scope exclude`，或带 `--accept-uncovered "<理由>"` 重跑）。`kind: request` 终态**不会**体现在 `dispatch` 的退出码上——detached 派发在 reviewer 跑完之前就返回了，它由 `rvf wait` 的摘要（`plan_status=blocked_on_reviewer_request`）报出。
+  - `plan_status=blocked_on_reviewer_request`（reason `reviewer_review_request_pending`）→ reviewer 尚未完成，可能同时存在 findings 和补证请求。runner 自主解析可读取材料、标准入口和已有锁；条件与有界尝试次数持久保存。使用普通 `rvf redispatch-reviewers` 自动只续跑未完成腿，保留完成腿及同腿 findings。响应使用 `respond-request`，reviewer 实际处理后 `resolve-request`，最后 `complete`。只有新权限、真实价值取舍或人独有信息交给人决定。精确 run、候选绑定、Stop 和在途执行每次恢复都会重验；等待状态不会推进高水位。
 
 > 例外只有一个：操作者显式设置 `CODEX_RVF_FORK_MODE=kanban-followup` 时，Stop hook 仍走旧的终端投递（注入一条 `$review-validate-fix` 开头的祈使句）。那是保留的逃生口/兼容入口，不是默认路径。
 
@@ -216,7 +216,7 @@ token 与 run 目录都可省——`rvf` 按「显式参数 > `RVF_RUN_DIR` > �
 - **判「本轮 double-review 是否成立」只看 `plan_status`，不看 `returncode`**（摘要末行会直接给出判定）：
   - `plan_status=completed` 且有效腿 `2/2` → 双评审成立，继续。
   - `plan_status=failed`（含某腿登录过期/认证失败/崩溃而补位不足，reason `reviewer_leg_produced_no_review_result`；或额度耗尽类 `*_usage_limit_*`；两类同时发生则 reason 为 `reviewer_legs_failed_mixed_usage_limit_and_no_review_result`，此时**两类都要处置**，别只等配额恢复）→ **不要拿现有结论当双评审用**。按摘要给出的 stderr 路径排障，处置后 `rvf redispatch-reviewers` 对同一 run 重派。reason 末尾带 `_with_review_request_pending` 后缀时，说明**除失败腿外还夹着一条 `kind: request` 腿**，必须连同下一条一起处置。
-  - `plan_status=blocked_on_reviewer_request`（reason `reviewer_review_request_pending`）→ 有腿返回 `kind: request`，这是待处理终态、不是故障也不是完成态 review。按 `references/review-merge-policy.md` 的 Contract Gate / Request Handling 满足、驳回或 spawn 子任务后，让**同一** reviewer 用同一 review packet 重试；request 不得进入 merge table。重派用 `rvf redispatch-reviewers --review-request-legs-only`（即 `dispatch_reviewers.py --execute --detached --redispatch-review-request-legs-only`，自动带当前 run 目录——不带 run 目录时 dispatcher 会静默新建一个 run）：复用上一轮 `reviewer-plan.json`，**只重派停在 `kind: request` 的腿**，健康且已完成的腿保留结果、不重跑也不被覆写。该模式不调用 `route()`，所以**不需要** `--selection-seed`；想先看会重派哪几腿，加 `--dry-run` 预演（不动任何 `review-result.json`）。
+  - `plan_status=blocked_on_reviewer_request`（reason `reviewer_review_request_pending`）→ reviewer 尚未完成，可能同时存在 findings 和补证请求。runner 自主解析可读取材料、标准入口和已有锁；条件与有界尝试次数持久保存。使用普通 `rvf redispatch-reviewers` 自动只续跑未完成腿，保留完成腿及同腿 findings。响应使用 `respond-request`，reviewer 实际处理后 `resolve-request`，最后 `complete`。只有新权限、真实价值取舍或人独有信息交给人决定。精确 run、候选绑定、Stop 和在途执行每次恢复都会重验；等待状态不会推进高水位。
   - `plan_status=partial` / `unknown` → 同样不成立，按 failed 处置。
   - `launch_status=launch_failed` → 读 status.json 的 `error` 与同目录 `.dispatch-thread.log`。
 - 只在摘要报告 0 个 external 可用（`needs_last_resort_fallback: true`）时，才按 `references/zero-external-reviewer-last-resort-in-harness-fallback.md` 走最后兜底。

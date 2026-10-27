@@ -55,5 +55,6 @@
     "--tools",
     "Bash,Read",
     "Reply with exactly: OK"
-  ]
+  ],
+  "reviewer_harness_id": "claude_code"
 }

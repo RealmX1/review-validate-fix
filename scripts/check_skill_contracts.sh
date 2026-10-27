@@ -530,6 +530,10 @@ required_files=(
   "scripts/run_alternative_reviewer.py"
   "scripts/build_review_packet.py"
   "scripts/write_review_result.py"
+  "scripts/read_frozen_review_evidence.py"
+  "scripts/reviewer_execution_attempt_evidence.py"
+  "scripts/reviewer_leg_recovery.py"
+  "scripts/reviewer_request_progress_identity.py"
   "scripts/check_review_result.py"
   "scripts/command_lock.py"
   "scripts/prepare_review_run.py"
@@ -569,6 +573,7 @@ repo_required_files=(
   "plugins/review-validate-fix/skills/rvf-land/SKILL.md"
   "plugins/review-validate-fix/skills/rvf-reopen/SKILL.md"
   "core/session_scope_allocation/reviewable_unit_diff_tracker.py"
+  "core/session_scope_allocation/frozen_review_unit_evidence.py"
   "core/session_scope_allocation/session_change_manifest.py"
   "core/session_scope_allocation/round_baseline_marker.py"
   "core/session_scope_allocation/review_highwater_marker.py"
@@ -914,7 +919,11 @@ run_step "tests: rvf_land_validation_cache_and_candidate_evidence" \
 # request→no_issues 却静默覆写）；重派只重跑 kind: request 的腿，健康腿结果不被覆写。
 run_step "tests: reviewer_result_artifact_lifecycle" \
   "$RVF_TOOL_RUNTIME_PYTHON_EXECUTABLE" -m pytest -q \
-    "$tests_dir/test_reviewer_result_artifact_lifecycle.py"
+    "$tests_dir/test_reviewer_result_artifact_lifecycle.py" \
+    "$tests_dir/test_reviewer_findings_with_pending_requests.py" \
+    "$tests_dir/test_reviewer_frozen_evidence_and_bounded_input.py" \
+    "$tests_dir/test_reviewer_shared_health_probe.py" \
+    "$tests_dir/test_reviewer_ordinary_resume_end_to_end.py"
 # fix attempt 因果链：全量物化、越界修改的告警-确认放行、validate-only 只验证并提交 Kanban backlog、
 # apply 状态门与内容漂移冲突。此前这个文件不在任何 gate 里，测试会静默不跑。
 # 迁移用例在干净 HEAD 上就红（极简 v3 库缺 leases 表，backlog 任务 64943 跟踪），修好后删掉这条 -k 排除。
@@ -1453,7 +1462,7 @@ require_literal "prompts/reviewer.md" 'standard-request'
 require_literal "prompts/reviewer.md" 'measurement-request'
 require_literal "prompts/reviewer.md" 'subtask-request'
 require_literal "prompts/reviewer.md" 'context-request'
-require_literal "prompts/reviewer.md" 'command lock'
+require_literal "prompts/reviewer.md" 'RVF_COMMAND_LOCK'
 require_literal "references/review-standards/index.md" 'RVF Review Standards Pack'
 require_literal "references/review-standards/main-agent.md" '默认策略：子代理可以请求子任务，但由主会话 spawn'
 require_literal "references/review-standards/main-agent.md" '当前可用的最佳模型'
@@ -1464,7 +1473,7 @@ require_literal "references/review-standards/simplification-subset.md" "Chestert
 require_literal "references/review-standards/security-subset.md" 'Three-tier boundary system'
 require_literal "references/review-standards/performance-subset.md" 'Measure before optimizing'
 require_literal "references/review-standards/protocol-extensions.md" 'subtask-request'
-require_literal "prompts/reviewer.md" '不要让 reviewer 只靠 `git diff HEAD` 猜 scope'
+require_literal "prompts/reviewer.md" 'primary_units'
 require_literal "SKILL.md" '`git diff HEAD` 是证据来源，不是默认 review scope'
 require_literal "prompts/validate-fix.md" 'source-agnostic'
 require_literal "prompts/validate-fix.md" 'RVF_STANDARD_REQUEST'

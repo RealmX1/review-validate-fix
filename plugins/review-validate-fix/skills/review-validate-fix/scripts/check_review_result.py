@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
 from pathlib import Path
 from typing import Any
+from reviewer_request_progress_identity import reviewer_request_content_identity
 
 
 SCHEMA_VERSION = 1
@@ -166,6 +168,13 @@ def validate_request(request: Any, index: int, errors: list[str]) -> str | None:
         errors.append(f"{prefix} must be an object")
         return None
     request_type = request.get("type")
+    status = request.get("status", "pending")
+    if status not in {"pending", "responded", "resolved"}:
+        errors.append(f"{prefix}.status must be pending, responded or resolved")
+    if status in {"responded", "resolved"}:
+        non_empty_string(request, "response", errors, prefix)
+    if status == "resolved":
+        non_empty_string(request, "resolution", errors, prefix)
     if request_type not in REQUEST_TYPES:
         errors.append(f"{prefix}.type must be one of: {', '.join(sorted(REQUEST_TYPES))}")
         return None
@@ -255,15 +264,24 @@ def classify(path: Path, *, scope_contract: Path | None = None) -> dict[str, Any
         )
 
     request_types: list[str] = []
+    request_identities: set[str] = set()
     for index, request in enumerate(requests):
+        if isinstance(request, dict):
+            identity = reviewer_request_content_identity(request)
+            if identity in request_identities:
+                errors.append("重复的请求内容身份")
+            request_identities.add(identity)
+            request["request_id"] = identity
         request_type = validate_request(request, index, errors)
         if request_type is not None:
             request_types.append(request_type)
 
+    pending_requests = [request for request in requests if isinstance(request, dict) and request.get("status", "pending") != "resolved"]
+
     if kind == "no_issues":
         if issues:
             errors.append("no_issues result must not include issues")
-        if requests:
+        if pending_requests:
             errors.append("no_issues result must not include requests")
         audit_summary = payload.get("audit_summary")
         if not isinstance(audit_summary, str) or not audit_summary.strip():
@@ -271,7 +289,7 @@ def classify(path: Path, *, scope_contract: Path | None = None) -> dict[str, Any
     elif kind == "issues":
         if not issues:
             errors.append("issues result must include at least one issue")
-        if requests:
+        if pending_requests:
             errors.append("issues result must not include requests")
         all_issues_outside_current_round_scope = bool(issues) and all(
             isinstance(issue, dict)
@@ -289,16 +307,19 @@ def classify(path: Path, *, scope_contract: Path | None = None) -> dict[str, Any
                 "pass --current-round-scope-audit-summary"
             )
     elif kind == "request":
-        if issues:
-            errors.append("request result must not include issues")
         if not requests:
             errors.append("request result must include at least one request")
 
-    completed_issues = issues if not errors and kind == "issues" else []
+    completed_issues = issues if not errors else []
+    evidence_complete, evidence_gaps = frozen_input_evidence_completeness(contract)
+    review_complete = not errors and kind in {"issues", "no_issues"} and not pending_requests and evidence_complete is True
     return {
         "valid": not errors,
         "kind": kind if not errors else "invalid",
-        "issue_count": len(issues) if not errors and kind == "issues" else 0,
+        "issue_count": len(issues) if not errors else 0,
+        "review_complete": review_complete,
+        "pending_request_count": len(pending_requests) if not errors else 0,
+        "frozen_evidence_gaps": evidence_gaps,
         "outside_current_round_scope_issue_count": sum(
             1
             for issue in completed_issues
@@ -312,11 +333,49 @@ def classify(path: Path, *, scope_contract: Path | None = None) -> dict[str, Any
         "request_types": sorted(set(request_types)) if not errors and kind == "request" else [],
         "lock_request_count": request_types.count("lock_request") if not errors and kind == "request" else 0,
         "audit_summary": payload.get("audit_summary") if not errors and kind in {"no_issues", "issues"} else None,
-        "issues": issues if not errors and kind == "issues" else [],
-        "requests": requests if not errors and kind == "request" else [],
+        "issues": issues if not errors else [],
+        "requests": requests if not errors else [],
         "warnings": warnings if not errors else [],
         "errors": errors,
     }
+
+
+def frozen_input_evidence_completeness(contract: dict[str, Any]) -> tuple[bool, list[str]]:
+    if contract.get("frozen_evidence_complete", True) is not True:
+        return False, ["冻结输入存在未核验 unit"]
+    index_path = contract.get("frozen_evidence_index")
+    if not index_path:
+        return True, []
+    try:
+        index_bytes = Path(index_path).read_bytes()
+        if hashlib.sha256(index_bytes).hexdigest() != contract.get("frozen_evidence_index_sha256"):
+            raise ValueError("冻结证据索引摘要不一致")
+        index = json.loads(index_bytes)
+        candidate = (contract.get("review_candidate_snapshot") or {}).get("checkpoint_commit")
+        if candidate and index.get("candidate_commit") != candidate:
+            raise ValueError("冻结证据不属于当前候选")
+        expected_units = contract.get("primary_units")
+        units = index["units"]
+        if expected_units and set(expected_units) != {unit["unit_id"] for unit in units}:
+            raise ValueError("冻结证据未覆盖全部 primary_units")
+        checked_files = set()
+        for unit in units:
+            if unit.get("evidence_status") != "verified":
+                raise ValueError("冻结 unit 仍有证据缺口")
+            for field in ("patch", "before", "after"):
+                descriptor = unit.get(field)
+                if not descriptor or descriptor["file"] in checked_files:
+                    continue
+                digest = hashlib.sha256()
+                with Path(descriptor["file"]).open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(65536), b""):
+                        digest.update(chunk)
+                if digest.hexdigest() != descriptor["sha256"]:
+                    raise ValueError("冻结 unit 内容摘要不一致")
+                checked_files.add(descriptor["file"])
+        return True, []
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        return False, [str(exc)]
 
 
 def main() -> int:

@@ -47,5 +47,6 @@
     "--sandbox",
     "workspace-write",
     "Reply with exactly: OK"
-  ]
+  ],
+  "reviewer_harness_id": "codex"
 }

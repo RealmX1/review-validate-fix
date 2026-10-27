@@ -93,5 +93,6 @@
     "默认模型缺失、查询失败或 provider 不符时，本腿明确不可用，不静默回退到旧模型。",
     "reasoning effort 仍由独立的 --thinking xhigh 指定。"
   ],
-  "reviewer_model_selection_source": "oh_my_pi_default_model_role"
+  "reviewer_model_selection_source": "oh_my_pi_default_model_role",
+  "reviewer_harness_id": "oh_my_pi"
 }

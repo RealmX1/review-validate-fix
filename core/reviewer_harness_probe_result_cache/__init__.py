@@ -13,6 +13,7 @@ from core.reviewer_harness_probe_result_cache.reviewer_harness_probe_result_cach
     compute_probe_identity_digest,
     invalidate_cached_probe_outcome,
     read_cached_probe_outcome,
+    read_cached_probe_result,
     resolved_outcome_ttl_seconds,
     resolved_probe_result_cache_entry_path,
     write_probe_outcome,

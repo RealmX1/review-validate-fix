@@ -17,6 +17,27 @@ def freeze_packet_test_candidate(repo, tmp_path):
     return git(repo, "commit-tree", tree, "-p", "HEAD", "-m", "test: 冻结 packet 输入")
 
 
+def observe_test_tracker_hunk_descriptors(repo, paths, *, committed_baseline=None, save_frozen_evidence=False):
+    from core.session_scope_allocation import reviewable_unit_diff_tracker as tracker
+    from core.session_scope_allocation.frozen_review_unit_evidence import freeze_observed_unit_evidence
+
+    entries = []
+    for path in paths:
+        observation = (tracker._classify_committed_path(repo, path, committed_baseline) if committed_baseline
+                       else tracker._classify_path(repo, path))
+        specs = tracker._specs_from_observation(observation, path)
+        records = freeze_observed_unit_evidence(repo, observation, specs,
+            source="committed" if committed_baseline else "dirty",
+            baseline_commit=committed_baseline or git(repo, "rev-parse", "HEAD"),
+            target_commit=git(repo, "rev-parse", "HEAD")) if save_frozen_evidence else []
+        for index, spec in enumerate(specs):
+            entry = {"unit_id": spec.unit_id, "path": path, "hunk_header": spec.hunk_header}
+            if records:
+                entry["frozen_evidence"] = records[index]
+            entries.append(entry)
+    return entries
+
+
 def test_frozen_packet_ignores_transient_live_content_and_scope_policy(valid_boundary, tmp_path):
     import build_review_packet
     f = valid_boundary
@@ -67,14 +88,16 @@ def test_frozen_packet_keeps_committed_and_dirty_tracker_projection(valid_bounda
     git(repo, "add", "a.py")
     git(repo, "commit", "-qm", "test: 已提交的同轮修改")
     (repo / "a.py").write_text("value = 3\n")
+    entries = [*observe_test_tracker_hunk_descriptors(repo, ["a.py"], committed_baseline=comparison),
+               *observe_test_tracker_hunk_descriptors(repo, ["a.py"])]
     candidate = freeze_packet_test_candidate(repo, tmp_path)
     manifest = tmp_path / "packet-session-manifest.json"
     manifest.write_text(json.dumps({
         "repo": str(repo), "owned_paths": ["a.py"], "owned_dirty_paths": ["a.py"],
         "owned_committed_round_paths": ["a.py"], "committed_round_baseline": comparison,
         "tracker": {"tracker_scope": {
-            "unit_ids": ["isolated-packet-unit"], "lease_id": "isolated-packet-lease",
-            "scope_hash": "isolated-packet-scope", "paths": ["a.py"],
+            "unit_ids": [entry["unit_id"] for entry in entries], "lease_id": "isolated-packet-lease",
+            "scope_hash": "isolated-packet-scope", "paths": ["a.py"], "hunks": entries,
         }},
     }))
     (repo / "a.py").write_text("value = 99\n")
@@ -170,6 +193,7 @@ def test_frozen_packet_blob_omission_and_symlinked_ignore_policy(valid_boundary,
     (repo / "excluded-source.py").write_text("不得进入审查\n")
     (repo / "large-source.txt").write_text("x" * 128)
     (repo / "binary-source.bin").write_bytes(b"\0binary")
+    entries = observe_test_tracker_hunk_descriptors(repo, ["large-source.txt", "binary-source.bin"])
     candidate = freeze_packet_test_candidate(repo, tmp_path)
     (repo / "frozen-ignore-policy").write_text("")
     manifest = None
@@ -178,8 +202,8 @@ def test_frozen_packet_blob_omission_and_symlinked_ignore_policy(valid_boundary,
         payload = {"repo": str(repo), "owned_paths": ["large-source.txt", "binary-source.bin"]}
         if scope_kind == "tracker":
             payload["tracker"] = {"tracker_scope": {
-                "unit_ids": ["new-file-unit"], "lease_id": "new-file-lease", "scope_hash": "new-file-scope",
-                "paths": ["large-source.txt", "binary-source.bin"],
+                "unit_ids": [entry["unit_id"] for entry in entries], "lease_id": "new-file-lease", "scope_hash": "new-file-scope",
+                "paths": ["large-source.txt", "binary-source.bin"], "hunks": entries,
             }}
         manifest.write_text(json.dumps(payload))
     packet, metadata = build_review_packet.build_packet(
@@ -205,11 +229,12 @@ def test_frozen_tracker_projection_keeps_only_allocated_dirty_hunk(valid_boundar
     original[45] = "unallocated background change"
     (repo / "a.py").write_text("\n".join(original) + "\n")
     headers = [line for line in git(repo, "diff", "HEAD", "--", "a.py").splitlines() if line.startswith("@@")]
+    entries = observe_test_tracker_hunk_descriptors(repo, ["a.py"])[:1]
     candidate = freeze_packet_test_candidate(repo, tmp_path)
     manifest = tmp_path / "allocated-dirty-hunk.json"
     manifest.write_text(json.dumps({"repo": str(repo), "owned_paths": ["a.py"], "owned_dirty_paths": ["a.py"],
-        "tracker": {"tracker_scope": {"unit_ids": ["first-hunk"], "lease_id": "hunk-lease", "scope_hash": "hunk-scope",
-            "paths": ["a.py"], "hunks": [{"path": "a.py", "hunk_header": headers[0]}]}}}))
+        "tracker": {"tracker_scope": {"unit_ids": [entry["unit_id"] for entry in entries], "lease_id": "hunk-lease", "scope_hash": "hunk-scope",
+            "paths": ["a.py"], "hunks": entries}}}))
     packet, _ = build_review_packet.build_packet(
         repo, None, manifest, 10000, [], [], allow_missing_session_context=True, frozen_candidate_commit=candidate,
     )
@@ -333,11 +358,12 @@ def test_frozen_tracker_projection_matches_ranges_when_function_titles_differ(va
     (repo / "source.txt").write_text("\n".join(lines) + "\n")
     header = next(line for line in git(repo, "diff", "-U3", "HEAD", "--", "source.txt").splitlines() if line.startswith("@@"))
     assert "SECTION_ALPHA" in header
+    entries = observe_test_tracker_hunk_descriptors(repo, ["source.txt"])
     candidate = freeze_packet_test_candidate(repo, tmp_path)
     manifest = tmp_path / "custom-title-hunk.json"
     manifest.write_text(json.dumps({"repo": str(repo), "owned_paths": ["source.txt"], "owned_dirty_paths": ["source.txt"],
-        "tracker": {"tracker_scope": {"unit_ids": ["custom-title-hunk"], "lease_id": "custom-title-lease", "scope_hash": "custom-title-scope",
-            "paths": ["source.txt"], "hunks": [{"path": "source.txt", "hunk_header": header}]}}}))
+        "tracker": {"tracker_scope": {"unit_ids": [entry["unit_id"] for entry in entries], "lease_id": "custom-title-lease", "scope_hash": "custom-title-scope",
+            "paths": ["source.txt"], "hunks": entries}}}))
     packet, _ = build_review_packet.build_packet(
         repo, None, manifest, 10000, [], [], allow_missing_session_context=True, frozen_candidate_commit=candidate,
     )
@@ -383,22 +409,20 @@ def test_frozen_tracker_diff_settings_keep_allocated_hunks_or_fail_closed(valid_
     git(repo, "config", "diff." + diff_setting, value)
     (repo / "source.txt").write_text("\n".join(modified) + "\n")
     headers = [line for line in git(repo, "diff", "-U3", "HEAD", "--", "source.txt").splitlines() if line.startswith("@@")]
+    entries = observe_test_tracker_hunk_descriptors(repo, ["source.txt"], save_frozen_evidence=True)
     candidate = freeze_packet_test_candidate(repo, tmp_path)
     manifest = tmp_path / "configured-allocated-hunks.json"
     manifest.write_text(json.dumps({"repo": str(repo), "owned_paths": ["source.txt"], "owned_dirty_paths": ["source.txt"],
-        "tracker": {"tracker_scope": {"unit_ids": ["configured-hunk"], "lease_id": "configured-lease", "scope_hash": "configured-scope",
-            "paths": ["source.txt"], "hunks": [{"path": "source.txt", "hunk_header": header} for header in headers]}}}))
+        "tracker": {"tracker_scope": {"unit_ids": [entry["unit_id"] for entry in entries], "lease_id": "configured-lease", "scope_hash": "configured-scope",
+            "paths": ["source.txt"], "hunks": entries}}}))
     if changed_after_allocation:
         git(repo, "config", "--unset", "diff." + diff_setting)
     def render():
         return build_review_packet.build_packet(
             repo, None, manifest, 10000, [], [], allow_missing_session_context=True, frozen_candidate_commit=candidate,
         )
-    if changed_after_allocation:
-        with pytest.raises(ValueError, match="已分配.*hunk"):
-            render()
-    else:
-        packet, _ = render()
-        allocated = packet.split("## Allocated Git Diff", 1)[1].split("## Full Git Diff", 1)[0]
-        assert "(no tracked diff for allocated paths)" not in allocated
-        assert "@@" in allocated
+    packet, metadata = render()
+    assert metadata["frozen_evidence_complete"] is True
+    allocated = packet.split("## Allocated Git Diff", 1)[1].split("## Full Git Diff", 1)[0]
+    assert "(no tracked diff for allocated paths)" not in allocated
+    assert "@@" in allocated

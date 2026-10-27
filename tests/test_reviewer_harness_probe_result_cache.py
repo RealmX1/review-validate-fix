@@ -212,6 +212,36 @@ def test_missing_executable_still_yields_a_stable_digest(tmp_path: Path):
     )
 
 
+def test_probe_identity_keeps_executable_path_even_when_stats_match(tmp_path: Path):
+    import os
+    config = tmp_path / "reviewer.json"
+    config.write_text("{}")
+    first_executable, second_executable = tmp_path / "first-cli", tmp_path / "second-cli"
+    for path in (first_executable, second_executable):
+        path.write_text("same contents")
+        os.utime(path, ns=(1000000000, 1000000000))
+    def digest(executable):
+        return compute_probe_identity_digest(config_path=config, user_local_config_override_path=None,
+            executable_path=executable, probe_mode="preflight")
+    assert digest(first_executable) != digest(second_executable)
+    assert compute_probe_identity_digest(config_path=config, user_local_config_override_path=tmp_path / "override.json",
+        executable_path=None, probe_mode="preflight")
+
+
+def test_quota_reset_invalidates_evidence_without_changing_default_failure_ttl(tmp_path: Path):
+    environment = _environment(tmp_path)
+    path = write_probe_outcome("codex", PROBE_OUTCOME_UNAVAILABLE, probe_identity_digest="quota-identity",
+        now_epoch_seconds=1000, reason_code="usage_limit_exhausted", returncode=125, reset_hint=120,
+        environment=environment)
+    assert json.loads(path.read_text())["ttl_seconds"] == 300
+    assert read_cached_probe_outcome("codex", probe_identity_digest="quota-identity", now_epoch_seconds=1119,
+        environment=environment) == PROBE_OUTCOME_UNAVAILABLE
+    inspection = {}
+    assert read_cached_probe_outcome("codex", probe_identity_digest="quota-identity", now_epoch_seconds=1120,
+        environment=environment, cache_inspection=inspection) is None
+    assert inspection["reason_code"] == "probe_cache_quota_reset_elapsed"
+
+
 # --- PC-4 · 主动作废 ------------------------------------------------------------
 
 
@@ -440,7 +470,7 @@ def _write_fake_probe_executable(executable_path: Path, shell_body: str) -> Path
     """造一个只为「能被 shutil.which 从 PATH 上解析出来」而存在的假 CLI。
 
     它永远不会被真的执行（``subprocess.run`` 在这些测试里被 ``_SpawnCounter`` 顶掉），
-    只提供两样东西：``_resolved_probe_execution_inputs`` 要的 PATH 命中，以及
+    只提供两样东西：``resolve_reviewer_probe_executable_path`` 要的 PATH 命中，以及
     ``compute_probe_identity_digest`` 要的 (size, mtime_ns) 身份。
     """
     executable_path.parent.mkdir(parents=True, exist_ok=True)
@@ -881,9 +911,17 @@ def test_dynamic_default_model_reprobes_and_observes_failure_within_cache_ttl(
     config = json.loads(config_path.read_text())
     config["reviewer_model_selection_source"] = source
     config_path.write_text(json.dumps(config))
+    import run_alternative_reviewer
+    selected_model = ["model-a"]
+    def resolve_model(config, command, health, **kwargs):
+        return [*command, "--model", selected_model[0]], health
+    monkeypatch.setattr(run_alternative_reviewer, "resolve_reviewer_model_commands", resolve_model)
     counter = _SpawnCounter()
     state_root = tmp_path / "state"
     assert _probe_once(dispatch, registry, counter, monkeypatch, state_root) == [HERMETIC_PROBE_HARNESS_ID]
+    assert _probe_once(dispatch, registry, counter, monkeypatch, state_root) == [HERMETIC_PROBE_HARNESS_ID]
+    assert counter.calls == 1
+    selected_model[0] = "model-b"
     counter.returncode = 2
     assert _probe_once(dispatch, registry, counter, monkeypatch, state_root) == []
     assert counter.calls == 2

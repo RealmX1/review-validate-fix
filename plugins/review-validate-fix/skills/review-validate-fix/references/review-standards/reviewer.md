@@ -44,7 +44,7 @@
 - `kind: no_issues`。
 - `kind: issues`，每条含 `path`、`line`、`message`、`kind`（`REAL`/`NIT`/`ELEVATE`）、`severity`（`high`/`medium`/`low`），可选 `scope_relation`（缺省 `in_current_round_scope`，范围外问题为 `outside_current_round_scope`）。
 
-非完成态只能是 `protocol-extensions.md` 中的 `kind: request` artifact。request 不得和完成态混写。最终自然语言 message 只作为日志，不是机器可读 review 状态。
+非完成态使用 `protocol-extensions.md` 中的 `kind: request` artifact，可携带已经发现的 `issues[]`。未解决的请求不能计为完成；补证响应及 reviewer 处理结果保留在请求历史中。最终自然语言 message 只作为日志，不是机器可读 review 状态。
 
 ## Issue 字段语义
 

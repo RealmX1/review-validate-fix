@@ -29,7 +29,7 @@ import math
 import os
 import re
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, Any
 
 from core.rvf_user_local_data_paths import resolved_rvf_user_local_data_paths
 
@@ -87,6 +87,7 @@ def compute_probe_identity_digest(
     user_local_config_override_path: Path | None,
     executable_path: Path | None,
     probe_mode: str,
+    effective_execution_inputs: Mapping[str, Any] | None = None,
 ) -> str:
     """把「这一轮要探的到底是什么」压成一个摘要：**有效**配置 + 可执行文件身份 + probe 模式。
 
@@ -107,6 +108,9 @@ def compute_probe_identity_digest(
     hasher = hashlib.sha256()
     hasher.update(b"probe_mode\0")
     hasher.update(probe_mode.encode("utf-8"))
+    if effective_execution_inputs is not None:
+        hasher.update(b"\0effective_execution_inputs\0")
+        hasher.update(json.dumps(effective_execution_inputs, sort_keys=True, ensure_ascii=False).encode())
     hasher.update(b"\0config\0")
     try:
         hasher.update(Path(config_path).read_bytes())
@@ -116,6 +120,7 @@ def compute_probe_identity_digest(
     if user_local_config_override_path is None:
         hasher.update(b"<override-path-unresolved>")
     else:
+        hasher.update(str(Path(user_local_config_override_path).resolve()).encode())
         try:
             hasher.update(Path(user_local_config_override_path).read_bytes())
         except FileNotFoundError:
@@ -126,6 +131,7 @@ def compute_probe_identity_digest(
     if executable_path is None:
         hasher.update(b"<executable-unresolved>")
     else:
+        hasher.update(str(Path(executable_path).resolve()).encode())
         try:
             stat_result = Path(executable_path).stat()
         except OSError:
@@ -205,6 +211,9 @@ def write_probe_outcome(
     unavailable_ttl_seconds: float | None = None,
     environment: Mapping[str, str] | None = None,
     home_directory: Path | None = None,
+    reason_code: str | None = None,
+    returncode: int | None = None,
+    reset_hint: float | None = None,
 ) -> Path:
     """记录一次**真实** probe 的结论。写失败一律吞掉——缓存不可用不该拖垮派发。"""
     if outcome not in SUPPORTED_PROBE_OUTCOMES:
@@ -228,6 +237,9 @@ def write_probe_outcome(
         "recorded_at_epoch_seconds": now_epoch_seconds,
         "expires_at_epoch_seconds": now_epoch_seconds + ttl_seconds,
         "ttl_seconds": ttl_seconds,
+        "reason_code": reason_code,
+        "returncode": returncode,
+        "reset_hint": reset_hint,
     }
     try:
         entry_path.parent.mkdir(parents=True, exist_ok=True)
@@ -248,34 +260,62 @@ def read_cached_probe_outcome(
     now_epoch_seconds: float,
     environment: Mapping[str, str] | None = None,
     home_directory: Path | None = None,
+    cache_inspection: dict[str, Any] | None = None,
 ) -> str | None:
     """命中则返回缓存的 outcome，否则 None（= 请跑一次真实 probe）。
 
     **任何拿不准的情况都返回 None**，绝不返回 ``available``：多跑一次 probe 只是多花钱，
     把死腿判活会让整轮双评审静默退化成单路。
     """
+    payload = read_cached_probe_result(harness_id, probe_identity_digest=probe_identity_digest,
+        now_epoch_seconds=now_epoch_seconds, environment=environment, home_directory=home_directory, cache_inspection=cache_inspection)
+    return payload["outcome"] if payload is not None else None
+
+
+def read_cached_probe_result(harness_id: str, *, probe_identity_digest: str, now_epoch_seconds: float,
+                             environment: Mapping[str, str] | None = None,
+                             home_directory: Path | None = None,
+                             cache_inspection: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """一次读取并联合核验身份、结果和 TTL，避免两次读取间换代的竞态。"""
+    inspection = cache_inspection if cache_inspection is not None else {}
+    inspection["reason_code"] = "probe_cache_invalid"
     if _cache_is_disabled(environment):
+        inspection["reason_code"] = "probe_cache_disabled"
         return None
-    entry_path = resolved_probe_result_cache_entry_path(
-        harness_id, environment=environment, home_directory=home_directory
-    )
     try:
-        payload = json.loads(entry_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        path = resolved_probe_result_cache_entry_path(harness_id, environment=environment, home_directory=home_directory)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("harness_id") != harness_id:
+            return None
+        if payload.get("probe_identity_digest") != probe_identity_digest:
+            inspection["reason_code"] = "probe_cache_execution_identity_changed"
+            return None
+        outcome = payload.get("outcome")
+        expires = payload.get("expires_at_epoch_seconds")
+        if outcome not in SUPPORTED_PROBE_OUTCOMES or not isinstance(expires, (float, int)):
+            return None
+        recorded_at = payload.get("recorded_at_epoch_seconds")
+        if type(recorded_at) not in (float, int) or not math.isfinite(recorded_at) or recorded_at > now_epoch_seconds:
+            return None
+        reset_hint = payload.get("reset_hint")
+        if reset_hint is not None and (type(reset_hint) not in (float, int) or not math.isfinite(reset_hint) or reset_hint < 0):
+            return None
+        if payload.get("reason_code") == "usage_limit_exhausted" and reset_hint is not None and now_epoch_seconds >= recorded_at + reset_hint:
+            inspection["reason_code"] = "probe_cache_quota_reset_elapsed"
+            return None
+        if not math.isfinite(expires) or now_epoch_seconds >= expires:
+            inspection["reason_code"] = "probe_cache_expired"
+            return None
+        returncode = payload.get("returncode")
+        if returncode is not None and (type(returncode) is not int or ((returncode == 0) != (outcome == PROBE_OUTCOME_AVAILABLE))):
+            return None
+        inspection["reason_code"] = "probe_cache_hit"
+        return payload
+    except FileNotFoundError:
+        inspection["reason_code"] = "probe_cache_absent"
         return None
-    if not isinstance(payload, dict):
+    except (OSError, ValueError, TypeError):
         return None
-    outcome = payload.get("outcome")
-    if outcome not in SUPPORTED_PROBE_OUTCOMES:
-        return None
-    if payload.get("probe_identity_digest") != probe_identity_digest:
-        return None
-    expires_at = payload.get("expires_at_epoch_seconds")
-    if not isinstance(expires_at, (int, float)):
-        return None
-    if now_epoch_seconds > float(expires_at):
-        return None
-    return outcome
 
 
 def invalidate_cached_probe_outcome(

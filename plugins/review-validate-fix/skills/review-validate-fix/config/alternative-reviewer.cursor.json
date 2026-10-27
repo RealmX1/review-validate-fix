@@ -80,5 +80,6 @@
     "--sandbox",
     "disabled",
     "Reply with exactly: OK"
-  ]
+  ],
+  "reviewer_harness_id": "cursor"
 }

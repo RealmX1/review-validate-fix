@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
+import hashlib
 import json
 import os
 import re
@@ -21,6 +23,15 @@ from kimi_latest_stable_model_selection import resolve_latest_kimi_managed_stabl
 import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
 from core.run_ledger.run_ledger import start_run  # noqa: E402
 from core.session_scope_allocation import reviewable_unit_diff_tracker  # noqa: E402
+from core.reviewer_harness_probe_result_cache import (  # noqa: E402
+    compute_probe_identity_digest, read_cached_probe_result, write_probe_outcome,
+    resolved_probe_result_cache_entry_path, PROBE_OUTCOME_AVAILABLE, PROBE_OUTCOME_UNAVAILABLE,
+)
+from reviewer_execution_attempt_evidence import (
+    DISPATCH_EXECUTION_LOCK_DESCRIPTOR_ENVIRONMENT_VARIABLE, REVIEWER_ATTEMPT_ID_ENVIRONMENT_VARIABLE,
+    inherited_reviewer_dispatch_execution_lock_descriptors, persist_reviewer_execution_attempt_receipt,
+    reviewer_execution_input_binding,
+)
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -118,6 +129,8 @@ CHILD_RVF_ENV_KEYS = {
     "RVF_REVIEW_PACKET_METADATA",
     "RVF_REVIEW_RESULT",
     "RVF_REVIEWER_ID",
+    DISPATCH_EXECUTION_LOCK_DESCRIPTOR_ENVIRONMENT_VARIABLE,
+    REVIEWER_ATTEMPT_ID_ENVIRONMENT_VARIABLE,
     REVIEWER_PROMPT_FILE_ENV,
 }
 USER_LOCAL_ALTERNATIVE_REVIEWER_CONFIG_OVERRIDE_RELATIVE_DIRECTORY = (
@@ -1207,6 +1220,9 @@ def build_prompt(
     repo: Path | None,
     scope_contract: Path | None = None,
     result_path: Path | None = None,
+    max_inline_prompt_bytes: int = 128 * 1024,
+    force_file_references: bool = False,
+    input_presentation_metadata: dict[str, Any] | None = None,
 ) -> str:
     parts = []
     env_lines = [
@@ -1269,7 +1285,23 @@ def build_prompt(
     parts.append(prompt_file.read_text(encoding="utf-8").strip())
     if review_packet is not None:
         parts.append(review_packet.read_text(encoding="utf-8").strip())
-    return "\n\n".join(part for part in parts if part)
+    prompt = "\n\n".join(part for part in parts if part)
+    original_prompt_bytes = len(prompt.encode("utf-8"))
+    use_file_references = force_file_references or original_prompt_bytes > max_inline_prompt_bytes
+    if use_file_references:
+        references = ["负责完整正式 Scope，自主查证；仅写结果工件，禁止修改源码。",
+                      f"评审协议：{prompt_file.resolve()}"]
+        for label, path in (("Scope", scope_contract), ("任务说明", session_context), ("冻结代码入口", review_packet), ("结果", result_path)):
+            if path is not None:
+                references.append(f"{label}：{path.resolve()}")
+        references.append("按需读取文件及冻结证据索引；发现问题和请求补证可以同时记录，未解决的 request 不算完成。")
+        prompt = "\n".join(references)
+        if len(prompt.encode("utf-8")) > max_inline_prompt_bytes:
+            raise ValueError("引用入口本身超过最终 prompt 预算")
+    if input_presentation_metadata is not None:
+        input_presentation_metadata.update(original_prompt_bytes=original_prompt_bytes, final_prompt_bytes=len(prompt.encode("utf-8")),
+            inline_prompt_budget_bytes=max_inline_prompt_bytes, prompt_presentation="file_references" if use_file_references else "inline")
+    return prompt
 
 
 def scrub_env(env_unset: list[str]) -> dict[str, str]:
@@ -1325,7 +1357,9 @@ def run_health(
     *,
     emit_output: bool = True,
     cwd: Path | None = None,
+    result_metadata: dict[str, Any] | None = None,
 ) -> int:
+    metadata = result_metadata if result_metadata is not None else {}
     try:
         completed = subprocess.run(
             command,
@@ -1337,12 +1371,110 @@ def run_health(
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:
+        metadata.update(reason_code="reviewer_health_timeout", returncode=1)
         return fail(f"health command timed out after {timeout}s")
+    except OSError as exc:
+        metadata.update(reason_code="reviewer_probe_spawn_failed", returncode=2)
+        return fail(str(exc), 2)
     if completed.returncode != 0:
+        from reviewer_leg_recovery import input_failure_condition
+        diagnostic = (completed.stdout or "") + "\n" + (completed.stderr or "")
+        if input_failure_condition({}, diagnostic):
+            metadata.update(reason_code="reviewer_input_context_limit", returncode=2)
+            return fail("健康探针输入超过上下文限制", 2)
+        signature = looks_like_usage_limit(diagnostic)
+        if signature:
+            import harness_limit_cooldown
+            metadata.update(reason_code="usage_limit_exhausted", returncode=EXTERNAL_REVIEWER_USAGE_LIMIT_EXIT_CODE,
+                            reset_hint=harness_limit_cooldown.parse_reset_hint(diagnostic))
+            return fail(EXTERNAL_REVIEWER_USAGE_LIMIT_FLAG + " " + signature, EXTERNAL_REVIEWER_USAGE_LIMIT_EXIT_CODE)
+        metadata.update(reason_code="reviewer_health_failed", returncode=completed.returncode)
         return fail(completed.stderr.strip() or completed.stdout.strip() or "health command failed")
+    metadata.update(reason_code="reviewer_health_completed", returncode=0)
     if emit_output:
         print(completed.stdout.strip())
     return 0
+
+
+def effective_reviewer_probe_identity(config_path: Path, config: dict[str, Any], command: list[str],
+                                      health_command: list[str] | None, cwd: Path | None, *, probe_mode: str = "preflight") -> str:
+    environment = build_alternative_reviewer_subprocess_environment(config.get("env_unset", []),
+                                                                    environment_variable_mapping(config, "env_set"))
+    execution_identity = {key: value for key, value in environment.items() if (
+        key in {"HOME", "PATH", "CODEX_HOME", "CODEX_SQLITE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME"}
+        or any(marker in key.upper() for marker in ("TOKEN", "API_KEY", "AUTH", "ACCOUNT")))}
+    label = config.get("label", "")
+    override = user_local_alternative_reviewer_config_override_path(label) if label.startswith("alternative-reviewer:") else None
+    executable = shutil.which(command[0])
+    return compute_probe_identity_digest(config_path=config_path, user_local_config_override_path=override,
+        executable_path=Path(executable) if executable else None, probe_mode=probe_mode,
+        effective_execution_inputs={"effective_config": config, "resolved_command": command,
+            "resolved_health_command": health_command, "execution_identity": execution_identity,
+            "working_directory": str(cwd) if cwd else None})
+
+
+def resolve_probe_identity_for_config(config_path: Path, *, repo: str | None = None, probe_mode: str = "preflight") -> str:
+    """选路和派发共享实际解析的模型与配置身份，不进行模型健康调用。"""
+    config, _ = load_effective_alternative_reviewer_config(config_path)
+    command = string_list(config, "command")
+    health = optional_string_list(config, "health_command")
+    cwd = Path(repo).expanduser().resolve() if repo and config.get("allow_repo_cwd") else Path.cwd()
+    command, health = resolve_reviewer_model_commands(config, command, health,
+        env=build_alternative_reviewer_subprocess_environment(config.get("env_unset", []), environment_variable_mapping(config, "env_set")),
+        cwd=cwd, timeout=int(positive_float(config, "health_timeout_seconds", 30)))
+    return effective_reviewer_probe_identity(config_path, config, command, health,
+                                             cwd if config.get("reviewer_model_selection_source") else None, probe_mode=probe_mode)
+
+
+def run_cached_reviewer_health_probe(*, harness_id: str, identity: str, command: list[str],
+                                     env: dict[str, str], timeout: int, cwd: Path | None,
+                                     ledger: Any) -> dict[str, Any]:
+    cache_path = resolved_probe_result_cache_entry_path(harness_id)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with cache_path.with_suffix(".probe-execution.lock").open("a") as lock:
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    waiting = {"returncode": 3, "reason_code": "reviewer_probe_in_flight", "probe_identity_digest": identity,
+                        "recovery_condition": "reviewer_probe_execution_lock_available",
+                        "probe_execution_lock_path": str(cache_path.with_suffix(".probe-execution.lock"))}
+                    ledger.event(phase="review", event="health_probe_wait", status="waiting", **waiting)
+                    return waiting
+                time.sleep(0.05)
+        cache_inspection: dict[str, Any] = {}
+        result = read_cached_probe_result(harness_id, probe_identity_digest=identity, now_epoch_seconds=time.time(), cache_inspection=cache_inspection)
+        cache_hit = result is not None
+        if result is None:
+            result = {}
+            returncode = run_health(command, env, timeout, emit_output=False, cwd=cwd, result_metadata=result)
+            result["returncode"] = returncode
+            result["recorded_at_epoch_seconds"] = time.time()
+            if result.get("reason_code") not in {"reviewer_input_context_limit", "reviewer_probe_spawn_failed"}:
+                write_probe_outcome(harness_id, PROBE_OUTCOME_AVAILABLE if returncode == 0 else PROBE_OUTCOME_UNAVAILABLE,
+                    probe_identity_digest=identity, now_epoch_seconds=result["recorded_at_epoch_seconds"],
+                    reason_code=result.get("reason_code"), returncode=returncode, reset_hint=result.get("reset_hint"))
+        if result.get("reason_code") == "usage_limit_exhausted":
+            restore_cooldown_from_effective_quota_probe_evidence(harness_id, result)
+        result["returncode"] = result.get("returncode") if isinstance(result.get("returncode"), int) else (0 if result.get("outcome") == PROBE_OUTCOME_AVAILABLE else 1)
+        result.update(probe_identity_digest=identity, cache_hit=cache_hit)
+        ledger.event(phase="review", event="health_probe_result", status="completed" if result["returncode"] == 0 else "failed",
+                     reason_code=result.get("reason_code") or "cached_health_probe", probe_identity_digest=identity, cache_hit=cache_hit,
+                     cache_reuse_reason=cache_inspection["reason_code"])
+        return result
+
+
+def restore_cooldown_from_effective_quota_probe_evidence(harness_id: str, probe: dict[str, Any]) -> None:
+    """复用额度事实时保留原观察时点，不能把缓存命中时间变成新的冷却起点。"""
+    import harness_limit_cooldown
+    observed_at = probe.get("recorded_at_epoch_seconds", time.time())
+    reset_hint = probe.get("reset_hint")
+    original_duration = reset_hint if isinstance(reset_hint, (int, float)) else harness_limit_cooldown.default_ttl_seconds()
+    remaining = max(0.0, original_duration - max(0.0, time.time() - observed_at))
+    harness_limit_cooldown.record(harness_id, ttl_seconds=remaining, reason="preflight_usage_limit_exhausted")
 
 
 def resolve_reviewer_model_commands(
@@ -1998,6 +2130,7 @@ def run_with_activity_timeout(
     max_runtime_seconds: float | None,
     output_format: str,
     tool_failure_threshold: int = DEFAULT_CURSOR_TOOL_FAILURE_THRESHOLD,
+    inherited_dispatch_execution_lock_descriptors: tuple[int, ...] = (),
 ) -> ReviewerRunResult:
     """运行外部 reviewer，并按 stdout/stderr 可观测活动刷新空闲超时。
 
@@ -2014,6 +2147,7 @@ def run_with_activity_timeout(
         text=True,
         env=reviewer_subprocess_environment,
         start_new_session=True,
+        **({"pass_fds": inherited_dispatch_execution_lock_descriptors} if inherited_dispatch_execution_lock_descriptors else {}),
     )
     set_active_reviewer_process(process)
     started_at = time.monotonic()
@@ -2690,6 +2824,7 @@ def main() -> int:
     parser.add_argument("--review-packet", help="Self-contained packet generated by build_review_packet.py, including Session Context.")
     parser.add_argument("--scope-contract", help="scope.contract.json path for this review run.")
     parser.add_argument("--prompt-file", default=str(DEFAULT_PROMPT), help="Review prompt file.")
+    parser.add_argument("--force-file-references", action="store_true", help="输入恢复时仅发送有界文件入口。")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Alternative reviewer config JSON.")
     parser.add_argument("--output", help="Optional file to write reviewer stdout.")
     parser.add_argument("--check", action="store_true", help="Validate config and command availability only.")
@@ -2700,6 +2835,7 @@ def main() -> int:
     parser.add_argument("--rvf-run-id", help="Use an existing RVF run id instead of creating a new one.")
     parser.add_argument("--rvf-run-dir", help="Use this RVF run directory instead of resolving state/runs/<run_id>.")
     parser.add_argument("--reviewer-id", help="Override the reviewer artifact id (defaults to the config label). Used by dispatch_reviewers.py to run two same-harness instances without colliding on artifacts/reviewers/<id>/.")
+    parser.add_argument("--reviewer-harness-id", help="注册表中的 harness 身份，供健康缓存和 cooldown 共用。")
     args = parser.parse_args()
     ledger = start_run(
         "reviewer",
@@ -2824,6 +2960,9 @@ def main() -> int:
         health_command_cwd = (
             model_selection_cwd if config.get("reviewer_model_selection_source") else None
         )
+        probe_identity_digest = effective_reviewer_probe_identity(config_path, config, command, health_command, health_command_cwd)
+        probe_harness_id = args.reviewer_harness_id or config.get("reviewer_harness_id") or reviewer_id_from_label(label)
+
         health_command_ledger_metadata = (
             {"command": health_command}
             if user_local_config_override_summary.get("applied") is not True
@@ -3067,12 +3206,11 @@ def main() -> int:
             )
             print("health command not configured")
             return 0
-        returncode = run_health(
-            health_command,
-            reviewer_support_subprocess_environment,
-            health_timeout,
-            cwd=health_command_cwd,
-        )
+        probe_result = run_cached_reviewer_health_probe(
+            harness_id=probe_harness_id, identity=probe_identity_digest, command=health_command,
+            env=reviewer_support_subprocess_environment, timeout=health_timeout, cwd=health_command_cwd, ledger=ledger)
+        returncode = probe_result["returncode"]
+        print(json.dumps(probe_result, ensure_ascii=False))
         ledger.event(
             phase="review",
             event="health_completed",
@@ -3094,12 +3232,11 @@ def main() -> int:
     if args.health:
         if health_command is None:
             return fail("health command not configured", 2)
-        returncode = run_health(
-            health_command,
-            reviewer_support_subprocess_environment,
-            health_timeout,
-            cwd=health_command_cwd,
-        )
+        probe_result = run_cached_reviewer_health_probe(
+            harness_id=probe_harness_id, identity=probe_identity_digest, command=health_command,
+            env=reviewer_support_subprocess_environment, timeout=health_timeout, cwd=health_command_cwd, ledger=ledger)
+        returncode = probe_result["returncode"]
+        print(json.dumps(probe_result, ensure_ascii=False))
         ledger.event(
             phase="review",
             event="health_completed",
@@ -3141,7 +3278,11 @@ def main() -> int:
         if scope_contract is not None and not scope_contract.exists():
             raise ValueError(f"scope contract file not found: {scope_contract}")
         scope_contract_payload = load_scope_contract(scope_contract)
-        prompt = build_prompt(prompt_file, session_context, review_packet, repo, scope_contract, review_result_path)
+        prompt_input_metadata: dict[str, Any] = {}
+        prompt = build_prompt(prompt_file, session_context, review_packet, repo, scope_contract, review_result_path,
+                              positive_int(config, "max_inline_prompt_bytes", 128 * 1024), args.force_file_references, prompt_input_metadata)
+        ledger.event(phase="review", event="reviewer_input_prepared", status="completed", reason_code="reviewer_input_budget_applied",
+                     reviewer_id=reviewer_id, **prompt_input_metadata)
     except Exception as exc:
         ledger.event(
             phase="review",
@@ -3168,6 +3309,12 @@ def main() -> int:
         reviewer_subprocess_environment["RVF_SCOPE_CONTRACT"] = str(scope_contract)
     reviewer_subprocess_environment["RVF_REVIEWER_ID"] = reviewer_id
     reviewer_subprocess_environment["RVF_REVIEW_RESULT"] = str(review_result_path)
+    reviewer_subprocess_environment["RVF_READ_FROZEN_REVIEW_EVIDENCE"] = str(Path(__file__).with_name("read_frozen_review_evidence.py"))
+    if scope_contract_payload.get("frozen_evidence_index"):
+        reviewer_subprocess_environment["RVF_FROZEN_REVIEW_EVIDENCE_INDEX"] = scope_contract_payload["frozen_evidence_index"]
+    candidate_commit = (scope_contract_payload.get("review_candidate_snapshot") or {}).get("checkpoint_commit")
+    if candidate_commit:
+        reviewer_subprocess_environment["RVF_REVIEW_CANDIDATE_COMMIT"] = candidate_commit
 
     # prompt artifact 与 argv 终结必须先于 --dry-run：指针形态的 argv 里逐字带着 prompt 文件的
     # 绝对路径，只有先落盘、先终结，--dry-run 打印出来的 command 才是真实将被执行的那一条。
@@ -3250,34 +3397,43 @@ def main() -> int:
         return 0
 
     if pre_run_health and health_command is not None:
-        returncode = run_health(
-            health_command,
-            reviewer_support_subprocess_environment,
-            health_timeout,
-            emit_output=False,
-            cwd=health_command_cwd,
-        )
+        probe_result = run_cached_reviewer_health_probe(
+            harness_id=probe_harness_id, identity=probe_identity_digest, command=health_command,
+            env=reviewer_support_subprocess_environment, timeout=health_timeout, cwd=health_command_cwd, ledger=ledger)
+        returncode = probe_result["returncode"]
+        probe_evidence_wait = probe_result.get("reason_code") == "reviewer_probe_in_flight"
         ledger.event(
             phase="review",
             event="pre_run_health_completed",
-            status="completed" if returncode == 0 else "failed",
+            status="waiting" if probe_evidence_wait else ("completed" if returncode == 0 else "failed"),
             reason_code=(
-                "reviewer_pre_run_health_completed"
-                if returncode == 0
-                else "reviewer_pre_run_health_failed"
+                "reviewer_probe_in_flight" if probe_evidence_wait else (
+                    "reviewer_pre_run_health_completed" if returncode == 0 else "reviewer_pre_run_health_failed"
+                )
             ),
             returncode=returncode,
             **health_command_ledger_metadata,
         )
         if returncode != 0:
+            if probe_evidence_wait:
+                from independent_backup_route import durable_json
+                durable_json(unique_child_path(reviewer_dir, "reviewer.summary.json"), {
+                    "created_at": datetime.now(timezone.utc).isoformat(), "reviewer_id": reviewer_id,
+                    "execution_attempt_id": os.environ.get(REVIEWER_ATTEMPT_ID_ENVIRONMENT_VARIABLE),
+                    "returncode": returncode, "review_result_complete": False,
+                    "output_error_reason": "reviewer_probe_in_flight", "probe_evidence_wait": probe_result,
+                })
             ledger.summary(
-                status="failed",
-                reason_code="reviewer_pre_run_health_failed",
-                message="alternative reviewer pre-run health command failed",
+                status="waiting" if probe_evidence_wait else "failed",
+                reason_code="reviewer_probe_in_flight" if probe_evidence_wait else "reviewer_pre_run_health_failed",
+                output_error_reason=probe_result.get("reason_code"),
+                message="等待共享 reviewer 探针完成" if probe_evidence_wait else "alternative reviewer pre-run health command failed",
                 returncode=returncode,
                 user_local_config_override=user_local_config_override_summary,
                 **health_command_ledger_metadata,
             )
+            if returncode == EXTERNAL_REVIEWER_USAGE_LIMIT_EXIT_CODE:
+                print(EXTERNAL_REVIEWER_USAGE_LIMIT_FLAG, file=sys.stderr)
             return returncode
 
     lease_runtime = TrackerLeaseRuntime(
@@ -3305,6 +3461,7 @@ def main() -> int:
                 max_runtime_seconds=max_runtime,
                 output_format=output_format,
                 tool_failure_threshold=tool_failure_threshold,
+                inherited_dispatch_execution_lock_descriptors=inherited_reviewer_dispatch_execution_lock_descriptors(ledger.run_dir),
             )
         except Exception as exc:
             completed = ReviewerRunResult(
@@ -3410,7 +3567,7 @@ def main() -> int:
     review_result_summary: dict[str, Any] | None = None
     review_result_check_stderr = ""
     review_result_summary_path: str | None = None
-    if completed.returncode == 0:
+    if completed.returncode == 0 or review_result_path.is_file():
         review_result_summary, review_result_check_stderr = check_review_result_artifact(
             review_result_path,
             scope_contract,
@@ -3421,13 +3578,13 @@ def main() -> int:
             review_result_summary,
             unique=True,
         )
-        if not review_result_summary.get("valid"):
+        if not review_result_summary.get("valid") and completed.returncode == 0:
             completed.returncode = 1
             errors = review_result_summary.get("errors")
             error_text = "; ".join(str(item) for item in errors) if isinstance(errors, list) else "invalid review result artifact"
             stderr = f"{stderr}\n{error_text}".strip()
     review_result_kind = review_result_summary.get("kind") if review_result_summary else None
-    review_result_complete = review_result_kind in {"no_issues", "issues"}
+    review_result_complete = completed.returncode == 0 and bool(review_result_summary and review_result_summary.get("review_complete"))
     review_request_pending = review_result_kind == "request"
     probe_history_path = write_child_artifact(
         reviewer_dir,
@@ -3581,6 +3738,12 @@ def main() -> int:
         reviewer_id=reviewer_id,
         user_local_config_override=user_local_config_override_summary,
     )
+
+    persist_reviewer_execution_attempt_receipt(run_directory=ledger.run_dir, reviewer_id=reviewer_id,
+        execution_input_binding=reviewer_execution_input_binding(run_id=ledger.run_id, repo=repo,
+            review_packet=review_packet, scope_contract=scope_contract), result_path=review_result_path,
+        returncode=completed.returncode, reviewer_subprocess_returncode=subprocess_returncode,
+        review_complete=review_result_complete)
 
     if completed.returncode != 0:
         if stderr:

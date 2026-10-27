@@ -4337,7 +4337,7 @@ def test_packet_emits_tracker_scope_section_when_present(tmp: Path) -> None:
     packet_text = (artifacts_dir / "review-packet.md").read_text(encoding="utf-8")
     assert "## Tracker Scope" in packet_text
     assert "## Allocated Git Diff" in packet_text
-    assert "## Full Git Diff HEAD (Evidence Only)" in packet_text
+    assert "## Full Git Diff HEAD (Evidence Only)" not in packet_text
     assert "## Session-Owned Git Diff" not in packet_text
     assert payload["lease_id"] in packet_text
     assert payload["scope_hash"] in packet_text
@@ -4507,6 +4507,10 @@ def test_allocated_git_diff_uses_tracker_scope_paths(tmp: Path) -> None:
     repo = _slice_2b_repo_with_two_dirty(tmp)
     log_root = tmp / "logs"
     payload = _slice_2b_tracker_scope_payload(paths=["tracked.txt"])
+    tracker = load_diff_tracker_module()
+    specs = tracker._specs_from_observation(tracker._classify_path(repo, "tracked.txt"), "tracked.txt")
+    payload["unit_ids"] = [spec.unit_id for spec in specs]
+    payload["hunks"] = [{"unit_id": spec.unit_id, "path": spec.path, "hunk_header": spec.hunk_header} for spec in specs]
     scope_path = _slice_2b_write_scope_file(tmp, payload)
     completed, artifacts_dir = _slice_2b_prepare(
         tmp=tmp, repo=repo, tracker_scope_path=scope_path, log_root=log_root
@@ -4515,10 +4519,11 @@ def test_allocated_git_diff_uses_tracker_scope_paths(tmp: Path) -> None:
     assert artifacts_dir is not None
     packet_text = (artifacts_dir / "review-packet.md").read_text(encoding="utf-8")
     allocated_idx = packet_text.index("## Allocated Git Diff")
-    full_idx = packet_text.index("## Full Git Diff HEAD (Evidence Only)")
-    assert allocated_idx < full_idx
-    allocated_block = packet_text[allocated_idx:full_idx]
-    full_block = packet_text[full_idx:]
+    assert "## Full Git Diff HEAD (Evidence Only)" not in packet_text
+    allocated_block = packet_text[allocated_idx:]
+    metadata = json.loads((artifacts_dir / "review-packet.metadata.json").read_text())
+    index = json.loads(Path(metadata["frozen_evidence_index"]).read_text())
+    full_block = Path(index["history_diff"]["file"]).read_text()
     assert "diff --git a/tracked.txt b/tracked.txt" in allocated_block
     assert "diff --git a/tracked2.txt b/tracked2.txt" not in allocated_block
     assert "diff --git a/tracked.txt b/tracked.txt" in full_block
@@ -4810,10 +4815,7 @@ def test_committed_round_manifest_to_packet_reviews_committed_work(tmp: Path) ->
 
 
 def test_committed_round_tracker_scope_renders_path_level_when_baseline(tmp: Path) -> None:
-    """(F1 regression) With a committed-round baseline, the tracker-scope Allocated diff must NOT be
-    silently emptied by hunk-header filtering when a file has both a committed and a residual-dirty
-    hunk (the recorded headers were computed against a different base than baseline-vs-worktree).
-    base_ref != HEAD falls back to path-level diff of the allocated paths."""
+    """历史基线较早时，已提交与 dirty unit 分别投影，不能退化为累计整文件 diff。"""
     repo, _ = _committed_round_repo(tmp)
     (repo / "f.txt").write_text("L1\nL2\nL3\nL4\nL5\n", encoding="utf-8")
     run(["git", "commit", "-qam", "grow"], cwd=repo)
@@ -4827,13 +4829,17 @@ def test_committed_round_tracker_scope_renders_path_level_when_baseline(tmp: Pat
             dirty_header = ln.split(" @@")[0] + " @@"
             break
     assert dirty_header
+    tracker = load_diff_tracker_module()
+    committed_specs = tracker._specs_from_observation(tracker._classify_committed_path(repo, "f.txt", grow_baseline), "f.txt")
+    dirty_specs = tracker._specs_from_observation(tracker._classify_path(repo, "f.txt"), "f.txt")
+    specs = [*committed_specs, *dirty_specs]
     manifest = {
         "version": 1, "repo": str(repo), "session_id": "s1",
         "owned_paths": ["f.txt"], "owned_dirty_paths": ["f.txt"], "owned_committed_round_paths": ["f.txt"],
         "committed_round_baseline": grow_baseline,
         "tracker": {"status": "ok", "session_id": "s1", "tracker_scope": {
-            "unit_ids": ["u1"], "lease_id": "lse-1", "scope_hash": "h1",
-            "paths": ["f.txt"], "hunks": [{"path": "f.txt", "hunk_header": dirty_header}]}},
+            "unit_ids": [spec.unit_id for spec in specs], "lease_id": "lse-1", "scope_hash": "h1",
+            "paths": ["f.txt"], "hunks": [{"unit_id": spec.unit_id, "path": "f.txt", "hunk_header": spec.hunk_header} for spec in specs]}},
     }
     packet, meta = _build_packet_with_manifest(tmp, repo, manifest)
     assert meta["owned_diff_base_ref"] == grow_baseline
@@ -5083,6 +5089,9 @@ def test_complete_review_scope_mark_reviewed_gate(tmp: Path) -> None:
     assert any(rev == "reviewed" for (_obs, rev) in after_real.values()), after_real
 
 
+from _rvf_test_support.completed_dual_reviewer_fixture import write_protocol_valid_completed_dual_reviewer_fixture
+
+
 def test_release_tracker_lease_noop_completion_does_not_mark_reviewed(tmp: Path) -> None:
     """finalize-level wiring of the no-op guard: `_release_tracker_lease` derives
     `mark_reviewed` from reviewer-artifact presence. A run_dir with NO
@@ -5149,7 +5158,7 @@ def test_release_tracker_lease_noop_completion_does_not_mark_reviewed(tmp: Path)
         real_run = tmp / "run-real"
         reviewer_dir = real_run / "artifacts" / "reviewers" / "rev2"
         reviewer_dir.mkdir(parents=True, exist_ok=True)
-        (reviewer_dir / "review-result.json").write_text("{}", encoding="utf-8")
+        write_protocol_valid_completed_dual_reviewer_fixture(real_run)
         _write_contract(real_run, alloc2["lease_id"], alloc2["scope_hash"], "r2", unit_ids)
         real_result = fin._release_tracker_lease(real_run, repo, decision_kind="handoff")
         assert real_result is not None and real_result["did_review"] is True, real_result
@@ -5314,6 +5323,7 @@ def test_advance_review_highwater_only_on_did_review(tmp: Path) -> None:
             "tracker_lease_release": {"did_review": True},
             "workspace_diff": {"head_after": head},
         }
+        write_protocol_valid_completed_dual_reviewer_fixture(run_dir)
         out_real = fin._advance_review_highwater(run_dir, repo, {}, {}, rec_real)
         assert out_real["status"] == "advanced", out_real
         assert out_real["reviewed_head"] == head, out_real
@@ -6800,7 +6810,7 @@ def test_detached_wrapper_executes_real_guardian_cli_post_exit(tmp_path: Path) -
         )
     )
     assert counter["analyze_completion_count"] == 1
-    assert counter["last_run_dir"] == str(run_dir)
+    assert Path(counter["last_run_dir"]).resolve() == run_dir.resolve()
 
 
 def test_rvf_analyze_thread_wires_verified_archive_execution(tmp_path: Path) -> None:
@@ -9172,11 +9182,11 @@ def test_agent_cli_dispatch_separates_blocked_on_reviewer_request_from_failure(t
     assert blocked.status == cli.DISPATCH_OUTCOME_BLOCKED_ON_REVIEWER_REQUEST, blocked
     assert blocked.exit_code == cli.EXIT_DISPATCH_BLOCKED_ON_REVIEWER_REQUEST
     assert blocked.exit_code != cli.EXIT_DISPATCH_FAILED
-    assert "Contract Gate" in blocked.message
+    assert "补证" in blocked.message
     # 指引必须给出**只重派 request 腿**的形态：整盘重跑会把健康且已完成的那条腿一并覆写，
     # 这条修复只在 flag 上生效、在标准操作流程上不生效（RVF-004）。
     assert any(
-        cli.REVIEW_REQUEST_REDISPATCH_FLAG in step for step in blocked.next_steps
+        "redispatch-reviewers" in step and "--review-request-legs-only" not in step for step in blocked.next_steps
     ), blocked.next_steps
     # token 不进终态：处置完 request 之后要能经同一入口重派。
     assert dts.read_decision_token(tok, root=roots.token_root, now=t0).state == dts.STATE_ACKNOWLEDGED

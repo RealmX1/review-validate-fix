@@ -517,6 +517,7 @@ def write_review_packet_build_command(inputs_dir: Path, packet_cmd: list[str]) -
     return path
 
 
+@guard_review_run_qualification_mutation(lambda arguments: run_directory_for_qualification_artifact(arguments["artifact_dir"] / "inputs/scope.contract.json"))
 def rerender_scope_of_work_into_review_packet(artifact_dir: Path) -> dict[str, Any]:
     """把**盘上现有的** ``scope-of-work.md`` 重新渲进 review packet（绕过 prepare 的 completed 幂等）。
 
@@ -577,6 +578,7 @@ def rerender_scope_of_work_into_review_packet(artifact_dir: Path) -> dict[str, A
         inputs_dir / "review-packet.md",
         inputs_dir / "review-packet.metadata.json",
         inputs_dir / "scope-of-work.md",
+        inputs_dir / "scope.contract.json",
     ):
         if source.is_file():
             relative = source.relative_to(artifact_dir)
@@ -586,6 +588,16 @@ def rerender_scope_of_work_into_review_packet(artifact_dir: Path) -> dict[str, A
             archived.append(relative.as_posix())
 
     run([sys.executable, str(BUILD_PACKET), *args])
+
+    # 重渲沿用候选和 Scope，同时绑定新索引；旧索引按内容寻址保留，归档引用继续有效。
+    refreshed_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    contract_path = inputs_dir / "scope.contract.json"
+    if contract_path.is_file() and "frozen_evidence_complete" in refreshed_metadata:
+        refreshed_contract = json.loads(contract_path.read_text(encoding="utf-8"))
+        for field in ("frozen_evidence_complete", "frozen_evidence_index", "frozen_evidence_index_sha256"):
+            refreshed_contract[field] = refreshed_metadata.get(field)
+        from core.run_ledger.run_ledger import _atomic_write_text
+        _atomic_write_text(contract_path, json.dumps(refreshed_contract, ensure_ascii=False, indent=2) + "\n")
 
     for source, destination in (
         (packet_path, inputs_dir / "review-packet.md"),
@@ -1394,6 +1406,11 @@ def prepare_run(
         tracker_transcript_max_line_number=contract_tracker_transcript_max_line_number,
         scope_contract_extensions=effective_scope_contract_extensions,
     )
+    if "frozen_evidence_complete" in metadata:
+        scope_contract["frozen_evidence_complete"] = metadata["frozen_evidence_complete"]
+        scope_contract["frozen_evidence_index"] = metadata.get("frozen_evidence_index")
+        scope_contract["frozen_evidence_index_sha256"] = metadata.get("frozen_evidence_index_sha256")
+        scope_contract_path.write_text(json.dumps(scope_contract, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     bootstrap = build_worktree_bootstrap(
         repo=root,
         artifact_dir=artifact_dir,

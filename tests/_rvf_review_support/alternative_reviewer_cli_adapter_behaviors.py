@@ -19,14 +19,14 @@ from pathlib import Path
 def _minimal_reviewer_subprocess_environment_with_isolated_rvf_state_roots(
     tmp_path: Path,
 ) -> dict[str, str]:
-    """只带 PATH 的最小子进程环境 + 两个 RVF 落盘根。
-
-    最小环境是为了钉住「reviewer CLI 不依赖调用方 env」；但它连 HOME 都没有，RVF 的 RunLedger
-    便回落到 ``Path.home()``——即开发者真实的 ``~/.rvf/user-local-data/run-logs``（F5·H5b 普查：
-    本文件 4 个用例每轮各写一个 reviewer run 进去）。落盘根不是被测行为的一部分，显式给 tmp。
-    """
+    """最小子进程环境显式隔离 HOME、Codex 配置和 RVF 状态，不依赖宿主机账户查询。"""
+    isolated_user_home = tmp_path / "isolated-user-home"
+    isolated_user_home.mkdir(exist_ok=True)
     return {
         "PATH": f"{tmp_path}:{os.environ.get('PATH', '')}",
+        "HOME": str(isolated_user_home),
+        "CODEX_HOME": str(tmp_path / "isolated-codex-configuration"),
+        "CODEX_SQLITE_HOME": str(tmp_path / "isolated-codex-conversation-storage"),
         "RVF_HOME": str(tmp_path / "isolated-rvf-home"),
         "RVF_USER_LOCAL_DATA_ROOT": str(tmp_path / "isolated-rvf-user-local-data"),
     }
@@ -805,16 +805,17 @@ def test_alternative_reviewer_delivers_entire_prompt_over_stdin_despite_watchdog
     repo = init_repo(tmp_path / "repo")
     packet = tmp_path / "packet.md"
     packet.write_text(
-        "## Review Packet\n\n" + ("prompt-delivery-filler " * 20_000) + "\n",
+        "## Review Packet\n\n" + ("prompt-delivery-filler " * 4_000) + "\n",
         encoding="utf-8",
     )
     reviewer_code = (
-        "import os, subprocess, sys; "
+        "import hashlib, os, subprocess, sys; "
         "delivered = sys.stdin.read(); "
         "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
         "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], "
         "'--audit-summary', 'audited diff; no correctness issues found'], check=True); "
-        "print('DELIVERED_PROMPT_CHARACTERS=' + str(len(delivered)))"
+        "print('DELIVERED_PROMPT_CHARACTERS=' + str(len(delivered))); "
+        "print('DELIVERED_PROMPT_SHA256=' + hashlib.sha256(delivered.encode()).hexdigest())"
     )
     config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp_path / "alternative-reviewer.json",
@@ -833,6 +834,8 @@ def test_alternative_reviewer_delivers_entire_prompt_over_stdin_despite_watchdog
             str(repo),
             "--review-packet",
             str(packet),
+            "--rvf-run-dir",
+            str(tmp_path / "prompt-delivery-run"),
         ],
         capture_output=True,
         text=True,
@@ -845,8 +848,13 @@ def test_alternative_reviewer_delivers_entire_prompt_over_stdin_despite_watchdog
     delivered_characters = int(
         completed.stdout.split(delivered_marker, 1)[1].split()[0]
     )
-    # reviewer 必须收到完整 packet，而不是被截断的前若干个 PIPE_BUF。
-    assert delivered_characters > len(packet.read_text(encoding="utf-8")), delivered_characters
+    # 验证预算内的大 prompt 逐字节投递，而非仅收到指针或若干 PIPE_BUF。
+    import hashlib
+    prompt_file = next((tmp_path / "prompt-delivery-run/artifacts/reviewers").glob("*/reviewer.prompt*.txt"))
+    prompt_bytes = prompt_file.read_bytes()
+    assert 65536 < len(prompt_bytes) <= 128 * 1024
+    assert delivered_characters == len(prompt_bytes.decode())
+    assert "DELIVERED_PROMPT_SHA256=" + hashlib.sha256(prompt_bytes).hexdigest() in completed.stdout
 
 
 def test_alternative_reviewer_stdin_writer_thread_start_failure_cleans_up_reviewer(

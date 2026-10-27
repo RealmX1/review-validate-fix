@@ -1,27 +1,4 @@
-#!/usr/bin/env python3
-"""reviewer 结果工件的生命周期契约（2026-08-15 run 暴露的死结与不对称）。
-
-护的不变量：
-
-* **LIFE-1（死结已解，且方向不对称是有意的）** —— 除了「已写成 ``issues`` 再换 kind」这一条，
-  三态之间其余方向都可达，且换 kind 一律先归档旧工件。历史上是：``request → issues`` 直接报错
-  （死结，reviewer 契约又禁止它删改工件 ⇒ 同一 run 内永远交不出 issues，实测废掉一整轮 codex
-  评审），而 ``request → no_issues`` 却**无条件原地覆写**（合法 request 无归档地凭空消失）。
-* **LIFE-2（不丢结果）** —— 归档链可追溯：新工件的 ``superseded`` 指向每一份被取代的旧工件。
-* **LIFE-3（只重派 request 腿）** —— ``--redispatch-review-request-legs-only`` 复用上一轮 plan、
-  只重跑停在 ``kind: request`` 的腿；健康且已完成的腿保留结果、不重跑。整盘重派会把它重跑一遍，
-  新一轮结果覆写掉旧的（实测一条 cursor 腿跑了三轮 2/4/3 条 issue，只留最后一轮）。
-* **LIFE-4（issues 是终态）** —— 归档保住的是**取证**能力，不是**判定**能力：canonical ``kind``
-  的读者（``check_review_result`` / dispatcher 有效腿判定 / merge policy / candidate evidence）
-  没有一个会合并 ``superseded`` 链。所以 ``issues → no_issues`` / ``issues → request`` 必须被
-  拒绝，否则后一次 writer 调用就能把已找到的 REAL issue 洗成 clean。反方向（补结论、退回待处理）
-  不封——封了就是同一类假绿的镜像。
-* **LIFE-5（预演不破坏）** —— ``--dry-run`` 的契约是 “Print plan JSON to stdout; do not write or
-  execute”；request-only 重派的工件轮转只能发生在真正 execute 之前，预演一次不得搬走当前结果。
-* **LIFE-6（指引与 flag 不许脱节）** —— ``blocked_on_reviewer_request`` 的 next_steps 与
-  SKILL.md / references/review-merge-policy.md 必须都指向 ``--redispatch-review-request-legs-only``。
-  只在 flag 上实现、指引仍写「整盘重跑」，等于修复在真实入口上没生效。
-"""
+"""结果生命周期：发现与补证并存、请求显式解决、续跑保留 canonical 及完成腿。"""
 
 from __future__ import annotations
 
@@ -79,8 +56,6 @@ def _archive_dir(out: Path) -> Path:
 @pytest.mark.parametrize(
     "first_arguments, first_kind, second_arguments, second_kind",
     [
-        (_request_arguments(), "request", _issue_arguments(), "issues"),
-        (_request_arguments(), "request", _no_issues_arguments(), "no_issues"),
         (_no_issues_arguments(), "no_issues", _issue_arguments(), "issues"),
         (_no_issues_arguments(), "no_issues", _request_arguments(), "request"),
     ],
@@ -142,6 +117,12 @@ def test_supersession_lineage_accumulates_across_multiple_flips(tmp_path: Path) 
     assert _write(run_dir, out, *_issue_arguments()).returncode == 0
 
     payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["kind"] == "request" and len(payload["issues"]) == 1
+    request_id = payload["requests"][0]["request_id"]
+    assert _write(run_dir, out, "respond-request", "--request-id", request_id, "--response", "已取得证据").returncode == 0
+    assert _write(run_dir, out, "resolve-request", "--request-id", request_id, "--resolution", "已核验").returncode == 0
+    assert _write(run_dir, out, "complete", "--audit-summary", "完整评审完成").returncode == 0
+    payload = json.loads(out.read_text(encoding="utf-8"))
     assert [entry["kind"] for entry in payload["superseded"]] == ["no_issues", "request"]
     assert len(list(_archive_dir(out).glob("review-result.*.json"))) == 2
 
@@ -150,7 +131,6 @@ def test_supersession_lineage_accumulates_across_multiple_flips(tmp_path: Path) 
     "second_arguments, second_kind",
     [
         (_no_issues_arguments(), "no_issues"),
-        (_request_arguments(), "request"),
     ],
 )
 def test_recorded_issues_are_a_terminal_kind_and_cannot_be_flipped_away(
@@ -170,7 +150,7 @@ def test_recorded_issues_are_a_terminal_kind_and_cannot_be_flipped_away(
     refused = _write(run_dir, out, *second_arguments)
 
     assert refused.returncode != 0, f"issues → {second_kind} 必须被拒绝"
-    assert "终态" in refused.stderr, refused.stderr
+    assert "已记录 issues" in refused.stderr, refused.stderr
     # 闸在 os.replace 之前：被拒时磁盘一个字节都没动。
     assert out.read_text(encoding="utf-8") == before
     assert not _archive_dir(out).exists()
@@ -203,7 +183,7 @@ def _seed_run_with_two_legs(tmp_path: Path, *, alpha_kind: str, beta_kind: str) 
                 {"path": "a.py", "line": 1, "message": "旧一轮找到的", "kind": "REAL", "severity": "high"}
             ]
         elif kind == "request":
-            payload["requests"] = [{"type": "context_request", "need": "file", "target": "a.py"}]
+            payload["requests"] = [{"type": "context_request", "need": "file", "target": "a.py", "reason": "所需材料缺失"}]
         elif kind == "no_issues":
             payload["audit_summary"] = "clean"
         (leg / "review-result.json").write_text(
@@ -251,14 +231,14 @@ def test_resume_selects_only_the_request_legs_without_touching_any_artifact(tmp_
         for reviewer_id in ("alpha", "beta")
     }
 
-    plan, indices = dispatch_reviewers._resume_plan_for_review_request_legs(reviewers_dir, artifacts)
+    plan, indices = dispatch_reviewers.load_reviewer_plan_and_select_incomplete_legs(reviewers_dir, artifacts)
 
     assert indices == [0], "只有 alpha 停在 request"
     assert plan["reviewers"][0]["reviewer_id"] == "alpha"
     assert plan["status"] == "planned", "上一轮的终态标记必须清掉，否则本轮永远挂着 blocked"
     assert "reason" not in plan
     assert any(
-        warning["code"] == "redispatching_review_request_legs_only" for warning in plan["warnings"]
+        warning["code"] == "resuming_incomplete_reviewer_legs" for warning in plan["warnings"]
     ), plan["warnings"]
 
     for reviewer_id, text in before.items():
@@ -277,15 +257,15 @@ def test_rotation_is_a_separate_execute_only_step(tmp_path: Path) -> None:
     reviewers_dir = artifacts / "reviewers"
     healthy_before = (reviewers_dir / "beta" / "review-result.json").read_text(encoding="utf-8")
     request_before = (reviewers_dir / "alpha" / "review-result.json").read_text(encoding="utf-8")
-    plan, indices = dispatch_reviewers._resume_plan_for_review_request_legs(reviewers_dir, artifacts)
+    plan, indices = dispatch_reviewers.load_reviewer_plan_and_select_incomplete_legs(reviewers_dir, artifacts)
 
-    rotated = dispatch_reviewers._rotate_review_request_leg_artifacts(plan, indices, artifacts)
+    rotated = dispatch_reviewers.checkpoint_incomplete_reviewer_leg_artifacts(plan, indices, artifacts)
 
     assert len(rotated) == 1
     # 健康腿：一个字节都不动。
     assert (reviewers_dir / "beta" / "review-result.json").read_text(encoding="utf-8") == healthy_before
     # request 腿：旧工件被轮转走，重跑从干净起点开始（否则新 request 会追加在旧的后面）。
-    assert not (reviewers_dir / "alpha" / "review-result.json").exists()
+    assert (reviewers_dir / "alpha" / "review-result.json").read_text(encoding="utf-8") == request_before
     archived = list(
         (reviewers_dir / "alpha" / write_review_result.SUPERSEDED_RESULT_ARTIFACTS_DIRNAME).glob(
             "review-result.*.json"
@@ -296,7 +276,7 @@ def test_rotation_is_a_separate_execute_only_step(tmp_path: Path) -> None:
 
 
 def test_dry_run_redispatch_prints_the_plan_without_moving_any_result_artifact(tmp_path: Path) -> None:
-    """LIFE-5（端到端）：``--dry-run --redispatch-review-request-legs-only`` 只打印 plan。
+    """LIFE-5（端到端）：普通恢复入口的 ``--dry-run`` 只打印 plan。
 
     契约原文是 “Print plan JSON to stdout; do not write or execute”；一次预演不得把当前
     canonical ``review-result.json`` 搬进归档目录。
@@ -322,7 +302,6 @@ def test_dry_run_redispatch_prints_the_plan_without_moving_any_result_artifact(t
             sys.executable,
             str(SCRIPT_DIRECTORY / "dispatch_reviewers.py"),
             "--dry-run",
-            "--redispatch-review-request-legs-only",
             "--rvf-run-id", "rvf-lifecycle-test",
             "--rvf-run-dir", str(artifacts.parent),
             "--assume-available", "codex,cursor",
@@ -352,7 +331,7 @@ def test_resume_fails_closed_without_a_previous_plan(tmp_path: Path) -> None:
     artifacts = tmp_path / "run" / "artifacts"
     (artifacts / "reviewers").mkdir(parents=True)
     with pytest.raises(ValueError, match="reviewer-plan.json"):
-        dispatch_reviewers._resume_plan_for_review_request_legs(artifacts / "reviewers", artifacts)
+        dispatch_reviewers.load_reviewer_plan_and_select_incomplete_legs(artifacts / "reviewers", artifacts)
 
 
 def test_resume_reports_nothing_to_do_when_no_leg_is_pending(tmp_path: Path) -> None:
@@ -360,54 +339,35 @@ def test_resume_reports_nothing_to_do_when_no_leg_is_pending(tmp_path: Path) -> 
     import dispatch_reviewers  # noqa: PLC0415
 
     artifacts = _seed_run_with_two_legs(tmp_path, alpha_kind="issues", beta_kind="no_issues")
-    _plan, indices = dispatch_reviewers._resume_plan_for_review_request_legs(
+    _plan, indices = dispatch_reviewers.load_reviewer_plan_and_select_incomplete_legs(
         artifacts / "reviewers", artifacts
     )
     assert indices == []
 
 
-def test_blocked_on_reviewer_request_guidance_points_at_the_request_only_flag() -> None:
-    """LIFE-6：真实入口（next_steps + 两份文档）必须都指向 request-only 重派，而不是整盘重跑。
-
-    只在 CLI flag 上实现、指引仍写「带同一 --selection-seed 重跑 --execute --detached」，
-    等于修复在标准操作流程上从未生效：照指引做，健康且已完成的那条腿仍会被重跑并覆写。
-    """
-    import inspect  # noqa: PLC0415
-
-    import rvf_agent_decision_cli  # noqa: PLC0415
-
-    flag = rvf_agent_decision_cli.REVIEW_REQUEST_REDISPATCH_FLAG
-    assert flag == "--redispatch-review-request-legs-only"
-
+def test_blocked_on_reviewer_request_guidance_uses_ordinary_resume_entrypoint() -> None:
+    import rvf_agent_decision_cli
+    import inspect
     source = inspect.getsource(rvf_agent_decision_cli.run_dispatch)
-    assert "REVIEW_REQUEST_REDISPATCH_FLAG" in source, (
-        "blocked_on_reviewer_request 的 next_steps 必须引用该 flag 常量"
-    )
-    assert "--selection-seed <seed>" not in source, (
-        "该终态下不该再指引带 --selection-seed 整盘重跑（重派模式根本不调用 route()）"
-    )
-
+    assert "redispatch-reviewers" in source
+    assert "--review-request-legs-only" not in source
     skill_directory = ROOT / "plugins/review-validate-fix/skills/review-validate-fix"
     for document in (skill_directory / "SKILL.md", skill_directory / "references/review-merge-policy.md"):
-        assert flag in document.read_text(encoding="utf-8"), f"{document} 未描述 request-only 重派"
+        text = document.read_text(encoding="utf-8")
+        assert "自动" in text and "未完成" in text
+        assert "--redispatch-review-request-legs-only" not in text
 
 
-def test_detached_argv_forwards_the_request_only_redispatch_flag() -> None:
-    """``--execute --detached`` 是主会话的标准用法：不透传这个 flag，修复在真正跑活的那条路径上作废。"""
-    import argparse  # noqa: PLC0415
-
-    import dispatch_reviewers  # noqa: PLC0415
-
-    args = argparse.Namespace(
-        registry="reg.json", probe_mode="fast", probe_timeout=1.0, main_harness="codex",
-        transcript=None, main_harness_file=None, assume_available=None, require_external=False,
-        selection_seed=None, redispatch_review_request_legs_only=True,
-    )
-    argv = dispatch_reviewers._build_detached_child_argv(
-        args, run_id="r", run_dir="/tmp/r", repo=None, review_packet=None,
-        session_context=None, scope_contract=None,
-    )
-    assert "--redispatch-review-request-legs-only" in argv, argv
+def test_detached_argv_uses_ordinary_resume_entrypoint() -> None:
+    import argparse
+    import dispatch_reviewers
+    args = argparse.Namespace(registry="reg.json", probe_mode="preflight", probe_timeout=1.0,
+        main_harness="codex", transcript=None, main_harness_file=None, assume_available=None,
+        require_external=False, selection_seed=None)
+    argv = dispatch_reviewers._build_detached_child_argv(args, run_id="r", run_dir="/persistent/r",
+        repo=None, review_packet=None, session_context=None, scope_contract=None)
+    assert "--execute" in argv and "--rvf-run-dir" in argv
+    assert "--redispatch-review-request-legs-only" not in argv
 
 
 CHECK_REVIEW_RESULT = SCRIPT_DIRECTORY / "check_review_result.py"

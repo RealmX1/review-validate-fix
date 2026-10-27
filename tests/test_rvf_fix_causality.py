@@ -160,6 +160,7 @@ def _register_issue_in_merge_dispositions(run_dir: Path, issue_file: Path) -> No
         (reviewers / "reviewer-plan.json").write_text(
             json.dumps(
                 {
+                    "schema_version": 1,
                     "status": "completed",
                     "reviewers": [{"reviewer_id": "reviewer-a", "returncode": 0}, {"reviewer_id": "reviewer-b", "returncode": 0}],
                 }

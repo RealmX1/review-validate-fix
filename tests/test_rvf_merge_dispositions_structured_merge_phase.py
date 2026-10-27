@@ -18,6 +18,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 TESTS_DIRECTORY = Path(__file__).resolve().parent
 sys.path.insert(0, str(TESTS_DIRECTORY))
 # 复用 evidence / land 测试的 run 构造器：三边断言的是同一份 run 形状，手抄会随门槛演进悄悄漂移。
@@ -231,7 +233,7 @@ def test_write_rejects_incomplete_or_malformed_dispositions(tmp_path: Path) -> N
 def test_write_refuses_request_leg_and_check_detects_redispatched_canonical_result(tmp_path: Path) -> None:
     _repo, run_dir = _run_with_reviewer_issues(tmp_path)
     assert _write_dispositions(run_dir, _adopt_merge_drop_decisions()).returncode == 0
-    # 模拟 --redispatch-review-request-legs-only：旧 canonical 轮转进 superseded、新一代结果落在原位。
+    # 模拟尝试检查点保存后 canonical 内容变化，旧 merge 不能沿用原摘要。
     leg_directory = run_dir / "artifacts/reviewers/reviewer-b"
     superseded = leg_directory / "superseded-review-result-artifacts"
     superseded.mkdir()
@@ -549,7 +551,7 @@ def test_last_resort_mimic_legs_are_discovered_and_their_identity_never_reaches_
         )
         (reviewer_root / mimic_id / "review-result.json").write_text(json.dumps(payload) + "\n", encoding="utf-8")
     (reviewer_root / "reviewer-plan.json").write_text(
-        json.dumps({"routing_rule": "R3", "needs_last_resort_fallback": True, "status": "planned", "reviewers": []}) + "\n",
+        json.dumps({"schema_version": 1, "routing_rule": "R3", "needs_last_resort_fallback": True, "status": "planned", "reviewers": []}) + "\n",
         encoding="utf-8",
     )
     written = _write_dispositions(
@@ -721,3 +723,18 @@ def test_causality_json_carries_dispositions_and_per_reviewer_outcomes(tmp_path:
     assert per_reviewer["reviewer-b"]["final_fix_issue_state_counts_for_adopted_or_merged_reviewer_issues"] == {"fixed": 1}
     ledger_issue = next(issue for issue in causality["issues"] if issue["issue_id"] == "RVF-001")
     assert {ref["reviewer_id"] for ref in ledger_issue["source_refs"]} == {"reviewer-a", "reviewer-b"}
+
+
+@pytest.mark.parametrize("returncode", [9, None, False])
+def test_merge_write_and_recheck_require_both_reviewers_normal_execution_exit(tmp_path: Path, returncode) -> None:
+    _, run_dir = _run_with_reviewer_issues(tmp_path)
+    initial = _write_dispositions(run_dir, _adopt_merge_drop_decisions())
+    assert initial.returncode == 0, initial.stderr
+    plan_path = run_dir / "artifacts/reviewers/reviewer-plan.json"
+    plan = json.loads(plan_path.read_text())
+    plan["reviewers"][0]["returncode"] = returncode
+    plan_path.write_text(json.dumps(plan))
+    checked = rvf_merge_dispositions.check_merge_dispositions(run_dir, require_fix_issue_cross_reference=False)
+    assert checked.errors and any("完成事实" in error for error in checked.errors)
+    refused = _write_dispositions(run_dir, _adopt_merge_drop_decisions())
+    assert refused.returncode != 0, refused.stdout

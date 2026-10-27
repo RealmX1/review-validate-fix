@@ -38,6 +38,7 @@ from contextvars import copy_context
 from independent_backup_route import durable_json, guard_normal_mutation, tracked_subprocess_run
 
 import argparse
+import fcntl
 import hashlib
 from datetime import datetime, timezone
 import json
@@ -58,6 +59,12 @@ from review_start_boundary_gate import require_prepared_run_review_start_boundar
 from core.review_start_boundary.review_start_boundary_verification import ReviewStartBoundaryNotVerified
 import harness_limit_cooldown
 from core.run_ledger.run_ledger import safe_token, start_run
+from core.run_ledger.review_run_lifecycle import read_review_run_lifecycle
+from reviewer_leg_recovery import prepare_request_leg_recovery, input_failure_condition
+from reviewer_execution_attempt_evidence import (
+    DISPATCH_EXECUTION_LOCK_DESCRIPTOR_ENVIRONMENT_VARIABLE, REVIEWER_ATTEMPT_ID_ENVIRONMENT_VARIABLE,
+    reviewer_execution_input_binding, recover_exited_reviewer_execution_attempts,
+)
 from core.host_adapter.current_agent_session_identity_from_environment import (
     CURRENT_AGENT_SESSION_ID_ENVIRONMENT_VARIABLE_NAMES,
 )
@@ -72,7 +79,8 @@ from run_alternative_reviewer import (
     EXTERNAL_REVIEWER_USAGE_LIMIT_FLAG,
     reviewer_id_from_label,
     safe_artifact_token,
-    user_local_alternative_reviewer_config_override_path,
+    resolve_probe_identity_for_config, load_effective_alternative_reviewer_config,
+    restore_cooldown_from_effective_quota_probe_evidence,
 )
 from write_review_result import SUPERSEDED_RESULT_ARTIFACTS_DIRNAME
 from core.host_adapter.host_transcript_format_detection import (
@@ -87,9 +95,9 @@ from core.reviewer_harness_selection import (
 from core.reviewer_harness_probe_result_cache import (
     PROBE_OUTCOME_AVAILABLE,
     PROBE_OUTCOME_UNAVAILABLE,
-    compute_probe_identity_digest,
     invalidate_cached_probe_outcome,
-    read_cached_probe_outcome,
+    read_cached_probe_result,
+    resolved_probe_result_cache_entry_path,
     write_probe_outcome,
 )
 from core.temporary_disable_window import TemporaryDisableWindow
@@ -106,6 +114,8 @@ PLAN_SCHEMA_VERSION = 1
 # 本轮 double-review 的**非完成态终态**：有腿返回合法 ``kind: request``（review 协议规定的
 # 待处理终态，既不是故障也不是完成态 review）。给名字而不是散落字面量，便于消费方对齐。
 PLAN_STATUS_BLOCKED_ON_REVIEWER_REQUEST = "blocked_on_reviewer_request"
+PLAN_STATUS_WAITING_FOR_REVIEWER_PROBE_EVIDENCE = "waiting_for_reviewer_probe_evidence"
+DISPATCH_WAITING_FOR_REVIEWER_PROBE_EVIDENCE_EXIT_CODE = 5
 # 该终态的**专用退出码**。既不能是 failed 的 1（那会把「无人出故障、只是等主会话处置」
 # 谎报成故障），更不能是 0——0 表示「被包命令干净完成」，会让 detached 幂等锁被
 # ``rvf_detached_thread._detached_run_finished_clean`` 判为「已完成的 run」而永久保留，
@@ -444,6 +454,10 @@ def probe_available(
     assume_available: list[str] | None = None,
     cooldown_active: set[str] | None = None,
     now_utc: datetime | None = None,
+    repo: str | None = None,
+    ledger: Any = None,
+    probe_identities: dict[str, str] | None = None,
+    probe_diagnostics: list[dict[str, Any]] | None = None,
 ) -> list[str]:
     """对每个 enabled harness 跑 ``run_alternative_reviewer.py --config <path> --<probe_mode>``。
 
@@ -473,33 +487,36 @@ def probe_available(
         # 第一道：零成本否定。可执行文件都不在 PATH 上，真跑 probe 必然失败，没必要为
         # 一个注定的结论付一次模型调用。**这个方向是安全的**——「不在 PATH」只能证否、
         # 不能用来证真，所以它不构成 health parity gate 要防的那种廉价替代判据。
-        executable_path, override_path, dynamic_model_requires_fresh_probe = _resolved_probe_execution_inputs(config_path)
+        executable_path = resolve_reviewer_probe_executable_path(config_path)
         if executable_path is None:
             continue
 
         # 第二道：复用一次**真实** probe 的结论。摘要绑 config 内容 + 可执行文件身份 +
         # probe 模式，任一变化即视为未命中。
-        probe_identity_digest = compute_probe_identity_digest(
-            config_path=config_path,
-            user_local_config_override_path=override_path,
-            executable_path=executable_path,
-            probe_mode=probe_mode,
-        )
+        try:
+            probe_identity_digest = resolve_probe_identity_for_config(config_path, repo=repo, probe_mode=probe_mode)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            if probe_diagnostics is not None:
+                probe_diagnostics.append({"harness_id": harness_id, "reason_code": "reviewer_probe_execution_identity_unresolved",
+                    "recovery_condition": "effective_model_and_configuration_identity_readable", "error_kind": type(exc).__name__})
+            continue
         now_epoch_seconds = time.time()
-        # shortcut: 动态默认选模每次真探测，缓存身份能绑定实际被探测的默认模型后再恢复复用。
-        cached_outcome = (
-            None
-            if dynamic_model_requires_fresh_probe
-            else read_cached_probe_outcome(
-                harness_id,
-                probe_identity_digest=probe_identity_digest,
-                now_epoch_seconds=now_epoch_seconds,
-            )
-        )
+        if probe_identities is not None:
+            probe_identities[harness_id] = probe_identity_digest
+        cache_inspection: dict[str, Any] = {}
+        cached_probe = read_cached_probe_result(harness_id,
+            probe_identity_digest=probe_identity_digest, now_epoch_seconds=now_epoch_seconds, cache_inspection=cache_inspection)
+        cached_outcome = cached_probe.get("outcome") if cached_probe else None
+        if ledger is not None:
+            ledger.event(phase="review", event="routing_health_probe_cache", status="completed",
+                reason_code=cache_inspection["reason_code"],
+                harness_id=harness_id, probe_identity_digest=probe_identity_digest, cache_hit=cached_outcome is not None)
         if cached_outcome == PROBE_OUTCOME_AVAILABLE:
             available.append(harness_id)
             continue
         if cached_outcome == PROBE_OUTCOME_UNAVAILABLE:
+            if cached_probe.get("reason_code") == "usage_limit_exhausted":
+                restore_cooldown_from_effective_quota_probe_evidence(harness_id, cached_probe)
             continue
 
         cmd = [
@@ -508,14 +525,12 @@ def probe_available(
             "--config",
             str(config_path),
             f"--{probe_mode}",
+            "--reviewer-harness-id", harness_id,
         ]
+        if repo:
+            cmd.extend(["--repo", repo])
         try:
-            completed = subprocess.run(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=timeout,
-            )
+            completed = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         except (subprocess.TimeoutExpired, OSError):
             # 这里兜的**只是外层 probe 进程**级的失败，不要把它读成「health 超时不写缓存」。
             # 两种超时归属不同，处理也必须不同：
@@ -532,62 +547,61 @@ def probe_available(
             #   进程压根没起来。那是 probe 机制本身失效，**不构成关于这条腿的任何信息**——
             #   记 available 会把死腿判活（health probe parity 事故的形状），记 unavailable
             #   会让好腿凭空缺席，所以两侧都不记，下一轮老实重跑。
+            if probe_diagnostics is not None:
+                probe_diagnostics.append({"harness_id": harness_id, "reason_code": "probe_process_evidence_unavailable",
+                                          "recovery_condition": "probe_process_can_finish"})
             continue
         probe_outcome = (
             PROBE_OUTCOME_AVAILABLE
             if completed.returncode == 0
             else PROBE_OUTCOME_UNAVAILABLE
         )
-        if not dynamic_model_requires_fresh_probe:
-            write_probe_outcome(
-                harness_id,
-                probe_outcome,
-                probe_identity_digest=probe_identity_digest,
-                now_epoch_seconds=now_epoch_seconds,
-            )
+        structured = {}
+        try:
+            stdout = getattr(completed, "stdout", "") or ""
+            structured = json.loads(stdout.strip().splitlines()[-1]) if stdout.strip() else {}
+        except (ValueError, IndexError):
+            pass
+        reason = structured.get("reason_code") if isinstance(structured, dict) else None
+        if reason == "usage_limit_exhausted":
+            restore_cooldown_from_effective_quota_probe_evidence(harness_id, structured)
+        if reason in {"reviewer_input_context_limit", "reviewer_probe_spawn_failed", "reviewer_probe_in_flight"}:
+            if probe_diagnostics is not None:
+                probe_diagnostics.append({"harness_id": harness_id, "reason_code": reason,
+                    "probe_identity_digest": probe_identity_digest,
+                    "recovery_condition": structured.get("recovery_condition", "input_or_probe_execution_condition_changed"),
+                    "probe_execution_lock_path": structured.get("probe_execution_lock_path")})
+            continue
+        if structured.get("probe_identity_digest") not in (None, probe_identity_digest):
+            # 动态默认或配置在父子解析之间变化，旧身份不能接收新身份的成功证据。
+            if probe_diagnostics is not None:
+                probe_diagnostics.append({"harness_id": harness_id, "reason_code": "reviewer_probe_execution_identity_changed",
+                    "recovery_condition": "effective_model_and_configuration_identity_stable"})
+            continue
+        write_probe_outcome(harness_id, probe_outcome, probe_identity_digest=probe_identity_digest,
+            now_epoch_seconds=structured.get("recorded_at_epoch_seconds", time.time()), reason_code=reason, returncode=completed.returncode,
+            reset_hint=structured.get("reset_hint"))
         if probe_outcome == PROBE_OUTCOME_AVAILABLE:
             available.append(harness_id)
     return available
 
 
-def _resolved_probe_execution_inputs(
-    config_path: Path,
-) -> tuple[Path | None, Path | None, bool]:
-    """解析这一轮 probe 真正依赖的两个外部输入：可执行文件，以及 user-local override 文件。
-
-    返回 ``(executable_path, user_local_config_override_path, dynamic_model_requires_fresh_probe)``。
-
-    ``executable_path`` 解析不出（config 读不动 / 没有 command / 命令不在 PATH）即代表这条腿
-    不可用——这是**证否**用途，绝不用它来判「可用」。
-
-    ``user_local_config_override_path`` 是**摘要输入**，不是可用性判据：``--preflight`` 跑的是
-    bundled config 叠加 override 之后的有效配置，而 override 能改掉 ``health_command`` 等
-    真正被执行的字段。它指向的文件多数机器上并不存在，此处仍如实返回路径，由摘要把「当前
-    有没有 override、内容是什么」一并纳入——否则新建或改动 override 不会让缓存失效。
-    解析不出 label（因而推不出 override 路径）时返回 None，摘要会用固定占位表示这一状态。
-    """
+def resolve_reviewer_probe_executable_path(config_path: Path) -> Path | None:
+    """廉价证否只看有效命令是否存在；完整缓存身份由实际模型与有效配置共同决定。"""
     try:
-        payload = json.loads(config_path.read_text(encoding="utf-8"))
+        payload, _ = load_effective_alternative_reviewer_config(config_path)
     except (OSError, json.JSONDecodeError):
-        return None, None, False
+        return None
     command = payload.get("command")
     if not isinstance(command, list) or not command:
-        return None, None, False
+        return None
     executable_name = str(command[0]).strip()
     if not executable_name:
-        return None, None, False
+        return None
     resolved = shutil.which(executable_name)
     if not resolved:
-        return None, None, False
-
-    override_path: Path | None = None
-    reviewer_label = payload.get("label")
-    if isinstance(reviewer_label, str) and reviewer_label.startswith("alternative-reviewer:"):
-        try:
-            override_path = user_local_alternative_reviewer_config_override_path(reviewer_label)
-        except (OSError, ValueError):
-            override_path = None
-    return Path(resolved), override_path, payload.get("reviewer_model_selection_source") is not None
+        return None
+    return Path(resolved)
 
 
 def invalidate_probe_result_cache_for_failed_dispatch(harness_id: str) -> bool:
@@ -629,6 +643,9 @@ def _build_reviewer_command(
         cmd += ["--session-context", session_context]
     if scope_contract:
         cmd += ["--scope-contract", scope_contract]
+    if reviewer.get("force_file_references"):
+        cmd.append("--force-file-references")
+    cmd.extend(["--reviewer-harness-id", reviewer["harness_id"]])
     return cmd
 
 
@@ -664,6 +681,30 @@ def _read_reviewer_stderr(reviewer_dir: Path) -> str | None:
         return None
 
 
+def _read_reviewer_probe_evidence_wait(reviewer: dict[str, Any], artifacts_dir: Path) -> dict[str, Any] | None:
+    """只接纳精确尝试返回的共享探针等待，旧 summary 不得遮盖新尝试的真失败。"""
+    if reviewer.get("returncode") not in (None, 3) or not reviewer.get("execution_attempt_id"):
+        return None
+    summary = _read_reviewer_summary(artifacts_dir / "reviewers" / reviewer["reviewer_id"]) or {}
+    waiting = summary.get("probe_evidence_wait")
+    if (summary.get("output_error_reason") == "reviewer_probe_in_flight"
+            and summary.get("execution_attempt_id") == reviewer["execution_attempt_id"]
+            and summary.get("returncode") == 3 and isinstance(waiting, dict)):
+        return waiting
+    return None
+
+
+def _reviewer_probe_execution_lock_available(harness_id: str) -> bool:
+    """缓存命中不能解除在途等待；独立重验共享执行锁，且不修改缓存结论。"""
+    lock_path = resolved_probe_result_cache_entry_path(harness_id).with_suffix(".probe-execution.lock")
+    try:
+        with lock_path.open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
+
+
 def _leg_usage_limit(reviewer: dict[str, Any], artifacts_dir: Path) -> tuple[bool, str | None]:
     """D3 双条件：returncode==125 且（summary.output_error_reason==usage_limit_exhausted
     或 stderr 含 flag）。返回 (是否额度耗尽, 错误文案 snippet 供解析 reset hint)。
@@ -684,60 +725,47 @@ def _leg_usage_limit(reviewer: dict[str, Any], artifacts_dir: Path) -> tuple[boo
 
 
 def _leg_produced_review_result(reviewer: dict[str, Any], artifacts_dir: Path) -> bool:
-    """这条腿是否真的产出了合法评审结论——double-review 契约的唯一真判据。
-
-    比 ``returncode == 0`` 严格：退出码只说进程怎么退出，不说有没有可用结论。2026-08-11 的
-    run rvf-20260811T170157Z 上，cursor 腿 rc=1、目录里根本没有 review-result.json，plan 却
-    只按 rc 计成 ``partial`` 就收工——主会话拿一份结论当双评审用（详见 ``execute_plan``）。
-
-    判据优先取 ``reviewer.summary.json`` 的 ``review_result_complete``（跨 harness 通用，由
-    run_alternative_reviewer.py 按 review-result 的 ``kind`` ∈ {no_issues, issues} 写入）；
-    summary 缺失/不可解析时回退到直接读 review-result.json 自身的 kind，避免因 artifact
-    形态变化而误判成「有结论」。
-    """
+    """合法且无待处理请求的 canonical 结论；summary 不能遮盖真实内容。"""
+    import check_review_result
     reviewer_dir = artifacts_dir / "reviewers" / reviewer["reviewer_id"]
+    path = Path(reviewer.get("review_result_path") or reviewer_dir / "review-result.json")
+    scope = artifacts_dir / "inputs/scope.contract.json"
+    classified = check_review_result.classify(path, scope_contract=scope if scope.is_file() else None)
     summary = _read_reviewer_summary(reviewer_dir)
-    if isinstance(summary, dict) and "review_result_complete" in summary:
-        return summary["review_result_complete"] is True
-    result_path = reviewer.get("review_result_path")
-    path = Path(result_path) if result_path else reviewer_dir / "review-result.json"
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    return isinstance(payload, dict) and payload.get("kind") in {"no_issues", "issues"}
+    return bool(classified.get("review_complete")) and not (
+        isinstance(summary, dict) and summary.get("review_result_complete") is False
+    )
 
 
 def _leg_is_effective(reviewer: dict[str, Any], artifacts_dir: Path) -> bool:
     """腿有效 = 干净退出 **且** 产出了合法评审结论（两者缺一不可）。"""
-    return reviewer.get("returncode") == 0 and _leg_produced_review_result(reviewer, artifacts_dir)
+    return type(reviewer.get("returncode")) is int and reviewer["returncode"] == 0 and _leg_produced_review_result(reviewer, artifacts_dir)
 
 
 def _leg_review_request_pending(reviewer: dict[str, Any], artifacts_dir: Path) -> bool:
-    """这条腿是否写出了合法的 ``kind: request``（非完成态、但也**不是**失败）。
-
-    request 是 review 协议的合法待处理终态：reviewer 要标准子集/命令锁/测量结果/上下文，
-    主会话应按 ``references/review-merge-policy.md`` 的 Contract Gate + Request Handling
-    满足、驳回或 spawn 子任务后**让原 reviewer 重试**。runner 对它以 rc=0 收尾，并在
-    ``reviewer.summary.json`` 写 ``review_request_pending: true``。
-
-    必须与「没产出结论的失败腿」分开判：否则 request 会被当成 ``no_review_result`` 换腿，
-    替换 leg 一成功 plan 就变 ``completed``，那条 request 再也不会被主会话按 Contract Gate
-    处理——reviewer 明确说「我还没审完、缺东西」却被静默丢弃。
-    """
-    if reviewer.get("returncode") != 0:
-        return False
+    """补证和部分发现可并存，request 始终不是完成评审。"""
+    import check_review_result
     reviewer_dir = artifacts_dir / "reviewers" / reviewer["reviewer_id"]
-    summary = _read_reviewer_summary(reviewer_dir)
-    if isinstance(summary, dict) and "review_request_pending" in summary:
-        return summary["review_request_pending"] is True
-    result_path = reviewer.get("review_result_path")
-    path = Path(result_path) if result_path else reviewer_dir / "review-result.json"
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    return isinstance(payload, dict) and payload.get("kind") == "request"
+    path = Path(reviewer.get("review_result_path") or reviewer_dir / "review-result.json")
+    classified = check_review_result.classify(path)
+    return bool(classified.get("valid")) and classified.get("kind") == "request"
+
+
+def recompute_reviewer_plan_leg_summary_from_canonical_results(
+    plan: dict[str, Any], artifacts_dir: Path
+) -> tuple[list[int], list[int], list[int]]:
+    """执行汇总与退出回执恢复共用有效腿及待补证腿的当前事实。"""
+    reviewers = plan.get("reviewers", [])
+    effective_slots = [index for index, reviewer in enumerate(reviewers) if _leg_is_effective(reviewer, artifacts_dir)]
+    pending_request_slots = [index for index, reviewer in enumerate(reviewers)
+                             if _leg_review_request_pending(reviewer, artifacts_dir)]
+    for index in effective_slots:
+        reviewers[index].pop("probe_evidence_wait", None)
+    pending_probe_slots = [index for index, reviewer in enumerate(reviewers) if reviewer.get("probe_evidence_wait")]
+    plan["effective_reviewer_count"] = len(effective_slots)
+    plan["review_request_pending_reviewer_ids"] = [reviewers[index]["reviewer_id"] for index in pending_request_slots]
+    plan["probe_evidence_pending_reviewer_ids"] = [reviewers[index]["reviewer_id"] for index in pending_probe_slots]
+    return effective_slots, pending_request_slots, pending_probe_slots
 
 
 def _dedupe_reviewer_id(reviewer_id: str, used_ids: set[str]) -> str:
@@ -790,26 +818,14 @@ def _reroute_candidates(
     return candidates
 
 
-def _resume_plan_for_review_request_legs(
+def load_reviewer_plan_and_select_incomplete_legs(
     reviewers_dir: Path, artifacts_dir: Path
 ) -> tuple[dict[str, Any], list[int]]:
-    """载入上一轮 plan，挑出停在 ``kind: request`` 的腿。**只读**：不动磁盘上任何工件。
-
-    为什么不重新 ``route()``：重派必须用**同一对** reviewer（同 selection_seed、同 reviewer_id），
-    否则「处置完 request 让原 reviewer 重试」就变成了换人重审，merge policy 的双腿身份对不上。
-
-    为什么这里**不**做工件轮转（2026-08-15 RVF-008）：本函数在 ``--dry-run`` 短路**之前**被调用，
-    ``--dry-run`` 自己的契约是 “Print plan JSON to stdout; do not write or execute”。曾经在这里
-    ``os.replace`` 掉 canonical ``review-result.json``，于是一次纯预演就把当前结果搬走了——
-    ``--plan-only`` 同理。轮转推迟到真正 execute 的那一步（``_rotate_review_request_leg_artifacts``）。
-
-    fail-closed：plan 缺失 / 不可读 / 无 reviewers 一律抛，绝不退回「整盘重派」——那正是要修的
-    行为，静默降级回去等于没修。
-    """
+    """只读载入精确 run 计划，保持身份并选择所有未完成腿。"""
     plan_path = reviewers_dir / "reviewer-plan.json"
     if not plan_path.is_file():
         raise ValueError(
-            f"--redispatch-review-request-legs-only 需要上一轮的 {plan_path}，但它不存在。"
+            f"恢复需要上一轮的 {plan_path}，但它不存在。"
         )
     try:
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
@@ -818,18 +834,21 @@ def _resume_plan_for_review_request_legs(
     if not isinstance(plan, dict) or not isinstance(plan.get("reviewers"), list) or not plan["reviewers"]:
         raise ValueError(f"上一轮 reviewer-plan.json 里没有 reviewers：{plan_path}")
 
+    recover_exited_reviewer_execution_attempts(plan, artifacts_dir)
+    effective_slots, _, _ = recompute_reviewer_plan_leg_summary_from_canonical_results(plan, artifacts_dir)
+
     indices = [
         index
         for index, reviewer in enumerate(plan["reviewers"])
-        if _leg_review_request_pending(reviewer, artifacts_dir)
+        if index not in effective_slots
     ]
 
     plan.setdefault("warnings", [])
     plan["warnings"].append(
         _warn(
-            "redispatching_review_request_legs_only",
+            "resuming_incomplete_reviewer_legs",
             "warning",
-            "只重派停在 kind: request 的腿（"
+            "自动续跑未完成腿（"
             + ", ".join(plan["reviewers"][i]["reviewer_id"] for i in indices)
             + "）；健康且已完成的腿保留上一轮结果，不重跑、不覆写。",
         )
@@ -841,39 +860,28 @@ def _resume_plan_for_review_request_legs(
 
 
 @guard_review_run_qualification_mutation(lambda arguments: run_directory_for_qualification_artifact(arguments["artifacts_dir"] / "reviewers/reviewer-plan.json"))
-def _rotate_review_request_leg_artifacts(
-    plan: dict[str, Any], indices: list[int], artifacts_dir: Path
-) -> list[str]:
-    """把待重派的 request 腿的 canonical ``review-result.json`` 轮转进归档目录。
-
-    **只在真正 execute 前调用**（RVF-008）：这是本流程唯一有破坏性的一步，``--dry-run`` /
-    ``--plan-only`` 都不得触发它。
-
-    为什么重派前必须轮转：不轮转的话，重跑那条 request 腿会把新的 request 追加在旧的后面
-    （writer 对同 kind 是原地追加），跨轮累积成一份越滚越大的 request 列表；而换成 issues 时
-    ``write_review_result.ensure_supersession_allowed`` 只放行 ``request → issues``、
-    ``issues`` 一旦落盘就是终态。轮转 = 每轮从**没有 canonical 文件**的干净起点开始，
-    上一轮内容仍可在归档里查。
-    """
-    rotated: list[str] = []
+def checkpoint_incomplete_reviewer_leg_artifacts(plan: dict[str, Any], indices: list[int], artifacts_dir: Path) -> list[str]:
+    """归档尝试前状态，canonical 原地保留，续跑可以继续累计发现和请求。"""
+    checkpoints = []
     for index in indices:
-        reviewer_id = plan["reviewers"][index]["reviewer_id"]
-        result_path = artifacts_dir / "reviewers" / reviewer_id / "review-result.json"
-        if not result_path.is_file():
+        path = artifacts_dir / "reviewers" / plan["reviewers"][index]["reviewer_id"] / "review-result.json"
+        if not path.is_file():
             continue
-        archive_dir = result_path.parent / SUPERSEDED_RESULT_ARTIFACTS_DIRNAME
+        archive_dir = path.parent / SUPERSEDED_RESULT_ARTIFACTS_DIRNAME
         archive_dir.mkdir(parents=True, exist_ok=True)
         sequence = 1 + sum(1 for _ in archive_dir.glob("review-result.*.json"))
-        archive_path = archive_dir / f"review-result.{sequence:02d}.request.json"
-        os.replace(result_path, archive_path)
-        rotated.append(str(archive_path))
-    return rotated
+        destination = archive_dir / f"review-result.{sequence:02d}.checkpoint.json"
+        shutil.copyfile(path, destination)
+        checkpoints.append(str(destination))
+    plan.setdefault("reviewer_attempt_checkpoint_paths", []).extend(checkpoints)
+    return checkpoints
 
 
 @guard_review_run_qualification_mutation(lambda arguments: run_directory_for_qualification_artifact(arguments["path"]))
 def write_canonical_reviewer_plan(path: Path, plan: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    from core.run_ledger.run_ledger import _atomic_write_text
+    _atomic_write_text(path, json.dumps(plan, ensure_ascii=False, indent=2) + "\n")
 
 
 def _backup_route_dispatch_repository(arguments):
@@ -910,6 +918,8 @@ def execute_plan(
     initial_dispatch_indices: list[int] | None = None,
     reviewer_command_output_directory: Path | None = None,
     supplemental_review_qualification_path: Path | None = None,
+    probe_additional_harnesses_on_recovery_failure: bool = False,
+    reviewer_dispatch_execution_lock_descriptor: int | None = None,
 ) -> dict[str, Any]:
     """派发 plan 的两路 external reviewer，回填 returncode / result path / status。
 
@@ -953,13 +963,32 @@ def execute_plan(
     cooldown_recorded: list[str] = []
     used_ids: set[str] = {r["reviewer_id"] for r in reviewers}
     available = available or []
+    recovery_fallback_probe_expanded = False
+    plan_path = artifacts_dir / "reviewers/reviewer-plan.json"
+    progress_lock = threading.RLock()
+    recovery_retry_counter_snapshots: dict[str, dict[str, Any]] = {}
+
+    def snapshot_recovery_retry_counters(reviewer: dict[str, Any]) -> None:
+        recovery_retry_counter_snapshots[reviewer["reviewer_id"]] = {
+            name: dict(counters) for name, counters in reviewer.get("recovery", {}).items()
+            if name.startswith("attempts_by_") and isinstance(counters, dict)}
+
+    def verify_recovery_execution_qualification() -> None:
+        lifecycle = read_review_run_lifecycle(Path(run_dir))
+        if lifecycle.get("review_run_terminal_status"):
+            raise ValueError("run 已有终态，禁止再次派发 reviewer")
+        _backup_route_dispatch_repository({"repo": repo, "scope_contract": scope_contract,
+            "run_id": run_id, "run_dir": run_dir, "review_packet": review_packet,
+            "supplemental_review_qualification_path": supplemental_review_qualification_path})
 
     def _dispatch_indices(indices: list[int]) -> None:
         """派发给定下标的 reviewer（尊重 sequential_execution），回填 returncode/result path。"""
+        verify_recovery_execution_qualification()
         local_results: dict[int, int] = {}
 
         def _run(index: int) -> None:
             reviewer = reviewers[index]
+            verify_recovery_execution_qualification()
             cmd = _build_reviewer_command(
                 reviewer,
                 repo=repo,
@@ -970,14 +999,20 @@ def execute_plan(
                 run_dir=run_dir,
             )
             try:
+                environment = {**os.environ, REVIEWER_ATTEMPT_ID_ENVIRONMENT_VARIABLE: reviewer["execution_attempt_id"]}
+                inherited_descriptors = ()
+                if reviewer_dispatch_execution_lock_descriptor is not None:
+                    environment[DISPATCH_EXECUTION_LOCK_DESCRIPTOR_ENVIRONMENT_VARIABLE] = str(reviewer_dispatch_execution_lock_descriptor)
+                    inherited_descriptors = (reviewer_dispatch_execution_lock_descriptor,)
                 if reviewer_command_output_directory is None:
-                    completed = tracked_subprocess_run(cmd)
+                    completed = tracked_subprocess_run(cmd, env=environment, pass_fds=inherited_descriptors)
                 else:
                     reviewer_command_output_directory.mkdir(parents=True, exist_ok=True)
                     output_stem = reviewer_command_output_directory / reviewer["reviewer_id"]
                     # 嵌入机器 JSON 接口时保留各腿原始输出，避免子进程 stdout 混入调用方协议。
                     with Path(str(output_stem) + ".stdout.log").open("ab") as stdout_log, Path(str(output_stem) + ".stderr.log").open("ab") as stderr_log:
-                        completed = tracked_subprocess_run(cmd, stdout=stdout_log, stderr=stderr_log)
+                        completed = tracked_subprocess_run(cmd, stdout=stdout_log, stderr=stderr_log,
+                            env=environment, pass_fds=inherited_descriptors)
                     receipt = {"schema": "rvf-reviewer-command-execution-result", "schema_version": 1,
                                "run_id": run_id, "repo": repo, "reviewer_id": reviewer["reviewer_id"],
                                "packet_sha256": hashlib.sha256(Path(review_packet).read_bytes()).hexdigest(),
@@ -989,6 +1024,39 @@ def execute_plan(
             except OSError as exc:  # pragma: no cover - 启动失败
                 local_results[index] = 1
                 reviewer["error"] = f"{type(exc).__name__}: {exc}"
+
+            with progress_lock:
+                reviewer["returncode"] = local_results.get(index, 1)
+                reviewer["review_result_path"] = str(artifacts_dir / "reviewers" / reviewer["reviewer_id"] / "review-result.json")
+                reviewer["execution_state"] = "exited"
+                previous_retry_counters = recovery_retry_counter_snapshots.pop(reviewer["reviewer_id"], {})
+                if waiting := _read_reviewer_probe_evidence_wait(reviewer, artifacts_dir):
+                    reviewer["probe_evidence_wait"] = waiting
+                    # pre-run 尚未执行 reviewer，不能消耗为本次恢复预留的重试次数。
+                    recovery = reviewer.get("recovery", {})
+                    input_condition = recovery.get("input_failure_condition")
+                    if input_condition and recovery.get("attempts_by_failure_condition", {}).get(input_condition, 0) > previous_retry_counters.get("attempts_by_failure_condition", {}).get(input_condition, 0):
+                        recovery["deferred_input_failure_retry_condition"] = input_condition
+                    for name in tuple(recovery):
+                        if name.startswith("attempts_by_"):
+                            recovery[name] = previous_retry_counters.get(name, {})
+                    if recovery:
+                        recovery["state"] = PLAN_STATUS_WAITING_FOR_REVIEWER_PROBE_EVIDENCE
+                else:
+                    reviewer.get("recovery", {}).pop("deferred_input_failure_retry_condition", None)
+                write_canonical_reviewer_plan(plan_path, plan)
+
+        for index in indices:
+            recovery = reviewers[index].get("recovery", {})
+            if condition := recovery.get("deferred_input_failure_retry_condition"):
+                # 延期预算先随尝试持久预留；再次等待会还原，真实执行后只消耗这一次。
+                recovery.setdefault("attempts_by_failure_condition", {})[condition] = 1
+            reviewers[index].pop("probe_evidence_wait", None)
+            reviewers[index]["execution_state"] = "running"
+            reviewers[index]["returncode"] = None
+            reviewers[index]["execution_attempt_id"] = secrets.token_hex(16)
+        plan["status"] = "running"
+        write_canonical_reviewer_plan(plan_path, plan)
 
         if plan.get("sequential_execution"):
             for index in indices:
@@ -1007,14 +1075,107 @@ def execute_plan(
                 artifacts_dir / "reviewers" / reviewer["reviewer_id"] / "review-result.json"
             )
 
+        # 输入问题只在同一腿恢复一次，不误记成 harness 不可用；旧输出和 findings 仍保留。
+        input_retry_indices = []
+        for index in indices:
+            reviewer = reviewers[index]
+            if reviewer.get("probe_evidence_wait"):
+                continue
+            directory = artifacts_dir / "reviewers" / reviewer["reviewer_id"]
+            condition = input_failure_condition(_read_reviewer_summary(directory) or {}, _read_reviewer_stderr(directory) or "")
+            condition = (condition + ":" + plan.get("effective_probe_identities", {}).get(reviewer["harness_id"], "")) if condition else None
+            attempts = reviewer.setdefault("recovery", {}).setdefault("attempts_by_failure_condition", {})
+            if reviewer.get("returncode") != 0 and condition and attempts.get(condition, 0) < 1:
+                snapshot_recovery_retry_counters(reviewer)
+                attempts[condition] = 1
+                reviewer["force_file_references"] = True
+                reviewer["recovery"]["state"] = "retry_with_bounded_file_references"
+                reviewer["recovery"]["input_failure_condition"] = condition
+                input_retry_indices.append(index)
+        if input_retry_indices:
+            checkpoint_incomplete_reviewer_leg_artifacts(plan, input_retry_indices, artifacts_dir)
+            _dispatch_indices(input_retry_indices)
+
     # 初派：默认全部两腿；``initial_dispatch_indices`` 在场时只派指定的那几腿。
     # 后者是「只重派 kind: request 的腿」用的——整盘重派会把健康且已完成的那腿也重跑一遍，
     # 它的结果被新一轮覆写丢弃（实测一条 cursor 腿跑了三轮 2/4/3 条 issue，只留最后一轮）。
-    _dispatch_indices(
-        list(range(len(reviewers)))
-        if initial_dispatch_indices is None
-        else list(initial_dispatch_indices)
-    )
+    requested_indices = list(range(len(reviewers))) if initial_dispatch_indices is None else list(initial_dispatch_indices)
+    ready_indices = []
+    for index in requested_indices:
+        reviewer = reviewers[index]
+        if reviewer.get("probe_evidence_wait"):
+            continue
+        snapshot_recovery_retry_counters(reviewer)
+        if _leg_review_request_pending(reviewer, artifacts_dir):
+            path = artifacts_dir / "reviewers" / reviewer["reviewer_id"] / "review-result.json"
+            if not prepare_request_leg_recovery(reviewer, path, repo=Path(repo), run_directory=Path(run_dir), skill_directory=SKILL_DIR):
+                continue
+        elif reviewer.get("returncode") not in (0, None) and not _read_reviewer_probe_evidence_wait(reviewer, artifacts_dir):
+            directory = artifacts_dir / "reviewers" / reviewer["reviewer_id"]
+            summary = _read_reviewer_summary(directory) or {}
+            stderr = _read_reviewer_stderr(directory) or ""
+            input_condition = input_failure_condition(summary, stderr)
+            recovery = reviewer.setdefault("recovery", {})
+            if input_condition:
+                condition = input_condition + ":" + plan.get("effective_probe_identities", {}).get(reviewer["harness_id"], "")
+                if recovery.get("attempts_by_failure_condition", {}).get(condition, 0) >= 1:
+                    recovery["state"] = "waiting_for_input_or_execution_identity_change"
+                    continue
+            fingerprint = hashlib.sha256(json.dumps({"reason_code": summary.get("reason_code"),
+                "stderr": stderr, "probe_identity": plan.get("effective_probe_identities", {}).get(reviewer["harness_id"]),
+                "result_sha256": hashlib.sha256((directory / "review-result.json").read_bytes()).hexdigest()
+                    if (directory / "review-result.json").is_file() else None}, sort_keys=True).encode()).hexdigest()
+            attempts = recovery.setdefault("attempts_by_restart_condition", {})
+            if attempts.get(fingerprint, 0) >= 1:
+                recovery["state"] = "waiting_for_failure_condition_change"
+                continue
+            attempts[fingerprint] = 1
+        ready_indices.append(index)
+    if ready_indices:
+        _dispatch_indices(ready_indices)
+    request_recovery_indices = []
+    for index in ready_indices:
+        reviewer = reviewers[index]
+        if reviewer.get("probe_evidence_wait"):
+            continue
+        if _leg_review_request_pending(reviewer, artifacts_dir):
+            path = artifacts_dir / "reviewers" / reviewer["reviewer_id"] / "review-result.json"
+            snapshot_recovery_retry_counters(reviewer)
+            if prepare_request_leg_recovery(reviewer, path, repo=Path(repo), run_directory=Path(run_dir), skill_directory=SKILL_DIR):
+                request_recovery_indices.append(index)
+    if request_recovery_indices:
+        checkpoint_incomplete_reviewer_leg_artifacts(plan, request_recovery_indices, artifacts_dir)
+        _dispatch_indices(request_recovery_indices)
+
+    # 可读取文件可能由并行工作产出；先有界等待，再由普通恢复入口跨重启重验。
+    try:
+        condition_wait_seconds = min(30.0, max(0.0, float(os.environ.get("RVF_REVIEWER_REQUEST_CONDITION_WAIT_SECONDS", "5"))))
+    except ValueError:
+        condition_wait_seconds = 5.0
+    deadline = time.monotonic() + condition_wait_seconds
+    while time.monotonic() < deadline:
+        waiting_indices = [index for index, reviewer in enumerate(reviewers)
+            if not reviewer.get("probe_evidence_wait") and _leg_review_request_pending(reviewer, artifacts_dir)
+            and any(condition.get("kind") in {"file_readable", "command_lock_available"}
+                    for condition in reviewer.get("recovery", {}).get("conditions", []))]
+        if not waiting_indices:
+            break
+        write_canonical_reviewer_plan(plan_path, plan)
+        time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+        if read_review_run_lifecycle(Path(run_dir)).get("review_run_terminal_status"):
+            plan.update(status="failed", reason="reviewer_recovery_run_terminal")
+            return plan
+        resumed = []
+        for index in waiting_indices:
+            reviewer = reviewers[index]
+            path = artifacts_dir / "reviewers" / reviewer["reviewer_id"] / "review-result.json"
+            snapshot_recovery_retry_counters(reviewer)
+            if prepare_request_leg_recovery(reviewer, path, repo=Path(repo), run_directory=Path(run_dir), skill_directory=SKILL_DIR):
+                resumed.append(index)
+        if resumed:
+            checkpoint_incomplete_reviewer_leg_artifacts(plan, resumed, artifacts_dir)
+            _dispatch_indices(resumed)
+            break
 
     # 反应式 reroute：bounded 轮次，每轮替换本轮新失败（额度 or 未产出结论）的 slot。
     can_reroute = registry is not None and main_harness is not None
@@ -1022,6 +1183,8 @@ def execute_plan(
         failed_slots: list[tuple[int, str | None]] = []
         usage_limited_slots: list[tuple[int, str | None]] = []
         for index, reviewer in enumerate(reviewers):
+            if reviewer.get("probe_evidence_wait"):
+                continue
             hit, err = _leg_usage_limit(reviewer, artifacts_dir)
             if hit:
                 failed_slots.append((index, err))
@@ -1043,7 +1206,9 @@ def execute_plan(
             # 派发实证这条腿本轮没能产出评审结论 ⇒ 它此前那条「可用」probe 缓存已被现实
             # 推翻，立刻废掉。不废的话，整个 TTL 内每一轮都会命中缓存、不再真实 probe，
             # 于是同一条死腿被反复选进两腿——缓存把一次性的失败变成自我延续的错误。
-            invalidate_probe_result_cache_for_failed_dispatch(failed_harness_id)
+            directory = artifacts_dir / "reviewers" / reviewers[index]["reviewer_id"]
+            if not input_failure_condition(_read_reviewer_summary(directory) or {}, _read_reviewer_stderr(directory) or ""):
+                invalidate_probe_result_cache_for_failed_dispatch(failed_harness_id)
         for index, err in usage_limited_slots:
             harness_id = reviewers[index]["harness_id"]
             if harness_id not in cooled:
@@ -1067,6 +1232,17 @@ def execute_plan(
             registry,
             already_failed=failed_harnesses,
         )
+        if not candidates and probe_additional_harnesses_on_recovery_failure and not recovery_fallback_probe_expanded:
+            verify_recovery_execution_qualification()
+            recovery_fallback_probe_expanded = True
+            preserved_harnesses = {reviewer["harness_id"] for reviewer in reviewers
+                                   if _leg_is_effective(reviewer, artifacts_dir) or _leg_review_request_pending(reviewer, artifacts_dir)
+                                   or reviewer.get("probe_evidence_wait")}
+            fallback_registry = {**registry, "harnesses": {key: {**value,
+                "enabled": value.get("enabled", True) and key not in failed_harnesses | preserved_harnesses | cooled}
+                for key, value in registry["harnesses"].items()}}
+            available.extend(probe_available(fallback_registry, repo=repo, cooldown_active=cooled))
+            candidates = _reroute_candidates(main_harness, available, cooled, registry, already_failed=failed_harnesses)
         surviving = {
             reviewers[i]["harness_id"]
             for i in range(len(reviewers))
@@ -1129,13 +1305,11 @@ def execute_plan(
 
     # 统计 + status + fail-close（F1/F2/R-e）。
     # ok 用「有效腿」而非裸 returncode：rc==0 但没写出 review-result 的腿不算数。
-    ok = sum(1 for reviewer in reviewers if _leg_is_effective(reviewer, artifacts_dir))
+    effective_slots, pending_request_slots, pending_probe_slots = recompute_reviewer_plan_leg_summary_from_canonical_results(
+        plan, artifacts_dir
+    )
+    ok = len(effective_slots)
     # 合法 request 腿：非完成态、但也不是失败，既不计入 unfilled_* 也不该被换腿。
-    pending_request_slots = [
-        index
-        for index, reviewer in enumerate(reviewers)
-        if _leg_review_request_pending(reviewer, artifacts_dir)
-    ]
     unfilled_usage = [
         index
         for index, reviewer in enumerate(reviewers)
@@ -1146,15 +1320,10 @@ def execute_plan(
         for index, reviewer in enumerate(reviewers)
         if index not in unfilled_usage
         and index not in pending_request_slots
+        and index not in pending_probe_slots
         and not _leg_is_effective(reviewer, artifacts_dir)
     ]
     plan["cooldown_recorded"] = cooldown_recorded
-    # 让消费者不必自己重算「到底有几条腿真的有结论」（additive，schema_version 仍为 1）。
-    plan["effective_reviewer_count"] = ok
-    # additive：哪几路停在 kind: request，待主会话按 Contract Gate / Request Handling 处置后重试。
-    plan["review_request_pending_reviewer_ids"] = [
-        reviewers[index]["reviewer_id"] for index in pending_request_slots
-    ]
 
     if ok == len(reviewers) and reviewers:
         plan["status"] = "completed"
@@ -1240,6 +1409,10 @@ def execute_plan(
             # 必须自报「还夹着一条待处理 request」——否则主会话照失败类 reason 处置完
             #（等配额 / 修 auth）就重跑，那条 request 从头到尾没被 Contract Gate 处理过。
             plan["reason"] = f"{plan['reason']}{REVIEW_REQUEST_PENDING_REASON_SUFFIX}"
+
+    if pending_probe_slots and not unfilled_usage and not unfilled_without_review_result:
+        plan.update(status=PLAN_STATUS_WAITING_FOR_REVIEWER_PROBE_EVIDENCE,
+                    reason="reviewer_probe_evidence_pending", needs_last_resort_fallback=False)
 
     return plan
 
@@ -1390,10 +1563,6 @@ def _build_detached_child_argv(
     selection_seed = getattr(args, "selection_seed", None)
     if selection_seed is not None:
         argv += ["--selection-seed", str(selection_seed)]
-    # 必须透传：不传的话 detached child 会退回整盘重派，把「只重派 request 腿」在真正跑活的那条
-    # 路径（--execute --detached 是主会话的标准用法）上悄悄作废。
-    if getattr(args, "redispatch_review_request_legs_only", False):
-        argv.append("--redispatch-review-request-legs-only")
     return argv
 
 
@@ -1553,15 +1722,6 @@ def main() -> int:
         help="Override pseudo-random reviewer selection seed (reproduce a recorded "
         "reviewer_selection.selection_seed; default: freshly generated and recorded).",
     )
-    parser.add_argument(
-        "--redispatch-review-request-legs-only",
-        action="store_true",
-        help="With --execute: reuse the previous reviewer-plan.json and re-run ONLY the legs "
-        "that ended in `kind: request`. Healthy completed legs keep their results untouched "
-        "(a whole-board re-dispatch re-runs them and their findings get overwritten by the "
-        "new round). Each re-dispatched leg's old artifact is rotated into "
-        "superseded-review-result-artifacts/ first.",
-    )
     parser.add_argument("--plan-only", action="store_true", help="Plan + write reviewer-plan.json; do not execute.")
     parser.add_argument("--execute", action="store_true", help="Plan then execute reviewers in parallel.")
     parser.add_argument("--dry-run", action="store_true", help="Print plan JSON to stdout; do not write or execute.")
@@ -1678,6 +1838,28 @@ def main() -> int:
             scope_contract=scope_contract,
         )
 
+    reviewers_dir.mkdir(parents=True, exist_ok=True)
+    dispatch_execution_lock = (reviewers_dir / ".reviewer-dispatch-execution.lock").open("a")
+    try:
+        fcntl.flock(dispatch_execution_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        durable_json(reviewers_dir / ".reviewer-dispatch-execution-wait.json", {
+            "run_id": ledger.run_id, "run_directory": str(ledger.run_dir.resolve()),
+            "state": "waiting_for_in_flight_reviewer_execution", "recovery_condition": "dispatch_execution_lock_available",
+            "attempted_actions": ["acquire_exact_run_execution_lock"], "observed_at": datetime.now(timezone.utc).isoformat()})
+        ledger.event(phase="review", event="dispatch_in_flight_execution_wait", status="waiting",
+            reason_code="dispatch_execution_lock_held", recovery_condition="dispatch_execution_lock_available")
+        print("[dispatch_reviewers] 精确 run 已在派发；等待在途执行结束后重验。", file=sys.stderr)
+        return DISPATCH_BLOCKED_ON_REVIEWER_REQUEST_EXIT_CODE
+    waiting_execution_path = reviewers_dir / ".reviewer-dispatch-execution-wait.json"
+    if waiting_execution_path.is_file():
+        try:
+            waiting_execution = json.loads(waiting_execution_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            waiting_execution = {"run_id": ledger.run_id, "prior_wait_observation_unreadable": True}
+        durable_json(waiting_execution_path, {**waiting_execution, "state": "execution_lock_available",
+            "condition_satisfied_at": datetime.now(timezone.utc).isoformat()})
+
     env_main_harness = os.environ.get("RVF_MAIN_HARNESS")
     main_harness_file = (
         Path(args.main_harness_file).expanduser()
@@ -1696,43 +1878,70 @@ def main() -> int:
         if args.assume_available is not None
         else None
     )
-    # 跨轮 cooldown：真实 probe 才应用（assume-available 仅测试用、不受额度冷却影响，D-O4）。
-    # 额度耗尽时 auth probe 仍返回 0，故须以独立 cooldown 标记把冷却中的 harness 排除在 probe 外。
-    cooled_markers = (
-        {} if assume_available is not None else harness_limit_cooldown.active_harnesses()
-    )
-    available = probe_available(
-        registry,
-        probe_mode=args.probe_mode,
-        timeout=args.probe_timeout,
-        assume_available=assume_available,
-        cooldown_active=set(cooled_markers),
-    )
-
     redispatch_indices: list[int] | None = None
-    if args.redispatch_review_request_legs_only:
+    plan_path = reviewers_dir / "reviewer-plan.json"
+    binding = reviewer_execution_input_binding(run_id=ledger.run_id, repo=repo,
+        review_packet=review_packet, scope_contract=scope_contract)
+    plan = None
+    if plan_path.is_file():
         try:
-            plan, redispatch_indices = _resume_plan_for_review_request_legs(
-                reviewers_dir, artifacts_dir
-            )
+            previous_plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            if previous_plan.get("execution_input_binding") not in (None, binding):
+                raise ValueError("已有 reviewer plan 与精确 run/候选/Scope 输入不一致")
+            if previous_plan.get("reviewers"):
+                plan, redispatch_indices = load_reviewer_plan_and_select_incomplete_legs(reviewers_dir, artifacts_dir)
+            elif previous_plan.get("schema_version") != PLAN_SCHEMA_VERSION or previous_plan.get("reviewers") != []:
+                raise ValueError("已有 reviewer plan 结构无效")
         except ValueError as exc:
-            print(f"[dispatch_reviewers] error: {exc}", file=sys.stderr)
+            print(f"[dispatch_reviewers] {exc}", file=sys.stderr)
             return 1
-        if not redispatch_indices:
-            print(
-                "[dispatch_reviewers] 上一轮 plan 里没有 kind: request 的腿，无需重派。",
-                file=sys.stderr,
-            )
-            print(str(reviewers_dir / "reviewer-plan.json"))
+        if plan is not None and not redispatch_indices:
+            plan["status"] = "completed"
+            if not args.dry_run:
+                write_canonical_reviewer_plan(plan_path, plan)
+            print(str(plan_path))
             return 0
-    else:
-        plan = route(
-            main_harness,
-            available,
-            registry,
-            require_external_only=args.require_external,
-            selection_seed=args.selection_seed,
-        )
+    cooled_markers = {} if assume_available is not None else harness_limit_cooldown.active_harnesses()
+    probe_registry = registry
+    if plan is not None:
+        related_harnesses = {plan["reviewers"][index]["harness_id"] for index in redispatch_indices}
+        probe_registry = {**registry, "harnesses": {key: {**value, "enabled": value.get("enabled", True) and key in related_harnesses}
+            for key, value in registry["harnesses"].items()}}
+    probe_identities: dict[str, str] = {}
+    probe_diagnostics: list[dict[str, Any]] = []
+    available = probe_available(
+        probe_registry, probe_mode=args.probe_mode, timeout=args.probe_timeout,
+        assume_available=assume_available, cooldown_active=set(cooled_markers), repo=repo, ledger=ledger,
+        probe_identities=probe_identities,
+        probe_diagnostics=probe_diagnostics,
+    )
+    if assume_available is None:
+        cooled_markers.update(harness_limit_cooldown.active_harnesses())
+    if plan is None:
+        plan = route(main_harness, available, registry, require_external_only=args.require_external,
+                     selection_seed=args.selection_seed)
+    plan["execution_input_binding"] = binding
+    plan["effective_probe_identities"] = probe_identities
+    plan["probe_diagnostics"] = probe_diagnostics
+    diagnostics_by_harness = {diagnostic["harness_id"]: diagnostic for diagnostic in probe_diagnostics}
+    for reviewer in plan.get("reviewers", []):
+        if _leg_is_effective(reviewer, artifacts_dir):
+            reviewer.pop("probe_evidence_wait", None)
+            continue
+        diagnostic = diagnostics_by_harness.get(reviewer["harness_id"])
+        previous_wait = reviewer.get("probe_evidence_wait") or _read_reviewer_probe_evidence_wait(reviewer, artifacts_dir)
+        if diagnostic:
+            reviewer["probe_evidence_wait"] = diagnostic
+        elif (previous_wait and previous_wait.get("reason_code") == "reviewer_probe_in_flight"
+                and not _reviewer_probe_execution_lock_available(reviewer["harness_id"])):
+            reviewer["probe_evidence_wait"] = previous_wait
+        else:
+            reviewer.pop("probe_evidence_wait", None)
+    plan["probe_evidence_pending_reviewer_ids"] = [reviewer["reviewer_id"] for reviewer in plan.get("reviewers", [])
+                                                  if reviewer.get("probe_evidence_wait")]
+    if (not available and probe_diagnostics and not plan.get("reviewers")) or plan["probe_evidence_pending_reviewer_ids"]:
+        plan.update(status=PLAN_STATUS_WAITING_FOR_REVIEWER_PROBE_EVIDENCE,
+                    reason="reviewer_probe_evidence_pending", needs_last_resort_fallback=False)
 
     # 被 cooldown 排除的 enabled harness：逐一发可观测 warning（O2 契约 code）。
     enabled_ids = set(_enabled_harnesses(registry))
@@ -1747,7 +1956,7 @@ def main() -> int:
             )
         )
     # F2：A 被 cooldown 清空（而非 probe 全失败）→ 响亮 error fail-close，绝不静默置伪 R3 last-resort。
-    if not available and cooled_enabled:
+    if not available and cooled_enabled and not probe_diagnostics:
         plan["status"] = "failed"
         plan["reason"] = "all_harnesses_usage_limited"
         plan["needs_last_resort_fallback"] = False
@@ -1783,10 +1992,9 @@ def main() -> int:
     if args.execute and plan["status"] != "failed" and plan["reviewers"]:
         pre_execute_warning_count = len(plan["warnings"])
         if redispatch_indices:
-            # 破坏性的一步，只能在这里发生：--dry-run / --plan-only 已在上面短路/落空，
-            # 它们看到的仍是上一轮完整的 canonical review-result.json（RVF-008）。
-            plan["rotated_review_request_artifacts"] = _rotate_review_request_leg_artifacts(
-                plan, redispatch_indices, artifacts_dir
+            # 真正续跑前保存检查点；只读预览不生成尝试归档。
+            checkpoint_incomplete_reviewer_leg_artifacts(
+                plan, [index for index in redispatch_indices if not plan["reviewers"][index].get("probe_evidence_wait")], artifacts_dir
             )
         plan = execute_plan(
             plan,
@@ -1801,6 +2009,8 @@ def main() -> int:
             main_harness=main_harness,
             available=available,
             initial_dispatch_indices=redispatch_indices,
+            probe_additional_harnesses_on_recovery_failure=redispatch_indices is not None and assume_available is None,
+            reviewer_dispatch_execution_lock_descriptor=dispatch_execution_lock.fileno(),
         )
         # reroute / fail-close 在 execute_plan 内可能追加 warning，只打印增量部分（避免重复已打印的）。
         for warning in plan["warnings"][pre_execute_warning_count:]:
@@ -1814,7 +2024,7 @@ def main() -> int:
             status=plan["status"],
             reason_code=f"dispatch_{plan['status']}",
             reviewers=[
-                {"reviewer_id": r["reviewer_id"], "returncode": r.get("returncode")}
+                {"reviewer_id": r["reviewer_id"], "returncode": r.get("returncode"), "recovery": r.get("recovery")}
                 for r in plan["reviewers"]
             ],
             fallbacks=plan.get("fallbacks", []),
@@ -1828,6 +2038,8 @@ def main() -> int:
 
     if plan["status"] == "failed":
         return 1
+    if plan["status"] == PLAN_STATUS_WAITING_FOR_REVIEWER_PROBE_EVIDENCE:
+        return DISPATCH_WAITING_FOR_REVIEWER_PROBE_EVIDENCE_EXIT_CODE
     if plan["status"] == PLAN_STATUS_BLOCKED_ON_REVIEWER_REQUEST:
         # 非完成态终态**不得**以 0 收尾。0 的含义是「被包命令干净完成」：detached 幂等锁的
         # staleness 判定（``rvf_detached_thread._detached_run_finished_clean``）据此认定该 run

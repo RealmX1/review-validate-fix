@@ -451,9 +451,11 @@ def _release_tracker_lease(
         # leased units to `reviewed` when a reviewer actually ran, so a no-op
         # completion releases the lease without silently marking unreviewed work
         # reviewed (which would convert an over-dispatch into a missed-review).
-        did_review = any(
-            (run_dir / "artifacts" / "reviewers").glob("*/review-result.json")
-        )
+        try:
+            from reviewed_candidate_completion_facts import completed_reviewer_legs
+            did_review = len(completed_reviewer_legs(run_dir)) == 2
+        except (OSError, ValueError, KeyError, TypeError):
+            did_review = False
         result = reviewable_unit_diff_tracker.complete_review_scope(
             repo=repo,
             lease_id=lease_id,
@@ -524,6 +526,11 @@ def _advance_review_highwater(
     did_review = bool(lease_rel.get("did_review")) if isinstance(lease_rel, dict) else False
     if not did_review:
         return {"status": "skipped", "reason": "no_review_artifacts"}
+    try:
+        from reviewed_candidate_completion_facts import completed_reviewer_legs
+        completed_reviewer_legs(run_dir)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return {"status": "skipped", "reason": "reviewer_completion_unverified", "detail": str(exc)}
     # S8·R23:RVF review 真完成计数(守护心跳的分子之一),best-effort 绝不影响 finalize。
     try:
         import agentic_initiation_guardian_dispatch as guardian_dispatch  # noqa: PLC0415
@@ -795,6 +802,9 @@ def _finalize_run_owned(
 
     summary = _read_summary(run_dir / "summary.json")
     repo = _resolve_repo(run_dir, summary, event)
+    if decision_kind not in NON_REVIEW_COMPLETION_KINDS and (run_dir / "artifacts/reviewers/reviewer-plan.json").is_file():
+        from reviewed_candidate_completion_facts import completed_reviewer_legs
+        completed_reviewer_legs(run_dir)
     terminal_was_already_recorded = bool(read_review_run_lifecycle(run_dir).get("review_run_terminal_status"))
     terminal_at = (event or {}).get("review_run_terminal_observed_at") or _utc_now()
     lifecycle = record_review_run_terminal(

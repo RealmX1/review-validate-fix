@@ -97,8 +97,8 @@ def test_real_canonical_writer_waits_for_consumer_lock_then_resumes(tmp_path: Pa
             successful([sys.executable, str(SCRIPT_DIRECTORY / "write_review_result.py"), "lock-request", "--out",
                         str(run_dir / "artifacts/reviewers/reviewer-b/review-result.json"), "--name", "qualification-lock",
                         "--command", "python --version", "--reason", "准备正式 request 轮转验收"])
-            body = ("from dispatch_reviewers import _rotate_review_request_leg_artifacts; "
-                    + f"print(_rotate_review_request_leg_artifacts({{'reviewers': [{{'reviewer_id': 'reviewer-b'}}]}}, [0], Path({str(run_dir / 'artifacts')!r})))")
+            body = ("from dispatch_reviewers import checkpoint_incomplete_reviewer_leg_artifacts; "
+                    + f"print(checkpoint_incomplete_reviewer_leg_artifacts({{'reviewers': [{{'reviewer_id': 'reviewer-b'}}]}}, [0], Path({str(run_dir / 'artifacts')!r})))")
         elif writer == "reviewer_plan":
             body = ("from dispatch_reviewers import write_canonical_reviewer_plan; import json; "
                     + f"path=Path({str(run_dir / 'artifacts/reviewers/reviewer-plan.json')!r}); "

@@ -33,10 +33,24 @@ def _write_json(path: Path, payload: object) -> None:
 
 def _verification_fixture(tmp_path: Path):
     installer = _load_module("installer_for_verifier_tests", INSTALLER_PATH)
+    # 生产部署使用干净源码；worktree 的共享 state 可能含真实 run，不能跟随链接复制进 fixture。
+    fixture_source_directory = tmp_path / "isolated-plugin-source-without-runtime-state"
+    def exclude_fixture_source_runtime_artifacts(directory, names):
+        ignored = installer._bundle_copy_ignore(directory, names)
+        if Path(directory) == ROOT / "plugins/review-validate-fix/skills/review-validate-fix":
+            ignored.add("state")
+        return ignored
+    for relative in ("plugins/review-validate-fix", "core", "adapters"):
+        shutil.copytree(ROOT / relative, fixture_source_directory / relative,
+            ignore=exclude_fixture_source_runtime_artifacts)
+    for relative in (".agents/plugins/marketplace.json", ".claude-plugin/marketplace.json", ".rvf-pyroot"):
+        destination = fixture_source_directory / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / relative, destination)
     home_directory = tmp_path / "home"
     source_commit = "b" * 40
     release = installer.build_developer_marketplace_release(
-        source_repository=ROOT,
+        source_repository=fixture_source_directory,
         home_directory=home_directory,
         source_commit=source_commit,
         source_commit_count=400,
@@ -46,7 +60,7 @@ def _verification_fixture(tmp_path: Path):
         home_directory=home_directory,
     )
     user_paths = installer.initialize_rvf_user_local_data(
-        source_repository=ROOT,
+        source_repository=fixture_source_directory,
         home_directory=home_directory,
     )
     plugin_root = active_marketplace_root / "plugins/review-validate-fix"
@@ -106,7 +120,7 @@ def _verification_fixture(tmp_path: Path):
         {
             "schema_version": 2,
             "status": "installed",
-            "deployment_source_worktree": str(ROOT),
+            "deployment_source_worktree": str(fixture_source_directory),
             "local_main_commit": source_commit,
             "generated_plugin_version": release.generated_plugin_version,
             "payload_digest": release.payload_digest,

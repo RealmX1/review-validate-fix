@@ -173,7 +173,7 @@ def test_build_packet_uses_session_manifest_as_scope_anchor(tmp_path: Path) -> N
     payload = json.loads(metadata.read_text(encoding="utf-8"))
     assert "## Session Manifest" in packet_text
     assert "## Session-Owned Git Diff" in packet_text
-    assert "## Full Git Diff HEAD (Evidence Only)" in packet_text
+    assert "## Full Git Diff HEAD (Evidence Only)" not in packet_text
     assert "Session-owned paths:" in packet_text
     owned_section = packet_text.split("Session-owned paths:", 1)[1].split("Unattributed dirty paths", 1)[0]
     assert "tracked.txt" in paths_from_compact_path_tree_blocks(owned_section)
@@ -279,7 +279,9 @@ def test_build_packet_filters_session_owned_diff_to_tracker_hunk(tmp_path: Path)
     session_owned_diff = packet_text.split("## Full Git Diff HEAD", 1)[0]
     assert "+session-owned" in session_owned_diff
     assert "+background" not in session_owned_diff
-    assert "+background" in packet_text
+    assert "+background" not in packet_text
+    payload = json.loads(metadata.read_text(encoding="utf-8"))
+    assert "+background" in Path(payload["repository_diff_evidence"]["file"]).read_text()
 
 
 def test_build_packet_rejects_session_manifest_for_different_repo(tmp_path: Path) -> None:

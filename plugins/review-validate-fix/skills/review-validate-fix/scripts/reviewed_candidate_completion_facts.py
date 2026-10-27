@@ -85,14 +85,14 @@ def completed_reviewer_legs(run_dir: Path) -> list[rvf_merge_dispositions.Canoni
         if (
             leg.read_error or result.get("schema_version") != 1
             or result.get("kind") not in {"no_issues", "issues"}
-            or not isinstance(issues, list) or result.get("requests") != []
+            or not isinstance(issues, list)
             or (result["kind"] == "no_issues" and issues)
             or (result["kind"] == "issues" and not issues)
             or any(not isinstance(issue, dict) for issue in issues)
         ):
             raise ValueError(f"review result {leg.reviewer_id} is not protocol-valid")
         classification = check_review_result.classify(leg.review_result_path, scope_contract=run_dir / "artifacts/inputs/scope.contract.json")
-        if not classification["valid"]:
+        if not classification["valid"] or not classification["review_complete"]:
             raise ValueError(f"review result {leg.reviewer_id} is not protocol-valid: {classification['errors']}")
     return legs
 

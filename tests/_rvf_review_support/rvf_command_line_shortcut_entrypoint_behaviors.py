@@ -387,7 +387,7 @@ def test_rvf_shortcut_results_summary_reads_canonical_legs_only(root: Path) -> N
     _write_json(reviewers / "kimi-code" / "superseded-review-result-artifacts" / "review-result.json",
                 {"schema_version": 1, "kind": "issues", "issues": [{**issue, "message": "SUPERSEDED_OLD_FINDING"}]})
     _write_json(reviewers / "reviewer-plan.json",
-                {"status": "completed", "effective_reviewer_count": 2, "reviewers": legs, "fallbacks": []})
+                {"schema_version": 1, "status": "completed", "effective_reviewer_count": 2, "reviewers": legs, "fallbacks": []})
     _write_json(reviewers / ".dispatch-thread.status.json",
                 {"launch_status": "launched", "returncode": 0, "finished_at": "2020-01-01T00:00:00Z"})
 
@@ -439,7 +439,7 @@ def test_rvf_shortcut_results_summary_reads_canonical_legs_only(root: Path) -> N
     (reviewers / "cursor-cli" / "review-result.json").write_text("{not json", encoding="utf-8")
     (reviewers / "kimi-code" / "review-result.json").unlink(missing_ok=True)
     _write_json(reviewers / "reviewer-plan.json",
-                {"status": "completed", "effective_reviewer_count": 2, "reviewers": stale_legs, "fallbacks": []})
+                {"schema_version": 1, "status": "completed", "effective_reviewer_count": 2, "reviewers": stale_legs, "fallbacks": []})
     completed = subprocess.run(
         [sys.executable, str(_entrypoint_script()), "results", "--run-dir", str(run_dir)],
         cwd=root, env=environment, capture_output=True, text=True, check=False,
@@ -523,7 +523,7 @@ def test_rvf_shortcut_fix_prepare_stop_apply_all_stopped_end_to_end(root: Path) 
         )
     ]
     _write_json(reviewers / "reviewer-plan.json",
-                {"status": "completed", "effective_reviewer_count": 2, "reviewers": legs, "fallbacks": []})
+                {"schema_version": 1, "status": "completed", "effective_reviewer_count": 2, "reviewers": legs, "fallbacks": []})
     refused = subprocess.run(
         [sys.executable, str(_entrypoint_script()), "fix", "prepare", str(issue_files[0]),
          "--run-dir", str(run_dir), "--json"],
@@ -630,11 +630,11 @@ def test_rvf_shortcut_redispatch_reviewers_argv_carries_current_run_dir(root: Pa
                                   "dispatched_preset": {"external_reviewer_count_target": 2}},
     )
     argv = module.build_redispatch_reviewers_argv(
-        context, review_request_legs_only=True, dry_run=False, selection_seed=None
+        context, dry_run=False, selection_seed=None
     )
     assert argv[argv.index("--rvf-run-dir") + 1] == str(run_dir), argv
     assert argv[argv.index("--rvf-run-id") + 1] == "rvf-x", argv
-    assert "--redispatch-review-request-legs-only" in argv and "--require-external" in argv, argv
+    assert "--redispatch-review-request-legs-only" not in argv and "--require-external" in argv, argv
     assert "--execute" in argv and "--detached" in argv, argv
     assert argv[argv.index("--review-packet") + 1] == str(run_dir / "artifacts/review-packet.md"), argv
 
@@ -827,7 +827,7 @@ def _invoke_real_stop_hook(environment: dict[str, str], *, repo: Path, session_i
 def _write_dispatch_status(run_dir: Path, *, finished: bool) -> None:
     reviewers = run_dir / "artifacts" / "reviewers"
     _write_json(reviewers / "reviewer-plan.json",
-                {"status": "completed", "effective_reviewer_count": 0, "reviewers": [], "fallbacks": []})
+                {"schema_version": 1, "status": "completed", "effective_reviewer_count": 0, "reviewers": [], "fallbacks": []})
     status = {"launch_status": "launched", "returncode": None}
     if finished:
         status.update({"returncode": 0, "finished_at": "2020-01-01T00:00:00Z"})
@@ -981,7 +981,7 @@ def _fix_loop_repo_and_run(root: Path) -> tuple[Path, Path, list[Path]]:
             "schema_version": 1, "kind": "no_issues", "issues": [], "requests": [], "audit_summary": "审过全部文件"}),
     ]
     _write_json(reviewers / "reviewer-plan.json",
-                {"status": "completed", "effective_reviewer_count": 2, "reviewers": legs, "fallbacks": []})
+                {"schema_version": 1, "status": "completed", "effective_reviewer_count": 2, "reviewers": legs, "fallbacks": []})
     merged = subprocess.run(
         [sys.executable, str(SCRIPT_DIR / "rvf_merge_dispositions.py"), "write", "--run-dir", str(run_dir)],  # noqa: F821
         input=json.dumps({"dispositions": [
@@ -1287,7 +1287,8 @@ def test_rvf_receipts_carry_explicit_run_dir_only_when_current_session_is_unreso
         run_dir, option_name="--rvf-run-dir", environ={}) == f" --rvf-run-dir '{run_dir}'"
 
     summary = {"plan_status": "completed", "effective_reviewer_count": 2, "reviewer_count": 2, "plan_path": "p",
-               "legs": [{"reviewer_id": r, "kind": "issues", "valid": True, "issues": [{"path": "a", "line": 1}]}
+               "legs": [{"reviewer_id": r, "kind": "issues", "valid": True, "review_complete": True,
+                         "returncode": 0, "issues": [{"path": "a", "line": 1}]}
                         for r in ("a", "b")]}
     with _only_these_host_session_environment_variables():
         kimi_wait = module.render_host_specific_reviewer_wait_instruction(
@@ -1366,7 +1367,7 @@ def test_rvf_results_summary_marks_outside_scope_and_excluded_path_issues_withou
                                     "audit_summary": "审了 a.py"}),
     ]
     _write_json(reviewers / "reviewer-plan.json",
-                {"status": "completed", "effective_reviewer_count": 2, "reviewers": legs, "fallbacks": []})
+                {"schema_version": 1, "status": "completed", "effective_reviewer_count": 2, "reviewers": legs, "fallbacks": []})
     environment = _isolated_environment(root, RVF_SCOPE_CONTRACT=str(run_dir / "artifacts" / "inputs" / "scope.contract.json"))
     completed = subprocess.run(
         [sys.executable, str(_entrypoint_script()), "results", "--run-dir", str(run_dir)],
