@@ -1,91 +1,14 @@
 ---
 name: rvf-analyze
-description: Use when the user asks for a post-mortem of a finalized RVF run — narrative summary plus issue ↔ patch causality scaffolding. Read-only complement to $review-validate-fix; never starts a new review, edits source, or generates handoff.md.
+description: 用户要求复盘精确 RVF run 时使用，只读分析，不启动新评审或修复。
 ---
 
-# RVF Analyze
+# RVF 按需复盘
 
-本 skill 仅用于对一次**已 finalize 的 RVF run** 做事后复盘。它读
-`<run_dir>/artifacts/` 下由 `rvf_run_finalize` 已经落盘的 trajectory + workspace
-diff + reviewer 产物，补全已经 scaffold 的 `artifacts/analysis/summary.md` 与
-`artifacts/analysis/causality.json`。
+使用用户指定的精确 run 目录；没有目录时先定位其任务中的运行材料，不选择 latest 代替身份核对。
 
-> ⚠️ 本 skill 与 `review-validate-fix` 严格分离。即便上下文里同时出现
-> review/validate/fix 的叙事，本 skill 的唯一职责是**复盘已 finalize 的 run**：
-> 不得启动新 review、不得改源码、不得跑 validate/fix、不得生成 handoff.md、
-> 不得自动开 PR 或派生新 task。
+运行 `rvf analyze --run-dir <目录>` 获取状态及真实尝试记录。按需读取需求、patch、角色 prompt、stdout/stderr、findings、fixer 补丁、最终验证和 Git 提交事实。
 
-本 skill 只应由用户显式调用：`$rvf-analyze`、`$rvf-analyze latest`、
-`$rvf-analyze <run_id>` 或 `$rvf-analyze /abs/path/to/run_dir`。
-不要因为上下文出现 `$review-validate-fix` 叙事自动转到本 skill，反之亦然。
+解释发现、验证和补丁之间的因果关系，区分未完成、未验证与已完成；给出实际成本、重复工作及可改进点。复盘发现的有价值问题交主 Agent 统一匹配 GitHub Issue 并追加 observation。
 
-自动化边界：`rvf_run_finalize.finalize_run()` 会在 RVF finish/finalize 后自动运行
-确定性 scaffold 后端，生成 `artifacts/analysis/summary.md` 与
-`artifacts/analysis/causality.json` 的初始骨架；这不是一次 LLM skill 调用。
-scaffold 之后，Stop hook **不再**向当前会话/Kanban task 注入 follow-up 用户消息，
-而是把 analyze 的 LLM 补全派进一个按 run 命名的 detached tmux 线程
-（`rvf-analyze-<run_name>`）后台运行；原会话 finalize 完即可 idle，无需等待
-analyze 跑完。该后台线程对用户不可见，其冻结 prompt、stdout/stderr 日志与
-launch/exit 状态落在 `<run_dir>/artifacts/analysis/.analyze-thread.*`（未来由自研
-Cline Kanban GUI 接管可视化与 workflow 集成）。无论后台线程成功、失败还是 tmux
-缺失，用户始终可以手动触发 `$rvf-analyze <run_dir>` 收尾。
-只有用户显式调用本 skill 时，agent 才进入叙事补全与 issue ↔ patch 因果归属流程。
-
-后台线程直接补全 finalize 已生成的骨架，不重新执行 `rvf_analyze.py`。Codex
-保持 `workspace-write`，额外只授权当前 run 的正式 `analysis/` 目录。禁止向业务
-worktree 或临时目录保存替代稿；无法写回时报告失败。分析专用包装器在退出后检查
-正式报告无 TODO、因果 JSON 的版本/run 身份和 patch 引用合法，且除候选归因外的
-事实未被改写；通过后才计入完成数。`.analyze-thread.status.json` 的
-`agent_process_returncode` 是进程结果，`formal_analysis_completion_status` 是
-`pending/completed/incomplete/failed`；`returncode` 是综合结果，非零允许后续重试。
-
-## 入口与脚本
-
-唯一入口脚本（确定性后端）：
-
-```
-plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_analyze.py
-```
-
-脚本住在 `review-validate-fix` 的 `scripts/` 目录里（与 `rvf_run_finalize`、
-`trajectory_capture` 等在同一 import 域），不要复制到本 sister skill 下。
-
-调用示例：
-
-```bash
-python3 plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_analyze.py \
-  [--run-id <id> | --run-dir <path> | --latest | <positional target>]
-```
-
-如果当前 cwd 不在仓库根，使用脚本的绝对路径。
-
-## 退出码语义（必须按此分支）
-
-脚本 stdout 总是结构化 JSON。退出码语义：
-
-| 退出码 | 含义 | agent 处理 |
-|---|---|---|
-| `0` | 已成功 scaffold `analysis/summary.md` 与 `analysis/causality.json` | 进入"叙事补全"流程 |
-| `2` | classification == `running`（run 看起来还在跑） | **询问用户**：是否仍要复盘？得到肯定后追加 `--force` 重入 |
-| `3` | classification 是 `orphan_candidate` 或 `cancel_without_lock`，需要决策 | **询问用户**："这个 run 看起来未完成，要现在 lazy finalize 一次再分析吗？"；yes → 追加 `--auto-finalize-orphan` 重入；no → 追加 `--decline-finalize` 重入 |
-| `5` | 上轮已传 `--auto-finalize-orphan` 但 finalize 自身抛异常 | **不要再发起同一询问**；读 stdout 的 `error` 字段把失败原因转给用户，建议 `--decline-finalize` 降级或排查 finalize_run |
-| `4` | 解析 run_dir 失败 | 反馈错误信息给用户，让其确认 `--run-id` / `--run-dir` |
-
-退出码 2/3 上**不得**自作主张选择，必须用中文向用户提问。
-
-## 复盘任务
-
-成功 scaffold 后（退出码 0），agent 的本职是**叙事补全 + 因果归属**：
-- 在 `analysis/summary.md` 各节填 `<!-- TODO(rvf-analyze): ... -->` 占位
-- 在 `analysis/causality.json::issues[].candidate_patch_call_ids` 里填上每条
-  issue 对应的 patch call_id 列表
-
-详细操作流程、节标题、启发式判断规则、边界情况清单，全部在
-`references/rvf-analyze.md`。**先读 reference 再操作**。
-
-## 不做的事
-
-- 不修改 `<run_dir>/` 下除 `analysis/` 之外的任何文件
-- 不调用 `finalize_run`（脚本会在 `--auto-finalize-orphan` 时自己调）
-- 不基于复盘结论改源码、开 PR 或派生新 task
-- 不读 `~/.codex/sessions/`；所有需要的 trajectory 已在 `run_dir/artifacts/trajectory/` 下
+不自动启动复盘，不修改业务源码，不制造成功事实或正式归档资格，不阻断提交或 base 同步。

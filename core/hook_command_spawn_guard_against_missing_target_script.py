@@ -58,6 +58,7 @@ RVF 自己的全部保护（``is_foreign_invocation``、受众契约翻译层、
 """
 
 from __future__ import annotations
+import shlex
 
 
 HOOK_TARGET_MISSING_BREADCRUMB_LOG_FILE_NAME = "rvf-hook-target-missing.log"
@@ -99,6 +100,7 @@ def hook_command_guarded_against_missing_target_script(
     hook_event_name: str,
     environment_assignment_prefix: str = "",
     hook_target_missing_breadcrumb_directory_shell_literal: str | None = None,
+    script_arguments: tuple[str, ...] = (),
 ) -> str:
     """把 ``python3 <script>`` 包成「永不以退出码 2 结束」的 POSIX sh 命令串。
 
@@ -143,7 +145,7 @@ def hook_command_guarded_against_missing_target_script(
         f"'{hook_event_name}' \"${target}\" >>{breadcrumb_log}; }} >/dev/null 2>&1"
     )
     spawn_with_normalized_exit_status = (
-        f'{environment_assignment_prefix}python3 "${target}"; '
+        f'{environment_assignment_prefix}python3 "${target}"' + ''.join(' ' + shlex.quote(argument) for argument in script_arguments) + '; '
         f"{exit_status}=$?; "
         f'if [ "${exit_status}" -eq {AGENT_DRIVING_HOOK_EXIT_STATUS_NORMALIZED_TO_ZERO} ]; '
         f"then {exit_status}=0; fi; "

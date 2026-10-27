@@ -30,4 +30,4 @@ RVF 的性能标准遵循 Measure before optimizing。没有需求、证据、�
 - “可能更快”的重写建议。
 - 与当前 scope 无关的性能债。
 
-如果需要测量才能判断，reviewer 通过 `$RVF_WRITE_REVIEW_RESULT measurement-request --out "$RVF_REVIEW_RESULT" ...` 写 request artifact，或在 validate/fix 阶段写入 `--status elevated`。
+缺少必要测量时先尝试隔离复现和替代证据；仍未知则保留 incomplete 及实际缺口。
