@@ -96,6 +96,15 @@ def _role_result(role_directory: Path, *, latest: bool = False, include_incomple
     return None
 
 
+def verified_context_response_original_path(run_directory: Path, response_sha256: str | None) -> Path | None:
+    if response_sha256 is None:
+        return None
+    original = run_directory / "context-response-originals-by-sha256" / f"{response_sha256}.md"
+    if not original.is_file() or hashlib.sha256(original.read_bytes()).hexdigest() != response_sha256:
+        raise ValueError("补证原件缺失或内容已改变；恢复匹配摘要的原件后接续，保留现有尝试")
+    return original
+
+
 def _start_role(run_directory: Path, record: dict, role_directory: Path, role: str, configurations: list[dict], findings: list[dict], *, force_new: bool = False) -> tuple[dict | None, subprocess.Popen | None]:
     completed = _role_result(role_directory, latest=role == "fixer")
     if completed and not force_new:
@@ -143,7 +152,7 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
         "result_file": str(result_file), "findings": findings,
         "candidate_commit": candidate_commit,
         "context_response_sha256": record.get('context_response_sha256'),
-        "context_response_file": str(run_directory/'context-response.md') if record.get('context_response_sha256') else None,
+        "context_response_file": str(verified_context_response_original_path(run_directory, record['context_response_sha256'])) if record.get('context_response_sha256') else None,
     }
     template = (skill_directory() / "prompts" / ("reviewer.md" if role == "reviewer" else "validate-fix.md")).read_text()
     if role == "reviewer":
@@ -158,7 +167,7 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
             request["previous_result_files"] = [str(path) for path in partials]
             inputs += "先前验证修复处置：" + ", ".join(str(path) for path in partials) + "；当前工作树已保留此前修复，逐条接续未完成问题。\n"
     if record.get('context_response_sha256'):
-        inputs+=f"通用补证：{run_directory/'context-response.md'}；不改变冻结需求与范围，不包含另一腿的结论。\n"
+        inputs+=f"通用补证：{request['context_response_file']}；历次通用补证原件按需读取 {run_directory/'context-response-originals-by-sha256'}，不改变冻结需求与范围，不包含另一腿的结论。\n"
     prompt = template.strip() + "\n" + inputs + f"\n结果可写入 {result_file}，或在最终回复中只输出结果 JSON。\n"
     write_bytes(attempt_directory / "prompt.md", prompt.encode())
     write_json(attempt_directory / "request.json", request)
@@ -384,10 +393,16 @@ def resume_review(run_directory: Path, *, reviewer_configs: list[dict] | None = 
         record = read_json(run_directory / "run.json")
         repo = verify_repository_identity(record)
         if context_response_file is not None:
+            verified_context_response_original_path(run_directory, record.get('context_response_sha256'))
             response=context_response_file.read_bytes()
-            write_bytes(run_directory/'context-response.md',response)
-            record['context_response_sha256']=hashlib.sha256(response).hexdigest()
+            response_sha256 = hashlib.sha256(response).hexdigest()
+            original = run_directory / 'context-response-originals-by-sha256' / f'{response_sha256}.md'
+            if not original.exists():
+                write_bytes(original, response)
+            verified_context_response_original_path(run_directory, response_sha256)
+            record['context_response_sha256']=response_sha256
             write_json(run_directory/'run.json',record)
+        verified_context_response_original_path(run_directory, record.get('context_response_sha256'))
         if hashlib.sha256((run_directory / "review-input.md").read_bytes()).hexdigest() != record["review_input_sha256"]:
             raise ValueError("固定评审输入已改变；为新输入创建快照")
         if hashlib.sha256((run_directory / "requirements.md").read_bytes()).hexdigest() != record["requirements_sha256"] or hashlib.sha256((run_directory / "task-changes.patch").read_bytes()).hexdigest() != record["patch_sha256"]:
