@@ -1,0 +1,524 @@
+{
+  "historical_product_commit": "fa7e2c6c8ccfb3c4f5c592a95fdaf89590ea0ebd",
+  "original_task_investigation_commit": "cc1ad47ced99f5a15cad3d67791b8a0d89cb95b6",
+  "task_head_after_absorption": "8634dfc114f7b26541d6a3cc27cc6f59be38090b",
+  "source_initial_commit": "fc25ab76176ad34865cbbacfe421b83577a75606",
+  "source_head_commit": "55ea63d9b218449378dd2b1f0a9167fc04287ac7",
+  "captured_source_provenance_sha256": "13bd9f598e79a32fcf676b92fa900a50a0d1579bdc305a53bba7919f50a34455",
+  "non_kanban_first_review_window_fix_in_scope": false,
+  "historical_assertions": [
+    {
+      "case": "first-review-before-prompt",
+      "candidate_path_count": 1,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": false,
+      "assertion_mode": "historical-defects",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "ordinary-prompt-before-handback",
+      "candidate_path_count": 1,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": false,
+      "assertion_mode": "historical-defects",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "manual-before-handback",
+      "candidate_path_count": 1,
+      "known_defect": false,
+      "assertion_mode": "historical-defects",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "handback-current-baseline",
+      "candidate_path_count": 0,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": true,
+      "assertion_mode": "historical-defects",
+      "assertion_purpose": "historical_defect_confirmation"
+    },
+    {
+      "case": "handback-frozen-initial-only",
+      "candidate_path_count": 0,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": true,
+      "assertion_mode": "historical-defects",
+      "assertion_purpose": "historical_defect_confirmation"
+    },
+    {
+      "case": "handback-both-overrides",
+      "candidate_path_count": 1,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": false,
+      "assertion_mode": "historical-defects",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "handback-with-available-owned-units",
+      "candidate_path_count": 0,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": true,
+      "assertion_mode": "historical-defects",
+      "assertion_purpose": "historical_defect_confirmation"
+    },
+    {
+      "case": "allocation-after-handback",
+      "candidate_unit_count": 0,
+      "known_defect": true,
+      "assertion_mode": "historical-defects",
+      "assertion_purpose": "historical_defect_confirmation"
+    },
+    {
+      "case": "handback-older-highwater",
+      "candidate_path_count": 0,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": true,
+      "assertion_mode": "historical-defects",
+      "assertion_purpose": "historical_defect_confirmation"
+    },
+    {
+      "case": "manual-after-handback",
+      "candidate_path_count": 0,
+      "known_defect": true,
+      "assertion_mode": "historical-defects",
+      "assertion_purpose": "historical_defect_confirmation"
+    },
+    {
+      "case": "base-ff-absorption",
+      "candidate_path_count": 0,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": false,
+      "assertion_mode": "historical-defects",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "detached-base-ff-absorption",
+      "candidate_path_count": 0,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": false,
+      "assertion_mode": "historical-defects",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "merge-absorption",
+      "candidate_path_count": 1,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": false,
+      "assertion_mode": "historical-defects",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "rebase-absorption",
+      "candidate_path_count": 1,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": false,
+      "assertion_mode": "historical-defects",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "on-main-before-next-prompt",
+      "candidate_path_count": 1,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": false,
+      "assertion_mode": "historical-defects",
+      "assertion_purpose": "out_of_scope_non_kanban_observation"
+    },
+    {
+      "case": "on-main-after-next-prompt",
+      "candidate_path_count": 0,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": true,
+      "assertion_mode": "historical-defects",
+      "assertion_purpose": "out_of_scope_non_kanban_observation"
+    },
+    {
+      "case": "on-main-manual-before-first-review",
+      "candidate_path_count": 0,
+      "known_defect": true,
+      "assertion_mode": "historical-defects",
+      "assertion_purpose": "out_of_scope_non_kanban_observation"
+    },
+    {
+      "case": "available-owned",
+      "candidate_path_count": 1,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": false,
+      "assertion_mode": "historical-defects",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "tracker-reviewed-owned",
+      "candidate_path_count": 0,
+      "review_state_filtered": 1,
+      "other_owner_filtered": 0,
+      "known_defect": false,
+      "assertion_mode": "historical-defects",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "reviewed-highwater-at-head",
+      "candidate_path_count": 0,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": false,
+      "assertion_mode": "historical-defects",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "strong-other-owner",
+      "candidate_path_count": 0,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 1,
+      "known_defect": false,
+      "assertion_mode": "historical-defects",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "weak-other-owner",
+      "candidate_path_count": 1,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": false,
+      "assertion_mode": "historical-defects",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "nonancestor-highwater-fallback",
+      "candidate_path_count": 1,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": false,
+      "assertion_mode": "historical-defects",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "merge-handback",
+      "candidate_path_count": 0,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": true,
+      "assertion_mode": "historical-defects",
+      "assertion_purpose": "historical_defect_confirmation"
+    },
+    {
+      "case": "squash-handback",
+      "candidate_path_count": 1,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": false,
+      "assertion_mode": "historical-defects",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "source-default",
+      "candidate_path_count": 0,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": true,
+      "assertion_mode": "historical-defects",
+      "assertion_purpose": "historical_defect_confirmation"
+    },
+    {
+      "case": "source-fixed-baseline-only",
+      "candidate_path_count": 0,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": true,
+      "assertion_mode": "historical-defects",
+      "assertion_purpose": "historical_defect_confirmation"
+    },
+    {
+      "case": "source-fixed-baseline-no-base-exclusion",
+      "candidate_path_count": 10,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": false,
+      "assertion_mode": "historical-defects",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "source-persisted-initial-still-excluded",
+      "candidate_path_count": 0,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": true,
+      "assertion_mode": "historical-defects",
+      "assertion_purpose": "historical_defect_confirmation"
+    }
+  ],
+  "fix_acceptance_assertions": [
+    {
+      "case": "first-review-before-prompt",
+      "candidate_path_count": 1,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": false,
+      "assertion_mode": "fix-acceptance",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "ordinary-prompt-before-handback",
+      "candidate_path_count": 1,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": false,
+      "assertion_mode": "fix-acceptance",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "manual-before-handback",
+      "candidate_path_count": 1,
+      "known_defect": false,
+      "assertion_mode": "fix-acceptance",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "handback-current-baseline",
+      "candidate_path_count": 1,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": true,
+      "assertion_mode": "fix-acceptance",
+      "assertion_purpose": "kanban_fix_acceptance"
+    },
+    {
+      "case": "handback-frozen-initial-only",
+      "candidate_path_count": 1,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": true,
+      "assertion_mode": "fix-acceptance",
+      "assertion_purpose": "kanban_fix_acceptance"
+    },
+    {
+      "case": "handback-both-overrides",
+      "candidate_path_count": 1,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": false,
+      "assertion_mode": "fix-acceptance",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "handback-with-available-owned-units",
+      "candidate_path_count": 1,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": true,
+      "assertion_mode": "fix-acceptance",
+      "assertion_purpose": "kanban_fix_acceptance"
+    },
+    {
+      "case": "allocation-after-handback",
+      "candidate_unit_count": 1,
+      "known_defect": true,
+      "assertion_mode": "fix-acceptance",
+      "assertion_purpose": "kanban_fix_acceptance"
+    },
+    {
+      "case": "handback-older-highwater",
+      "candidate_path_count": 1,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": true,
+      "assertion_mode": "fix-acceptance",
+      "assertion_purpose": "kanban_fix_acceptance"
+    },
+    {
+      "case": "manual-after-handback",
+      "candidate_path_count": 1,
+      "known_defect": true,
+      "assertion_mode": "fix-acceptance",
+      "assertion_purpose": "kanban_fix_acceptance"
+    },
+    {
+      "case": "base-ff-absorption",
+      "candidate_path_count": 0,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": false,
+      "assertion_mode": "fix-acceptance",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "detached-base-ff-absorption",
+      "candidate_path_count": 0,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": false,
+      "assertion_mode": "fix-acceptance",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "merge-absorption",
+      "candidate_path_count": 1,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": false,
+      "assertion_mode": "fix-acceptance",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "rebase-absorption",
+      "candidate_path_count": 1,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": false,
+      "assertion_mode": "fix-acceptance",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "on-main-before-next-prompt",
+      "candidate_path_count": 1,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": false,
+      "assertion_mode": "fix-acceptance",
+      "assertion_purpose": "out_of_scope_non_kanban_observation"
+    },
+    {
+      "case": "on-main-after-next-prompt",
+      "candidate_path_count": 0,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": true,
+      "assertion_mode": "fix-acceptance",
+      "assertion_purpose": "out_of_scope_non_kanban_observation"
+    },
+    {
+      "case": "on-main-manual-before-first-review",
+      "candidate_path_count": 0,
+      "known_defect": true,
+      "assertion_mode": "fix-acceptance",
+      "assertion_purpose": "out_of_scope_non_kanban_observation"
+    },
+    {
+      "case": "available-owned",
+      "candidate_path_count": 1,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": false,
+      "assertion_mode": "fix-acceptance",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "tracker-reviewed-owned",
+      "candidate_path_count": 0,
+      "review_state_filtered": 1,
+      "other_owner_filtered": 0,
+      "known_defect": false,
+      "assertion_mode": "fix-acceptance",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "reviewed-highwater-at-head",
+      "candidate_path_count": 0,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": false,
+      "assertion_mode": "fix-acceptance",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "strong-other-owner",
+      "candidate_path_count": 0,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 1,
+      "known_defect": false,
+      "assertion_mode": "fix-acceptance",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "weak-other-owner",
+      "candidate_path_count": 1,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": false,
+      "assertion_mode": "fix-acceptance",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "nonancestor-highwater-fallback",
+      "candidate_path_count": 1,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": false,
+      "assertion_mode": "fix-acceptance",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "merge-handback",
+      "candidate_path_count": 1,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": true,
+      "assertion_mode": "fix-acceptance",
+      "assertion_purpose": "kanban_fix_acceptance"
+    },
+    {
+      "case": "squash-handback",
+      "candidate_path_count": 1,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": false,
+      "assertion_mode": "fix-acceptance",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "source-default",
+      "candidate_path_count": 10,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": true,
+      "assertion_mode": "fix-acceptance",
+      "assertion_purpose": "kanban_fix_acceptance"
+    },
+    {
+      "case": "source-fixed-baseline-only",
+      "candidate_path_count": 10,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": true,
+      "assertion_mode": "fix-acceptance",
+      "assertion_purpose": "kanban_fix_acceptance"
+    },
+    {
+      "case": "source-fixed-baseline-no-base-exclusion",
+      "candidate_path_count": 10,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": false,
+      "assertion_mode": "fix-acceptance",
+      "assertion_purpose": "preserved_control"
+    },
+    {
+      "case": "source-persisted-initial-still-excluded",
+      "candidate_path_count": 10,
+      "review_state_filtered": 0,
+      "other_owner_filtered": 0,
+      "known_defect": true,
+      "assertion_mode": "fix-acceptance",
+      "assertion_purpose": "kanban_fix_acceptance"
+    }
+  ],
+  "final_kanban_regression_test_count": 26,
+  "related_pytest_group_passed_count": 270,
+  "legacy_targeted_runner_passed_count": 38,
+  "repaired_stop_delivery_regression_passed_count": 4,
+  "full_contract_suite_status": "failed_with_three_verified_preexisting_support_test_failures; four_introduced_stop_failures_fixed"
+}

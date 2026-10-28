@@ -15,6 +15,9 @@ from core.task_snapshot_review.github_issue_observations import collect_report, 
 from core.task_snapshot_review.persistent_artifacts import read_json, write_json
 from core.task_snapshot_review.task_snapshot import create_snapshot
 from core.task_snapshot_review.workflow import resume_review, load_reviewer_configuration
+from adapters.cline_kanban.task_review_starting_point import (
+    attach_task_review_run, record_task_review_start, resolve_task_review_starting_point,
+)
 
 
 def main(argv=None) -> int:
@@ -25,13 +28,21 @@ def main(argv=None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     review = commands.add_parser("review-task-snapshot", help="固定显式任务范围并运行独立评审")
     review.add_argument("--repo", type=Path, default=Path.cwd())
-    review.add_argument("--base-ref", required=True, help="解析一次的本地基线 ref 或 commit")
+    baseline = review.add_mutually_exclusive_group(required=True)
+    baseline.add_argument("--base-ref", help="解析一次的本地基线 ref 或 commit")
+    baseline.add_argument("--base-from-kanban-task", help="从指定 Kanban task 的已核实证据取得固定起点")
+    review.add_argument("--incremental-after-run", type=Path, help="明确选择同任务已完成 run 作为增量起点；范围扩大仍从原起点覆盖")
     review.add_argument("--scope", action="append", required=True, help="可重复的仓内相对路径；全仓范围显式使用 .")
     review.add_argument("--requirements-file", type=Path, required=True)
     review.add_argument("--run-directory", type=Path)
     review.add_argument("--prepare-only", action="store_true")
     review.add_argument("--reviewer-config", type=Path, action="append")
     review.add_argument("--reviewer-count", type=int, default=2, help="正式 reviewer 数量，至少 2；接续沿用此数量")
+    starting = commands.add_parser('record-kanban-task-review-start', help='明确保存一段实现开始前的固定起点与范围')
+    starting.add_argument('--repo', type=Path, default=Path.cwd())
+    starting.add_argument('--task-id', required=True)
+    starting.add_argument('--base-ref', required=True)
+    starting.add_argument('--scope', action='append', required=True)
     resume = commands.add_parser("resume-task-review", help="复用精确 run，接续未完成评审、修复及验证")
     resume.add_argument("--run-dir", type=Path, required=True)
     resume.add_argument("--reviewer-config", type=Path, action="append")
@@ -55,13 +66,27 @@ def main(argv=None) -> int:
             pass
     try:
         if arguments.command == "review-task-snapshot":
+            evidence = None
+            if arguments.incremental_after_run and not arguments.base_from_kanban_task:
+                parser.error('--incremental-after-run 需要 --base-from-kanban-task')
+            if arguments.base_from_kanban_task:
+                evidence = resolve_task_review_starting_point(arguments.repo, arguments.base_from_kanban_task,
+                    scope_paths=arguments.scope, incremental_after_run=arguments.incremental_after_run)
+                if evidence['status'] != 'verified':
+                    print(json.dumps(evidence, ensure_ascii=False))
+                    return 2
             run = arguments.run_directory or root / "task-snapshot-reviews" / f"task-review-{uuid.uuid4().hex}"
-            record = create_snapshot(arguments.repo, base_ref=arguments.base_ref, scope_paths=arguments.scope,
+            record = create_snapshot(arguments.repo, base_ref=evidence['base_commit'] if evidence else arguments.base_ref, scope_paths=arguments.scope,
                                      requirements=arguments.requirements_file.read_bytes(), run_directory=run,
-                                     reviewer_count=arguments.reviewer_count)
+                                     reviewer_count=arguments.reviewer_count, starting_point_evidence=evidence)
+            if evidence:
+                attach_task_review_run(arguments.repo, arguments.base_from_kanban_task, run)
             result = {"status":record["status"],"run_directory":str(run.resolve()),"reviewer_count":record["reviewer_count"]}
             if not arguments.prepare_only:
                 result = resume_review(run, reviewer_configs=[load_reviewer_configuration(path) for path in arguments.reviewer_config] if arguments.reviewer_config else None)
+        elif arguments.command == 'record-kanban-task-review-start':
+            result = record_task_review_start(arguments.repo, arguments.task_id,
+                                              base_ref=arguments.base_ref, scope_paths=arguments.scope)
         elif arguments.command == "resume-task-review":
             validations = json.loads(arguments.validation_commands.read_text()) if arguments.validation_commands else None
             result = resume_review(arguments.run_dir,
@@ -90,6 +115,8 @@ def main(argv=None) -> int:
             result = {"run_directory":str(run),"status":record["status"],"base_commit":record["base_commit"],
                       "candidate_commit":record["candidate_commit"],"attempts":attempts,"analysis_required_for_completion":False}
         print(json.dumps(result, ensure_ascii=False))
+        if result.get('status') == 'unknown':
+            return 2
         return 1 if result.get("status") in ("review_incomplete","fix_incomplete","findings_unresolved","validation_failed","candidate_changed") else 0
     except KeyboardInterrupt:
         print(json.dumps({'status':'interrupted','message':'已停止当前执行，原始进度保留；明确接续时复用原 run。'},ensure_ascii=False))

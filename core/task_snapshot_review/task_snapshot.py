@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import uuid
 from pathlib import Path, PurePosixPath
@@ -51,7 +52,7 @@ def capture_worktree_tree(repo: Path, scope_paths: list[str], artifacts: Path, *
 
 
 def create_snapshot(repo: Path, *, base_ref: str, scope_paths: list[str], requirements: bytes, run_directory: Path,
-                    reviewer_count: int = 2) -> dict:
+                    reviewer_count: int = 2, starting_point_evidence: dict | None = None) -> dict:
     if type(reviewer_count) is not int or reviewer_count < 2:
         raise ValueError("reviewer 数量必须是至少为 2 的整数")
     scope_paths = normalized_scope_paths(scope_paths)
@@ -63,6 +64,13 @@ def create_snapshot(repo: Path, *, base_ref: str, scope_paths: list[str], requir
     run_directory.mkdir(parents=True, exist_ok=False, mode=0o700)
     baseline = git_text(repo, "rev-parse", "--verify", "--end-of-options", f"{base_ref}^{{commit}}")
     original_head = git_text(repo, "rev-parse", "HEAD")
+    if starting_point_evidence is not None:
+        if (starting_point_evidence.get('status') != 'verified'
+                or starting_point_evidence.get('base_commit') != baseline
+                or starting_point_evidence.get('observed_head') != original_head
+                or starting_point_evidence.get('scope_paths') != scope_paths
+                or any(starting_point_evidence.get('binding', {}).get(key) != value for key, value in identity.items())):
+            raise ValueError('起点证据与当前任务快照不一致；重新核验来源后创建快照')
     candidate_tree = capture_worktree_tree(repo, scope_paths, run_directory, head=original_head)
     if capture_worktree_tree(repo, scope_paths, run_directory, head=original_head) != candidate_tree or git_text(repo, "rev-parse", "HEAD") != original_head:
         raise RuntimeError("快照期间任务文件或 HEAD 发生变化，请在写入稳定后重新创建快照")
@@ -87,6 +95,8 @@ def create_snapshot(repo: Path, *, base_ref: str, scope_paths: list[str], requir
         "requirements_sha256": hashlib.sha256(requirements).hexdigest(),
         "patch_sha256": hashlib.sha256(patch).hexdigest(), "status": "review_pending",
     }
+    if starting_point_evidence is not None:
+        record['starting_point_evidence'] = json.loads(json.dumps(starting_point_evidence))
     write_json(run_directory / "run.json", record)
     packet = (
         "# 固定任务评审输入\n\n"
