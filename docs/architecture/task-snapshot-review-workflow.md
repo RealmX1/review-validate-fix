@@ -2,7 +2,7 @@
 
 本文件落实 cdd62 中用户批准的「RVF 工作流解耦、Prompt 精简与 GitHub Issue 收集」计划。
 
-RVF 的流程为：固定任务快照 → 两路独立 reviewer → 来源匿名的合并 validate/fix → 主会话最终验证与提交 → 按既有授权执行 base 同步。
+RVF 的流程为：一次固定材料启动 → 两路独立 reviewer → 来源匿名的合并 validate/fix → 完整被测树最终验证 → 一次结果交回 → 主 Agent 审阅、提交并立即展示计划完成情况与 recap。base 同步按既有授权另行执行。
 
 ## 组件接口
 
@@ -10,6 +10,18 @@ RVF 的流程为：固定任务快照 → 两路独立 reviewer → 来源匿名
 - `rvf resume-task-review --run-dir <持久目录>` 接续原 run，只执行未完成部分。可附 `--fix` 执行一个合并 fixer，`--validation-commands <JSON 文件>` 执行最终验证。主会话使用普通 Git 提交；该入口也可核对已发生的提交。
 - `rvf collect-issues --report <JSON 文件>` 由主 Agent 统一收集问题。`rvf collect-issues --flush` 接续持久待补写材料。失败不阻断评审、提交或同步。
 - `rvf analyze --run-dir <目录>` 按需读取结果生成复盘材料，无自动启动、归档门禁或写源码权限。
+
+自动推进入口在 `review-task-snapshot` 同时接受 `--fix`、`--validation-commands`、`--preparation-commands`、`--machine-context-file`、`--machine-evidence-commands` 和 `--implementation-plan-file`。材料按摘要冻结到 `execution-plan.json`，后续只接续精确 run。默认最多三轮语义修复（包含首次 finding 修复），CLI 传输重试另计；预算与角色原总时限持久保存。完成 reviewer 的上下文与判断不共享，仅共享绑定完整树、cwd、命令、工具链和依赖身份的机器事实。依赖身份缺证时重新采集。
+
+`findings=[]` 的最终验证失败也会进入 validation repair；fixer request 包含原失败命令、日志和真实 `tested_commit`，补丁从该被测基线计算。隔离准备命令不能改写候选源码，其生成物不混入任务修复。安全的外部 HEAD 前移自动合并已评审任务补丁并重验；新的未评审 hunk 或不能安全合并的内容保留原件并形成具体处置。
+
+`business-result.json` 区分 `agent_review_ready`、`agent_judgment_required`、`machine_evidence_pending` 与 `cancelled`，退出码不授予业务资格。机器等待包含缺证、等价来源、证据路径、触发条件、恢复动作和有界次数。原生错误优先，文本兜底仅扫描失败进程的 stderr；正常正文的额度关键词不是额度错误。认证/额度同配置 300 秒后最多复核一次；新凭据或配置摘要允许恢复，不能无限重试。
+
+使用 `--kanban-task-id` 与 `--kanban-project-path` 将同一 run 委托给通用 `kanban task command-execution`。执行记录先冻结 incarnation、主会话、工作树、材料、恢复动作及稳定结果 ID，宿主负责等待与原生接受补证。`cancel-task-review` 先写持久撤销，再仅取消匹配启动身份的所属进程；原生共享宿主取消证据未知时保留 unknown。Stop 后不能以自动恢复再次派发。
+
+本工作流默认在 RVF 顺利完成且主 Agent 最终审阅通过后自主 commit 收尾；明确只读、不得提交等限制继续优先。`elevated` 处置必须注明 `elevation_impact: none|rollback|broad_rewrite`；普通 elevation 不单独阻止提交，后两类形成具体判断请求。主 Agent 提交后以 `--closeout-report` 保存逐项计划状态、证据与工作 recap，原 run 核实真实提交并立即输出收尾，先于任何 base-branch-sync。未提供实施证据时计划完成情况是 unknown，而非从 RVF 成功推定。
+
+Analyze 支持重复 `--run-dir`，纯读取原始 outcome 与持久 reconciliation，分别展示 raw/effective 状态及原件指针，不调用会写补证的执行状态读取器。全部 attempt 与独立 reviewer 保留，缺失版本、原生 usage 或主 Agent 往返指标保持 unknown。
 
 run 中保留需求原文、固定基线、候选 Git 对象、显式范围、实际拼装的角色 prompt、原始 stdout/stderr 和进度。后台进程由脚本或宿主等待；重启复用同一目录。一次失败最多原路重试一次，之后改用已配置的其他可用 CLI；两路未完成如实保留。
 

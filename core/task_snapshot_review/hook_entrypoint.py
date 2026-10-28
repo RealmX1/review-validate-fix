@@ -40,6 +40,9 @@ def handle_hook(event: dict, *, event_name: str, host_adapter) -> dict | None:
     identity = repository_identity(repo)
     repo = Path(identity["repo"])
     task_id = os.environ.get('KANBAN_TASK_ID') or os.environ.get('CLINE_KANBAN_TASK_ID')
+    from .active_run_observation import workspace_matches_registered_run
+    if workspace_matches_registered_run(repo, task_id):
+        return None
     if git(repo, "status", "--porcelain", "--untracked-files=all"):
         changes = git(repo, "diff", "--binary", "--full-index", "--no-ext-diff", "HEAD")
         untracked = git(repo, "ls-files", "--others", "--exclude-standard", "-z")

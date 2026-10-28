@@ -260,11 +260,11 @@ def test_explicit_process_stop_cancels_owned_roles_but_retains_restart_materials
     process.terminate()
     stdout,stderr=process.communicate(timeout=15)
     assert process.returncode==130,(stdout,stderr)
-    assert read_json(run/'run.json')['status']=='interrupted'
+    assert read_json(run/'run.json')['status']=='cancelled'
     assert all(read_json(path)['status']=='cancelled' for path in run.glob('reviewer-*/attempt-*/outcome.json'))
     assert canary(repository)==before
     config=fake_config(tmp_path)
-    assert resume_review(run,reviewer_configs=[config,config])['status']=='ready_for_validation'
+    assert resume_review(run,reviewer_configs=[config,config])['status']=='cancelled'
 
 
 def test_changed_main_worktree_blocks_only_patch_application_and_retains_fixer_result(repository, tmp_path):
@@ -458,12 +458,11 @@ def test_stopping_final_validation_reaps_its_process_before_unlocking(repository
         os.kill(child_pid, 0)
     assert not marker.exists()
     assert read_json(run / "validation.json")["status"] == "interrupted"
-    assert resume_review(run, validation_commands=[[sys.executable, "-c", "pass"]])["status"] == "ready_to_commit"
+    assert resume_review(run, validation_commands=[[sys.executable, "-c", "pass"]])["status"] == "cancelled"
     attempts = sorted((run / "final-validation").glob("attempt-*"))
-    assert len(attempts) == 2
+    assert len(attempts) == 1
     assert read_json(attempts[0] / "validation.json")["status"] == "interrupted"
     assert "interrupted-validation-marker" in (attempts[0] / "command-001" / "stdout.txt").read_text()
-    assert read_json(attempts[1] / "validation.json")["status"] == "passed"
 
 
 def test_failed_leg_fallback_starts_before_the_healthy_leg_finishes(repository, tmp_path):

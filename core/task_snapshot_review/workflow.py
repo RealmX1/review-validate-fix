@@ -8,11 +8,19 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from .persistent_artifacts import exclusive_lock, git, git_text, read_json, verify_repository_identity, write_bytes, write_json
 from .role_process_execution import launch_role, process_lock_is_held, reconcile_completed_role_attempt
 from .task_snapshot import capture_worktree_tree
+from .execution_lifecycle import (
+    ExecutionRevoked, append_stage_event, ensure_execution_not_revoked, execution_is_revoked,
+    publish_business_result, register_owned_process, revoke_execution,
+    persist_execution_revocation,
+    finish_owned_process_registration,
+)
+from .machine_evidence import collect_shared_machine_evidence, prepare_isolated_workspace
 
 
 def skill_directory() -> Path:
@@ -49,32 +57,61 @@ def default_reviewer_configurations() -> list[dict]:
 def load_reviewer_configuration(path: Path) -> dict:
     from .harness_cli_adapters import load_effective_alternative_reviewer_config
     config, _ = load_effective_alternative_reviewer_config(path)
-    return {**config,'configuration_file_path':str(path.resolve())}
+    executable_name = Path(config["command"][0]).name
+    effective_environment = dict(os.environ)
+    for name in config.get("env_unset", []):
+        effective_environment.pop(name, None)
+    effective_environment.update(config.get("env_set", {}))
+    if effective_environment.get("HOME"):
+        effective_home = Path(effective_environment["HOME"])
+    else:
+        import pwd
+        effective_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    credential_paths = {
+        "codex": [str(Path(effective_environment.get("CODEX_HOME") or effective_home / ".codex") / "auth.json")],
+        "claude": [str(Path(effective_environment.get("CLAUDE_CONFIG_DIR") or effective_home / ".claude") / ".credentials.json")],
+    }
+    return {**config, "credential_evidence_paths": config.get("credential_evidence_paths", credential_paths.get(executable_name, [])), 'configuration_file_path':str(path.resolve())}
 
 
 def persistent_configuration(config: dict) -> dict:
     frozen=dict(config)
+    credential_paths = frozen.get("credential_evidence_paths", [])
+    if not isinstance(credential_paths, list) or any(not isinstance(path, str) or "\0" in path for path in credential_paths):
+        raise ValueError("credential_evidence_paths 必须是凭据证据路径字符串列表")
+    if credential_paths:
+        observations = {}
+        for path in credential_paths:
+            try:
+                observations[path] = hashlib.sha256(Path(path).expanduser().read_bytes()).hexdigest()
+            except OSError as error:
+                observations[path] = type(error).__name__
+        frozen["credential_evidence_sha256"] = hashlib.sha256(json.dumps(observations, sort_keys=True).encode()).hexdigest()
     secrets=frozen.pop('env_set',{})
     if secrets:
         frozen['credential_environment_variable_names']=sorted(secrets)
         frozen['credential_environment_sha256']=hashlib.sha256(json.dumps(secrets,sort_keys=True).encode()).hexdigest()
+    elif frozen.get('credential_environment_variable_names'):
+        current = {name: os.environ[name] for name in frozen['credential_environment_variable_names'] if name in os.environ}
+        if len(current) == len(frozen['credential_environment_variable_names']):
+            frozen['credential_environment_sha256'] = hashlib.sha256(json.dumps(current, sort_keys=True).encode()).hexdigest()
     return frozen
 
 
 def configuration_digest(config: dict) -> str:
-    return hashlib.sha256(json.dumps(persistent_configuration(config), sort_keys=True).encode()).hexdigest()
+    executable = shutil.which(config["command"][0])
+    executable_identity = hashlib.sha256(Path(executable).read_bytes()).hexdigest() if executable else None
+    return hashlib.sha256(json.dumps({"configuration": persistent_configuration(config), "executable_sha256": executable_identity}, sort_keys=True).encode()).hexdigest()
 
 
 def _role_attempt_status(attempt: Path) -> str | None:
     reconcile_completed_role_attempt(attempt)
     outcome_file = attempt / "outcome.json"
-    if not outcome_file.exists():
-        return None
     reconciliation_file = attempt / "reconciled-native-completion.json"
     # 补证状态用于接续，原始失败记录保持不变。
     if reconciliation_file.exists():
         return read_json(reconciliation_file).get("status")
-    return read_json(outcome_file).get("status")
+    return read_json(outcome_file).get("status") if outcome_file.exists() else None
 
 
 def _role_result(role_directory: Path, *, latest: bool = False, include_incomplete: bool = False) -> dict | None:
@@ -106,10 +143,18 @@ def verified_context_response_original_path(run_directory: Path, response_sha256
 
 
 def _start_role(run_directory: Path, record: dict, role_directory: Path, role: str, configurations: list[dict], findings: list[dict], *, force_new: bool = False) -> tuple[dict | None, subprocess.Popen | None]:
+    ensure_execution_not_revoked(run_directory)
     completed = _role_result(role_directory, latest=role == "fixer")
     if completed and not force_new:
         return completed, None
     role_directory.mkdir(exist_ok=True)
+    deadline_file = role_directory / "role-deadline.json"
+    if deadline_file.exists() and read_json(deadline_file)["deadline_at"] <= time.time():
+        write_json(role_directory / "deadline-exhausted.json", {
+            "status": "incomplete", "recovery": {"category": "deadline_exhausted", "maximum_same_configuration_retries": 0},
+            "deadline_at": read_json(deadline_file)["deadline_at"], "observed_at": time.time(),
+        })
+        return None, None
     attempts = sorted(role_directory.glob("attempt-*"))
     if any(process_lock_is_held(attempt) for attempt in attempts):
         return None, None
@@ -120,12 +165,38 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
             write_json(attempt/'outcome.json',{'status':'failed','retryable':True,'error':'执行中断，原进程已经结束但结果未知；保留原始输出并补跑此腿'})
     chosen = None
     candidate_commit = record.get("validated_candidate_commit", record["candidate_commit"]) if role == "fixer" else record["candidate_commit"]
+    fix_application_base_commit = None
+    validation_failure = read_json(run_directory / "validation.json") if role == "fixer" and (run_directory / "validation.json").exists() else {}
+    if validation_failure.get("status") == "failed":
+        candidate_commit = validation_failure["tested_commit"]
     if role == "fixer":
         progress = _role_result(role_directory, latest=True, include_incomplete=True)
-        if progress:
-            candidate_commit = _snapshot_fixer_progress(run_directory, record, progress)["after"]
+        if progress and (validation_failure.get("status") != "failed" or _role_attempt_status(Path(progress["attempt_directory"])) == "incomplete"):
+            progress_intent = _snapshot_fixer_progress(run_directory, record, progress)
+            candidate_commit = progress_intent["after"]
+            if not _matches_tree(Path(record["repo"]), candidate_commit, progress_intent["paths"], run_directory):
+                fix_application_base_commit = progress_intent["before"]
     for config in configurations:
         identity = configuration_digest(config)
+        matching_configuration_attempt_outcomes = [(read_json(attempt / "request.json"), read_json(attempt / "outcome.json"))
+            for attempt in attempts if (attempt / "request.json").exists() and (attempt / "outcome.json").exists()
+            and read_json(attempt / "request.json")["configuration_digest"] == identity]
+        if any(outcome.get("recovery", {}).get("category") in {"configuration", "deterministic"}
+               for _, outcome in matching_configuration_attempt_outcomes):
+            continue
+        # 准备失败只在每次 controller 接续时复核一次，不占用模型传输重试预算。
+        if any(outcome.get("recovery", {}).get("category") == "workspace_preparation"
+               and request.get("preparation_recovery_cycle") == record.get("preparation_recovery_cycle")
+               for request, outcome in matching_configuration_attempt_outcomes):
+            continue
+        # 凭据故障预算独立于候选、机器事实和补证摘要，避免无关环境变化绕过冷却。
+        credential_failures = [outcome for _, outcome in matching_configuration_attempt_outcomes
+            if outcome.get("recovery", {}).get("category") in {"authentication", "usage_limit"}]
+        if credential_failures:
+            if len(credential_failures) >= 2 or time.time() < credential_failures[-1].get("retry_not_before", float("inf")):
+                continue
+            chosen = config
+            break
         matching = [attempt for attempt in attempts if (attempt / "request.json").exists()
                     and read_json(attempt / "request.json")["configuration_digest"] == identity
                     and (read_json(attempt / "request.json")["candidate_commit"] == candidate_commit
@@ -133,6 +204,8 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
                              and read_json(attempt / "outcome.json").get("status") == "incomplete"))
                     and read_json(attempt / "request.json").get("findings", []) == findings
                     and read_json(attempt/'request.json').get('context_response_sha256') == record.get('context_response_sha256')
+                    and read_json(attempt/'request.json').get('shared_machine_evidence_recovery_sha256') == record.get('shared_machine_evidence_recovery_sha256')
+                    and not ((attempt / "outcome.json").exists() and read_json(attempt / "outcome.json").get("recovery", {}).get("category") == "workspace_preparation")
                     and not ((attempt/'outcome.json').exists() and read_json(attempt/'outcome.json').get('status')=='cancelled')]
         if any((attempt / "outcome.json").exists() and read_json(attempt / "outcome.json").get("retryable") is False for attempt in matching):
             continue
@@ -141,6 +214,19 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
             break
     if chosen is None:
         return None, None
+    if not deadline_file.exists():
+        write_json(deadline_file, {"deadline_at": time.time() + float(chosen.get("timeout_seconds", 1800))})
+    if role == "fixer" and record.get("execution_plan_sha256"):
+        plan = read_json(run_directory / "execution-plan.json")
+        # CLI 传输失败复用同一语义轮；完成后再修复才消耗下一轮，配置变化不重置预算。
+        same_round = bool(attempts and not force_new and _role_attempt_status(attempts[-1]) in {"failed", "incomplete", None})
+        used = record.get("semantic_repair_rounds_used", 0)
+        if not same_round and used >= plan["maximum_semantic_repair_rounds"]:
+            record["repair_budget_exhausted"] = True
+            write_json(run_directory / "run.json", record)
+            return None, None
+        record["semantic_repair_rounds_used"] = used if same_round else used + 1
+        write_json(run_directory / "run.json", record)
     attempt_directory = role_directory / f"attempt-{len(attempts) + 1:03d}"
     attempt_directory.mkdir()
     workspace = attempt_directory / "workspace"
@@ -151,6 +237,14 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
         "repository": record['repo'],
         "result_file": str(result_file), "findings": findings,
         "candidate_commit": candidate_commit,
+        "fix_application_base_commit": fix_application_base_commit,
+        "run_directory": str(run_directory),
+        "validation_failure": validation_failure if validation_failure.get("status") == "failed" else None,
+        "preparation_commands": read_json(run_directory / "execution-plan.json").get("preparation_commands", []) if record.get("execution_plan_sha256") else [],
+        "semantic_repair_round": record.get("semantic_repair_rounds_used") if role == "fixer" else None,
+        "preparation_recovery_cycle": record.get("preparation_recovery_cycle"),
+        "shared_machine_evidence": record.get("shared_machine_evidence"),
+        "shared_machine_evidence_recovery_sha256": record.get("shared_machine_evidence_recovery_sha256"),
         "context_response_sha256": record.get('context_response_sha256'),
         "context_response_file": str(verified_context_response_original_path(run_directory, record['context_response_sha256'])) if record.get('context_response_sha256') else None,
     }
@@ -166,11 +260,18 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
         if partials:
             request["previous_result_files"] = [str(path) for path in partials]
             inputs += "先前验证修复处置：" + ", ".join(str(path) for path in partials) + "；当前工作树已保留此前修复，逐条接续未完成问题。\n"
+        if request["validation_failure"]:
+            inputs += f"机器验证失败（不属于 reviewer finding）：{run_directory / 'validation.json'}；当前基线为真实 tested_commit，读取失败命令与日志并修复，然后由执行器重新验证。\n"
+    if record.get("execution_plan_sha256"):
+        inputs += f"机器上下文与预登记命令：{run_directory / 'execution-plan.json'}。共享机器事实按需读取 {run_directory / 'machine-evidence'}，只适用于各证据声明的完整树和环境。\n"
     if record.get('context_response_sha256'):
         inputs+=f"通用补证：{request['context_response_file']}；历次通用补证原件按需读取 {run_directory/'context-response-originals-by-sha256'}，不改变冻结需求与范围，不包含另一腿的结论。\n"
+    remaining = max(0, read_json(deadline_file)["deadline_at"] - time.time())
+    inputs += f"角色剩余总时限约 {remaining:.0f} 秒；请在 {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(time.time() + remaining * 0.7))} 前收束审计并输出 JSON，预留原生 CLI 结束时间。到收束点仍有缺口就返回 incomplete 与已有发现，不延长或重置总时限。\n"
     prompt = template.strip() + "\n" + inputs + f"\n结果可写入 {result_file}，或在最终回复中只输出结果 JSON。\n"
     write_bytes(attempt_directory / "prompt.md", prompt.encode())
     write_json(attempt_directory / "request.json", request)
+    append_stage_event(run_directory, "role_dispatch", role=role_directory.name, attempt=str(attempt_directory), candidate_commit=candidate_commit)
     return None, launch_role(attempt_directory,environment_overrides=chosen.get('env_set',{}))
 
 
@@ -182,6 +283,7 @@ def _run_roles(run_directory: Path, record: dict, roles: list[tuple[str, str, li
             if process:
                 active[name] = process
         while active:
+            ensure_execution_not_revoked(run_directory)
             for name, process in list(active.items()):
                 try:
                     process.wait(timeout=0.05)
@@ -198,7 +300,8 @@ def _run_roles(run_directory: Path, record: dict, roles: list[tuple[str, str, li
                     _, replacement = _start_role(run_directory, record, role_directory, role_config[1], role_config[2], findings)
                     if replacement:
                         active[name] = replacement
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExecutionRevoked):
+        persist_execution_revocation(run_directory, "用户停止角色执行")
         for process in active.values():
             if process.poll() is None:
                 process.send_signal(signal.SIGTERM)
@@ -209,9 +312,11 @@ def _run_roles(run_directory: Path, record: dict, roles: list[tuple[str, str, li
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait()
-        record['status'] = 'interrupted'
+        record['status'] = 'cancelled' if execution_is_revoked(run_directory) else 'interrupted'
         write_json(run_directory / 'run.json', record)
         raise
+    if force_new and record.get("repair_budget_exhausted"):
+        return [None for _ in roles]
     return [_role_result(run_directory / name, latest=role == "fixer") for name, role, _ in roles]
 
 
@@ -248,9 +353,11 @@ def _snapshot_fixer_progress(run_directory: Path, record: dict, result: dict) ->
         intent["applied"] = False
     else:
         request = read_json(attempt_directory / "request.json")
-        before = record.get("validated_candidate_commit", record["candidate_commit"])
+        before = request.get("fix_application_base_commit") or request["candidate_commit"]
         workspace = attempt_directory / "workspace"
-        fixed_tree = capture_worktree_tree(workspace, ["."], run_directory)
+        preparation_paths_file = attempt_directory / "preparation-created-untracked-paths.json"
+        fixed_tree = capture_worktree_tree(workspace, ["."], run_directory,
+            excluded_preparation_paths=read_json(preparation_paths_file)["paths"] if preparation_paths_file.exists() else None)
         fixed_commit = git_text(repo, "commit-tree", fixed_tree, "-p", request["candidate_commit"], input_bytes=b"RVF validated fixes\n", environment={
             "GIT_AUTHOR_NAME": "RVF Fixes", "GIT_AUTHOR_EMAIL": "fixes@rvf.local",
             "GIT_COMMITTER_NAME": "RVF Fixes", "GIT_COMMITTER_EMAIL": "fixes@rvf.local"})
@@ -265,11 +372,38 @@ def _snapshot_fixer_progress(run_directory: Path, record: dict, result: dict) ->
 
 
 def _prepare_and_apply_fix(run_directory: Path, record: dict, result: dict) -> bool:
+    ensure_execution_not_revoked(run_directory)
     repo = Path(record["repo"])
     attempt_directory = Path(result["attempt_directory"])
     intent_file = attempt_directory / "fix-application.json"
     patch_file = attempt_directory / "fixer.patch"
     intent = _snapshot_fixer_progress(run_directory, record, result)
+    applied_patch_file = patch_file
+    head = git_text(repo, "rev-parse", "HEAD")
+    prior_base = record.get("candidate_base_head", record["original_head"])
+    if intent["paths"] and head != prior_base and not _matches_tree(repo, intent["after"], intent["paths"], run_directory):
+        try:
+            git(repo, "merge-base", "--is-ancestor", prior_base, head)
+            rebased = {}
+            for side in ("before", "after"):
+                tree = git_text(repo, "merge-tree", "--write-tree", f"--merge-base={prior_base}", intent[side], head).splitlines()[0]
+                rebased[side] = git_text(repo, "commit-tree", tree, "-p", head, input_bytes=b"RVF repair on advanced local HEAD\n")
+            if not any(_matches_tree(repo, rebased[side], intent["paths"], run_directory) for side in ("before", "after")):
+                raise ValueError("外部 HEAD 之外仍存在未评审的任务改动")
+            intent["original_snapshots"] = {side: intent[side] for side in ("before", "after")}
+            intent.update(rebased)
+            applied_patch_file = attempt_directory / "fixer-on-advanced-head.patch"
+            write_bytes(applied_patch_file, git(repo, "diff", "--binary", "--full-index", intent["before"], intent["after"]))
+            intent["applied_patch_file"] = str(applied_patch_file)
+            record["candidate_base_head"] = head
+        except (RuntimeError, ValueError):
+            intent["error"] = "外部 HEAD 无法与修复安全合并，保留原始补丁"
+            write_json(intent_file, intent)
+            write_json(run_directory / "fix-application.json", intent)
+            write_bytes(run_directory / "fixer.patch", patch_file.read_bytes())
+            return False
+    elif intent.get("applied_patch_file"):
+        applied_patch_file = Path(intent["applied_patch_file"])
     requires_changes = intent["requires_changes"]
     if not intent["paths"]:
         intent["applied"] = not requires_changes
@@ -278,12 +412,15 @@ def _prepare_and_apply_fix(run_directory: Path, record: dict, result: dict) -> b
     elif _matches_tree(repo, intent["after"], intent["paths"], run_directory):
         intent["applied"] = True
     elif _matches_tree(repo, intent["before"], intent["paths"], run_directory):
-        patch = patch_file.read_bytes()
+        patch = applied_patch_file.read_bytes()
         git(repo, "apply", "--check", "-", input_bytes=patch)
-        git(repo, "apply", "-", input_bytes=patch)
+        # 与撤销写入共用锁；Git 继承锁以覆盖 controller 退出后的真实副作用窗口。
+        with exclusive_lock(run_directory / "execution-revocation.lock") as application_lock:
+            ensure_execution_not_revoked(run_directory)
+            git(repo, "apply", "-", input_bytes=patch, pass_fds=(application_lock.fileno(),))
         intent["applied"] = True
     write_json(intent_file, intent)
-    write_bytes(run_directory / "fixer.patch", patch_file.read_bytes())
+    write_bytes(run_directory / "fixer.patch", applied_patch_file.read_bytes())
     write_json(run_directory / "fix-application.json", intent)
     if intent["applied"]:
         record["validated_candidate_commit"] = intent["after"]
@@ -316,47 +453,62 @@ def _validate(run_directory: Path, record: dict, commands: list[list[str]], lock
     candidate = record.get("validated_candidate_commit", record["candidate_commit"])
     scope = record.get("effective_scope_paths", record["scope_paths"])
     if not _matches_tree(repo, candidate, scope, run_directory):
-        return {"status": "candidate_changed", "returncode": None}
+        head = git_text(repo, "rev-parse", "HEAD")
+        prior_base = record.get("candidate_base_head", record["original_head"])
+        try:
+            if head == prior_base:
+                raise ValueError("HEAD 未变化，候选存在新的未评审改动")
+            merged_tree = git_text(repo, "merge-tree", "--write-tree", f"--merge-base={prior_base}", candidate, head).splitlines()[0]
+            current_tree = capture_worktree_tree(repo, scope, run_directory, head=head)
+            if git(repo, "diff", "--name-only", merged_tree, current_tree, "--", *scope):
+                raise ValueError("当前任务内容不等于已评审补丁与新 HEAD 的安全合并")
+            candidate = git_text(repo, "commit-tree", current_tree, "-p", head, input_bytes=b"RVF candidate on advanced local HEAD\n", environment={
+                "GIT_AUTHOR_NAME": "RVF Snapshot", "GIT_AUTHOR_EMAIL": "snapshot@rvf.local",
+                "GIT_COMMITTER_NAME": "RVF Snapshot", "GIT_COMMITTER_EMAIL": "snapshot@rvf.local"})
+            record.update({"validated_candidate_commit": candidate, "candidate_base_head": head})
+            git(repo, "update-ref", record["snapshot_reference"] + "-head-rebuild", candidate)
+            append_stage_event(run_directory, "external_head_rebuilt", previous_base=prior_base, tested_head=head, candidate_commit=candidate)
+        except (RuntimeError, ValueError):
+            return {"status": "candidate_changed", "returncode": None}
     # 只将任务路径叠加到当前 HEAD；范围外 WIP 不参与最终候选验证。
     head = git_text(repo, "rev-parse", "HEAD")
     tested_tree = capture_worktree_tree(repo, scope, run_directory, head=head)
     prior = run_directory / "validation.json"
-    old = read_json(prior) if prior.exists() else {}
+    # 任意登记命令的依赖与外部服务身份尚未获得证明；历史通过不授予当前执行资格。
     history_root = run_directory / "final-validation"
     history_root.mkdir(exist_ok=True)
     attempt_directory = history_root / f"attempt-{len(list(history_root.glob('attempt-*'))) + 1:03d}"
     attempt_directory.mkdir()
     validation = {"status": "running", "candidate_commit": candidate, "commands": commands, "completed_commands": 0,
                   "tested_tree": tested_tree, "tested_head": head, "attempt_directory": str(attempt_directory)}
-    previous_workspace = Path(old["workspace"]) if old.get("workspace") else None
-    if (old.get("status") in {"running", "interrupted"} and old.get("candidate_commit") == candidate
-            and old.get("tested_tree") == tested_tree and old.get("commands") == commands
-            and previous_workspace and previous_workspace.exists()
-            and not git(previous_workspace, "diff", "--name-only", old["tested_commit"])):
-        workspace = previous_workspace
-        tested_commit = old["tested_commit"]
-        validation["completed_commands"] = old.get("completed_commands", 0)
-        validation["resumed_from"] = old.get("attempt_directory")
-    else:
-        tested_commit = git_text(repo, "commit-tree", tested_tree, "-p", head,
-            input_bytes=b"RVF final validation snapshot\n", environment={
-                "GIT_AUTHOR_NAME": "RVF Validation", "GIT_AUTHOR_EMAIL": "validation@rvf.local",
-                "GIT_COMMITTER_NAME": "RVF Validation", "GIT_COMMITTER_EMAIL": "validation@rvf.local"})
-        workspace = attempt_directory / "workspace"
-        git(repo, "worktree", "add", "--detach", str(workspace), tested_commit)
+    from .execution_lifecycle import runtime_environment_identity
+    validation["runtime_environment"] = runtime_environment_identity()
+    tested_commit = git_text(repo, "commit-tree", tested_tree, "-p", head,
+        input_bytes=b"RVF final validation snapshot\n", environment={
+            "GIT_AUTHOR_NAME": "RVF Validation", "GIT_AUTHOR_EMAIL": "validation@rvf.local",
+            "GIT_COMMITTER_NAME": "RVF Validation", "GIT_COMMITTER_EMAIL": "validation@rvf.local"})
+    workspace = attempt_directory / "workspace"
+    git(repo, "worktree", "add", "--detach", str(workspace), tested_commit)
     validation.update({"workspace": str(workspace), "tested_commit": tested_commit})
+    if record.get("execution_plan_sha256"):
+        prepare_isolated_workspace(run_directory, workspace, read_json(run_directory / "execution-plan.json")["preparation_commands"], attempt_directory,
+                                   inherited_lock_descriptors=(lock_handle.fileno(),))
     def save_validation():
         write_json(attempt_directory / "validation.json", validation)
         write_json(prior, validation)
     save_validation()
     for i in range(validation["completed_commands"], len(commands)):
+        ensure_execution_not_revoked(run_directory)
         logs = attempt_directory / f"command-{i + 1:03d}"
         logs.mkdir()
         with (logs / "stdout.txt").open("wb") as stdout, (logs / "stderr.txt").open("wb") as stderr:
             process = subprocess.Popen(commands[i], cwd=workspace, stdout=stdout, stderr=stderr, pass_fds=(lock_handle.fileno(),), start_new_session=True)
+            register_owned_process(run_directory, process.pid, "final_validation", owns_process_group=True)
             try:
-                returncode = process.wait()
-            except KeyboardInterrupt:
+                from .execution_lifecycle import wait_for_owned_process
+                returncode = wait_for_owned_process(process, run_directory)
+            except (KeyboardInterrupt, ExecutionRevoked):
+                persist_execution_revocation(run_directory, "用户停止最终验证")
                 if process.poll() is None:
                     os.killpg(process.pid, signal.SIGTERM)
                     try:
@@ -384,13 +536,14 @@ def _validate(run_directory: Path, record: dict, commands: list[list[str]], lock
     return validation
 
 
-def resume_review(run_directory: Path, *, reviewer_configs: list[dict] | None = None,
+def _resume_review_iteration(run_directory: Path, *, reviewer_configs: list[dict] | None = None,
                   fix: bool = False, fixer_config: dict | None = None,
                   validation_commands: list[list[str]] | None = None,
                   context_response_file: Path | None = None) -> dict:
     run_directory = run_directory.expanduser().resolve()
     with exclusive_lock(run_directory / "workflow.lock", blocking=False) as lock_handle:
         record = read_json(run_directory / "run.json")
+        ensure_execution_not_revoked(run_directory)
         repo = verify_repository_identity(record)
         if context_response_file is not None:
             verified_context_response_original_path(run_directory, record.get('context_response_sha256'))
@@ -445,7 +598,8 @@ def resume_review(run_directory: Path, *, reviewer_configs: list[dict] | None = 
                 or prior_validation.get("status") == "failed"
                 or (prior_application.get("requires_changes") and not prior_application.get("paths") and not prior_application.get("applied"))
             ))
-            if findings and (fix or fixer_result):
+            if (findings or prior_validation.get("status") == "failed") and (fix or fixer_result):
+                needs_new_fix = needs_new_fix or bool(fixer_result and prior_validation.get("status") == "failed")
                 if not fixer_result or needs_new_fix:
                     configs = [fixer_config] if fixer_config else reviewer_configs
                     fixer_result = _run_roles(run_directory, record, [("fixer", "fixer", configs)], findings, force_new=needs_new_fix)[0]
@@ -478,7 +632,7 @@ def resume_review(run_directory: Path, *, reviewer_configs: list[dict] | None = 
                     validation = read_json(run_directory / "validation.json")
                     if validation.get("candidate_commit") != current_candidate:
                         validation = {}
-                    elif (validation.get("status") in {"running", "interrupted"}
+                    elif (validation.get("status") in {"running", "interrupted", "passed"}
                           or validation.get("tested_tree") != capture_worktree_tree(
                               repo, record.get("effective_scope_paths", record["scope_paths"]), run_directory)):
                         validation = _validate(run_directory, record, validation["commands"], lock_handle)
@@ -513,3 +667,88 @@ def resume_review(run_directory: Path, *, reviewer_configs: list[dict] | None = 
                 "finding_count": record.get("finding_count", 0), **({"commit": record["commit"]} if record.get("commit") else {}),
                 **({'next_action':next_actions[record['status']]} if record['status'] in next_actions else {}),
                 **({"recovery_condition": record["recovery_condition"]} if record.get("recovery_condition") else {})}
+
+
+def resume_review(run_directory: Path, *, reviewer_configs: list[dict] | None = None,
+                  fix: bool = False, fixer_config: dict | None = None,
+                  validation_commands: list[list[str]] | None = None,
+                  context_response_file: Path | None = None, closeout_report_file: Path | None = None) -> dict:
+    run_directory = run_directory.expanduser().resolve()
+    with exclusive_lock(run_directory / "controller.lock", blocking=False):
+        record = read_json(run_directory / "run.json")
+        if os.environ.get("KANBAN_COMMAND_EXECUTION_REVOCATION_FILE"):
+            record["command_execution_revocation_file"] = os.environ["KANBAN_COMMAND_EXECUTION_REVOCATION_FILE"]
+            write_json(run_directory / "run.json", record)
+        if execution_is_revoked(run_directory):
+            revoke_execution(run_directory, "接续时补齐已撤销执行的取消证据")
+            return publish_business_result(run_directory, {"status": "cancelled", "run_directory": str(run_directory)})
+        plan = {}
+        if record.get("execution_plan_sha256"):
+            path = run_directory / "execution-plan.json"
+            if hashlib.sha256(path.read_bytes()).hexdigest() != record["execution_plan_sha256"]:
+                raise ValueError("冻结启动材料摘要不匹配；恢复原件后接续")
+            plan = read_json(path)
+            if fix and not plan["fix"]:
+                raise ValueError("接续不能增加启动时未冻结的修复意图；请为新候选登记完整启动材料")
+            if validation_commands is not None and validation_commands != plan["validation_commands"]:
+                raise ValueError("接续不能替换已冻结的最终验证命令")
+            fix = plan["fix"]
+            validation_commands = plan["validation_commands"] or None
+        if plan.get("preparation_commands"):
+            verified_context_response_original_path(run_directory, record.get("context_response_sha256"))
+            record["preparation_recovery_cycle"] = record.get("preparation_recovery_cycle", 0) + 1
+            write_json(run_directory / "run.json", record)
+        if closeout_report_file is not None:
+            from .execution_lifecycle import record_closeout_report
+            record_closeout_report(run_directory, record, plan, closeout_report_file)
+        if reviewer_configs is not None:
+            if len(reviewer_configs) < 2:
+                raise ValueError("需要两路独立 reviewer 配置")
+            write_json(run_directory / "reviewer-configurations.json", {"configurations": [persistent_configuration(config) for config in reviewer_configs]})
+        if fixer_config is not None:
+            write_json(run_directory / "fixer-configuration.json", persistent_configuration(fixer_config))
+        elif (run_directory / "fixer-configuration.json").exists():
+            fixer_config = read_json(run_directory / "fixer-configuration.json")
+            if fixer_config.get("configuration_file_path"):
+                fixer_config = load_reviewer_configuration(Path(fixer_config["configuration_file_path"]))
+        register_owned_process(run_directory, os.getpid(), "workflow_controller")
+        try:
+            pending_reviewers = any(_role_result(run_directory / f"reviewer-{index + 1}") is None for index in range(record["reviewer_count"]))
+            shared_evidence = collect_shared_machine_evidence(run_directory, record, plan) if pending_reviewers else None
+            if shared_evidence:
+                record["shared_machine_evidence"] = shared_evidence["original"]
+                record["shared_machine_evidence_recovery_sha256"] = hashlib.sha256(json.dumps({
+                    "identity": shared_evidence["identity_sha256"], "status": shared_evidence["status"],
+                    "commands": [{key: command.get(key) for key in ("argv", "returncode", "stdout_sha256", "stderr_sha256")}
+                                 for command in shared_evidence["commands"]],
+                }, sort_keys=True).encode()).hexdigest()
+                write_json(run_directory / "run.json", record)
+            for _ in range(plan.get("maximum_semantic_repair_rounds", 0) + 2):
+                ensure_execution_not_revoked(run_directory)
+                result = _resume_review_iteration(run_directory, reviewer_configs=reviewer_configs, fix=fix,
+                    fixer_config=fixer_config, validation_commands=validation_commands, context_response_file=context_response_file)
+                append_stage_event(run_directory, "workflow_progress", status=result["status"])
+                if not plan or not fix or result["status"] not in {"validation_failed", "findings_unresolved"}:
+                    return publish_business_result(run_directory, result)
+            return publish_business_result(run_directory, result)
+        except ExecutionRevoked:
+            revoke_execution(run_directory, "所属执行已撤销")
+            return publish_business_result(run_directory, {"status": "cancelled", "run_directory": str(run_directory)})
+        except (OSError, subprocess.SubprocessError, RuntimeError) as error:
+            record = read_json(run_directory / "run.json")
+            record.update({"status": "machine_evidence_pending", "recovery": {
+                "missing_evidence": str(error), "equivalent_sources": ["registered_commands", "native_role_output"],
+                "original_evidence_paths": getattr(error, "original_evidence_paths", []),
+                "trigger": "environment_or_configuration_changed", "action": "resume_same_run", "maximum_unchanged_retries": 1,
+            }})
+            write_json(run_directory / "run.json", record)
+            return publish_business_result(run_directory, {"status": record["status"], "run_directory": str(run_directory)})
+        except KeyboardInterrupt:
+            revoke_execution(run_directory, "用户明确停止 controller")
+            record = read_json(run_directory / "run.json")
+            record["status"] = "cancelled"
+            write_json(run_directory / "run.json", record)
+            publish_business_result(run_directory, {"status": "cancelled", "run_directory": str(run_directory)})
+            raise
+        finally:
+            finish_owned_process_registration(run_directory, os.getpid(), "workflow_controller")

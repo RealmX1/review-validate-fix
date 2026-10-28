@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import fcntl
 import os
 import signal
@@ -12,6 +13,9 @@ from pathlib import Path
 
 from . import harness_cli_adapters as cli
 from .persistent_artifacts import exclusive_lock, git, git_text, read_json, write_bytes, write_json
+from .execution_lifecycle import ExecutionRevoked, ensure_execution_not_revoked, register_owned_process, wait_for_owned_process
+from .role_failure_recovery import classify_role_failure, native_invocation_facts
+from .machine_evidence import WorkspacePreparationFailed, prepare_isolated_workspace
 
 
 def process_lock_is_held(attempt_directory: Path) -> bool:
@@ -48,7 +52,8 @@ def _role_redactions(request: dict, environment: dict) -> dict:
 def _redact_role_artifacts(attempt_directory: Path, request: dict, redactions: dict) -> None:
     # 成功、失败及恢复都清理同一组原始文件，不能只脱敏 stdout。
     paths = {attempt_directory / "stdout.txt", attempt_directory / "stderr.txt",
-             attempt_directory / "result.json", Path(request["result_file"])}
+             attempt_directory / "result.json", attempt_directory / "model-invocation.json", Path(request["result_file"]),
+             *attempt_directory.glob("preparation/command-*/stdout.txt"), *attempt_directory.glob("preparation/command-*/stderr.txt")}
     for path in paths:
         if path.exists():
             original = path.read_text(errors="replace")
@@ -106,8 +111,10 @@ def validate_role_result(payload: dict, role: str, expected_findings: list[dict]
         if payload["status"] == "completed" and (len(identities) != len(set(identities)) or set(identities) != {item["finding_id"] for item in expected_findings}):
             raise ValueError("fixer 必须说明所有分配发现的处置结果")
         for item in dispositions:
-            if not isinstance(item, dict) or item.get("status") not in ("fixed", "false_positive", "unresolved", "out_of_scope") or not item.get("reason"):
+            if not isinstance(item, dict) or item.get("status") not in ("fixed", "false_positive", "unresolved", "out_of_scope", "elevated") or not item.get("reason"):
                 raise ValueError("fixer 处置状态或理由无效")
+            if item.get("status") == "elevated" and item.get("elevation_impact") not in ("none", "rollback", "broad_rewrite"):
+                raise ValueError("elevation 必须明确是否涉及回滚或大范围重写")
         new_findings = payload.get("new_findings", [])
         if not isinstance(new_findings, list):
             raise ValueError("fixer new_findings 必须是列表")
@@ -146,30 +153,36 @@ def reconcile_completed_role_attempt(attempt_directory: Path) -> None:
     result_file = attempt_directory / "result.json"
     request_file = attempt_directory / "request.json"
     stdout_file = attempt_directory / "stdout.txt"
-    if not outcome_file.exists() or not request_file.exists():
+    if not request_file.exists() or process_lock_is_held(attempt_directory):
         return
     request = read_json(request_file)
     try:
         redactions = _role_redactions(request, role_environment(request))
         _redact_role_artifacts(attempt_directory, request, redactions)
-        outcome = read_json(outcome_file)
+        outcome = read_json(outcome_file) if outcome_file.exists() else {}
         if reconciliation_file.exists() and result_file.exists():
             return
-        if outcome.get("returncode") != 0 or (outcome.get("status") == "completed" and result_file.exists()):
+        if outcome.get("status") == "cancelled" or (outcome.get("returncode") is not None and outcome["returncode"] != 0) or (outcome.get("status") == "completed" and result_file.exists()):
             return
+        if outcome.get("returncode") is None:
+            if request["config"].get("output_format", "text") == "text" or not (attempt_directory / "model-invocation.json").exists():
+                return
+            ensure_execution_not_revoked(Path(request["run_directory"]))
         if not stdout_file.exists():
             return
         payload = _validated_role_payload(request, stdout_file.read_text(errors="replace"), redactions)
         if request["role"] == "reviewer":
             workspace = Path(request["workspace"])
-            if git(workspace, "status", "--porcelain", "--untracked-files=all") or git_text(workspace, "rev-parse", "HEAD") != request["candidate_commit"]:
+            prepared = attempt_directory / "prepared-worktree-state.json"
+            prepared_status = read_json(prepared)["status_porcelain"].encode() if prepared.exists() else b""
+            if git(workspace, "status", "--porcelain", "--untracked-files=all") != prepared_status or git_text(workspace, "rev-parse", "HEAD") != request["candidate_commit"]:
                 raise ValueError("reviewer 修改了独立候选工作树；该腿不计完成")
     except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError):
         return
     write_json(attempt_directory / "result.json", payload)
     write_json(reconciliation_file, {
         "status": payload["status"], "source": "original_stdout",
-        "original_outcome": str(outcome_file), "reconciled_at": time.time(),
+        "original_outcome": str(outcome_file) if outcome_file.exists() else None, "reconciled_at": time.time(),
     })
 
 
@@ -178,6 +191,7 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
         if (attempt_directory / "outcome.json").exists():
             return
         request = read_json(attempt_directory / "request.json")
+        run_directory = Path(request["run_directory"])
         workspace = Path(request["workspace"])
         config = request["config"]
         prompt = (attempt_directory / "prompt.md").read_text()
@@ -192,18 +206,33 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
         def cancel_role(signum,frame):
             nonlocal cancellation_requested
             cancellation_requested=True
-            outcome.update({'status':'cancelled','retryable':True})
+            outcome.update({'status':'cancelled','retryable':False})
             if active_process is not None and active_process.poll() is None:
                 raise InterruptedError('已取消角色执行')
         signal.signal(signal.SIGTERM,cancel_role)
         signal.signal(signal.SIGINT,cancel_role)
         try:
+            ensure_execution_not_revoked(run_directory)
+            deadline_file = attempt_directory.parent / "role-deadline.json"
+            if not deadline_file.exists():
+                write_json(deadline_file, {"deadline_at": started_at + float(config.get("timeout_seconds", 1800))})
+            deadline_at = read_json(deadline_file)["deadline_at"]
+            if deadline_at <= time.time():
+                raise ValueError("原角色总时限已经耗尽，配置切换不重置时限")
+            register_owned_process(run_directory, os.getpid(), "role_worker", owns_process_group=True)
             if not workspace.exists():
                 git(Path(request['repository']),'worktree','add','--detach',str(workspace),request['candidate_commit'],pass_fds=(execution_lock.fileno(),))
             elif not (attempt_directory/'model-invocation.json').exists():
                 git(workspace,'reset','--hard',request['candidate_commit'],pass_fds=(execution_lock.fileno(),))
             environment = role_environment(request)
-            command, _ = cli.resolve_reviewer_model_commands(config, command, config.get("health_command"), env=environment, cwd=workspace, timeout=30)
+            prepare_isolated_workspace(run_directory, workspace, request.get("preparation_commands", []), attempt_directory, environment=environment, deadline_at=deadline_at,
+                                       inherited_lock_descriptors=(execution_lock.fileno(),))
+            prepared_status = git(workspace, "status", "--porcelain", "--untracked-files=all")
+            write_json(attempt_directory / "prepared-worktree-state.json", {"status_porcelain": prepared_status.decode()})
+            remaining_seconds = deadline_at - time.time()
+            if remaining_seconds <= 0:
+                raise ValueError("准备环境后原角色总时限已经耗尽")
+            command, _ = cli.resolve_reviewer_model_commands(config, command, config.get("health_command"), env=environment, cwd=workspace, timeout=min(30, remaining_seconds))
             command = cli.normalise_reviewer_command_for_output_format(command, output_format=output_format)
             if config.get("run_directory_grant_flag"):
                 command = cli.ensure_run_directory_grant_argument(command, attempt_directory, grant_flag=config["run_directory_grant_flag"])
@@ -214,16 +243,37 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
             write_bytes(attempt_directory / "stdin.txt", stdin_text.encode())
             if cancellation_requested:
                 raise InterruptedError('已在派发模型前取消')
-            write_json(attempt_directory/'model-invocation.json',{'started_at':time.time()})
+            remaining_seconds = read_json(deadline_file)["deadline_at"] - time.time()
+            if remaining_seconds <= 0:
+                outcome["recovery"] = {"category": "deadline_exhausted", "maximum_same_configuration_retries": 0}
+                raise ValueError("原角色总时限已经耗尽，配置切换不重置时限")
+            import shutil
+            executable = shutil.which(command[0])
+            cli_version = None
+            if executable and Path(executable).name in {"codex", "claude", "kimi", "cursor-agent", "agent", "omp", "python", "python3"}:
+                try:
+                    version = subprocess.run([executable, "--version"], capture_output=True, text=True, env=environment, timeout=min(3, remaining_seconds))
+                    if version.returncode == 0:
+                        cli_version = (version.stdout or version.stderr).strip()[:4096]
+                except (OSError, subprocess.SubprocessError):
+                    pass
+            remaining_seconds = read_json(deadline_file)["deadline_at"] - time.time()
+            if remaining_seconds <= 0:
+                raise ValueError("CLI 版本核验后原角色总时限已经耗尽")
+            write_json(attempt_directory/'model-invocation.json',{'started_at':time.time(), "command": command,
+                       "cli_version": cli_version, "cli_executable": executable,
+                       "cli_executable_sha256": hashlib.sha256(Path(executable).read_bytes()).hexdigest() if executable else None,
+                       "output_format": output_format, "deadline_at": read_json(deadline_file)["deadline_at"]})
             with (attempt_directory / "stdin.txt").open("rb") as stdin, (attempt_directory / "stdout.txt").open("wb") as stdout, (attempt_directory / "stderr.txt").open("wb") as stderr:
                 # harness 继承同一把锁；worker 意外退出时，恢复方先等待真实子进程结束。
                 process = subprocess.Popen(command, stdin=stdin, stdout=stdout, stderr=stderr, cwd=workspace,
                                            env=environment, start_new_session=True, pass_fds=(execution_lock.fileno(),))
                 active_process=process
+                register_owned_process(run_directory, process.pid, "role_cli", owns_process_group=True)
                 if cancellation_requested:
                     cancel_role(signal.SIGTERM,None)
                 try:
-                    returncode = process.wait(timeout=float(config.get("timeout_seconds", 1800)))
+                    returncode = wait_for_owned_process(process, run_directory, timeout=remaining_seconds)
                 except subprocess.TimeoutExpired:
                     os.killpg(process.pid, signal.SIGTERM)
                     try:
@@ -235,18 +285,35 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
             raw_output = (attempt_directory / "stdout.txt").read_text(errors="replace")
             raw_error = (attempt_directory / "stderr.txt").read_text(errors="replace")
             outcome["returncode"] = returncode
+            failure = classify_role_failure(raw_output, raw_error, returncode, output_format)
+            if output_format != "text":
+                outcome.update(native_invocation_facts(raw_output))
+            if failure:
+                outcome["recovery"] = failure
+                outcome["retryable"] = failure["category"] == "transient"
+                outcome["retry_not_before"] = time.time() + failure["retry_not_before_seconds"]
+                raise ValueError(f"角色故障分类：{failure['category']}；原生事实与错误通道已保留")
             if returncode:
-                outcome["retryable"] = not bool(cli.looks_like_usage_limit(raw_output + raw_error))
+                outcome["retryable"] = True
                 raise ValueError(f"角色进程退出码 {returncode}；参见原始 stdout/stderr")
             payload = _validated_role_payload(request, raw_output, _role_redactions(request, environment))
-            if request["role"] == "reviewer" and (git(workspace, "status", "--porcelain", "--untracked-files=all") or git_text(workspace,"rev-parse","HEAD") != request["candidate_commit"]):
+            if request["role"] == "reviewer" and (git(workspace, "status", "--porcelain", "--untracked-files=all") != prepared_status or git_text(workspace,"rev-parse","HEAD") != request["candidate_commit"]):
                 raise ValueError("reviewer 修改了独立候选工作树；该腿不计完成")
             write_json(attempt_directory / "result.json", payload)
             outcome.update({"status": payload["status"], "result_file": str(attempt_directory / "result.json")})
             if payload['status']=='incomplete':
                 outcome['retryable']=False
         except Exception as error:
+            if isinstance(error, WorkspacePreparationFailed):
+                outcome.update({"retryable": True, "retry_not_before": time.time() + 30,
+                    "recovery": {"category": "workspace_preparation", "action": "recheck_registered_preparation",
+                                 "original_evidence_paths": error.original_evidence_paths,
+                                 "maximum_unchanged_retries": 1}})
+            if isinstance(error, (ExecutionRevoked, InterruptedError)):
+                outcome.update({"status": "cancelled", "retryable": False, "native_cancellation_status": "unknown"})
             outcome["error"] = str(error)
+            if not cancellation_requested and (attempt_directory.parent / "role-deadline.json").exists() and read_json(attempt_directory.parent / "role-deadline.json")["deadline_at"] <= time.time():
+                outcome.update({"recovery": {"category": "deadline_exhausted", "maximum_same_configuration_retries": 0}, "retryable": False})
             outcome.setdefault("retryable", False)
         finally:
             if active_process is not None and active_process.poll() is None:
@@ -264,7 +331,7 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
             if "error" in outcome:
                 outcome["error"] = cli.redact_configured_environment_variable_values(outcome["error"], redactions)
             outcome["finished_at"] = time.time()
-            write_json(attempt_directory / "outcome.json", outcome)
+            write_json(attempt_directory / "outcome.json", cli.redact_configured_environment_variable_values_in_json_value(outcome, redactions))
 
 
 def launch_role(attempt_directory: Path, *, environment_overrides: dict | None = None) -> subprocess.Popen:

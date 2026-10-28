@@ -35,7 +35,10 @@ def role_repository(tmp_path):
 
 def _request(attempt, repo, program, *, role="reviewer", output_format="text", env=None):
     attempt.mkdir()
+    run_directory = attempt / "execution-lifecycle"
+    write_json(run_directory / "run.json", {"status": "review_pending"})
     request = {
+        "run_directory": str(run_directory),
         "role": role,
         "repository": str(repo),
         "workspace": str(attempt / "workspace"),
@@ -65,6 +68,19 @@ def _assert_no_secret(directory):
     for path in directory.rglob("*"):
         if path.is_file() and "workspace" not in path.relative_to(directory).parts:
             assert SECRET.encode() not in path.read_bytes(), str(path)
+
+
+def test_finished_native_output_survives_missing_worker_outcome_without_invented_exit_code(role_repository, tmp_path):
+    attempt = tmp_path / "native-completed-before-worker-crash"
+    request = _request(attempt, role_repository, "pass", output_format="codex_json")
+    git(role_repository, "worktree", "add", "--detach", request["workspace"], request["candidate_commit"])
+    write_json(attempt / "model-invocation.json", {"output_format": "codex_json"})
+    payload = {"status": "completed", "audit_summary": "原生回合正常结束，候选未改变", "findings": []}
+    (attempt / "stdout.txt").write_text(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(payload)}}) + "\n" + json.dumps({"type": "turn.completed", "usage": {"input_tokens": 2, "output_tokens": 1}}))
+    reconcile_completed_role_attempt(attempt)
+    assert read_json(attempt / "reconciled-native-completion.json")["status"] == "completed"
+    assert not (attempt / "outcome.json").exists()
+    assert read_json(attempt / "result.json") == payload
 
 
 @pytest.mark.parametrize("source", ["file", "stdout", "structured-stream"])

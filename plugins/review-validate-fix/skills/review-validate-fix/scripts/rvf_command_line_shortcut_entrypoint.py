@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import signal
 import sys
 import uuid
@@ -15,13 +16,18 @@ from core.task_snapshot_review.github_issue_observations import collect_report, 
 from core.task_snapshot_review.persistent_artifacts import read_json, write_json
 from core.task_snapshot_review.task_snapshot import create_snapshot
 from core.task_snapshot_review.workflow import resume_review, load_reviewer_configuration
+from core.task_snapshot_review.execution_lifecycle import revoke_execution, persist_execution_revocation
+from core.task_snapshot_review.trajectory_analysis import analyze_runs
 from adapters.cline_kanban.task_review_starting_point import (
     attach_task_review_run, record_task_review_start, resolve_task_review_starting_point,
 )
 
 
 def main(argv=None) -> int:
+    active_run_directory = None
     def interrupted(signum,frame):
+        if active_run_directory is not None:
+            persist_execution_revocation(active_run_directory, "用户明确停止 CLI")
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM,interrupted)
     parser = argparse.ArgumentParser(description=__doc__)
@@ -38,6 +44,17 @@ def main(argv=None) -> int:
     review.add_argument("--prepare-only", action="store_true")
     review.add_argument("--reviewer-config", type=Path, action="append")
     review.add_argument("--reviewer-count", type=int, default=2, help="正式 reviewer 数量，至少 2；接续沿用此数量")
+    review.add_argument("--fix", action="store_true", help="授权自动验证并修复任务关联问题")
+    review.add_argument("--fixer-config", type=Path)
+    review.add_argument("--validation-commands", type=Path, help="冻结最终验证 argv 数组列表 JSON")
+    review.add_argument("--preparation-commands", type=Path, help="冻结隔离工作树准备 argv 数组列表 JSON")
+    review.add_argument("--machine-evidence-commands", type=Path, help="冻结共享机器事实采集 argv 数组列表 JSON")
+    review.add_argument("--machine-context-file", type=Path, help="冻结机器上下文 JSON")
+    review.add_argument("--implementation-plan-file", type=Path, help="冻结计划实施条目字符串列表 JSON")
+    review.add_argument("--maximum-semantic-repair-rounds", type=int, default=3)
+    review.add_argument("--kanban-task-id", help="使用 Kanban 通用所属执行托管本 run")
+    review.add_argument("--kanban-project-path", type=Path)
+    review.add_argument("--kanban-cli", type=Path)
     starting = commands.add_parser('record-kanban-task-review-start', help='明确保存一段实现开始前的固定起点与范围')
     starting.add_argument('--repo', type=Path, default=Path.cwd())
     starting.add_argument('--task-id', required=True)
@@ -50,13 +67,17 @@ def main(argv=None) -> int:
     resume.add_argument("--fixer-config", type=Path)
     resume.add_argument("--validation-commands", type=Path, help="最终验证 argv 数组列表 JSON")
     resume.add_argument('--context-response-file',type=Path,help='为缺失腿补充通用机器证据，保持两路独立')
+    resume.add_argument('--closeout-report', type=Path, help='主 Agent 最终审阅的计划实施、recap 与遗留事项 JSON')
+    cancel = commands.add_parser("cancel-task-review", help="先持久撤销，再取消身份匹配的所属进程")
+    cancel.add_argument("--run-dir", type=Path, required=True)
+    cancel.add_argument("--reason", default="用户明确取消")
     collect = commands.add_parser("collect-issues", help="主 Agent 统一收集问题；不可达时持久保留")
     collect.add_argument("--report", type=Path)
     collect.add_argument("--repo", type=Path, default=Path.cwd())
     collect.add_argument("--flush", action="store_true")
     collect.add_argument("--list-repository", help="匹配旧人工 Issue 前读取开放与关闭问题")
     analyze = commands.add_parser("analyze", help="按需汇总原始运行事实，不产生完成门禁")
-    analyze.add_argument("--run-dir", type=Path, required=True)
+    analyze.add_argument("--run-dir", type=Path, required=True, action="append")
     arguments = parser.parse_args(argv)
     root = resolved_rvf_user_local_data_paths().user_local_data_root
     if arguments.command in ('review-task-snapshot','resume-task-review'):
@@ -78,21 +99,60 @@ def main(argv=None) -> int:
             run = arguments.run_directory or root / "task-snapshot-reviews" / f"task-review-{uuid.uuid4().hex}"
             record = create_snapshot(arguments.repo, base_ref=evidence['base_commit'] if evidence else arguments.base_ref, scope_paths=arguments.scope,
                                      requirements=arguments.requirements_file.read_bytes(), run_directory=run,
-                                     reviewer_count=arguments.reviewer_count, starting_point_evidence=evidence)
+                                     reviewer_count=arguments.reviewer_count, starting_point_evidence=evidence,
+                                     execution_plan={"fix": arguments.fix,
+                                         "validation_commands": json.loads(arguments.validation_commands.read_text()) if arguments.validation_commands else [],
+                                         "preparation_commands": json.loads(arguments.preparation_commands.read_text()) if arguments.preparation_commands else [],
+                                         "machine_evidence_commands": json.loads(arguments.machine_evidence_commands.read_text()) if arguments.machine_evidence_commands else [],
+                                         "maximum_semantic_repair_rounds": arguments.maximum_semantic_repair_rounds,
+                                         **({"machine_context": json.loads(arguments.machine_context_file.read_text())} if arguments.machine_context_file else {}),
+                                         **({"implementation_plan": json.loads(arguments.implementation_plan_file.read_text())} if arguments.implementation_plan_file else {})})
             if evidence:
                 attach_task_review_run(arguments.repo, arguments.base_from_kanban_task, run)
             result = {"status":record["status"],"run_directory":str(run.resolve()),"reviewer_count":record["reviewer_count"]}
-            if not arguments.prepare_only:
-                result = resume_review(run, reviewer_configs=[load_reviewer_configuration(path) for path in arguments.reviewer_config] if arguments.reviewer_config else None)
+            active_run_directory = run.resolve()
+            reviewer_configs = [load_reviewer_configuration(path) for path in arguments.reviewer_config] if arguments.reviewer_config else None
+            if reviewer_configs:
+                from core.task_snapshot_review.workflow import persistent_configuration
+                write_json(run / "reviewer-configurations.json", {"configurations": [persistent_configuration(config) for config in reviewer_configs]})
+            fixer_config = load_reviewer_configuration(arguments.fixer_config) if arguments.fixer_config else None
+            if fixer_config:
+                from core.task_snapshot_review.workflow import persistent_configuration
+                write_json(run / "fixer-configuration.json", persistent_configuration(fixer_config))
+            if arguments.kanban_task_id and not arguments.prepare_only:
+                from adapters.cline_kanban.owned_command_execution import start_managed_review
+                result = start_managed_review(run.resolve(), arguments.kanban_task_id,
+                    project_path=arguments.kanban_project_path, kanban_cli=arguments.kanban_cli, entrypoint=Path(__file__).resolve())
+            elif not arguments.prepare_only:
+                result = resume_review(run, reviewer_configs=reviewer_configs, fixer_config=fixer_config)
         elif arguments.command == 'record-kanban-task-review-start':
             result = record_task_review_start(arguments.repo, arguments.task_id,
                                               base_ref=arguments.base_ref, scope_paths=arguments.scope)
         elif arguments.command == "resume-task-review":
+            active_run_directory = arguments.run_dir.expanduser().resolve()
+            binding_file = active_run_directory / "kanban-command-execution-binding.json"
+            receipt_file = active_run_directory / "kanban-command-execution-start-receipt.json"
+            if binding_file.exists() and not os.environ.get("KANBAN_COMMAND_EXECUTION_ID") and not arguments.closeout_report:
+                receipt = read_json(receipt_file) if receipt_file.exists() else {}
+                try:
+                    accepted = receipt.get("returncode") == 0 and json.loads(receipt.get("stdout", "{}")).get("ok") is True
+                except ValueError:
+                    accepted = False
+                if not accepted:
+                    from adapters.cline_kanban.owned_command_execution import start_managed_review
+                    binding = read_json(binding_file)
+                    result = start_managed_review(active_run_directory, binding["task_id"], project_path=Path(binding["project_path"]),
+                        kanban_cli=Path(binding["kanban_cli"]) if binding["kanban_cli"] else None, entrypoint=Path(__file__).resolve())
+                    print(json.dumps(result, ensure_ascii=False))
+                    return 0
             validations = json.loads(arguments.validation_commands.read_text()) if arguments.validation_commands else None
             result = resume_review(arguments.run_dir,
                                    reviewer_configs=[load_reviewer_configuration(path) for path in arguments.reviewer_config] if arguments.reviewer_config else None,
                                    fix=arguments.fix, fixer_config=load_reviewer_configuration(arguments.fixer_config) if arguments.fixer_config else None,
-                                   validation_commands=validations,context_response_file=arguments.context_response_file)
+                                   validation_commands=validations,context_response_file=arguments.context_response_file,
+                                   closeout_report_file=arguments.closeout_report)
+        elif arguments.command == "cancel-task-review":
+            result = revoke_execution(arguments.run_dir.expanduser().resolve(), arguments.reason)
         elif arguments.command == "collect-issues":
             if arguments.list_repository:
                 issues = list_repository_issues(arguments.list_repository)
@@ -109,17 +169,13 @@ def main(argv=None) -> int:
             else:
                 parser.error("collect-issues 需要 --report、--flush 或 --list-repository")
         else:
-            run = arguments.run_dir.resolve()
-            record = read_json(run / "run.json")
-            attempts = [{"role":path.parent.parent.name, "attempt":path.parent.name, **read_json(path)} for path in sorted(run.glob("*/attempt-*/outcome.json"))]
-            result = {"run_directory":str(run),"status":record["status"],"base_commit":record["base_commit"],
-                      "candidate_commit":record["candidate_commit"],"attempts":attempts,"analysis_required_for_completion":False}
+            result = analyze_runs(arguments.run_dir)
         print(json.dumps(result, ensure_ascii=False))
         if result.get('status') == 'unknown':
             return 2
         return 1 if result.get("status") in ("review_incomplete","fix_incomplete","findings_unresolved","validation_failed","candidate_changed") else 0
     except KeyboardInterrupt:
-        print(json.dumps({'status':'interrupted','message':'已停止当前执行，原始进度保留；明确接续时复用原 run。'},ensure_ascii=False))
+        print(json.dumps({'status':'cancelled','disposition':'cancelled','message':'已持久撤销当前执行，原始进度保留；重启不会重新派发已撤销工作。'},ensure_ascii=False))
         return 130
     except (OSError, ValueError, RuntimeError, KeyError) as error:
         print(json.dumps({"status":"error","message":str(error)}, ensure_ascii=False), file=sys.stderr)

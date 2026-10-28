@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
+import signal
 import subprocess
 import sys
 import time
@@ -9,7 +11,7 @@ import time
 import pytest
 
 from test_task_snapshot_review_workflow import ROOT, canary, fake_config, plain_reviewer_config, prepare, repository
-from core.task_snapshot_review.persistent_artifacts import git, git_text, read_json, write_json
+from core.task_snapshot_review.persistent_artifacts import exclusive_lock, git, git_text, read_json, write_json
 from core.task_snapshot_review.task_snapshot import create_snapshot
 from core.task_snapshot_review.workflow import default_reviewer_configurations, resume_review
 
@@ -147,15 +149,15 @@ def test_cancellation_during_initial_three_reviewer_dispatch_reaps_started_worke
         if process.poll() is None:
             process.kill()
             process.communicate()
-    assert read_json(run / 'run.json')['status'] == 'interrupted'
+    assert read_json(run / 'run.json')['status'] == 'cancelled'
     outcome = read_json(run / 'reviewer-1/attempt-001/outcome.json')
     assert outcome['status'] == 'cancelled'
     assert not finished.exists()
     config = plain_reviewer_config(tmp_path)
-    assert resume_review(run, reviewer_configs=[config, config])['status'] == 'ready_for_validation'
+    assert resume_review(run, reviewer_configs=[config, config])['status'] == 'cancelled'
 
 
-def test_interrupted_validation_reuses_build_outputs_and_only_runs_remaining_commands(repository, tmp_path):
+def test_interrupted_validation_rechecks_build_without_dependency_identity_proof(repository, tmp_path):
     run = dependency_task(repository, tmp_path)
     counter = tmp_path / 'build-invocations'
     started = tmp_path / 'validation-started'
@@ -176,17 +178,34 @@ def test_interrupted_validation_reuses_build_outputs_and_only_runs_remaining_com
         while not started.exists():
             assert time.monotonic() < deadline
             time.sleep(0.02)
-        process.terminate()
+        # 模拟机器退出：先终止 controller，再结束其独立验证进程；这不是用户 Stop。
+        process.kill()
         stdout, stderr = process.communicate(timeout=15)
-        assert process.returncode == 130, (stdout, stderr)
+        assert process.returncode == -9, (stdout, stderr)
     finally:
         if process.poll() is None:
             process.kill()
             process.communicate()
     before = read_json(run / 'validation.json')
-    assert before['status'] == 'interrupted'
+    assert before['status'] == 'running'
+    owned = read_json(run / 'owned-processes.json')['processes']
+    for child in owned:
+        if child['purpose'] == 'final_validation':
+            try:
+                os.killpg(child['pid'], signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            with exclusive_lock(run / 'workflow.lock', blocking=False):
+                break
+        except RuntimeError:
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
     assert before['completed_commands'] == 1
     proceed.touch()
     assert resume_review(run)['status'] == 'ready_to_commit'
-    assert counter.read_text() == 'x'
+    assert counter.read_text() == 'xx'
     assert read_json(run / 'validation.json')['completed_commands'] == 2
+    assert read_json(Path(before['attempt_directory']) / 'validation.json')['status'] == 'running'
