@@ -7,8 +7,10 @@ description: 用户明确调用 RVF，或主会话依据任务授权选择执行
 
 固定任务快照 → 两路独立 reviewer → 匿名合并 validate/fix → 主会话最终验证与提交 → 已授权的 base 同步。保留 SANTA-method 与角色独立上下文；默认一个 fixer 处理全部相关发现。
 
-1. 核对任务需求、有效授权和实际 Git 工作树。选择固定基线及明确任务路径，背景 WIP 保持原样。将用户原话和必要实现说明保存为一份持久需求文件。
+1. 核对任务需求、有效授权和实际 Git 工作树。选择固定基线及明确任务路径，背景 WIP 保持原样。将用户原话和必要实现说明保存为一份持久需求文件。Kanban 新的一段实现开始前，可用 `rvf record-kanban-task-review-start --repo <工作树> --task-id <task-id> --base-ref <实现前固定 SHA> --scope <路径> ...` 明确保存起点；prompt、换会话和吸收 base 都不会推进它。未记录时仅使用可证明的任务创建/checkpoint 起点，不猜 live main。
 2. `rvf review-task-snapshot --repo <工作树> --base-ref <基线> --scope <相对路径> ... --requirements-file <文件>`。工具保存精确 run 目录、原始输入与输出，默认两路独立进程；用 `--reviewer-count <数量>` 指定更多 reviewer，`--reviewer-config <JSON>` 指定 CLI。所有分配的 reviewer 都必须实际完成，缺腿和格式异常如实保留。接续沿用原数量，不另建 run 补一条腿。
+
+   Kanban 可用 `--base-from-kanban-task <task-id>` 替代 `--base-ref`，仍明确提供范围和需求。未知来源返回 `unknown` 与持久恢复条件，不解释为无候选。新一轮默认保留原起点；只有明确使用 `--incremental-after-run <同任务已完成目录>` 才选择增量起点，范围扩大则从原起点重新覆盖。已有 run 始终按精确目录接续。路径内使用完整净 diff，包括同路径外部上下文，不声称 session/hunk 所有权。
 3. 使用回执中的精确目录执行 `rvf resume-task-review --run-dir <目录> --fix`。先读结果，必要时主会话归并同根因发现；默认 fixer 只收到匿名 findings 和需求。在隔离工作树验证后生成补丁，主工作树有并发变化时保留补丁并接续合并。
 4. 最终验证命令写成 JSON argv 数组列表，执行 `rvf resume-task-review --run-dir <目录> --validation-commands <文件>`。真实失败须解决。确认实际改动与结果后，主会话使用普通 Git 精确暂存并提交，再接续原 run 核对已发生的提交；不 rewind、不另起 land 会话。base 同步仅按既有授权执行，由同步工具自行保全 WIP 和核对 Git 状态。
 5. 主 Agent 统一收集 reviewers、fixer 与自己发现的有价值问题。用 `rvf collect-issues --list-repository <owner/repo>` 查询开放和关闭问题，语义匹配后沿用稳定 `problem_key` 或指定已有 `issue_number`，新发现用稳定的 `observation_id`。准备报告后 `rvf collect-issues --report <JSON>`；格式按需读 `references/github-issue-observation-report.md`。写入失败保留持久材料，恢复后 `rvf collect-issues --flush`，不阻断提交或同步。

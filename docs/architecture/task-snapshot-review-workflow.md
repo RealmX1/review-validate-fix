@@ -27,6 +27,28 @@ Validate-Fixer 返回 `incomplete` 仍保留新发现、处置、隔离修复快
 
 Cline Kanban 只提供通用任务、会话、进程等待及恢复。不消费 RVF 的分界、token、阶段资格、rewind、自动 land 或收尾再投递。旧历史仍是历史，不迁移成新流程成功事实。
 
+## Kanban 固定起点与已提交工作发现
+
+`--base-from-kanban-task <task-id>` 与 `--base-ref` 二选一，`--scope` 和需求文件保持必填。
+Kanban 适配层核对 task 创建身份、provenance incarnation、真实 worktree、Git common-dir 和目录实体，
+优先沿用保存的精确 run/实现起点；未记录时仅接受创建 provenance 或首轮 checkpoint 与 Git 创建记录的等价证明。
+core 只接收统一的起点证据并随 `run.json` 冻结，不读取 `~/.cline`。
+
+开始一段新实现时，用 `record-kanban-task-review-start --task-id <id> --repo <工作树> --base-ref <实现前 SHA> --scope <路径>` 明确记录。
+普通 prompt、换 session、提交进入 main 或 base 前移都不会推进起点。
+`--incremental-after-run <目录>` 必须显式选择同任务、已完成且完整树验证可核对的新版 run；其范围不能盖住新路径，扩大时回到原起点。
+旧 tracker、unit、封窗或 session 归属不构成新的覆盖。
+
+任务提交发现使用 Kanban 已观察提交与当前 worktree Git 提交记录，历史改写只接受唯一的一对一 patch-id。
+纯 base 同步不能因此变成任务自有提交。这里的归属仅用于发现；评审仍使用显式路径完整净 diff，包含同路径外部 hunk 作为上下文。
+净 diff 为零（包括已 revert）不触发决策。
+
+Stop 对有证据的 clean committed 改动提出一次发起决策，提交已进入 base 也不消失；同任务同观察跨会话去重。
+当前范围已由关联的新版 run 完成且内容一致时不重复提醒。不会因此启动 reviewer/fixer。
+unknown、损坏状态和补证诊断只持久保存，不驱动 Agent。每个来源观察只核验一次，来源变化或下一次有身份的真实 prompt 可重验；
+起点文件损坏时尝试从独立持久解析记录恢复，同时保留损坏原件和每次补证结果。来源恢复后无需新增人工审批。
+缺证不妨碍独立 dirty 工作走既有入口。运行材料在 RVF 用户数据目录内；`RVF_CLINE_KANBAN_STATE_DIRECTORY` 可指定隔离的 Kanban 状态目录。
+
 base-branch-sync 根据实际 Git 状态、任务授权和必要验证保全 WIP、吸收 base 与交回提交，不读取 RVF 内部 schema、缓存、run 资格或封窗记录。同步后若产生实质新增行为，按实际风险验证；历史评审事实不被改写。
 
 ## 问题收集

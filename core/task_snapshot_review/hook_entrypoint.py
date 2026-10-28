@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 from pathlib import Path
 
 from core.rvf_user_local_data_paths import resolved_rvf_user_local_data_paths
@@ -13,6 +14,7 @@ from core.stop_hook_output_audience import (
     STOP_HOOK_OUTPUT_AUDIENCE_AGENT_MUST_ACT_NOW,
 )
 from .persistent_artifacts import exclusive_lock, git, git_text, read_json, repository_identity, write_json
+from adapters.cline_kanban.task_review_starting_point import resolve_task_review_starting_point
 
 
 def handle_hook(event: dict, *, event_name: str, host_adapter) -> dict | None:
@@ -20,6 +22,13 @@ def handle_hook(event: dict, *, event_name: str, host_adapter) -> dict | None:
         return None
     if event_name == "UserPromptSubmit":
         prompt = event.get("prompt", "")
+        task_id = os.environ.get('KANBAN_TASK_ID') or os.environ.get('CLINE_KANBAN_TASK_ID')
+        if task_id and isinstance(prompt, str) and prompt.strip():
+            try:
+                resolve_task_review_starting_point(Path(event.get('cwd') or os.getcwd()), task_id, event=event)
+            except Exception as error:
+                # 当前用户的显式入口独立于机器补证；诊断只进入开发者 stderr。
+                print(f'RVF hook 补证诊断：{type(error).__name__}: {error}', file=sys.stderr)
         if not isinstance(prompt, str) or not re.match(r"^\s*(?:\$|/|:)review-validate-fix(?:\s|$)", prompt):
             return None
         return host_adapter.user_prompt_context_payload(
@@ -30,17 +39,22 @@ def handle_hook(event: dict, *, event_name: str, host_adapter) -> dict | None:
     repo = Path(event.get("cwd") or os.getcwd())
     identity = repository_identity(repo)
     repo = Path(identity["repo"])
-    if not git(repo, "status", "--porcelain", "--untracked-files=all"):
-        return None
-    changes = git(repo, "diff", "--binary", "--full-index", "--no-ext-diff", "HEAD")
-    untracked = git(repo, "ls-files", "--others", "--exclude-standard", "-z")
-    for value in untracked.decode().split("\0"):
-        if value:
-            path = repo / value
-            changes += value.encode() + b"\0" + (os.readlink(path).encode() if path.is_symlink() else path.read_bytes())
-    fingerprint = hashlib.sha256(git(repo, "rev-parse", "HEAD") + changes).hexdigest()
-    session = str(event.get("session_id") or event.get("sessionId") or os.environ.get("KANBAN_TASK_ID"))
-    key = hashlib.sha256((identity["git_directory"] + "\0" + session).encode()).hexdigest()
+    task_id = os.environ.get('KANBAN_TASK_ID') or os.environ.get('CLINE_KANBAN_TASK_ID')
+    if git(repo, "status", "--porcelain", "--untracked-files=all"):
+        changes = git(repo, "diff", "--binary", "--full-index", "--no-ext-diff", "HEAD")
+        untracked = git(repo, "ls-files", "--others", "--exclude-standard", "-z")
+        for value in untracked.decode().split("\0"):
+            if value:
+                path = repo / value
+                changes += value.encode() + b"\0" + (os.readlink(path).encode() if path.is_symlink() else path.read_bytes())
+        fingerprint = hashlib.sha256(git(repo, 'rev-parse', 'HEAD') + changes).hexdigest()
+    else:
+        evidence = resolve_task_review_starting_point(repo, task_id)
+        if evidence['status'] != 'verified' or evidence['committed_work_status'] != 'present' or evidence.get('current_scope_reviewed'):
+            return None
+        changes = git(repo, 'diff', '--binary', '--full-index', '--no-ext-diff', evidence['base_commit'], 'HEAD', '--', *evidence['scope_paths'])
+        fingerprint = hashlib.sha256(json.dumps(evidence['binding'], sort_keys=True).encode() + evidence['base_commit'].encode() + changes).hexdigest()
+    key = hashlib.sha256((identity['git_directory'] + '\0' + task_id).encode()).hexdigest()
     state = resolved_rvf_user_local_data_paths().runtime_state_root / "task-review-decisions" / f"{key}.json"
     with exclusive_lock(state.with_suffix(".lock")):
         if state.exists() and read_json(state).get("candidate_fingerprint") == fingerprint:

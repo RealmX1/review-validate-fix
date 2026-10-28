@@ -9,5 +9,6 @@ def isolated_user_runtime_environment(tmp_path, monkeypatch):
     for key,value in {'HOME':home,'CODEX_HOME':home/'.codex','CODEX_SQLITE_HOME':home/'.codex-sqlite',
                       'RVF_USER_LOCAL_DATA_ROOT':home/'.rvf/user-local-data'}.items():
         monkeypatch.setenv(key,str(value))
-    for key in ('KANBAN_TASK_ID','KANBAN_PROJECT_PATH','CLINE_KANBAN_TASK_ID','CLINE_KANBAN_PROJECT_PATH','RVF_SUPPRESS_STOP_HOOK'):
+    for key in ('KANBAN_TASK_ID','KANBAN_PROJECT_PATH','CLINE_KANBAN_TASK_ID','CLINE_KANBAN_PROJECT_PATH',
+                'RVF_CLINE_KANBAN_STATE_DIRECTORY','RVF_SUPPRESS_STOP_HOOK'):
         monkeypatch.delenv(key,raising=False)

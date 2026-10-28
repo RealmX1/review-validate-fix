@@ -8,4 +8,6 @@ UserPromptSubmit 搭用户当前回合注入上下文：Claude/Codex 使用 `add
 
 当前轻量 hook 只在绑定 Kanban task、候选内容改变且未提示过时提出一次发起决策；不铸 token、不追踪 session/hunk，不承担派发、原生分界、rewind、阶段资格或自动收尾。无 Kanban task 的 Codex GUI 持续关闭自动发起；手动命令保留。用户 Stop 与其他明确限制优先。
 
+有可靠固定起点和任务提交证据时，干净已提交工作也参与该决策，进入 base 不使其消失。同任务同观察跨 session 去重；关联的新版 run 已完成且当前范围内容相同则不重复提示。来源不足、身份不符、损坏和恢复记录均为 developer_only，只保存诊断与有界重验条件。真实 UserPromptSubmit 可触发补证，不为补证另开 Agent 回合，也不推进固定起点。
+
 实现：`core/task_snapshot_review/hook_entrypoint.py`、`adapters/__init__.py` 与 `core/stop_hook_output_audience/`。测试覆盖宿主字段、一次性决策、递归抑制和故障静默。
