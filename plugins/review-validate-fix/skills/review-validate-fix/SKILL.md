@@ -7,6 +7,8 @@ description: 用户明确调用 RVF，或主会话依据任务授权选择执行
 
 一次冻结材料启动 → 工具完成独立双审、必要修复及完整树验证 → 一次结果交回 → 主 Agent 审阅、提交并展示收尾。保留 SANTA-method 与角色独立上下文；默认一个匿名 fixer，最多三轮语义修复。
 
+**临时三路外审至 2026-11-02 00:00 America/New_York（UTC 05:00）：** 正式创建的新 run（含 prepare-only、Kanban 托管）最低三席，普通席及 fallback 排除 Codex CLI，最后一席只运行独立工作树和上下文中的外部 `codex exec`；主会话是 Codex 也不改用 internal subagent。oh-my-pi 正常参与普通席。`--reviewer-count` 是总数，至少提升为三；显式配置仍须符合各席约束，未提供 Codex 配置时补用已启用的默认 Codex 配置。必选席缺 CLI、认证或额度失败不降级为其他 harness，其他席继续；保存恢复条件并复用原预算和总时限。全部席完成后综合所有发现与重复发现的补充证据，再进入现有 validate/fix。截止后创建恢复正常双路及 Codex 普通候选资格；既有 run 保持创建时的数量与约束，到期后接续也不减席。
+
 1. 核对任务需求、有效授权和实际 Git 工作树。选择固定基线及明确任务路径，背景 WIP 保持原样。将用户原话和必要实现说明保存为一份持久需求文件。Kanban 新的一段实现开始前，可用 `rvf record-kanban-task-review-start --repo <工作树> --task-id <task-id> --base-ref <实现前固定 SHA> --scope <路径> ...` 明确保存起点；prompt、换会话和吸收 base 都不会推进它。未记录时仅使用可证明的任务创建/checkpoint 起点，不猜 live main。
 2. 准备最终验证命令的 JSON argv 数组列表，一次执行 `rvf review-task-snapshot --repo <工作树> --base-ref <基线> --scope <相对路径> ... --requirements-file <文件> --fix --validation-commands <文件>`。隔离环境需要准备时附 `--preparation-commands <argv JSON>`；可附 `--machine-context-file <JSON>`、`--machine-evidence-commands <argv JSON>` 和 `--implementation-plan-file <条目字符串列表 JSON>`。材料冻结到精确 run；`--reviewer-config <JSON>`、`--fixer-config <JSON>` 在启动时选择 CLI。所有分配 reviewer 必须实际完成，缺腿不能降为通过。
 

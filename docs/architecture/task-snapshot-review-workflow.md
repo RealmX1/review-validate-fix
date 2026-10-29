@@ -11,6 +11,14 @@ RVF 的流程为：一次固定材料启动 → 两路独立 reviewer → 来源
 - `rvf collect-issues --report <JSON 文件>` 由主 Agent 统一收集问题。`rvf collect-issues --flush` 接续持久待补写材料。失败不阻断评审、提交或同步。
 - `rvf analyze --run-dir <目录>` 按需读取结果生成复盘材料，无自动启动、归档门禁或写源码权限。
 
+### 临时 Codex 必选外部席
+
+2026-11-02 00:00 America/New_York（UTC 05:00）前，正式创建入口将总数最低提升为三，`run.json` 冻结 `reviewer_count` 和逐席 `reviewer_harness_constraints`。普通席的约束是 `non_codex_external_cli`，最后一席是 `codex_external_cli`；更大显式数量仍表示总数，其中一席固定 Codex。`--prepare-only` 与 Kanban 所属执行在同一入口冻结分配。 普通席仅接受直接可识别的 Claude、Cursor、Kimi、oh-my-pi 命令；Python、Node、shell 及无法识别的自定义包装器保留为配置缺失，不参与普通席或 fallback。首次派发时若该席没有可用配置，仍建立默认 1800 秒总时限，之后恢复配置沿用该截止时间。
+
+派发和全部 fallback 都先过滤本席允许的实际 CLI 命令，再沿用优先级、额度池偏好和独立进程规则。oh-my-pi 不因使用相同额度池而被排除。显式配置同样受约束；缺少 Codex 配置时追加已启用的默认外部 Codex 配置。Codex 席仅接受 `codex exec`，不会转给 internal subagent 或其他 harness，主会话为 Codex 也一样。缺 CLI 时保存逐席 `reviewer_configuration_recovery`，其余席继续；认证、额度、重试、原总时限与撤销沿用角色执行契约。环境或配置恢复后接续精确 run，已完成席不重复。
+
+所有已分配席完成后，`anonymous_findings` 合并全部报告，保留每份独有发现和重复问题的补充证据；不采用多数票。到期后新 run 使用 `any_external_cli`，恢复正常双路和 Codex 普通候选资格。接续只读创建时约束，不重新计算临时政策；既有分配不变。
+
 自动推进入口在 `review-task-snapshot` 同时接受 `--fix`、`--validation-commands`、`--preparation-commands`、`--machine-context-file`、`--machine-evidence-commands` 和 `--implementation-plan-file`。材料按摘要冻结到 `execution-plan.json`，后续只接续精确 run。默认最多三轮语义修复（包含首次 finding 修复），CLI 传输重试另计；预算与角色原总时限持久保存。完成 reviewer 的上下文与判断不共享，仅共享绑定完整树、cwd、命令、工具链和依赖身份的机器事实。依赖身份缺证时重新采集。
 
 `findings=[]` 的最终验证失败也会进入 validation repair；fixer request 包含原失败命令、日志和真实 `tested_commit`，补丁从该被测基线计算。隔离准备命令不能改写候选源码，其生成物不混入任务修复。安全的外部 HEAD 前移自动合并已评审任务补丁并重验；新的未评审 hunk 或不能安全合并的内容保留原件并形成具体处置。

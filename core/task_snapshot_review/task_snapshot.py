@@ -6,9 +6,22 @@ import json
 import os
 import uuid
 import time
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 from .persistent_artifacts import git, git_text, repository_identity, write_bytes, write_json
+
+
+TEMPORARY_MANDATORY_CODEX_REVIEWER_DEADLINE_AT = datetime(2026, 11, 2, 5, tzinfo=timezone.utc).timestamp()
+
+
+def reviewer_allocation_for_new_run(reviewer_count: int) -> tuple[int, list[str]]:
+    if type(reviewer_count) is not int or reviewer_count < 2:
+        raise ValueError("reviewer 数量必须是至少为 2 的整数")
+    if time.time() < TEMPORARY_MANDATORY_CODEX_REVIEWER_DEADLINE_AT:
+        reviewer_count = max(3, reviewer_count)
+        return reviewer_count, ["non_codex_external_cli"] * (reviewer_count - 1) + ["codex_external_cli"]
+    return reviewer_count, ["any_external_cli"] * reviewer_count
 
 
 def normalized_scope_paths(scope_paths: list[str]) -> list[str]:
@@ -57,11 +70,15 @@ def capture_worktree_tree(repo: Path, scope_paths: list[str], artifacts: Path, *
 
 def create_snapshot(repo: Path, *, base_ref: str, scope_paths: list[str], requirements: bytes, run_directory: Path,
                     reviewer_count: int = 2, starting_point_evidence: dict | None = None,
-                    execution_plan: dict | None = None) -> dict:
+                    execution_plan: dict | None = None, reviewer_harness_constraints: list[str] | None = None) -> dict:
     from .execution_lifecycle import normalized_execution_plan, runtime_environment_identity
     plan = normalized_execution_plan(execution_plan) if execution_plan is not None else None
     if type(reviewer_count) is not int or reviewer_count < 2:
         raise ValueError("reviewer 数量必须是至少为 2 的整数")
+    if reviewer_harness_constraints is not None and (len(reviewer_harness_constraints) != reviewer_count
+            or any(constraint not in {"any_external_cli", "non_codex_external_cli", "codex_external_cli"}
+                   for constraint in reviewer_harness_constraints)):
+        raise ValueError("reviewer harness 约束必须逐席对应数量并使用已知的外部 CLI 约束")
     scope_paths = normalized_scope_paths(scope_paths)
     identity = repository_identity(repo)
     repo = Path(identity["repo"])
@@ -106,6 +123,7 @@ def create_snapshot(repo: Path, *, base_ref: str, scope_paths: list[str], requir
         "original_worktree_observation_commit": observation_commit,
         "scope_paths": scope_paths, "changed_paths": [path for path in changed_paths if path],
         "reviewer_count": reviewer_count,
+        "reviewer_harness_constraints": reviewer_harness_constraints or ["any_external_cli"] * reviewer_count,
         "requirements_sha256": hashlib.sha256(requirements).hexdigest(),
         "patch_sha256": hashlib.sha256(patch).hexdigest(), "status": "review_pending",
         "created_at": time.time(), "runtime_environment": runtime_environment_identity(),

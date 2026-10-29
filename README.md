@@ -2,6 +2,8 @@
 
 一次启动固定任务快照，两路独立评审、匿名修复和完整树验证自动推进，一次结果交回主 Agent 审阅与提交。
 
+**临时策略：2026-11-02 00:00 America/New_York（UTC 05:00）前创建的 run 最低三路：普通席及全部 fallback 排除 Codex CLI，额外一席必选外部 `codex exec`。** oh-my-pi 仍正常参与普通席选择。`--reviewer-count` 表示总席数，更大数量中仍只有一席固定 Codex。prepare-only 和 Kanban 托管同样在创建时冻结数量及约束；到期后的新 run 恢复双路选取，在途 run 完成全部原分配席。主会话使用 Codex 也会启动独立外部 Codex；缺 CLI、认证或额度失败保留未完成及恢复条件，其他两席继续执行。全部报告按发现综合并去重，不使用多数票。
+
 ```sh
 rvf review-task-snapshot --repo /path/to/worktree --base-ref main \
   --scope src --scope tests --requirements-file /persistent/task-requirements.md \

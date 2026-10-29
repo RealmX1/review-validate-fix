@@ -14,7 +14,7 @@ import _rvf_pyroot
 from core.rvf_user_local_data_paths import resolved_rvf_user_local_data_paths
 from core.task_snapshot_review.github_issue_observations import collect_report, flush_pending_reports, list_repository_issues, schedule_pending_issue_delivery
 from core.task_snapshot_review.persistent_artifacts import read_json, write_json
-from core.task_snapshot_review.task_snapshot import create_snapshot
+from core.task_snapshot_review.task_snapshot import create_snapshot, reviewer_allocation_for_new_run
 from core.task_snapshot_review.workflow import resume_review, load_reviewer_configuration
 from core.task_snapshot_review.execution_lifecycle import revoke_execution, persist_execution_revocation
 from core.task_snapshot_review.trajectory_analysis import analyze_runs
@@ -43,7 +43,7 @@ def main(argv=None) -> int:
     review.add_argument("--run-directory", type=Path)
     review.add_argument("--prepare-only", action="store_true")
     review.add_argument("--reviewer-config", type=Path, action="append")
-    review.add_argument("--reviewer-count", type=int, default=2, help="正式 reviewer 数量，至少 2；接续沿用此数量")
+    review.add_argument("--reviewer-count", type=int, default=2, help="reviewer 总数，至少 2；2026-11-02 00:00 America/New_York 前最低三席，其中一席必选外部 Codex，其余排除 Codex CLI；创建时冻结，接续沿用")
     review.add_argument("--fix", action="store_true", help="授权自动验证并修复任务关联问题")
     review.add_argument("--fixer-config", type=Path)
     review.add_argument("--validation-commands", type=Path, help="冻结最终验证 argv 数组列表 JSON")
@@ -66,7 +66,7 @@ def main(argv=None) -> int:
     resume.add_argument("--fix", action="store_true")
     resume.add_argument("--fixer-config", type=Path)
     resume.add_argument("--validation-commands", type=Path, help="最终验证 argv 数组列表 JSON")
-    resume.add_argument('--context-response-file',type=Path,help='为缺失腿补充通用机器证据，保持两路独立')
+    resume.add_argument('--context-response-file',type=Path,help='为缺失席补充通用机器证据，保持各路独立')
     resume.add_argument('--closeout-report', type=Path, help='主 Agent 最终审阅的计划实施、recap 与遗留事项 JSON')
     cancel = commands.add_parser("cancel-task-review", help="先持久撤销，再取消身份匹配的所属进程")
     cancel.add_argument("--run-dir", type=Path, required=True)
@@ -97,9 +97,11 @@ def main(argv=None) -> int:
                     print(json.dumps(evidence, ensure_ascii=False))
                     return 2
             run = arguments.run_directory or root / "task-snapshot-reviews" / f"task-review-{uuid.uuid4().hex}"
+            reviewer_count, reviewer_harness_constraints = reviewer_allocation_for_new_run(arguments.reviewer_count)
             record = create_snapshot(arguments.repo, base_ref=evidence['base_commit'] if evidence else arguments.base_ref, scope_paths=arguments.scope,
                                      requirements=arguments.requirements_file.read_bytes(), run_directory=run,
-                                     reviewer_count=arguments.reviewer_count, starting_point_evidence=evidence,
+                                     reviewer_count=reviewer_count, reviewer_harness_constraints=reviewer_harness_constraints,
+                                     starting_point_evidence=evidence,
                                      execution_plan={"fix": arguments.fix,
                                          "validation_commands": json.loads(arguments.validation_commands.read_text()) if arguments.validation_commands else [],
                                          "preparation_commands": json.loads(arguments.preparation_commands.read_text()) if arguments.preparation_commands else [],

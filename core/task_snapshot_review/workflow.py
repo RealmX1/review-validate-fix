@@ -31,7 +31,26 @@ def skill_directory() -> Path:
     raise RuntimeError("无法定位插件角色模板")
 
 
-def default_reviewer_configurations() -> list[dict]:
+def reviewer_configuration_matches_harness_constraint(config: dict, constraint: str) -> bool:
+    from .harness_cli_adapters import is_codex_exec_command
+    if constraint == "codex_external_cli":
+        return is_codex_exec_command(config["command"])
+    if constraint == "non_codex_external_cli":
+        from .harness_cli_adapters import (
+            is_claude_print_command, is_cursor_print_command,
+            is_kimi_prompt_command, is_oh_my_pi_print_command,
+        )
+        # 只接受可识别的直接 harness；通用解释器和自定义启动器无法证明身份。
+        return config.get("output_format") != "codex_json" and any(
+            identify(config["command"]) for identify in (
+                is_claude_print_command, is_cursor_print_command,
+                is_kimi_prompt_command, is_oh_my_pi_print_command))
+    if constraint != "any_external_cli":
+        raise ValueError(f"未知 reviewer harness 约束：{constraint}")
+    return True
+
+
+def default_reviewer_configurations(*, harness_constraint: str = "any_external_cli") -> list[dict]:
     directory = skill_directory()
     from core.rvf_user_local_data_paths import resolved_rvf_reviewer_registry_path
     registry = read_json(resolved_rvf_reviewer_registry_path(directory / "config/reviewer-registry.json"))
@@ -40,7 +59,8 @@ def default_reviewer_configurations() -> list[dict]:
         if not item.get("enabled"):
             continue
         config = load_reviewer_configuration(directory / item["config_path"])
-        if config.get("enabled", True) and shutil.which(config["command"][0]):
+        if (config.get("enabled", True) and reviewer_configuration_matches_harness_constraint(config, harness_constraint)
+                and shutil.which(config["command"][0])):
             available.append((item.get("underlying_provider_account_quota_pool_identity"), config))
     # 优先不同额度池；每个角色仍使用独立新进程与工作树。
     if len(available) > 1:
@@ -49,7 +69,7 @@ def default_reviewer_configurations() -> list[dict]:
     configs = [item[1] for item in available]
     if len(configs) == 1:
         configs.append(configs[0])
-    if len(configs) < 2:
+    if len(configs) < 2 and harness_constraint == "any_external_cli":
         raise RuntimeError("没有可执行的 reviewer CLI；可通过 --reviewer-config 提供其他独立 CLI")
     return configs
 
@@ -149,6 +169,9 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
         return completed, None
     role_directory.mkdir(exist_ok=True)
     deadline_file = role_directory / "role-deadline.json"
+    if not configurations and not deadline_file.exists():
+        # 首次派发即开始计时，配置缺失也消耗默认总预算。
+        write_json(deadline_file, {"deadline_at": time.time() + 1800})
     if deadline_file.exists() and read_json(deadline_file)["deadline_at"] <= time.time():
         write_json(role_directory / "deadline-exhausted.json", {
             "status": "incomplete", "recovery": {"category": "deadline_exhausted", "maximum_same_configuration_retries": 0},
@@ -601,25 +624,42 @@ def _resume_review_iteration(run_directory: Path, *, reviewer_configs: list[dict
         if hashlib.sha256((run_directory / "requirements.md").read_bytes()).hexdigest() != record["requirements_sha256"] or hashlib.sha256((run_directory / "task-changes.patch").read_bytes()).hexdigest() != record["patch_sha256"]:
             raise ValueError("固定评审输入已改变；保留原 run 并为新输入创建快照")
         configurations_file = run_directory / "reviewer-configurations.json"
+        uses_default_reviewer_pool = reviewer_configs is None and (not configurations_file.exists()
+            or read_json(configurations_file).get("uses_default_reviewer_pool", False))
         if reviewer_configs is not None:
             if len(reviewer_configs) < 2:
                 raise ValueError("需要两路独立 reviewer 配置（可使用同一 CLI 的两个新实例）")
             write_json(configurations_file, {"configurations": [persistent_configuration(config) for config in reviewer_configs]})
-        elif configurations_file.exists():
+        elif configurations_file.exists() and not uses_default_reviewer_pool:
             reviewer_configs = read_json(configurations_file)["configurations"]
             reviewer_configs = [load_reviewer_configuration(Path(config['configuration_file_path']))
                                 if config.get('configuration_file_path') and Path(config['configuration_file_path']).is_file()
                                 else config for config in reviewer_configs]
             write_json(configurations_file, {"configurations": [persistent_configuration(config) for config in reviewer_configs]})
         else:
-            reviewer_configs = default_reviewer_configurations()
-            write_json(configurations_file, {"configurations": [persistent_configuration(config) for config in reviewer_configs]})
+            constrained_codex_seat = "codex_external_cli" in record.get("reviewer_harness_constraints", [])
+            reviewer_configs = default_reviewer_configurations(harness_constraint="non_codex_external_cli") if constrained_codex_seat else default_reviewer_configurations()
+        constraints = record.get("reviewer_harness_constraints", ["any_external_cli"] * record["reviewer_count"])
+        if len(constraints) != record["reviewer_count"]:
+            raise ValueError("冻结的 reviewer harness 约束与数量不一致")
+        if "codex_external_cli" in constraints and not any(reviewer_configuration_matches_harness_constraint(config, "codex_external_cli") for config in reviewer_configs):
+            reviewer_configs = [*reviewer_configs, *default_reviewer_configurations(harness_constraint="codex_external_cli")]
+        write_json(configurations_file, {"configurations": [persistent_configuration(config) for config in reviewer_configs],
+                                         "uses_default_reviewer_pool": uses_default_reviewer_pool})
         reviewer_count = record["reviewer_count"]
         roles = []
-        for reviewer_index in range(reviewer_count):
-            primary_index = reviewer_index % len(reviewer_configs)
-            configurations = [reviewer_configs[primary_index], *reviewer_configs[:primary_index], *reviewer_configs[primary_index + 1:]]
+        configuration_recovery = []
+        for reviewer_index, constraint in enumerate(constraints):
+            eligible = [config for config in reviewer_configs if reviewer_configuration_matches_harness_constraint(config, constraint)]
+            primary_index = reviewer_index % len(eligible) if eligible else 0
+            configurations = [eligible[primary_index], *eligible[:primary_index], *eligible[primary_index + 1:]] if eligible else []
             roles.append((f"reviewer-{reviewer_index + 1}", "reviewer", configurations))
+            if not configurations and _role_result(run_directory / f"reviewer-{reviewer_index + 1}") is None:
+                configuration_recovery.append({"role": f"reviewer-{reviewer_index + 1}", "harness_constraint": constraint,
+                    "trigger": "reviewer_configuration_or_cli_availability_changed", "action": "resume_same_run",
+                    "maximum_unchanged_retries": 0})
+        record["reviewer_configuration_recovery"] = configuration_recovery
+        write_json(run_directory / "run.json", record)
         results = _run_roles(run_directory, record, roles, [])
         if any(result is None for result in results):
             record["status"] = "review_incomplete"

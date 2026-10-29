@@ -93,9 +93,13 @@ def test_cli_persists_three_reviewers_before_dispatch_and_resumes_all_three(repo
     assert prepared.returncode == 0, prepared.stderr
     assert read_json(run / 'run.json')['reviewer_count'] == 3
     config = tmp_path / 'reviewer-config.json'
-    config.write_text(json.dumps(fake_config(tmp_path)))
+    from test_temporary_mandatory_codex_external_reviewer import codex_cli_substitute, fake_config as direct_fake_config
+    config.write_text(json.dumps(direct_fake_config(tmp_path)))
+    codex_config = tmp_path / 'codex-reviewer-config.json'
+    codex_config.write_text(json.dumps(codex_cli_substitute(tmp_path)))
     resumed = subprocess.run([sys.executable, str(entry), 'resume-task-review', '--run-dir', str(run),
-                              '--reviewer-config', str(config), '--reviewer-config', str(config)],
+                              '--reviewer-config', str(config), '--reviewer-config', str(config),
+                              '--reviewer-config', str(codex_config)],
                              env=environment, capture_output=True, text=True)
     assert resumed.returncode == 0, resumed.stderr
     assert json.loads(resumed.stdout)['status'] == 'ready_for_validation'
