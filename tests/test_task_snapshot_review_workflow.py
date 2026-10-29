@@ -27,6 +27,9 @@ def repository(tmp_path, monkeypatch):
     git(repo, "init", "-q")
     git(repo, "config", "user.name", "RVF test")
     git(repo, "config", "user.email", "rvf-test@example.invalid")
+    # 在冻结候选前声明 Python 生成物，验证仍须识别任何新增源码。
+    with (repo / ".git/info/exclude").open("a") as excluded_paths:
+        excluded_paths.write("\n__pycache__/\n")
     (repo / "task.py").write_text("value = 1\n")
     (repo / "background.txt").write_text("original\n")
     git(repo, "add", ".")

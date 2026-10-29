@@ -1,18 +1,22 @@
 """预登记机器命令的隔离执行与 run 内单飞证据。"""
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from .execution_lifecycle import (
-    append_stage_event, ensure_execution_not_revoked, register_owned_process,
-    runtime_environment_identity, wait_for_owned_process,
+    append_stage_event, ensure_execution_not_revoked, register_owned_process, process_start_identity, ExecutionRevoked,
+    owned_process_start_time_and_group_match,
+    runtime_environment_identity, wait_for_owned_process, register_supervised_command_directory,
 )
 from .persistent_artifacts import exclusive_lock, git, git_text, read_json, write_json
 from .task_snapshot import capture_worktree_tree
@@ -24,45 +28,159 @@ class WorkspacePreparationFailed(RuntimeError):
         self.original_evidence_paths = [str(original)]
 
 
+def verified_execution_plan(run_directory: Path, record: dict | None = None) -> dict:
+    record = record if record is not None else read_json(run_directory / "run.json")
+    expected_digest = record.get("execution_plan_sha256")
+    if not expected_digest:
+        return {}
+    original = (run_directory / "execution-plan.json").read_bytes()
+    if hashlib.sha256(original).hexdigest() != expected_digest:
+        raise ValueError("冻结启动材料摘要不匹配；恢复原件后接续")
+    return json.loads(original)
+
+
+def ensure_previous_supervised_commands_exited(run_directory: Path, collection_directory: Path) -> None:
+    from .native_owned_process_observation import native_process_identity, owned_process_snapshot
+    registry = run_directory / 'registered-supervised-command-directories.json'
+    for registered_directory in read_json(registry)['command_directories'] if registry.exists() else []:
+        command_directory = Path(registered_directory).resolve()
+        relative = command_directory.relative_to(run_directory.resolve())
+        if 'workspace' in relative.parts or not relative.parts:
+            raise ValueError('已登记监督目录不能指向候选源码或 run 根目录')
+        if not command_directory.is_relative_to(collection_directory.resolve()):
+            continue
+        supervision_file = command_directory / 'command-supervision.json'
+        reconciliation_file = command_directory / 'descendant-exit-reconciliation.json'
+        if reconciliation_file.exists() and read_json(reconciliation_file).get('status') == 'exited':
+            continue
+        observation = {'status': 'unknown', 'observed_at': time.time(),
+            'recovery_condition': 'previous_supervisor_and_descendants_exit_proven',
+            'action': 'resume_same_run', 'supervision_file': str(supervision_file)}
+        try:
+            if not supervision_file.exists():
+                execution = read_json(command_directory / 'execution.json')
+                if execution.get('status') == 'launch_failed' and execution.get('execution_started') is False:
+                    observation.update({'status': 'not_started', 'native_launch_error': execution['native_launch_error']})
+                    write_json(reconciliation_file, observation)
+                    continue
+            facts = read_json(supervision_file)
+            if facts.get('status') == 'completed':
+                continue
+            current = native_process_identity(facts['supervisor_pid'])
+            identity = facts.get('supervisor_native_identity')
+            if not identity:
+                # 监督者须先持久保存启动身份才获准派发；此前退出可证明命令未启动。
+                if current is not None or facts.get('command_pid') is not None:
+                    raise RuntimeError('缺少上一监督者原生启动身份')
+                observation['status'] = 'exited'
+            else:
+                recorded = {item['pid']: item for item in facts.get('owned_processes', [])}
+                descendants = owned_process_snapshot(facts['execution_token'], facts['supervisor_pid'], recorded,
+                    supervisor_native_identity=identity)
+                observation.update({'owned_processes': list(descendants.values()),
+                    'status': 'pending' if current == identity or descendants else 'exited'})
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
+            observation['error'] = str(error)
+        write_json(reconciliation_file, observation)
+        if observation['status'] != 'exited':
+            error = WorkspacePreparationFailed(reconciliation_file)
+            error.recovery = {'trigger': observation['recovery_condition'], 'action': 'resume_same_run',
+                'equivalent_sources': ['native_process_start_identity', 'native_descendant_ownership_snapshot'],
+                'maximum_unchanged_retries': 1}
+            raise error
+
+
 def execute_registered_commands(run_directory: Path, workspace: Path, commands: list[list[str]],
                                 artifacts: Path, purpose: str, *, environment: dict | None = None, deadline_at: float | None = None,
-                                inherited_lock_descriptors: tuple[int, ...] = ()) -> dict:
-    plan = read_json(run_directory / "execution-plan.json") if (run_directory / "execution-plan.json").exists() else {}
+                                inherited_lock_descriptors: tuple[int, ...] = (),
+                                excluded_preparation_paths: list[str] | None = None,
+                                expected_source_tree: str | None = None) -> dict:
+    plan = verified_execution_plan(run_directory)
     registered = [*plan.get("preparation_commands", []), *plan.get("machine_evidence_commands", []), *plan.get("validation_commands", [])]
     if plan and any(command not in registered for command in commands):
         raise ValueError("执行器只能代跑启动时登记的命令")
     records = []
     for index, command in enumerate(commands):
         ensure_execution_not_revoked(run_directory)
+        verified_execution_plan(run_directory)
         if deadline_at is not None and deadline_at <= time.time():
             raise subprocess.TimeoutExpired(command, 0)
         command_directory = artifacts / f"command-{index + 1:03d}"
         command_directory.mkdir(parents=True, exist_ok=True)
-        source_tree_before = capture_worktree_tree(workspace, ["."], command_directory) if purpose == "shared_machine_evidence" else None
+        source_tree_before = (capture_worktree_tree(workspace, ["."], command_directory,
+            excluded_preparation_paths=excluded_preparation_paths)
+            if purpose in {"shared_machine_evidence", "incomplete_fixer_machine_validation"} else None)
         record = {"argv": command, "cwd": str(workspace), "started_at": time.time(), "status": "running"}
+        if source_tree_before is not None:
+            record["source_tree_before"] = source_tree_before
+            if expected_source_tree is not None and source_tree_before != expected_source_tree:
+                record.update({"status": "candidate_changed", "execution_started": False})
+                write_json(command_directory / "execution.json", record)
+                records.append(record)
+                append_stage_event(run_directory, "machine_command", purpose=purpose, **record)
+                return {"status": "candidate_changed", "commands": records, "failed_command_directory": str(command_directory)}
         write_json(command_directory / "execution.json", record)
         with (command_directory / "stdout.txt").open("wb") as stdout, (command_directory / "stderr.txt").open("wb") as stderr:
-            process = subprocess.Popen(command, cwd=workspace, env=environment, stdout=stdout, stderr=stderr,
-                                       start_new_session=True, pass_fds=inherited_lock_descriptors)
-            register_owned_process(run_directory, process.pid, purpose, owns_process_group=True)
+            with exclusive_lock(run_directory / "execution-revocation.lock"):
+                verified_execution_plan(run_directory)
+                ensure_execution_not_revoked(run_directory)
+                if deadline_at is not None and deadline_at <= time.time():
+                    raise subprocess.TimeoutExpired(command, 0)
+                launch_command = command
+                if inherited_lock_descriptors:
+                    register_supervised_command_directory(run_directory, command_directory)
+                    launch_command = [sys.executable, str(Path(__file__).with_name("retained_command_supervisor.py")),
+                        str(run_directory), str(command_directory), str(deadline_at),
+                        json.dumps(list(inherited_lock_descriptors)), json.dumps(command)]
+                try:
+                    process = subprocess.Popen(launch_command, cwd=workspace, env=environment, stdout=stdout, stderr=stderr,
+                                               start_new_session=True, pass_fds=inherited_lock_descriptors)
+                except OSError as error:
+                    record.update({'status': 'launch_failed', 'execution_started': False, 'finished_at': time.time(),
+                        'native_launch_error': {'type': type(error).__name__, 'errno': error.errno, 'message': str(error)}})
+                    write_json(command_directory / 'execution.json', record)
+                    error.original_evidence_paths = [str(command_directory / 'execution.json')]
+                    raise
+                register_owned_process(run_directory, process.pid, purpose, owns_process_group=True)
             try:
+                try:
+                    record["process_identity"] = process_start_identity(process.pid)
+                except (OSError, subprocess.SubprocessError, RuntimeError) as error:
+                    record["process_identity_error"] = str(error)
+                write_json(command_directory / "execution.json", record)
                 try:
                     returncode = wait_for_owned_process(process, run_directory, timeout=None if deadline_at is None else max(0, deadline_at - time.time()))
                 except subprocess.TimeoutExpired:
                     returncode = 124
+                if deadline_at is not None and time.time() >= deadline_at:
+                    returncode = 124
             finally:
                 if process.poll() is None:
-                    os.killpg(process.pid, signal.SIGTERM)
+                    (os.kill if inherited_lock_descriptors else os.killpg)(process.pid, signal.SIGTERM)
                     try:
-                        process.wait(timeout=5)
+                        # 仅等待撤销清理确认；命令的执行期限没有延长。
+                        process.wait(timeout=0.75 if inherited_lock_descriptors else
+                            (5 if deadline_at is None else max(0, min(5, deadline_at - time.time()))))
                     except subprocess.TimeoutExpired:
+                        supervision_file = command_directory / 'command-supervision.json'
+                        if inherited_lock_descriptors and supervision_file.exists():
+                            from .retained_command_supervisor import terminate_supervised_command_descendants
+                            observations = terminate_supervised_command_descendants(command_directory)
+                            if any(item['cancellation_status'] == 'unknown' for item in observations):
+                                raise WorkspacePreparationFailed(supervision_file)
                         os.killpg(process.pid, signal.SIGKILL)
                         process.wait()
+        supervision_file = command_directory / 'command-supervision.json'
+        if supervision_file.exists() and read_json(supervision_file).get('status') == 'descendant_exit_unproven':
+            record.update({'returncode': returncode, 'finished_at': time.time(), 'status': 'descendant_exit_unproven'})
+            write_json(command_directory / 'execution.json', record)
+            raise WorkspacePreparationFailed(supervision_file)
         record.update({"returncode": returncode, "finished_at": time.time(), "status": "passed" if returncode == 0 else "failed"})
         record.update({f"{stream}_sha256": hashlib.sha256((command_directory / f"{stream}.txt").read_bytes()).hexdigest()
                        for stream in ("stdout", "stderr")})
         if source_tree_before is not None:
-            source_tree_after = capture_worktree_tree(workspace, ["."], command_directory)
+            source_tree_after = capture_worktree_tree(workspace, ["."], command_directory,
+                excluded_preparation_paths=excluded_preparation_paths)
             record.update({"source_tree_before": source_tree_before, "source_tree_after": source_tree_after})
             if source_tree_before != source_tree_after:
                 record["status"] = "candidate_changed"
@@ -81,6 +199,7 @@ def prepare_isolated_workspace(run_directory: Path, workspace: Path, commands: l
                                inherited_lock_descriptors: tuple[int, ...] = ()) -> None:
     if not commands:
         return
+    ensure_previous_supervised_commands_exited(run_directory, artifacts.parent)
     before = set(git(workspace, "ls-files", "--others", "--exclude-standard", "-z").decode().split("\0")) - {""}
     preparation_paths_file = artifacts / "preparation-created-untracked-paths.json"
     previously_created = set(read_json(preparation_paths_file)["paths"]) if preparation_paths_file.exists() else set()
@@ -104,6 +223,7 @@ def collect_shared_machine_evidence(run_directory: Path, record: dict, plan: dic
     with exclusive_lock(run_directory / "machine-evidence.lock") as collection_lock:
         root = run_directory / "machine-evidence"
         root.mkdir(exist_ok=True)
+        ensure_previous_supervised_commands_exited(run_directory, root)
         commands_identity = []
         for command in [*plan.get("preparation_commands", []), *commands]:
             executable = shutil.which(command[0])
@@ -129,3 +249,169 @@ def collect_shared_machine_evidence(run_directory: Path, record: dict, plan: dic
                     "dependency_identity_proven": proven_dependencies, "original": str(attempt / "evidence.json")}
         write_json(attempt / "evidence.json", evidence)
         return evidence
+
+
+def _terminate_retained_collection_commands(directory: Path, reason: str) -> None:
+    observations = []
+    identity_check_deadline = time.monotonic() + 0.2
+    execution_files = [path for pattern in ('commands/command-*/execution.json',
+        'preparation/command-*/execution.json', 'attempt-*/commands/command-*/execution.json',
+        'attempt-*/preparation/command-*/execution.json') for path in directory.glob(pattern)]
+    for execution_file in execution_files:
+        execution = read_json(execution_file)
+        if execution.get("status") != "running":
+            continue
+        identity = execution.get("process_identity")
+        status = "unknown"
+        try:
+            remaining_identity_check_seconds = identity_check_deadline - time.monotonic()
+            if identity and remaining_identity_check_seconds > 0:
+                current = process_start_identity(identity["pid"], timeout_seconds=remaining_identity_check_seconds)
+                if current is None:
+                    status = "process_group_exit_unproven"
+                elif not owned_process_start_time_and_group_match(current, identity):
+                    status = "identity_changed_no_signal"
+                else:
+                    os.killpg(identity["pid"], signal.SIGTERM if (execution_file.parent / 'command-supervision.json').exists() else signal.SIGKILL)
+                    status = "termination_requested"
+        except (OSError, subprocess.SubprocessError, RuntimeError):
+            pass
+        observations.append({"execution_file": str(execution_file), "process_identity": identity, "status": status})
+    write_json(directory / "collection-recovery.json", {"reason": reason, "processes": observations,
+        "observed_at": time.time(), "recovery_condition": "owned_process_identity_or_exit_evidence_changed"})
+
+
+@contextmanager
+def _bounded_incomplete_fixer_collection_lock(run_directory: Path, directory: Path, deadline_at: float):
+    with (directory / "collection.lock").open("a+b") as handle:
+        while True:
+            try:
+                ensure_execution_not_revoked(run_directory)
+            except ExecutionRevoked:
+                _terminate_retained_collection_commands(directory, "execution_revoked")
+                raise
+            if time.time() >= deadline_at:
+                _terminate_retained_collection_commands(directory, "original_deadline_exhausted")
+                yield None
+                return
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                time.sleep(min(0.05, max(0, deadline_at - time.time())))
+        try:
+            yield handle
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def collect_incomplete_fixer_machine_validation(run_directory: Path, record: dict, candidate_commit: str,
+                                               deadline_at: float) -> Path | None:
+    plan = verified_execution_plan(run_directory, record)
+    commands = plan.get("validation_commands", [])
+    if not commands:
+        return None
+    directory = run_directory / "incomplete-fixer-machine-validation" / f"round-{record['semantic_repair_rounds_used']:03d}"
+    directory.mkdir(parents=True, exist_ok=True)
+    with _bounded_incomplete_fixer_collection_lock(run_directory, directory, deadline_at) as collection_lock:
+        if collection_lock is None:
+            return None
+        ensure_execution_not_revoked(run_directory)
+        if deadline_at <= time.time():
+            return None
+        ensure_previous_supervised_commands_exited(run_directory, run_directory / 'incomplete-fixer-machine-validation')
+        repo = Path(record["repo"])
+        tested_tree = git_text(repo, "rev-parse", candidate_commit + "^{tree}")
+        intent_file = directory / "collection-intent.json"
+        evidence_file = directory / "evidence.json"
+        recovery_identity = runtime_environment_identity()
+        recovery_identity['shared_machine_evidence_recovery_sha256'] = record.get('shared_machine_evidence_recovery_sha256')
+        recovery_identity['command_executables'] = [
+            {'argv': command, 'sha256': hashlib.sha256(Path(executable).read_bytes()).hexdigest() if executable else None}
+            for command in [*plan.get('preparation_commands', []), *commands]
+            for executable in [shutil.which(command[0])]]
+        recovery_sha256 = hashlib.sha256(json.dumps(recovery_identity, sort_keys=True).encode()).hexdigest()
+        intent = read_json(intent_file) if intent_file.exists() else {
+            "tested_tree": tested_tree, "tested_commit": candidate_commit, "collection_attempt_count": 0}
+        if intent["tested_tree"] != tested_tree:
+            if record['semantic_repair_rounds_used'] >= plan['maximum_semantic_repair_rounds']:
+                record['repair_budget_exhausted'] = True
+                write_json(run_directory / 'run.json', record)
+                return None
+            record['semantic_repair_rounds_used'] += 1
+            write_json(run_directory / 'run.json', record)
+            append_stage_event(run_directory, 'semantic_repair_tree_changed', tested_tree=tested_tree,
+                semantic_repair_round=record['semantic_repair_rounds_used'])
+            return collect_incomplete_fixer_machine_validation(run_directory, record, candidate_commit, deadline_at)
+        if intent.get("evidence_sha256"):
+            accepted_evidence_file = Path(intent['published_evidence_path'])
+            if not accepted_evidence_file.exists() or hashlib.sha256(accepted_evidence_file.read_bytes()).hexdigest() != intent["evidence_sha256"]:
+                raise RuntimeError("保留修复树的机器补证原件缺失或摘要不符；恢复原件后接续")
+            previous_evidence = read_json(accepted_evidence_file)
+            unchanged_recovery_evidence = intent.get('recovery_sha256') == recovery_sha256
+            recovery_probe_due = (intent.get('retry_not_before') is not None
+                and time.time() >= intent['retry_not_before'] and not intent.get('unchanged_recovery_probe_used'))
+            reusable_pass = previous_evidence['status'] == 'passed' and previous_evidence.get('dependency_identity_proven') is True
+            if unchanged_recovery_evidence and (reusable_pass or previous_evidence['status'] != 'passed' and not recovery_probe_due):
+                return accepted_evidence_file
+            if previous_evidence['status'] == 'candidate_changed':
+                return accepted_evidence_file
+            if unchanged_recovery_evidence:
+                intent['unchanged_recovery_probe_used'] = True
+        # 失败后仅在恢复证据变化时重采；中断与环境恢复共享有界次数，原期限不变。
+        if intent["collection_attempt_count"] >= 3:
+            return None
+        intent["collection_attempt_count"] += 1
+        intent['recovery_sha256'] = recovery_sha256
+        intent.pop('evidence_sha256', None)
+        write_json(intent_file, intent)
+        attempt_directory = directory / f"attempt-{intent['collection_attempt_count']:03d}"
+        attempt_directory.mkdir()
+        workspace = attempt_directory / "workspace"
+        git(repo, "worktree", "add", "--detach", str(workspace), intent["tested_commit"])
+        try:
+            prepare_isolated_workspace(run_directory, workspace, plan.get("preparation_commands", []), attempt_directory,
+                deadline_at=deadline_at, inherited_lock_descriptors=(collection_lock.fileno(),))
+        except subprocess.TimeoutExpired:
+            _terminate_retained_collection_commands(directory, 'original_deadline_exhausted')
+            return None
+        preparation_paths = attempt_directory / "preparation-created-untracked-paths.json"
+        excluded = read_json(preparation_paths)["paths"] if preparation_paths.exists() else None
+        before = capture_worktree_tree(workspace, ["."], attempt_directory, excluded_preparation_paths=excluded)
+        result = {"status": "candidate_changed", "commands": []}
+        if before == tested_tree:
+            try:
+                result = execute_registered_commands(run_directory, workspace, commands, attempt_directory / "commands",
+                    "incomplete_fixer_machine_validation", deadline_at=deadline_at,
+                    inherited_lock_descriptors=(collection_lock.fileno(),), excluded_preparation_paths=excluded,
+                    expected_source_tree=tested_tree)
+            except subprocess.TimeoutExpired:
+                _terminate_retained_collection_commands(directory, 'original_deadline_exhausted')
+                return None
+        after = capture_worktree_tree(workspace, ["."], attempt_directory, excluded_preparation_paths=excluded)
+        if after != tested_tree:
+            result["status"] = "candidate_changed"
+        evidence = {**result, "tested_tree": tested_tree, "tested_commit": intent["tested_commit"],
+            "source_tree_before": before, "source_tree_after": after, "workspace": str(workspace),
+            "runtime_environment": runtime_environment_identity(), "dependency_identity_proven": False,
+            "role_outcome_status": "incomplete", "semantic_repair_round": record["semantic_repair_rounds_used"],
+            "collection_attempt": intent['collection_attempt_count'], "original": str(attempt_directory / 'evidence.json')}
+        write_json(attempt_directory / 'evidence.json', evidence)
+        if intent['collection_attempt_count'] == 1:
+            write_json(evidence_file, evidence)
+        intent['published_evidence_path'] = str(evidence_file if intent['collection_attempt_count'] == 1 else attempt_directory / 'evidence.json')
+        intent["evidence_sha256"] = hashlib.sha256(Path(intent['published_evidence_path']).read_bytes()).hexdigest()
+        if result['status'] == 'failed':
+            from .role_failure_recovery import classify_role_failure
+            failure_directory = Path(result['failed_command_directory'])
+            failure = classify_role_failure('', (failure_directory / 'stderr.txt').read_text(errors='replace'),
+                result['commands'][-1]['returncode'], 'text')
+            intent['recovery'] = {'trigger': 'environment_changed_or_bounded_probe_due', 'action': 'resume_same_run',
+                'maximum_unchanged_retries': 1, 'failure': failure}
+            intent['retry_not_before'] = (time.time() + max(5, failure['retry_not_before_seconds'])
+                if failure['maximum_same_configuration_retries'] else None)
+        else:
+            intent.pop('retry_not_before', None)
+            intent.pop('recovery', None)
+        write_json(intent_file, intent)
+        return Path(intent['published_evidence_path'])

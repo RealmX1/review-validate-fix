@@ -34,10 +34,17 @@ def analyze_runs(run_directories: list[Path]) -> dict:
                 **facts, "native_facts_evidence": facts_evidence})
         validations = [read_json(path) for path in sorted(run.glob("final-validation/attempt-*/validation.json"))]
         evidence = [read_json(path) for path in sorted(run.glob("machine-evidence/attempt-*/evidence.json"))]
+        incomplete_fixer_machine_validations = []
+        for directory in sorted(run.glob('incomplete-fixer-machine-validation/round-*/attempt-*')):
+            path = directory / 'evidence.json'
+            incomplete_fixer_machine_validations.append(dict(read_json(path), original=str(path)) if path.exists()
+                else {'status': 'incomplete', 'attempt_directory': str(directory),
+                      'commands': [read_json(original) for original in sorted(directory.glob('commands/command-*/execution.json'))]})
         runs.append({"run_directory": str(run), "status": record["status"], "base_commit": record.get("base_commit"),
             "candidate_commit": record.get("candidate_commit"), "source_version": record.get("source_version"),
             "runtime_environment": record.get("runtime_environment"), "attempts": attempts, "validations": validations,
-            "shared_evidence": evidence, "commit": record.get("commit"),
+            "shared_evidence": evidence, "incomplete_fixer_machine_validations": incomplete_fixer_machine_validations,
+            "commit": record.get("commit"),
             "stage_events": read_json(run / "stage-events.json").get("events", []) if (run / "stage-events.json").exists() else None,
             "closeout": read_json(run / "business-result.json").get("closeout") if (run / "business-result.json").exists() else None})
     attempts = [attempt for run in runs for attempt in run["attempts"]]
@@ -46,8 +53,8 @@ def analyze_runs(run_directories: list[Path]) -> dict:
         "metrics": {"main_agent_model_round_trips": None, "main_agent_tool_polls": None,
             "role_invocations": sum((Path(item["attempt_directory"]) / "model-invocation.json").exists() for item in attempts),
             "supplemental_context_responses": sum(len(list(Path(run["run_directory"]).glob("context-response-originals-by-sha256/*.md"))) for run in runs),
-            "validation_attempts": sum(len(run["validations"]) for run in runs),
-            "machine_evidence_collections": sum(len(run["shared_evidence"]) for run in runs),
+            "validation_attempts": sum(len(run["validations"]) + len(run["incomplete_fixer_machine_validations"]) for run in runs),
+            "machine_evidence_collections": sum(len(run["shared_evidence"]) + len(run["incomplete_fixer_machine_validations"]) for run in runs),
             "role_elapsed_seconds": sum(item["raw_outcome"]["finished_at"] - item["raw_outcome"]["started_at"] for item in attempts
                 if isinstance(item["raw_outcome"].get("finished_at"), (int, float)) and isinstance(item["raw_outcome"].get("started_at"), (int, float))),
             "native_usage": usages if len(usages) == len(attempts) and attempts else None,

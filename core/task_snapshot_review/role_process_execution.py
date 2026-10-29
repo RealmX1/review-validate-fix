@@ -104,6 +104,9 @@ def validate_role_result(payload: dict, role: str, expected_findings: list[dict]
         if payload.get("requests") and payload["status"] == "completed":
             raise ValueError("仍有未解决请求的 reviewer 不能算完成")
     else:
+        if payload.get("completion_blocker") is not None and (
+                payload["status"] != "incomplete" or payload["completion_blocker"] != "registered_machine_validation"):
+            raise ValueError("机器补证请求只允许 incomplete fixer 使用 registered_machine_validation")
         dispositions = payload.get("dispositions")
         if not isinstance(dispositions, list):
             raise ValueError("fixer 结果需要 dispositions 列表")

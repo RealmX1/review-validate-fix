@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import platform
 import signal
 import subprocess
@@ -50,14 +51,24 @@ def ensure_execution_not_revoked(run_directory: Path) -> None:
         raise ExecutionRevoked("所属执行已持久撤销；不能派发、恢复、应用补丁或投递结果")
 
 
-def process_start_identity(pid: int) -> dict | None:
+def process_start_identity(pid: int, *, timeout_seconds: float = 5) -> dict | None:
     completed = subprocess.run(["ps", "-p", str(pid), "-o", "lstart=", "-o", "pgid=", "-o", "command="],
-                               capture_output=True, text=True, timeout=5)
+                               capture_output=True, text=True, timeout=timeout_seconds)
     if completed.returncode == 1 and not completed.stdout.strip():
         return None
     if completed.returncode or not completed.stdout.strip():
         raise RuntimeError("进程启动身份查询不可用，不能据此推断进程退出")
     return {"pid": pid, "start_and_command": " ".join(completed.stdout.split())}
+
+
+def owned_process_start_time_and_group_match(current: dict, recorded: dict) -> bool:
+    if current.get("pid") != recorded.get("pid"):
+        return False
+    # exec 只改变命令；信号资格绑定已观察的启动时刻与进程组，无法解析时保留未知。
+    pattern = r"^(\S+\s+\S+\s+\d+\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(\d+)(?:\s|$)"
+    current_start = re.match(pattern, current.get("start_and_command") or "")
+    recorded_start = re.match(pattern, recorded.get("start_and_command") or "")
+    return bool(current_start and recorded_start and current_start.groups() == recorded_start.groups())
 
 
 def register_owned_process(run_directory: Path, pid: int, purpose: str, *, owns_process_group: bool = False) -> None:
@@ -94,8 +105,39 @@ def persist_execution_revocation(run_directory: Path, reason: str) -> None:
             write_json(path, {"reason": reason, "revoked_at": time.time()})
 
 
+def register_supervised_command_directory(run_directory: Path, command_directory: Path) -> None:
+    directory = command_directory.resolve()
+    relative = directory.relative_to(run_directory.resolve())
+    if 'workspace' in relative.parts or not relative.parts:
+        raise ValueError('命令监督目录必须位于 run 控制目录，不能位于候选源码中')
+    with exclusive_lock(run_directory / 'registered-supervised-command-directories.lock'):
+        registry = run_directory / 'registered-supervised-command-directories.json'
+        directories = read_json(registry)['command_directories'] if registry.exists() else []
+        if str(directory) not in directories:
+            write_json(registry, {'command_directories': [*directories, str(directory)]})
+
+
 def revoke_execution(run_directory: Path, reason: str) -> dict:
     persist_execution_revocation(run_directory, reason)
+    # 监督者已退出也不能丢弃跨 session 后代；原生启动身份重新核验后才发送信号。
+    from .retained_command_supervisor import terminate_supervised_command_descendants
+    supervised_descendants = []
+    registry = run_directory / 'registered-supervised-command-directories.json'
+    try:
+        directories = read_json(registry)['command_directories'] if registry.exists() else []
+        for registered_directory in directories:
+            try:
+                directory = Path(registered_directory).resolve()
+                relative = directory.relative_to(run_directory.resolve())
+                if 'workspace' in relative.parts or not relative.parts:
+                    raise ValueError('已登记监督目录指向候选源码或 run 根目录')
+                if (directory / 'command-supervision.json').exists():
+                    supervised_descendants.extend(terminate_supervised_command_descendants(directory))
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
+                supervised_descendants.append({'command_directory': registered_directory,
+                    'cancellation_status': 'unknown', 'error': str(error)})
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        supervised_descendants.append({'cancellation_status': 'unknown', 'error': str(error)})
     owned = run_directory / "owned-processes.json"
     observations = []
     for process in read_json(owned).get("processes", []) if owned.exists() else []:
@@ -107,7 +149,7 @@ def revoke_execution(run_directory: Path, reason: str) -> dict:
             current = process_start_identity(process["pid"])
             if current is None:
                 status = "local_process_exited"
-            elif current != {key: process[key] for key in ("pid", "start_and_command")}:
+            elif not owned_process_start_time_and_group_match(current, process):
                 status = "identity_changed_no_signal"
             else:
                 (os.killpg if process["owns_process_group"] else os.kill)(process["pid"], signal.SIGTERM)
@@ -124,7 +166,7 @@ def revoke_execution(run_directory: Path, reason: str) -> dict:
                 current = process_start_identity(item["pid"])
                 if current is None:
                     item["local_cancellation_status"] = "local_process_exited"
-                elif current != {key: item[key] for key in ("pid", "start_and_command")}:
+                elif not owned_process_start_time_and_group_match(current, item):
                     item["local_cancellation_status"] = "identity_changed_no_signal"
                 elif time.monotonic() >= deadline:
                     (os.killpg if item["owns_process_group"] else os.kill)(item["pid"], signal.SIGKILL)
@@ -137,6 +179,7 @@ def revoke_execution(run_directory: Path, reason: str) -> dict:
         if pending:
             time.sleep(0.05)
     evidence = {"status": "cancelled", "disposition": "cancelled", "processes": observations,
+                "supervised_descendants": supervised_descendants,
                 "recovery": {"trigger": "owned_process_identity_or_native_receipt_changed", "action": "reconcile_cancellation",
                              "maximum_unchanged_retries": 1}, "observed_at": time.time()}
     write_json(run_directory / "cancellation-observations.json", evidence)
@@ -254,13 +297,20 @@ def publish_business_result(run_directory: Path, result: dict) -> dict:
         paths = [str(path.parent / "outcome.json") for path in attempts]
         paths.extend(str(path.parent / filename) for path in attempts for filename in
                      ("stdout.txt", "stderr.txt", "model-invocation.json", "progress.json"))
+        machine_retry_times = []
+        for intent in run_directory.glob("incomplete-fixer-machine-validation/round-*/collection-intent.json"):
+            paths.extend([str(intent), str(intent.parent / "evidence.json")])
+            collection = read_json(intent)
+            if (collection.get('retry_not_before') and not collection.get('unchanged_recovery_probe_used')
+                    and collection.get('collection_attempt_count', 0) < 3):
+                machine_retry_times.append(collection['retry_not_before'] * 1000)
         configurations = [read_json(path).get("config", {}).get("configuration_file_path") for path in attempts]
         paths.extend(str(Path(evidence).expanduser()) for path in attempts for evidence in read_json(path).get("config", {}).get("credential_evidence_paths", []))
         paths.extend(path for path in configurations if path)
         paths.extend(str(run_directory / filename) for filename in ("reviewer-configurations.json", "fixer-configuration.json", "context-response-originals-by-sha256"))
         latest_attempts = {path.parent.parent: path.parent for path in attempts}
         failures = [read_json(attempt / "outcome.json") for attempt in latest_attempts.values() if (attempt / "outcome.json").exists()]
-        retry_times = [item["retry_not_before"] * 1000 for item in failures if item.get("retry_not_before") and
+        retry_times = machine_retry_times + [item["retry_not_before"] * 1000 for item in failures if item.get("retry_not_before") and
                        item.get("recovery", {}).get("category") in {"authentication", "usage_limit", "workspace_preparation"}]
         result["recovery"] = {**record.get("recovery", {"missing_evidence": result["status"],
             "equivalent_sources": ["role_native_output", "registered_configuration", "validation_command_logs"],

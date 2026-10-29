@@ -18,9 +18,9 @@ from .execution_lifecycle import (
     ExecutionRevoked, append_stage_event, ensure_execution_not_revoked, execution_is_revoked,
     publish_business_result, register_owned_process, revoke_execution,
     persist_execution_revocation,
-    finish_owned_process_registration,
+    finish_owned_process_registration, register_supervised_command_directory,
 )
-from .machine_evidence import collect_shared_machine_evidence, prepare_isolated_workspace
+from .machine_evidence import collect_shared_machine_evidence, collect_incomplete_fixer_machine_validation, prepare_isolated_workspace, verified_execution_plan, ensure_previous_supervised_commands_exited
 
 
 def skill_directory() -> Path:
@@ -245,6 +245,7 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
         "preparation_recovery_cycle": record.get("preparation_recovery_cycle"),
         "shared_machine_evidence": record.get("shared_machine_evidence"),
         "shared_machine_evidence_recovery_sha256": record.get("shared_machine_evidence_recovery_sha256"),
+        "incomplete_fixer_machine_validation_evidence": record.get("incomplete_fixer_machine_validation_evidence") if role == "fixer" else None,
         "context_response_sha256": record.get('context_response_sha256'),
         "context_response_file": str(verified_context_response_original_path(run_directory, record['context_response_sha256'])) if record.get('context_response_sha256') else None,
     }
@@ -477,6 +478,7 @@ def _validate(run_directory: Path, record: dict, commands: list[list[str]], lock
     # 任意登记命令的依赖与外部服务身份尚未获得证明；历史通过不授予当前执行资格。
     history_root = run_directory / "final-validation"
     history_root.mkdir(exist_ok=True)
+    ensure_previous_supervised_commands_exited(run_directory, history_root)
     attempt_directory = history_root / f"attempt-{len(list(history_root.glob('attempt-*'))) + 1:03d}"
     attempt_directory.mkdir()
     validation = {"status": "running", "candidate_commit": candidate, "commands": commands, "completed_commands": 0,
@@ -497,13 +499,36 @@ def _validate(run_directory: Path, record: dict, commands: list[list[str]], lock
         write_json(attempt_directory / "validation.json", validation)
         write_json(prior, validation)
     save_validation()
+    preparation_paths = attempt_directory / 'preparation-created-untracked-paths.json'
+    excluded = read_json(preparation_paths)['paths'] if preparation_paths.exists() else None
     for i in range(validation["completed_commands"], len(commands)):
         ensure_execution_not_revoked(run_directory)
         logs = attempt_directory / f"command-{i + 1:03d}"
         logs.mkdir()
+        source_before = capture_worktree_tree(workspace, ['.'], logs, excluded_preparation_paths=excluded)
+        command_record = {'argv': commands[i], 'cwd': str(workspace), 'source_tree_before': source_before}
+        if source_before != tested_tree:
+            validation['status'] = 'candidate_changed'
+            command_record.update({'status': 'candidate_changed', 'execution_started': False})
+            write_json(logs / 'execution.json', command_record)
+            break
         with (logs / "stdout.txt").open("wb") as stdout, (logs / "stderr.txt").open("wb") as stderr:
-            process = subprocess.Popen(commands[i], cwd=workspace, stdout=stdout, stderr=stderr, pass_fds=(lock_handle.fileno(),), start_new_session=True)
-            register_owned_process(run_directory, process.pid, "final_validation", owns_process_group=True)
+            with exclusive_lock(run_directory / 'execution-revocation.lock'):
+                ensure_execution_not_revoked(run_directory)
+                register_supervised_command_directory(run_directory, logs)
+                launch_command = [sys.executable, str(Path(__file__).with_name('retained_command_supervisor.py')),
+                    str(run_directory), str(logs), 'None', json.dumps([lock_handle.fileno()]), json.dumps(commands[i])]
+                try:
+                    process = subprocess.Popen(launch_command, cwd=workspace, stdout=stdout, stderr=stderr, pass_fds=(lock_handle.fileno(),), start_new_session=True)
+                except OSError as error:
+                    command_record.update({'status': 'launch_failed', 'execution_started': False, 'finished_at': time.time(),
+                        'native_launch_error': {'type': type(error).__name__, 'errno': error.errno, 'message': str(error)}})
+                    write_json(logs / 'execution.json', command_record)
+                    validation['status'] = 'launch_failed'
+                    save_validation()
+                    error.original_evidence_paths = [str(logs / 'execution.json')]
+                    raise
+                register_owned_process(run_directory, process.pid, "final_validation", owns_process_group=True)
             try:
                 from .execution_lifecycle import wait_for_owned_process
                 returncode = wait_for_owned_process(process, run_directory)
@@ -521,7 +546,22 @@ def _validate(run_directory: Path, record: dict, commands: list[list[str]], lock
                 record["status"] = "interrupted"
                 write_json(run_directory / "run.json", record)
                 raise
+        supervision_file = logs / 'command-supervision.json'
+        if supervision_file.exists() and read_json(supervision_file).get('status') == 'descendant_exit_unproven':
+            validation['status'] = 'machine_evidence_pending'
+            save_validation()
+            error = RuntimeError('最终验证命令的后代退出证据未知；等待原生归属查询恢复')
+            error.original_evidence_paths = [str(supervision_file)]
+            raise error
         validation["returncode"] = returncode
+        source_after = capture_worktree_tree(workspace, ['.'], logs, excluded_preparation_paths=excluded)
+        command_record.update({'returncode': returncode, 'source_tree_after': source_after,
+            'status': 'passed' if returncode == 0 else 'failed'})
+        if source_after != tested_tree:
+            command_record['status'] = validation['status'] = 'candidate_changed'
+        write_json(logs / 'execution.json', command_record)
+        if validation['status'] == 'candidate_changed':
+            break
         if returncode:
             validation["status"] = "failed"
             break
@@ -609,7 +649,20 @@ def _resume_review_iteration(run_directory: Path, *, reviewer_configs: list[dict
                     record["status"] = "fix_incomplete"
                     progress = _role_result(run_directory / "fixer", latest=True, include_incomplete=True)
                     if progress:
-                        _snapshot_fixer_progress(run_directory, record, progress)
+                        intent = _snapshot_fixer_progress(run_directory, record, progress)
+                        if progress["result"].get("completion_blocker") == "registered_machine_validation" and record.get("execution_plan_sha256"):
+                            deadline = read_json(run_directory / "fixer/role-deadline.json")["deadline_at"]
+                            evidence = collect_incomplete_fixer_machine_validation(run_directory, record, intent["after"], deadline)
+                            if evidence is not None and record.get("incomplete_fixer_machine_validation_evidence") != str(evidence):
+                                previous = verified_context_response_original_path(run_directory, record.get("context_response_sha256"))
+                                response = (f"执行器已对保留修复树运行启动时冻结的最终验证，原始 incomplete 不变，语义结论仍由本角色判断。\n"
+                                    f"机器原件：{evidence}\n原通用补证：{previous or '无'}\n"
+                                    "核对完整树、命令、cwd 和日志后接续；不在受限沙箱重复同一机器命令，不延长原总时限。\n").encode()
+                                digest = hashlib.sha256(response).hexdigest()
+                                original = run_directory / "context-response-originals-by-sha256" / f"{digest}.md"
+                                write_bytes(original, response)
+                                record.update({"context_response_sha256": digest,
+                                    "incomplete_fixer_machine_validation_evidence": str(evidence), "status": "machine_evidence_available"})
                 else:
                     new_findings = fixer_result["result"].get("new_findings", [])
                     in_scope_new = anonymous_findings([{"result": {"findings": [item for item in new_findings if item.get("scope_relation") != "outside_task_scope"]}}])
@@ -632,7 +685,7 @@ def _resume_review_iteration(run_directory: Path, *, reviewer_configs: list[dict
                     validation = read_json(run_directory / "validation.json")
                     if validation.get("candidate_commit") != current_candidate:
                         validation = {}
-                    elif (validation.get("status") in {"running", "interrupted", "passed"}
+                    elif (validation.get("status") in {"running", "interrupted", "passed", "launch_failed"}
                           or validation.get("tested_tree") != capture_worktree_tree(
                               repo, record.get("effective_scope_paths", record["scope_paths"]), run_directory)):
                         validation = _validate(run_directory, record, validation["commands"], lock_handle)
@@ -684,10 +737,7 @@ def resume_review(run_directory: Path, *, reviewer_configs: list[dict] | None = 
             return publish_business_result(run_directory, {"status": "cancelled", "run_directory": str(run_directory)})
         plan = {}
         if record.get("execution_plan_sha256"):
-            path = run_directory / "execution-plan.json"
-            if hashlib.sha256(path.read_bytes()).hexdigest() != record["execution_plan_sha256"]:
-                raise ValueError("冻结启动材料摘要不匹配；恢复原件后接续")
-            plan = read_json(path)
+            plan = verified_execution_plan(run_directory, record)
             if fix and not plan["fix"]:
                 raise ValueError("接续不能增加启动时未冻结的修复意图；请为新候选登记完整启动材料")
             if validation_commands is not None and validation_commands != plan["validation_commands"]:
@@ -723,12 +773,13 @@ def resume_review(run_directory: Path, *, reviewer_configs: list[dict] | None = 
                                  for command in shared_evidence["commands"]],
                 }, sort_keys=True).encode()).hexdigest()
                 write_json(run_directory / "run.json", record)
-            for _ in range(plan.get("maximum_semantic_repair_rounds", 0) + 2):
+            for _ in range(2 * plan.get("maximum_semantic_repair_rounds", 0) + 2):
                 ensure_execution_not_revoked(run_directory)
                 result = _resume_review_iteration(run_directory, reviewer_configs=reviewer_configs, fix=fix,
                     fixer_config=fixer_config, validation_commands=validation_commands, context_response_file=context_response_file)
+                context_response_file = None
                 append_stage_event(run_directory, "workflow_progress", status=result["status"])
-                if not plan or not fix or result["status"] not in {"validation_failed", "findings_unresolved"}:
+                if not plan or not fix or result["status"] not in {"validation_failed", "findings_unresolved", "machine_evidence_available"}:
                     return publish_business_result(run_directory, result)
             return publish_business_result(run_directory, result)
         except ExecutionRevoked:
@@ -740,6 +791,7 @@ def resume_review(run_directory: Path, *, reviewer_configs: list[dict] | None = 
                 "missing_evidence": str(error), "equivalent_sources": ["registered_commands", "native_role_output"],
                 "original_evidence_paths": getattr(error, "original_evidence_paths", []),
                 "trigger": "environment_or_configuration_changed", "action": "resume_same_run", "maximum_unchanged_retries": 1,
+                **getattr(error, 'recovery', {}),
             }})
             write_json(run_directory / "run.json", record)
             return publish_business_result(run_directory, {"status": record["status"], "run_directory": str(run_directory)})

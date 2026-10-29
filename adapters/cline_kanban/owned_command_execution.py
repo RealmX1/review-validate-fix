@@ -28,6 +28,7 @@ def start_managed_review(run_directory: Path, task_id: str, *, project_path: Pat
     record = read_json(run_directory / "run.json")
     spec = {"command": [sys.executable, str(entrypoint), "resume-task-review", "--run-dir", str(run_directory)],
             "resumeCommand": [sys.executable, str(entrypoint), "resume-task-review", "--run-dir", str(run_directory)],
+            "resumeCommandPreservesBusinessSingleFlight": True,
             "cancelCommand": [sys.executable, str(entrypoint), "cancel-task-review", "--run-dir", str(run_directory)],
             "workingDirectory": record["repo"], "resultFile": str(run_directory / "business-result.json"),
             "materialSha256": hashlib.sha256((record["execution_plan_sha256"] + record["review_input_sha256"]).encode()).hexdigest(),

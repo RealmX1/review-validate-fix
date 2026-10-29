@@ -17,6 +17,12 @@ RVF 的流程为：一次固定材料启动 → 两路独立 reviewer → 来源
 
 `business-result.json` 区分 `agent_review_ready`、`agent_judgment_required`、`machine_evidence_pending` 与 `cancelled`，退出码不授予业务资格。机器等待包含缺证、等价来源、证据路径、触发条件、恢复动作和有界次数。原生错误优先，文本兜底仅扫描失败进程的 stderr；正常正文的额度关键词不是额度错误。认证/额度同配置 300 秒后最多复核一次；新凭据或配置摘要允许恢复，不能无限重试。
 
+fixer 的 completed 表示发现的语义处置和必要的针对性验证完成；执行器应用补丁后仍须统一运行完整最终验证。只有决定处置所必需的具体机器事实无法在既有权限和等价来源下取得、且可由已登记命令补齐时，才使用 `completion_blocker: registered_machine_validation` 的 incomplete；尚未执行整套 final 本身不构成语义未完成。执行器在保留修复树上自动补验，保存完整树、cwd、准备环境及日志，再交回同一 fixer 独立收束，不把原始 incomplete 改成 completed。中断和环境恢复共享每个语义轮最多三次采集的预算；失败后按恢复证据变化或一次定时探测有界接续，环境变化也使既有通过证据失效。所有 attempt 原件保留，全部动作继续受原角色总时限和持久撤销约束；语义缺口不触发这一机器补证。
+
+准备、机器补验和权威最终验证均由独立监督者等待所属后代。原生启动身份和继承的随机执行归属覆盖新 session 后代；`ps` 不可用时使用平台原生查询。短暂查询失败只作有界复核，持续缺证保存命令退出事实、后代退出未知与恢复条件，不能把未知写成通过或耗尽整个角色期限后冒充命令失败。
+
+观测缺证不终止尚在执行的已登记命令；有界复核后，以直接子进程退出这一新事实触发再次核验。退出证明仍未知时不写通过，也不派发下一份命令。Stop 可使用尚未回收的 Popen 直接子进程句柄这一独立归属证据；其他后代仍核对原生启动身份。原生 Popen 启动失败单独保存未派发事实及 errno，重采可据此安全恢复，不把缺少监督文件直接解释为退出。
+
 使用 `--kanban-task-id` 与 `--kanban-project-path` 将同一 run 委托给通用 `kanban task command-execution`。执行记录先冻结 incarnation、主会话、工作树、材料、恢复动作及稳定结果 ID，宿主负责等待与原生接受补证。`cancel-task-review` 先写持久撤销，再仅取消匹配启动身份的所属进程；原生共享宿主取消证据未知时保留 unknown。Stop 后不能以自动恢复再次派发。
 
 本工作流默认在 RVF 顺利完成且主 Agent 最终审阅通过后自主 commit 收尾；明确只读、不得提交等限制继续优先。`elevated` 处置必须注明 `elevation_impact: none|rollback|broad_rewrite`；普通 elevation 不单独阻止提交，后两类形成具体判断请求。主 Agent 提交后以 `--closeout-report` 保存逐项计划状态、证据与工作 recap，原 run 核实真实提交并立即输出收尾，先于任何 base-branch-sync。未提供实施证据时计划完成情况是 unknown，而非从 RVF 成功推定。
@@ -25,7 +31,7 @@ Analyze 支持重复 `--run-dir`，纯读取原始 outcome 与持久 reconciliat
 
 run 中保留需求原文、固定基线、候选 Git 对象、显式范围、实际拼装的角色 prompt、原始 stdout/stderr 和进度。后台进程由脚本或宿主等待；重启复用同一目录。一次失败最多原路重试一次，之后改用已配置的其他可用 CLI；两路未完成如实保留。
 
-最终验证在独立工作树执行：当前 HEAD 的已提交内容叠加已评审的任务路径，不带入范围外 staged/unstaged/untracked WIP。`validation.json` 保存完整 `tested_tree`、实际 `tested_commit`、工作树与命令；依赖随 HEAD 漂移时自动重跑原验证命令，不重跑已完成 reviewer。只在实际提交的完整树与已通过验证的树一致时登记完成。同一树的中断验证复用原验证工作树和已完成命令，保留构建产物；树发生变化则从头验证。
+最终验证在独立工作树执行：当前 HEAD 的已提交内容叠加已评审的任务路径，不带入范围外 staged/unstaged/untracked WIP。`validation.json` 保存完整 `tested_tree`、实际 `tested_commit`、工作树与命令；依赖随 HEAD 漂移时自动重跑原验证命令，不重跑已完成 reviewer。只在实际提交的完整树与已通过验证的树一致时登记完成。同一树的中断验证保留原工作树和构建产物；依赖身份无法证明时完整重验，不复用旧通过记录或命令前缀。
 
 Validate-Fixer 返回 `incomplete` 仍保留新发现、处置、隔离修复快照与补丁；下次输入包含先前结果，工作树接续已保存修复。新范围内发现先并入匿名分配，未解决时不能进入最终验证；未完成修复不提前覆盖主工作树。明确停止在初始角色派发及等待阶段均取消并回收当前流程拥有的 worker。
 

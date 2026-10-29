@@ -37,6 +37,7 @@ def test_failed_kanban_registration_reuses_frozen_binding_on_plain_resume(reposi
         for number, handler in previous_handlers.items():
             signal.signal(number, handler)
     assert "managed_execution_started" in capsys.readouterr().out
+    assert read_json(run / "kanban-command-execution-specification.json")["resumeCommandPreservesBusinessSingleFlight"] is True
     assert len(list((run / "kanban-command-execution-registration-attempts").glob("attempt-*.json"))) == 2
     assert not list(run.glob("reviewer-*/attempt-*"))
 
@@ -150,7 +151,7 @@ def test_same_tested_tree_is_revalidated_without_dependency_identity_proof(repos
 
 
 def test_validation_repair_resumes_incomplete_tree_instead_of_original_red_tree(repository, tmp_path):
-    run = automatic_snapshot(repository, tmp_path, commands=[[sys.executable, "-c", "from task import value; assert value == 4"]])
+    run = automatic_snapshot(repository, tmp_path, commands=[[sys.executable, "-B", "-c", "from task import value; assert value == 4"]])
     partial = tmp_path / "partial-validation-repair.py"
     partial.write_text("from pathlib import Path\nimport json\nPath('task.py').write_text('value = 3\\n')\nprint(json.dumps({'status':'incomplete','dispositions':[]}))\n")
     config = fake_config(tmp_path)
@@ -170,7 +171,7 @@ def test_safe_external_head_hunk_is_preserved_before_fix_application(repository,
     path.write_text(original.replace("value = 1\n", "value = 2\n", 1))
     run = tmp_path / "head-before-application"
     create_snapshot(repository, base_ref="HEAD", scope_paths=["task.py"], requirements=b"repair first line", run_directory=run,
-                    execution_plan={"fix": True, "validation_commands": [[sys.executable, "-c", "from task import value,external_value; assert (value,external_value)==(3,2)"]]})
+                    execution_plan={"fix": True, "validation_commands": [[sys.executable, "-B", "-c", "from task import value,external_value; assert (value,external_value)==(3,2)"]]})
     actual_apply = workflow._prepare_and_apply_fix
     def advance_head(*args):
         path.write_text(original.replace("external_value = 1", "external_value = 2"))

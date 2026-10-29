@@ -158,6 +158,9 @@ def test_cancellation_during_initial_three_reviewer_dispatch_reaps_started_worke
 
 
 def test_interrupted_validation_rechecks_build_without_dependency_identity_proof(repository, tmp_path):
+    # 构建产物属于准备环境；不能被当作验证期间新增的候选源码。
+    with (repository / '.git/info/exclude').open('a') as excluded_paths:
+        excluded_paths.write('\nbuild-result\n')
     run = dependency_task(repository, tmp_path)
     counter = tmp_path / 'build-invocations'
     started = tmp_path / 'validation-started'
