@@ -24,7 +24,12 @@ OUTPUT_FORMAT_KIMI_STREAM_JSON = 'kimi_stream_json'
 OUTPUT_FORMAT_OH_MY_PI_JSON = 'oh_my_pi_json'
 USER_LOCAL_ALTERNATIVE_REVIEWER_CONFIG_OVERRIDE_RELATIVE_DIRECTORY = Path('.rvf') / 'alternative-reviewer-config-overrides'
 USER_LOCAL_ALTERNATIVE_REVIEWER_CONFIG_OVERRIDE_SCHEMA_VERSION = 1
-USER_LOCAL_ALTERNATIVE_REVIEWER_CONFIG_OVERRIDE_ALLOWED_FIELDS = {'env_set', 'health_command', 'health_timeout_seconds', 'pre_run_health'}
+USER_LOCAL_ALTERNATIVE_REVIEWER_CONFIG_OVERRIDE_ALLOWED_FIELDS = {
+    'env_set', 'health_command', 'health_timeout_seconds', 'pre_run_health', 'credential_evidence_paths',
+    'account_identity', 'credential_source_identity', 'route_identity', 'account_status_evidence_path',
+    'credential_identity_source',
+    'model_scope_identity',
+}
 STRUCTURED_REVIEWER_OUTPUT_PROTOCOL_CONTROL_FIELD_NAMES = {'event', 'kind', 'name', 'role', 'status', 'subtype', 'type'}
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -372,12 +377,12 @@ def normalise_reviewer_command_for_output_format(argv: list[str], output_format:
         return ensure_oh_my_pi_json_command(argv)
     return list(argv)
 
-def resolve_reviewer_model_commands(config: dict[str, Any], command: list[str], health_command: list[str] | None, *, env: dict[str, str], cwd: Path, timeout: int) -> tuple[list[str], list[str] | None]:
+def resolve_formal_reviewer_model_command(config: dict[str, Any], command: list[str], *, env: dict[str, str], cwd: Path, timeout: int) -> list[str]:
     source = config.get('reviewer_model_selection_source')
     if source != 'kimi_latest_managed_stable_model':
-        return resolve_oh_my_pi_default_model_commands(config, command, health_command, env=env, cwd=cwd, timeout=timeout)
-    if not is_kimi_prompt_command(command) or not health_command or (not is_kimi_prompt_command(health_command)):
-        raise ValueError('Kimi 动态选模要求正式评审和健康检查都使用 kimi')
+        return resolve_oh_my_pi_default_model_command(config, command, env=env, cwd=cwd, timeout=timeout)
+    if not is_kimi_prompt_command(command):
+        raise ValueError('Kimi 动态选模要求正式评审使用 kimi')
 
     def extract_native_resume_selector(argv: list[str]) -> tuple[list[str], list[str], list[str]]:
         selector_tokens: list[str] = []
@@ -403,12 +408,7 @@ def resolve_reviewer_model_commands(config: dict[str, Any], command: list[str], 
                 without_resume.append(item)
             index += 1
         return (selector_tokens, canonical_selector, without_resume)
-    resume_tokens, resume_selector, _ = extract_native_resume_selector(command)
-    _, health_resume_selector, health_without_resume = extract_native_resume_selector(health_command)
-    if health_resume_selector and health_resume_selector != resume_selector:
-        raise ValueError('Kimi 正式评审与健康检查的原生恢复会话不一致')
-    if resume_tokens:
-        health_command = [*health_without_resume, *resume_tokens]
+    resume_tokens, _, _ = extract_native_resume_selector(command)
 
     def extract_explicit_model_selector(argv: list[str]) -> tuple[str | None, list[str]]:
         selectors = []
@@ -431,16 +431,11 @@ def resolve_reviewer_model_commands(config: dict[str, Any], command: list[str], 
             raise ValueError('Kimi 显式模型参数为空或重复')
         return (selectors[0] if selectors else None, without_model)
     selected_model, command_without_model = extract_explicit_model_selector(command)
-    health_model, health_without_model = extract_explicit_model_selector(health_command)
-    if selected_model is None and health_model is not None:
-        raise ValueError('Kimi 健康检查不能单独覆盖正式评审的模型')
-    if selected_model is not None and health_model not in {None, selected_model}:
-        raise ValueError('Kimi 正式评审与健康检查的显式模型不一致')
     if selected_model is None:
         if resume_tokens:
-            return (command, health_command)
+            return command
         selected_model = resolve_latest_kimi_managed_stable_model(command[0], env=env, timeout=min(timeout, 10))
-    return ([command[0], '--model', selected_model, *command_without_model[1:]], [health_command[0], '--model', selected_model, *health_without_model[1:]])
+    return [command[0], '--model', selected_model, *command_without_model[1:]]
 
 class ReviewerStructuredOutputError(ValueError):
     """结构化 stdout 里读出的、足以否定整条评审腿的 typed 错误。
@@ -813,15 +808,15 @@ def structured_output_terminated_cleanly(output: str, output_format: str) -> boo
         return terminated
     return None
 
-def resolve_oh_my_pi_default_model_commands(config: dict[str, Any], command: list[str], health_command: list[str] | None, *, env: dict[str, str], cwd: Path, timeout: int) -> tuple[list[str], list[str] | None]:
+def resolve_oh_my_pi_default_model_command(config: dict[str, Any], command: list[str], *, env: dict[str, str], cwd: Path, timeout: int) -> list[str]:
     source = config.get('reviewer_model_selection_source')
     if source is None:
-        return (command, health_command)
+        return command
     if source != 'oh_my_pi_default_model_role':
         raise ValueError('未知 reviewer_model_selection_source')
-    if not is_oh_my_pi_print_command(command) or not health_command or (not is_oh_my_pi_print_command(health_command)):
-        raise ValueError('OMP 默认选模要求正式评审和健康检查都使用 omp')
-    if any((item == '--model' or item.startswith('--model=') for item in command + health_command)):
+    if not is_oh_my_pi_print_command(command):
+        raise ValueError('OMP 默认选模要求正式评审使用 omp')
+    if any((item == '--model' or item.startswith('--model=') for item in command)):
         raise ValueError('动态默认选模不能同时配置固定 --model')
     try:
         completed = subprocess.run([command[0], 'config', 'get', 'modelRoles', '--json'], check=False, capture_output=True, text=True, env=env, cwd=cwd, timeout=min(timeout, 5))
@@ -837,7 +832,7 @@ def resolve_oh_my_pi_default_model_commands(config: dict[str, Any], command: lis
     selector = roles.get('default') if isinstance(roles, dict) else None
     if not isinstance(selector, str) or not re.fullmatch('openai-codex/[A-Za-z0-9][A-Za-z0-9._-]*(?::(?:off|minimal|low|medium|high|xhigh|max|ultra|inherit))?', selector):
         raise ValueError('OMP 默认模型必须明确指定 openai-codex 的单一模型；该评审腿不可用')
-    return ([command[0], '--model', selector, *command[1:]], [health_command[0], '--model', selector, *health_command[1:]])
+    return [command[0], '--model', selector, *command[1:]]
 
 def safe_artifact_token(value: str) -> str:
     token = "".join(char if char.isalnum() or char in "._-" else "-" for char in value.strip())

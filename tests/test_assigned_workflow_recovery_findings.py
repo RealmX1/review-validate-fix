@@ -26,7 +26,8 @@ def test_credentials_follow_effective_role_environment(tmp_path, executable, env
                                     "env_unset": ["CODEX_HOME"] if "HOME" in environment else []})
     configuration = workflow.load_reviewer_configuration(configuration_file)
     credentials = tmp_path / expected
-    assert configuration["credential_evidence_paths"] == [str(credentials)]
+    assert configuration['credential_evidence_paths'][0] == str(credentials)
+    assert all(Path(path).parent == credentials.parent for path in configuration['credential_evidence_paths'])
     original_digest = workflow.configuration_digest(configuration)
     credentials.parent.mkdir(parents=True, exist_ok=True)
     credentials.write_text("已刷新测试凭据")

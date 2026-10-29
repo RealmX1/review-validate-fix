@@ -21,6 +21,9 @@ from .execution_lifecycle import (
     finish_owned_process_registration, register_supervised_command_directory,
 )
 from .machine_evidence import collect_shared_machine_evidence, collect_incomplete_fixer_machine_validation, prepare_isolated_workspace, verified_execution_plan, ensure_previous_supervised_commands_exited
+from .reviewer_account_eligibility import (
+    reviewer_eligibility, reviewer_credential_evidence_paths, reviewer_execution_environment,
+)
 
 
 def skill_directory() -> Path:
@@ -50,7 +53,7 @@ def reviewer_configuration_matches_harness_constraint(config: dict, constraint: 
     return True
 
 
-def default_reviewer_configurations(*, harness_constraint: str = "any_external_cli") -> list[dict]:
+def default_reviewer_configurations(*, harness_constraint: str = "any_external_cli", eligibility_observations: list | None = None) -> list[dict]:
     directory = skill_directory()
     from core.rvf_user_local_data_paths import resolved_rvf_reviewer_registry_path
     registry = read_json(resolved_rvf_reviewer_registry_path(directory / "config/reviewer-registry.json"))
@@ -61,6 +64,12 @@ def default_reviewer_configurations(*, harness_constraint: str = "any_external_c
         config = load_reviewer_configuration(directory / item["config_path"])
         if (config.get("enabled", True) and reviewer_configuration_matches_harness_constraint(config, harness_constraint)
                 and shutil.which(config["command"][0])):
+            config['underlying_provider_account_quota_pool_identity'] = item.get('underlying_provider_account_quota_pool_identity')
+            eligibility = reviewer_eligibility(config)
+            if eligibility_observations is not None:
+                eligibility_observations.append(eligibility)
+            if not eligibility['can_dispatch']:
+                continue
             available.append((item.get("underlying_provider_account_quota_pool_identity"), config))
     # 优先不同额度池；每个角色仍使用独立新进程与工作树。
     if len(available) > 1:
@@ -69,29 +78,14 @@ def default_reviewer_configurations(*, harness_constraint: str = "any_external_c
     configs = [item[1] for item in available]
     if len(configs) == 1:
         configs.append(configs[0])
-    if len(configs) < 2 and harness_constraint == "any_external_cli":
-        raise RuntimeError("没有可执行的 reviewer CLI；可通过 --reviewer-config 提供其他独立 CLI")
     return configs
 
 
 def load_reviewer_configuration(path: Path) -> dict:
     from .harness_cli_adapters import load_effective_alternative_reviewer_config
     config, _ = load_effective_alternative_reviewer_config(path)
-    executable_name = Path(config["command"][0]).name
-    effective_environment = dict(os.environ)
-    for name in config.get("env_unset", []):
-        effective_environment.pop(name, None)
-    effective_environment.update(config.get("env_set", {}))
-    if effective_environment.get("HOME"):
-        effective_home = Path(effective_environment["HOME"])
-    else:
-        import pwd
-        effective_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
-    credential_paths = {
-        "codex": [str(Path(effective_environment.get("CODEX_HOME") or effective_home / ".codex") / "auth.json")],
-        "claude": [str(Path(effective_environment.get("CLAUDE_CONFIG_DIR") or effective_home / ".claude") / ".credentials.json")],
-    }
-    return {**config, "credential_evidence_paths": config.get("credential_evidence_paths", credential_paths.get(executable_name, [])), 'configuration_file_path':str(path.resolve())}
+    return {**config, 'credential_evidence_paths': reviewer_credential_evidence_paths(config, reviewer_execution_environment(config)),
+            'configuration_file_path': str(path.resolve())}
 
 
 def persistent_configuration(config: dict) -> dict:
@@ -169,9 +163,10 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
         return completed, None
     role_directory.mkdir(exist_ok=True)
     deadline_file = role_directory / "role-deadline.json"
-    if not configurations and not deadline_file.exists():
-        # 首次派发即开始计时，配置缺失也消耗默认总预算。
-        write_json(deadline_file, {"deadline_at": time.time() + 1800})
+    if not deadline_file.exists():
+        # 首次资格判断即开始计时；不可用和换配置都不延长原预算。
+        write_json(deadline_file, {"deadline_at": time.time() + float(configurations[0].get('timeout_seconds', 1800)
+            if configurations else record.get('default_reviewer_timeout_seconds', 1800))})
     if deadline_file.exists() and read_json(deadline_file)["deadline_at"] <= time.time():
         write_json(role_directory / "deadline-exhausted.json", {
             "status": "incomplete", "recovery": {"category": "deadline_exhausted", "maximum_same_configuration_retries": 0},
@@ -187,6 +182,8 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
                 return None,launch_role(attempt)
             write_json(attempt/'outcome.json',{'status':'failed','retryable':True,'error':'执行中断，原进程已经结束但结果未知；保留原始输出并补跑此腿'})
     chosen = None
+    eligibility_observations = []
+    chosen_eligibility = None
     candidate_commit = record.get("validated_candidate_commit", record["candidate_commit"]) if role == "fixer" else record["candidate_commit"]
     fix_application_base_commit = None
     validation_failure = read_json(run_directory / "validation.json") if role == "fixer" and (run_directory / "validation.json").exists() else {}
@@ -200,6 +197,11 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
             if not _matches_tree(Path(record["repo"]), candidate_commit, progress_intent["paths"], run_directory):
                 fix_application_base_commit = progress_intent["before"]
     for config in configurations:
+        eligibility = reviewer_eligibility(config, deadline_at=read_json(deadline_file)['deadline_at'],
+                                           run_directory=run_directory)
+        eligibility_observations.append(eligibility)
+        if not eligibility['can_dispatch']:
+            continue
         identity = configuration_digest(config)
         matching_configuration_attempt_outcomes = [(read_json(attempt / "request.json"), read_json(attempt / "outcome.json"))
             for attempt in attempts if (attempt / "request.json").exists() and (attempt / "outcome.json").exists()
@@ -207,19 +209,16 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
         if any(outcome.get("recovery", {}).get("category") in {"configuration", "deterministic"}
                for _, outcome in matching_configuration_attempt_outcomes):
             continue
+        if (eligibility.get('storage_error') or not Path(eligibility['evidence_path']).exists()) and any(outcome.get('availability_evidence_persistence_error')
+               and outcome.get('recovery', {}).get('category') in {'authentication', 'account_banned', 'usage_limit'}
+               for _, outcome in matching_configuration_attempt_outcomes):
+            # 共享存储暂不可写时仍以本 run 的原生失败为依据，不重复消耗模型请求。
+            continue
         # 准备失败只在每次 controller 接续时复核一次，不占用模型传输重试预算。
         if any(outcome.get("recovery", {}).get("category") == "workspace_preparation"
                and request.get("preparation_recovery_cycle") == record.get("preparation_recovery_cycle")
                for request, outcome in matching_configuration_attempt_outcomes):
             continue
-        # 凭据故障预算独立于候选、机器事实和补证摘要，避免无关环境变化绕过冷却。
-        credential_failures = [outcome for _, outcome in matching_configuration_attempt_outcomes
-            if outcome.get("recovery", {}).get("category") in {"authentication", "usage_limit"}]
-        if credential_failures:
-            if len(credential_failures) >= 2 or time.time() < credential_failures[-1].get("retry_not_before", float("inf")):
-                continue
-            chosen = config
-            break
         matching = [attempt for attempt in attempts if (attempt / "request.json").exists()
                     and read_json(attempt / "request.json")["configuration_digest"] == identity
                     and (read_json(attempt / "request.json")["candidate_commit"] == candidate_commit
@@ -229,16 +228,19 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
                     and read_json(attempt/'request.json').get('context_response_sha256') == record.get('context_response_sha256')
                     and read_json(attempt/'request.json').get('shared_machine_evidence_recovery_sha256') == record.get('shared_machine_evidence_recovery_sha256')
                     and not ((attempt / "outcome.json").exists() and read_json(attempt / "outcome.json").get("recovery", {}).get("category") == "workspace_preparation")
+                    and not ((attempt / 'outcome.json').exists() and read_json(attempt / 'outcome.json').get('recovery', {}).get('category')
+                             in {'authentication', 'account_banned', 'usage_limit', 'reviewer_unavailable'})
                     and not ((attempt/'outcome.json').exists() and read_json(attempt/'outcome.json').get('status')=='cancelled')]
         if any((attempt / "outcome.json").exists() and read_json(attempt / "outcome.json").get("retryable") is False for attempt in matching):
             continue
         if len(matching) < 2:
             chosen = config
+            chosen_eligibility = eligibility
             break
+    write_json(role_directory / 'reviewer-eligibility.json', {'observations': eligibility_observations})
     if chosen is None:
         return None, None
-    if not deadline_file.exists():
-        write_json(deadline_file, {"deadline_at": time.time() + float(chosen.get("timeout_seconds", 1800))})
+    ensure_execution_not_revoked(run_directory)
     if role == "fixer" and record.get("execution_plan_sha256"):
         plan = read_json(run_directory / "execution-plan.json")
         # CLI 传输失败复用同一语义轮；完成后再修复才消耗下一轮，配置变化不重置预算。
@@ -256,6 +258,7 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
     result_file = attempt_directory / "role-output.json"
     request = {
         "role": role, "config": persistent_configuration(chosen), "configuration_digest": configuration_digest(chosen),
+        'reviewer_eligibility': chosen_eligibility,
         "workspace": str(workspace), "input_file": str(attempt_directory / "request.json"),
         "repository": record['repo'],
         "result_file": str(result_file), "findings": findings,
@@ -624,6 +627,7 @@ def _resume_review_iteration(run_directory: Path, *, reviewer_configs: list[dict
         if hashlib.sha256((run_directory / "requirements.md").read_bytes()).hexdigest() != record["requirements_sha256"] or hashlib.sha256((run_directory / "task-changes.patch").read_bytes()).hexdigest() != record["patch_sha256"]:
             raise ValueError("固定评审输入已改变；保留原 run 并为新输入创建快照")
         configurations_file = run_directory / "reviewer-configurations.json"
+        candidate_eligibility_observations = []
         uses_default_reviewer_pool = reviewer_configs is None and (not configurations_file.exists()
             or read_json(configurations_file).get("uses_default_reviewer_pool", False))
         if reviewer_configs is not None:
@@ -638,12 +642,17 @@ def _resume_review_iteration(run_directory: Path, *, reviewer_configs: list[dict
             write_json(configurations_file, {"configurations": [persistent_configuration(config) for config in reviewer_configs]})
         else:
             constrained_codex_seat = "codex_external_cli" in record.get("reviewer_harness_constraints", [])
-            reviewer_configs = default_reviewer_configurations(harness_constraint="non_codex_external_cli") if constrained_codex_seat else default_reviewer_configurations()
+            reviewer_configs = default_reviewer_configurations(harness_constraint="non_codex_external_cli" if constrained_codex_seat else 'any_external_cli',
+                eligibility_observations=candidate_eligibility_observations)
         constraints = record.get("reviewer_harness_constraints", ["any_external_cli"] * record["reviewer_count"])
         if len(constraints) != record["reviewer_count"]:
             raise ValueError("冻结的 reviewer harness 约束与数量不一致")
         if "codex_external_cli" in constraints and not any(reviewer_configuration_matches_harness_constraint(config, "codex_external_cli") for config in reviewer_configs):
-            reviewer_configs = [*reviewer_configs, *default_reviewer_configurations(harness_constraint="codex_external_cli")]
+            reviewer_configs = [*reviewer_configs, *default_reviewer_configurations(harness_constraint="codex_external_cli",
+                eligibility_observations=candidate_eligibility_observations)]
+        write_json(run_directory / 'reviewer-candidate-eligibility.json', {'observations': candidate_eligibility_observations})
+        if candidate_eligibility_observations:
+            record.setdefault('default_reviewer_timeout_seconds', candidate_eligibility_observations[0]['role_timeout_seconds'])
         write_json(configurations_file, {"configurations": [persistent_configuration(config) for config in reviewer_configs],
                                          "uses_default_reviewer_pool": uses_default_reviewer_pool})
         reviewer_count = record["reviewer_count"]

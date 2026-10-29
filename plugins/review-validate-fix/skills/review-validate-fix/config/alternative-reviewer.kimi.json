@@ -25,12 +25,5 @@
     "KIMI_OAUTH_HOST",
     "KIMI_CODE_EXPERIMENTAL_FLAG"
   ],
-  "health_command": [
-    "kimi",
-    "--output-format",
-    "stream-json",
-    "-p",
-    "Reply with exactly: OK"
-  ],
   "timeout_seconds": 900
 }

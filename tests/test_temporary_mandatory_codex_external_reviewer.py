@@ -151,7 +151,7 @@ def test_all_ordinary_fallbacks_exclude_codex(repository, tmp_path, monkeypatch)
 def test_missing_codex_cli_leaves_recovery_and_allows_ordinary_reports(repository, tmp_path, monkeypatch):
     run = create_via_cli(repository, tmp_path, monkeypatch)
     original_default = workflow.default_reviewer_configurations
-    monkeypatch.setattr(workflow.shutil, 'which', lambda executable: None if executable == 'codex' else executable)
+    monkeypatch.setattr(workflow.shutil, 'which', lambda executable, **kwargs: None if executable == 'codex' else executable)
     ordinary = fake_config(tmp_path)
     assert workflow.resume_review(run, reviewer_configs=[ordinary, ordinary])['status'] == 'review_incomplete'
     assert read_json(run / 'reviewer-1/attempt-001/outcome.json')['status'] == 'completed'
@@ -213,7 +213,7 @@ def test_default_ordinary_pool_preserves_oh_my_pi_and_quota_preference(tmp_path,
                            'underlying_provider_account_quota_pool_identity': pool}
     write_json(registry, {'harnesses': harnesses})
     monkeypatch.setattr(paths, 'resolved_rvf_reviewer_registry_path', lambda bundled: registry)
-    monkeypatch.setattr(workflow.shutil, 'which', lambda executable: executable)
+    monkeypatch.setattr(workflow.shutil, 'which', lambda executable, **kwargs: executable)
     selected = workflow.default_reviewer_configurations(harness_constraint='non_codex_external_cli')
     assert [config['command'][0] for config in selected] == ['omp', 'claude']
     assert [config['command'][0] for config in workflow.default_reviewer_configurations()] == ['codex', 'claude', 'omp']
