@@ -104,7 +104,62 @@ def _claude_secure_storage_fingerprint(config: dict, environment: dict) -> str |
         return type(error).__name__
 
 
-def _without_model_selector(command: list[str]) -> list[str]:
+def _without_native_session_selectors(command: list[str]) -> list[str]:
+    remaining = [command[0]]
+    executable_name = Path(command[0]).name
+    codex_exec_index = cli.codex_subcommand_index(command)
+    codex_positional_argument_seen = False
+    codex_session_id_pending = False
+    value_selectors = {'--session', '--session-id', '--resume'}
+    if executable_name == 'kimi':
+        value_selectors.add('-S')
+    if executable_name in {'claude', 'omp'}:
+        value_selectors.add('-r')
+    if executable_name == 'omp':
+        value_selectors.add('--fork')
+    index = 1
+    while index < len(command):
+        item = command[index]
+        if item == '--':
+            remaining.extend(command[index:index + 1] + command[index + 2:]
+                             if codex_session_id_pending else command[index:])
+            break
+        if executable_name == 'codex' and item in cli.CODEX_GLOBAL_AND_EXEC_OPTIONS_WITH_ARGUMENT_VALUES:
+            remaining.extend(command[index:index + 2])
+            index += 2
+            continue
+        if codex_session_id_pending and not item.startswith('-'):
+            codex_session_id_pending = False
+            index += 1
+            continue
+        codex_session_subcommand = False
+        if (codex_exec_index is not None and index > codex_exec_index
+                and not item.startswith('-') and not codex_positional_argument_seen):
+            codex_session_subcommand = item in {'resume', 'fork'}
+            codex_positional_argument_seen = True
+        if codex_session_subcommand:
+            codex_session_id_pending = True
+            index += 1
+            continue
+        if item in value_selectors:
+            index += 1
+            if index < len(command) and not command[index].startswith('-'):
+                index += 1
+            continue
+        if (any(item.startswith(selector + '=') for selector in value_selectors if selector.startswith('--'))
+                or executable_name == 'kimi' and item.startswith('-S') and len(item) > 2
+                or executable_name == 'claude' and item.startswith('-r') and len(item) > 2
+                or item in {'--continue', '--fork-session', '--last'}
+                or executable_name in {'kimi', 'claude', 'omp'} and item == '-c'):
+            index += 1
+            continue
+        remaining.append(item)
+        index += 1
+    return remaining
+
+
+def _account_identity_command(command: list[str]) -> list[str]:
+    command = _without_native_session_selectors(command)
     remaining = []
     index = 0
     while index < len(command):
@@ -147,7 +202,7 @@ def _identity(config: dict, environment: dict, resolved_command: list[str] | Non
         or any(name.endswith(('_KEY', '_TOKEN')) and environment.get(name) for name in configured_credential_names)
         or all(config.get(field) for field in ('account_identity', 'credential_source_identity', 'route_identity')))
     account_identity = {
-        'command': _without_model_selector(config['command']), 'executable': executable,
+        'command': _account_identity_command(config['command']), 'executable': executable,
         'executable_sha256': executable_sha256, 'credential_observations': credential_observations,
         'claude_secure_storage_sha256': secure_storage_sha256,
         'execution_environment': relevant_environment,
@@ -166,8 +221,9 @@ def _identity(config: dict, environment: dict, resolved_command: list[str] | Non
         configuration_paths.append(str(cli.user_local_alternative_reviewer_config_override_path(config['label'])))
     return {'identity_sha256': account_sha256,
             'configuration_scope_sha256': _sha256([account_sha256, configuration]),
-            'model_scope_sha256': _sha256([account_sha256, config.get('model_scope_identity') or config.get('underlying_provider_account_quota_pool_identity')
-                or config.get('reviewer_model_selection_source') or resolved_command or config['command']]),
+            'model_scope_sha256': _sha256([account_sha256, _without_native_session_selectors(resolved_command or config['command'])]),
+            'declared_model_or_quota_pool_scope_sha256s': [_sha256([account_sha256, field, config[field]]) for field in (
+                'model_scope_identity', 'underlying_provider_account_quota_pool_identity') if config.get(field)],
             'evidence_path': str(root / f'{account_sha256}.json'),
             'credential_evidence_paths': sorted(credential_observations),
             'configuration_evidence_paths': configuration_paths,
@@ -339,15 +395,42 @@ def _cached_account_status(config: dict, now: float) -> dict:
         return {'status': 'unknown', 'reason': 'cached_account_status_unavailable'}
 
 
+def _applicable_reviewer_account_failures(record: dict, identity: dict) -> list[tuple[str, dict]]:
+    model_scopes = {identity['model_scope_sha256']}
+    pool_scopes = set(identity['declared_model_or_quota_pool_scope_sha256s'])
+    applicable = {}
+    # 声明只能扩展已有故障的约束，不能让同一实际模型脱离原故障与恢复预算。
+    while True:
+        previous_count = len(applicable)
+        for scope, failure in record['negative_evidence'].items():
+            if scope == 'account':
+                applicable[scope] = failure
+            elif (model_scopes.intersection(failure.get('model_scope_sha256s', [scope]))
+                    or pool_scopes.intersection(failure.get('declared_model_or_quota_pool_scope_sha256s', []))):
+                applicable[scope] = failure
+                model_scopes.update(failure.get('model_scope_sha256s', [scope]))
+                pool_scopes.update(failure.get('declared_model_or_quota_pool_scope_sha256s', []))
+        if len(applicable) == previous_count:
+            break
+    for scope in applicable:
+        _invalidate_formal_success_evidence(record, scope)
+    return list(applicable.items())
+
+
 def _invalidate_formal_success_evidence(record: dict, failure_scope: str) -> None:
+    failure = record['negative_evidence'][failure_scope]
     record['formal_success_by_configuration'] = {
         key: value for key, value in record['formal_success_by_configuration'].items()
-        if failure_scope != 'account' and value.get('model_scope_sha256') != failure_scope}
+        if failure_scope != 'account'
+        and value.get('model_scope_sha256') not in failure.get('model_scope_sha256s', [failure_scope])
+        and not set(value.get('declared_model_or_quota_pool_scope_sha256s', [])).intersection(
+            failure.get('declared_model_or_quota_pool_scope_sha256s', []))}
 
 
 def reviewer_eligibility(config: dict, *, environment: dict | None = None, cwd: Path | None = None,
                          deadline_at: float | None = None, run_directory: Path | None = None,
-                         reserve_recovery_for: str | None = None, resolved_command: list[str] | None = None) -> dict:
+                         reserve_recovery_for: str | None = None, resolved_command: list[str] | None = None,
+                         locked_pre_invocation_attempt_directory: Path | None = None) -> dict:
     environment = reviewer_execution_environment(config) if environment is None else environment
     identity = _identity(config, environment, resolved_command)
     path = Path(identity['evidence_path'])
@@ -365,13 +448,14 @@ def reviewer_eligibility(config: dict, *, environment: dict | None = None, cwd: 
             status_check_configuration_sha256 = _sha256([config.get('health_command'), config.get('pre_run_health')])
             if run_directory is not None and deadline_at is not None:
                 budgets = record.setdefault('non_inference_check_budgets_by_run', {})
-                check_budget = budgets.setdefault(_sha256([str(run_directory), status_check_configuration_sha256]), {
-                    'attempt_count': 0, 'maximum_attempts': math.ceil(max(0, deadline_at - now) / AVAILABILITY_RECOVERY_COOLDOWN_SECONDS) + 1,
+                check_budget = budgets.setdefault(_sha256([str(run_directory), deadline_at, status_check_configuration_sha256]), {
+                    'attempt_count': 0, 'maximum_attempts': math.ceil(max(0, deadline_at - now) / NON_INFERENCE_OBSERVATION_VALIDITY_SECONDS) + 1,
                     'deadline_at': deadline_at})
             observation = record.get('non_inference_observation', {})
-            if ((now >= observation.get('next_check_at', 0)
-                    or observation.get('configuration_sha256') != status_check_configuration_sha256)
-                    and (check_budget is None or check_budget['attempt_count'] < check_budget['maximum_attempts'])):
+            observation_expired = (now >= observation.get('next_check_at', 0)
+                                   or observation.get('configuration_sha256') != status_check_configuration_sha256)
+            status_check_available = check_budget is None or check_budget['attempt_count'] < check_budget['maximum_attempts']
+            if observation_expired and status_check_available:
                 timeout = min(5, max(0.01, float(config.get('health_timeout_seconds', 5))),
                               max(0.01, deadline_at - now) if deadline_at is not None else 5)
                 checked = _query_non_inference_status(config, environment, cwd, timeout, run_directory)
@@ -384,41 +468,70 @@ def reviewer_eligibility(config: dict, *, environment: dict | None = None, cwd: 
                     'next_check_at': now + (AVAILABILITY_RECOVERY_COOLDOWN_SECONDS if checked['status'] == 'unavailable'
                                             else NON_INFERENCE_OBSERVATION_VALIDITY_SECONDS)}
                 record['non_inference_observation'] = observation
+            elif observation_expired:
+                observation = {**observation, 'status': 'unknown', 'stale': True,
+                               'reason': 'non_inference_status_budget_exhausted'}
+                result.update(can_dispatch=False, reason=observation['reason'],
+                              recovery={'trigger': 'credentials_or_bound_account_status_changed',
+                                        'action': 'resume_same_run', 'maximum_unchanged_retries': 0})
             result['non_inference_observation'] = observation
             account_status = _cached_account_status(config, now)
             result['account_status_observation'] = account_status
             if account_status['status'] == 'unavailable':
                 category = account_status['category']
-                scope = 'account' if category in ACCOUNT_FAILURE_CATEGORIES else identity['model_scope_sha256']
+                quota_failures = [(key, failure) for key, failure in _applicable_reviewer_account_failures(record, identity) if key != 'account']
+                scope = 'account' if category in ACCOUNT_FAILURE_CATEGORIES else (
+                    quota_failures[0][0] if quota_failures else identity['model_scope_sha256'])
                 fingerprint = _sha256([category, account_status.get('quota')])
                 fingerprints = record.setdefault('cached_account_failure_fingerprints_by_scope', {})
-                if fingerprints.get(scope) != fingerprint:
-                    previous = record['negative_evidence'].get(scope, {})
+                previous = record['negative_evidence'].get(scope, {})
+                if (fingerprints.get(scope) != fingerprint or category == 'usage_limit'
+                        and identity['model_scope_sha256'] not in previous.get('model_scope_sha256s', [])):
                     failure = {**previous, 'category': 'account_banned' if previous.get('category') == 'account_banned' else category,
                         'observed_at': max(account_status['observed_at'], previous.get('observed_at', 0)),
                         'failure_count': max(1, previous.get('failure_count', 0)),
                         'evidence_path': result['account_status_evidence_path'],
                         'retry_not_before': max(now + AVAILABILITY_RECOVERY_COOLDOWN_SECONDS,
                             account_status.get('quota', {}).get('reset_at') or 0)}
+                    if category == 'usage_limit':
+                        reported_models = set(previous.get('model_scope_sha256s', [scope] if previous else []))
+                        reported_pools = set(previous.get('declared_model_or_quota_pool_scope_sha256s', []))
+                        if identity['model_scope_sha256'] not in reported_models:
+                            reported_pools.update(identity['declared_model_or_quota_pool_scope_sha256s'])
+                        reported_models.add(identity['model_scope_sha256'])
+                        failure.update(model_scope_sha256s=sorted(reported_models),
+                                       declared_model_or_quota_pool_scope_sha256s=sorted(reported_pools))
                     record['negative_evidence'][scope] = failure
+                    _applicable_reviewer_account_failures(record, identity)
                     _invalidate_formal_success_evidence(record, scope)
                     record['events'].append({'event': 'cached_account_status_failed', 'scope': scope, **failure})
                     fingerprints[scope] = fingerprint
-            active_failures = [(key, failure) for key, failure in record['negative_evidence'].items()
-                               if key in {'account', identity['model_scope_sha256']}]
+                elif account_status['observed_at'] > previous.get('observed_at', 0):
+                    previous['observed_at'] = account_status['observed_at']
+                    record['events'].append({'event': 'cached_account_status_reconfirmed', 'scope': scope,
+                                             'observed_at': previous['observed_at']})
+            active_failures = _applicable_reviewer_account_failures(record, identity)
             recovery_candidates = []
             for key, failure in active_failures:
+                quota_recovery_sample_covers_failure_scope = (not config.get('model_scope_identity')
+                    or set(failure.get('model_scope_sha256s', [key])) == {identity['model_scope_sha256']})
                 if (account_status['status'] == 'available'
                         and account_status.get('observed_at', 0) > failure['observed_at']
-                        and (failure['category'] != 'usage_limit' or account_status.get('quota_available'))):
+                        and (failure['category'] != 'usage_limit' or account_status.get('quota_available')
+                             and account_status.get('quota', {}).get('observed_at', 0) > failure['observed_at']
+                             and quota_recovery_sample_covers_failure_scope)):
                     record['events'].append({'event': 'account_status_recovered', 'observed_at': account_status['observed_at'], 'scope': key})
                     del record['negative_evidence'][key]
                     record.get('cached_account_failure_fingerprints_by_scope', {}).pop(key, None)
                 else:
+                    # 调用方持有原尝试的执行锁；启动证据存在后仍禁止重放该认领。
+                    resuming_own_claim = (locked_pre_invocation_attempt_directory is not None
+                        and failure.get('recovery_attempt_claim') == str(locked_pre_invocation_attempt_directory)
+                        and not (locked_pre_invocation_attempt_directory / 'model-invocation.json').exists())
                     retry_available = (now >= failure['retry_not_before']
                         and failure['category'] != 'account_banned'
                         and failure['failure_count'] < MAXIMUM_UNCHANGED_FAILURE_ATTEMPTS
-                        and not failure.get('recovery_attempt_claim'))
+                        and (not failure.get('recovery_attempt_claim') or resuming_own_claim))
                     if retry_available:
                         recovery_candidates.append(failure)
                     if not retry_available:
@@ -452,11 +565,12 @@ def reviewer_eligibility(config: dict, *, environment: dict | None = None, cwd: 
                     recovery.get('retry_not_before_epoch_ms', float('inf')) / 1000) * 1000
             if result['can_dispatch'] and reserve_recovery_for:
                 for failure in recovery_candidates:
-                    failure['recovery_attempt_claim'] = reserve_recovery_for
-                    failure['recovery_attempt_claimed_at'] = now
+                    if not failure.get('recovery_attempt_claim'):
+                        failure['recovery_attempt_claim'] = reserve_recovery_for
+                        failure['recovery_attempt_claimed_at'] = now
             success = record['formal_success_by_configuration'].get(identity['configuration_scope_sha256'])
             if (result['can_dispatch'] and identity['credential_identity_observable']
-                    and not any(key in record['negative_evidence'] for key in ('account', identity['model_scope_sha256'])) and success
+                    and not _applicable_reviewer_account_failures(record, identity) and success
                     and 0 <= now - success['observed_at'] < FORMAL_INVOCATION_SUCCESS_VALIDITY_SECONDS):
                 result.update(status='available', reason='recent_formal_invocation_success', formal_success=success)
             if json.dumps(record, sort_keys=True) != before or not path.exists():
@@ -484,26 +598,38 @@ def record_formal_invocation_result(eligibility: dict, *, started_at: float, suc
         if invocation_identity in processed:
             return
         now = time.time()
+        applicable = _applicable_reviewer_account_failures(record, eligibility)
         if failure_category in PERSISTENT_FAILURE_CATEGORIES:
-            scope = 'account' if failure_category in ACCOUNT_FAILURE_CATEGORIES else eligibility['model_scope_sha256']
-            previous = record['negative_evidence'].get(scope, {})
+            prior_failures = [(key, failure) for key, failure in applicable
+                              if (key == 'account') == (failure_category in ACCOUNT_FAILURE_CATEGORIES)]
+            scope = 'account' if failure_category in ACCOUNT_FAILURE_CATEGORIES else (
+                prior_failures[0][0] if prior_failures else eligibility['model_scope_sha256'])
+            previous = max((failure for _, failure in prior_failures), key=lambda failure: failure['failure_count'], default={})
             failure = {'category': 'account_banned' if previous.get('category') == 'account_banned' else failure_category,
                        'observed_at': now, 'evidence_path': evidence_path,
                        'retry_not_before': now + AVAILABILITY_RECOVERY_COOLDOWN_SECONDS,
                        'failure_count': previous.get('failure_count', 0) + 1}
+            if failure_category == 'usage_limit':
+                reported_models = {model for key, prior in prior_failures for model in prior.get('model_scope_sha256s', [key])}
+                reported_pools = {pool for _, prior in prior_failures for pool in prior.get('declared_model_or_quota_pool_scope_sha256s', [])}
+                reported_pools.update(eligibility['declared_model_or_quota_pool_scope_sha256s'])
+                reported_models.add(eligibility['model_scope_sha256'])
+                failure.update(model_scope_sha256s=sorted(reported_models),
+                               declared_model_or_quota_pool_scope_sha256s=sorted(reported_pools))
+                for key, _ in prior_failures:
+                    record['negative_evidence'].pop(key, None)
             record['negative_evidence'][scope] = failure
             _invalidate_formal_success_evidence(record, scope)
             record['events'].append({'event': 'formal_invocation_failed', 'scope': scope, **failure})
         elif success:
-            applicable = [failure for key, failure in record['negative_evidence'].items()
-                          if key in {'account', eligibility['model_scope_sha256']}]
-            if all(started_at > failure['observed_at'] for failure in applicable):
-                for scope in ('account', eligibility['model_scope_sha256']):
+            if all(started_at > failure['observed_at'] for _, failure in applicable):
+                for scope, _ in applicable:
                     record['negative_evidence'].pop(scope, None)
                     record.get('cached_account_failure_fingerprints_by_scope', {}).pop(scope, None)
                 record['formal_success_by_configuration'][eligibility['configuration_scope_sha256']] = {
                     'observed_at': now, 'valid_until': now + FORMAL_INVOCATION_SUCCESS_VALIDITY_SECONDS,
                     'model_scope_sha256': eligibility['model_scope_sha256'],
+                    'declared_model_or_quota_pool_scope_sha256s': eligibility['declared_model_or_quota_pool_scope_sha256s'],
                     'evidence_path': evidence_path}
                 record['events'].append({'event': 'formal_invocation_succeeded', 'observed_at': now, 'evidence_path': evidence_path})
         processed.append(invocation_identity)

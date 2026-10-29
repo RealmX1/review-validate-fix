@@ -239,7 +239,9 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
                 raise ValueError("原角色总时限已经耗尽，配置切换不重置时限")
             register_owned_process(run_directory, os.getpid(), "role_worker", owns_process_group=True)
             environment = role_environment(request)
-            eligibility = reviewer_eligibility(config, environment=environment, deadline_at=deadline_at, run_directory=run_directory)
+            eligibility = reviewer_eligibility(config, environment=environment, deadline_at=deadline_at, run_directory=run_directory,
+                resolved_command=request.get('preselected_formal_model_command'),
+                locked_pre_invocation_attempt_directory=attempt_directory)
             write_json(attempt_directory / 'reviewer-eligibility.json', eligibility)
             if not eligibility['can_dispatch']:
                 outcome.update(recovery={'category': 'reviewer_unavailable', **eligibility.get('recovery', {})}, retryable=False)
@@ -255,7 +257,8 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
             remaining_seconds = deadline_at - time.time()
             if remaining_seconds <= 0:
                 raise ValueError("准备环境后原角色总时限已经耗尽")
-            command = cli.resolve_formal_reviewer_model_command(config, command, env=environment, cwd=workspace, timeout=min(30, remaining_seconds))
+            command = (list(request['preselected_formal_model_command']) if request.get('preselected_formal_model_command')
+                else cli.resolve_formal_reviewer_model_command(config, command, env=environment, cwd=workspace, timeout=min(30, remaining_seconds)))
             resolved_model_command = list(command)
             command = cli.normalise_reviewer_command_for_output_format(command, output_format=output_format)
             if config.get("run_directory_grant_flag"):
@@ -286,7 +289,7 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
                 raise ValueError("CLI 版本核验后原角色总时限已经耗尽")
             eligibility = reviewer_eligibility(config, environment=environment, cwd=workspace,
                 deadline_at=deadline_at, run_directory=run_directory, resolved_command=resolved_model_command,
-                reserve_recovery_for=str(attempt_directory))
+                reserve_recovery_for=str(attempt_directory), locked_pre_invocation_attempt_directory=attempt_directory)
             write_json(attempt_directory / 'reviewer-eligibility.json', eligibility)
             if not eligibility['can_dispatch']:
                 outcome.update(recovery={'category': 'reviewer_unavailable', **eligibility.get('recovery', {})}, retryable=False)

@@ -31,6 +31,12 @@ USER_LOCAL_ALTERNATIVE_REVIEWER_CONFIG_OVERRIDE_ALLOWED_FIELDS = {
     'model_scope_identity',
 }
 STRUCTURED_REVIEWER_OUTPUT_PROTOCOL_CONTROL_FIELD_NAMES = {'event', 'kind', 'name', 'role', 'status', 'subtype', 'type'}
+CODEX_GLOBAL_AND_EXEC_OPTIONS_WITH_ARGUMENT_VALUES = {
+    '-a', '--add-dir', '--ask-for-approval', '-c', '-C', '--cd', '--config', '--disable', '--enable',
+    '-i', '--image', '--local-provider', '-m', '--model', '-p', '--profile', '--remote',
+    '--remote-auth-token-env', '-s', '--sandbox', '--thread-source', '--cyber-access-program',
+    '--output-schema', '--color', '-o', '--output-last-message',
+}
 
 def load_config(path: Path) -> dict[str, Any]:
     with path.open(encoding='utf-8') as handle:
@@ -148,7 +154,6 @@ def is_oh_my_pi_print_command(command: list[str]) -> bool:
 def codex_subcommand_index(command: list[str]) -> int | None:
     if not command or Path(command[0]).name != 'codex':
         return None
-    options_with_values = {'-a', '--add-dir', '--ask-for-approval', '-c', '-C', '--cd', '--config', '--disable', '--enable', '-i', '--image', '--local-provider', '-m', '--model', '-p', '--profile', '--remote', '--remote-auth-token-env', '-s', '--sandbox'}
     index = 1
     while index < len(command):
         item = command[index]
@@ -156,7 +161,7 @@ def codex_subcommand_index(command: list[str]) -> int | None:
             return index
         if item == '--':
             return None
-        if item in options_with_values:
+        if item in CODEX_GLOBAL_AND_EXEC_OPTIONS_WITH_ARGUMENT_VALUES:
             index += 2
             continue
         if item.startswith('--') and '=' in item:

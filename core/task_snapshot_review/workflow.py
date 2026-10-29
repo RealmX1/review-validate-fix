@@ -25,6 +25,8 @@ from .reviewer_account_eligibility import (
     reviewer_eligibility, reviewer_credential_evidence_paths, reviewer_execution_environment,
 )
 
+FORMAL_MODEL_CATALOG_RECHECK_INTERVAL_SECONDS = 30
+
 
 def skill_directory() -> Path:
     for root in Path(__file__).resolve().parents:
@@ -184,6 +186,7 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
     chosen = None
     eligibility_observations = []
     chosen_eligibility = None
+    chosen_formal_model_command = None
     candidate_commit = record.get("validated_candidate_commit", record["candidate_commit"]) if role == "fixer" else record["candidate_commit"]
     fix_application_base_commit = None
     validation_failure = read_json(run_directory / "validation.json") if role == "fixer" and (run_directory / "validation.json").exists() else {}
@@ -197,11 +200,63 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
             if not _matches_tree(Path(record["repo"]), candidate_commit, progress_intent["paths"], run_directory):
                 fix_application_base_commit = progress_intent["before"]
     for config in configurations:
+        ensure_execution_not_revoked(run_directory)
         eligibility = reviewer_eligibility(config, deadline_at=read_json(deadline_file)['deadline_at'],
                                            run_directory=run_directory)
         eligibility_observations.append(eligibility)
-        if not eligibility['can_dispatch']:
+        if not eligibility['can_dispatch'] and not (
+                config.get('reviewer_model_selection_source') and eligibility['reason'] == 'persistent_usage_limit'):
             continue
+        if config.get('reviewer_model_selection_source'):
+            from .harness_cli_adapters import resolve_formal_reviewer_model_command
+            deadline_at = read_json(deadline_file)['deadline_at']
+            remaining_seconds = deadline_at - time.time()
+            model_selection_observation_file = (role_directory / 'formal-model-selection-observations'
+                / f'{candidate_commit}-{configuration_digest(config)}.json')
+            model_selection_observation = (read_json(model_selection_observation_file)
+                if model_selection_observation_file.exists() else {
+                    'consecutive_query_failure_count': 0,
+                    'recheck_interval_seconds': min(FORMAL_MODEL_CATALOG_RECHECK_INTERVAL_SECONDS, max(0.01, remaining_seconds / 2))})
+            model_selection_observation.setdefault('maximum_consecutive_query_failures',
+                int(max(0, remaining_seconds) // model_selection_observation['recheck_interval_seconds']) + 1)
+            previous_model_selection_eligibility = model_selection_observation.get('eligibility', {})
+            if (previous_model_selection_eligibility.get('reason') == 'formal_model_selection_evidence_pending'
+                    and (time.time() < model_selection_observation.get('retry_not_before', 0)
+                         or model_selection_observation['consecutive_query_failure_count'] >= model_selection_observation['maximum_consecutive_query_failures'])):
+                eligibility_observations[-1] = previous_model_selection_eligibility
+                continue
+            try:
+                model_selection_workspace = run_directory / 'formal-model-selection-candidate-workspaces' / candidate_commit
+                if not model_selection_workspace.exists():
+                    model_selection_workspace.parent.mkdir(exist_ok=True)
+                    git(Path(record['repo']), 'worktree', 'add', '--detach', str(model_selection_workspace), candidate_commit)
+                command = resolve_formal_reviewer_model_command(config, list(config['command']),
+                    env=reviewer_execution_environment(config), cwd=model_selection_workspace,
+                    timeout=min(30, max(0.01, deadline_at - time.time())))
+                ensure_execution_not_revoked(run_directory)
+                eligibility = reviewer_eligibility(config, resolved_command=command,
+                    deadline_at=read_json(deadline_file)['deadline_at'], run_directory=run_directory)
+                chosen_formal_model_command = command
+                model_selection_observation['consecutive_query_failure_count'] = 0
+            except ExecutionRevoked:
+                raise
+            except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as error:
+                ensure_execution_not_revoked(run_directory)
+                model_selection_observation['consecutive_query_failure_count'] += 1
+                retry_at = min(time.time() + model_selection_observation['recheck_interval_seconds'], deadline_at)
+                retry_available = (retry_at < deadline_at and model_selection_observation['consecutive_query_failure_count']
+                    < model_selection_observation['maximum_consecutive_query_failures'])
+                eligibility = {**eligibility, 'status': 'unknown', 'can_dispatch': False,
+                    'reason': 'formal_model_selection_evidence_pending', 'error_type': type(error).__name__,
+                    'recovery': {'trigger': 'model_catalog_or_configuration_changed', 'action': 'resume_same_run',
+                                 'maximum_unchanged_retries': int(retry_available),
+                                 **({'retry_not_before_epoch_ms': retry_at * 1000} if retry_available else {})}}
+                model_selection_observation['retry_not_before'] = retry_at
+            model_selection_observation['eligibility'] = eligibility
+            write_json(model_selection_observation_file, model_selection_observation)
+            eligibility_observations[-1] = eligibility
+            if not eligibility['can_dispatch']:
+                continue
         identity = configuration_digest(config)
         matching_configuration_attempt_outcomes = [(read_json(attempt / "request.json"), read_json(attempt / "outcome.json"))
             for attempt in attempts if (attempt / "request.json").exists() and (attempt / "outcome.json").exists()
@@ -236,6 +291,8 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
         if len(matching) < 2:
             chosen = config
             chosen_eligibility = eligibility
+            if not config.get('reviewer_model_selection_source'):
+                chosen_formal_model_command = None
             break
     write_json(role_directory / 'reviewer-eligibility.json', {'observations': eligibility_observations})
     if chosen is None:
@@ -259,6 +316,7 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
     request = {
         "role": role, "config": persistent_configuration(chosen), "configuration_digest": configuration_digest(chosen),
         'reviewer_eligibility': chosen_eligibility,
+        'preselected_formal_model_command': chosen_formal_model_command,
         "workspace": str(workspace), "input_file": str(attempt_directory / "request.json"),
         "repository": record['repo'],
         "result_file": str(result_file), "findings": findings,
