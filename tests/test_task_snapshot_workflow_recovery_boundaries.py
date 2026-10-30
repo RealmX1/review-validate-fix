@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import os
 import signal
 import subprocess
@@ -14,6 +15,22 @@ from test_task_snapshot_review_workflow import ROOT, canary, fake_config, plain_
 from core.task_snapshot_review.persistent_artifacts import exclusive_lock, git, git_text, read_json, write_json
 from core.task_snapshot_review.task_snapshot import create_snapshot
 from core.task_snapshot_review.workflow import default_reviewer_configurations, resume_review
+
+
+def has_native_process_ownership_evidence_recovery_condition(workflow_resume_result):
+    return workflow_resume_result['status'] == 'machine_evidence_pending' and any(
+        read_json(Path(original_evidence_path)).get('recovery_condition') in {
+            'native_process_ownership_observation_available', 'previous_supervisor_and_descendants_exit_proven'}
+        for original_evidence_path in workflow_resume_result.get('recovery', {}).get('original_evidence_paths', []))
+
+
+def resume_after_native_process_ownership_evidence_recovers(run_directory, **resume_review_parameters):
+    # 全局进程表可暂时含有归属未知的新孤儿；接续原 run，仍由真实门禁证明可执行。
+    for recovery_attempt_index in range(5):
+        workflow_resume_result = resume_review(run_directory, **resume_review_parameters)
+        if not has_native_process_ownership_evidence_recovery_condition(workflow_resume_result) or recovery_attempt_index == 4:
+            return workflow_resume_result
+        time.sleep(0.05)
 
 
 def dependency_task(repository, tmp_path, *, expected=1, background=None):
@@ -33,7 +50,7 @@ def dependency_task(repository, tmp_path, *, expected=1, background=None):
 def test_background_dependency_cannot_hide_a_red_candidate(repository, tmp_path):
     run = dependency_task(repository, tmp_path, expected=2, background=2)
     before = canary(repository)
-    result = resume_review(run, validation_commands=[[sys.executable, '-B', 'task.py']])
+    result = resume_after_native_process_ownership_evidence_recovers(run, validation_commands=[[sys.executable, '-B', 'task.py']])
     assert result['status'] == 'validation_failed'
     validation = read_json(run / 'validation.json')
     assert validation['returncode'] == 1
@@ -45,13 +62,13 @@ def test_background_dependency_cannot_hide_a_red_candidate(repository, tmp_path)
 def test_head_tree_drift_revalidates_without_rerunning_reviewers(repository, tmp_path, dependency_value):
     run = dependency_task(repository, tmp_path)
     command = [sys.executable, '-B', 'task.py']
-    assert resume_review(run, validation_commands=[command])['status'] == 'ready_to_commit'
+    assert resume_after_native_process_ownership_evidence_recovers(run, validation_commands=[command])['status'] == 'ready_to_commit'
     original_validation = read_json(run / 'validation.json')
     reviewer_attempts = sorted(run.glob('reviewer-*/attempt-*/outcome.json'))
     (repository / 'dependency.py').write_text(f'value = {dependency_value}\n# base 漂移\n')
     git(repository, 'commit', '--only', '-qm', 'test: 提交依赖漂移', '--', 'dependency.py')
     git(repository, 'commit', '--only', '-qm', 'test: 提交任务', '--', 'task.py')
-    result = resume_review(run)
+    result = resume_after_native_process_ownership_evidence_recovers(run)
     assert result['status'] == ('validation_failed' if dependency_value == 0 else 'completed')
     validation = read_json(run / 'validation.json')
     assert validation['tested_tree'] != original_validation['tested_tree']
@@ -174,12 +191,21 @@ def test_interrupted_validation_rechecks_build_without_dependency_identity_proof
     commands_file = tmp_path / 'commands.json'
     write_json(commands_file, commands)
     entry = ROOT / 'plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_command_line_shortcut_entrypoint.py'
-    process = subprocess.Popen([sys.executable, str(entry), 'resume-task-review', '--run-dir', str(run),
-                                '--validation-commands', str(commands_file)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    controller_command = [sys.executable, str(entry), 'resume-task-review', '--run-dir', str(run),
+                          '--validation-commands', str(commands_file)]
+    process = subprocess.Popen(controller_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
         deadline = time.monotonic() + 10
+        native_ownership_recovery_attempts = 0
         while not started.exists():
             assert time.monotonic() < deadline
+            if process.poll() is not None:
+                stdout, stderr = process.communicate()
+                assert process.returncode == 0, (stdout, stderr)
+                assert has_native_process_ownership_evidence_recovery_condition(json.loads(stdout)), (stdout, stderr)
+                assert native_ownership_recovery_attempts < 4, (stdout, stderr)
+                native_ownership_recovery_attempts += 1
+                process = subprocess.Popen(controller_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             time.sleep(0.02)
         # 模拟机器退出：先终止 controller，再结束其独立验证进程；这不是用户 Stop。
         process.kill()
@@ -207,8 +233,10 @@ def test_interrupted_validation_rechecks_build_without_dependency_identity_proof
             assert time.monotonic() < deadline
             time.sleep(0.02)
     assert before['completed_commands'] == 1
+    # 初次启动的补证也可能重做构建；中断后必须至少再构建一次。
+    build_invocations_before_resume = counter.read_text()
     proceed.touch()
-    assert resume_review(run)['status'] == 'ready_to_commit'
-    assert counter.read_text() == 'xx'
+    assert resume_after_native_process_ownership_evidence_recovers(run)['status'] == 'ready_to_commit'
+    assert counter.read_text().startswith(build_invocations_before_resume + 'x')
     assert read_json(run / 'validation.json')['completed_commands'] == 2
     assert read_json(Path(before['attempt_directory']) / 'validation.json')['status'] == 'running'
