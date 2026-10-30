@@ -55,8 +55,11 @@ def handle_hook(event: dict, *, event_name: str, host_adapter) -> dict | None:
             return None
         if not dirty and evidence['committed_work_status'] != 'present':
             return None
+        # 补齐创建来源不改变内容身份；incarnation 冲突仍由起点解析器核验。
+        binding_identity = {key: value for key, value in evidence['binding'].items()
+                            if key not in {'creation_commit', 'provenance_incarnation_id'}}
         fingerprint = hashlib.sha256(json.dumps({
-            'binding': evidence['binding'], 'base_commit': evidence['base_commit'],
+            'binding': binding_identity, 'base_commit': evidence['base_commit'],
             'scope_paths': evidence['scope_paths'], 'worktree_tree': evidence['observed_worktree_tree'],
         }, sort_keys=True).encode()).hexdigest()
     elif dirty:

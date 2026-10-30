@@ -89,7 +89,8 @@ def test_new_formal_failure_preserves_new_pool_and_existing_retry_budget(tmp_pat
 def test_catalog_failure_schedules_bounded_recovery_without_role_runtime_limit(repository, tmp_path, monkeypatch, timeout_seconds, error_type):
     run = prepare(repository, tmp_path)
     config = {**fake_config(tmp_path), 'timeout_seconds': timeout_seconds, 'reviewer_model_selection_source': 'oh_my_pi_default_model_role'}
-    epoch = [time.time()]
+    # 固定秒与毫秒往返会向上舍入的原失败时间，按接口单位核验严格上限。
+    epoch = [1793385482.123886]
     monkeypatch.setattr(workflow.time, 'time', lambda: epoch[0])
     available = [False]
     queries = []
@@ -105,8 +106,9 @@ def test_catalog_failure_schedules_bounded_recovery_without_role_runtime_limit(r
     workflow._start_role(run, record, run / 'reviewer-1', 'reviewer', [config], [])
     assert not launched
     result = publish_business_result(run, {'status': 'review_incomplete'})
-    retry_at = result['recovery']['retry_not_before_epoch_ms'] / 1000
-    assert epoch[0] < retry_at <= epoch[0] + 30
+    retry_not_before_epoch_ms = result['recovery']['retry_not_before_epoch_ms']
+    assert epoch[0] * 1000 < retry_not_before_epoch_ms <= (epoch[0] + 30) * 1000
+    retry_at = retry_not_before_epoch_ms / 1000
     assert not (run / 'reviewer-1/role-deadline.json').exists()
     workflow._start_role(run, record, run / 'reviewer-1', 'reviewer', [config], [])
     assert len(queries) == 1

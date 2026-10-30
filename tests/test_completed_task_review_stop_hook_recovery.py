@@ -334,3 +334,124 @@ def test_unproven_historical_completion_does_not_suppress_later_real_content(kan
     assert resolve(task)['completion_evidence_status'] == 'unknown'
     git(task['repo'], 'commit', '-qam', 'fix: 历史缺证后的独立新内容')
     assert task_stop_hook_payload_from_fresh_process(task, host) is None
+
+
+@pytest.mark.parametrize('host', ['codex', 'claude_code', 'kimi_code'])
+def test_linked_completion_rejects_replaced_observation_with_unreviewed_new_file(kanban_task, tmp_path, host, capsys):
+    task = kanban_task
+    run = tmp_path / 'linked-observation-replacement-run'
+    record = create_completed_task_snapshot_with_real_git_evidence(task, run)
+    original_run = (run / 'run.json').read_bytes()
+    original_validation = (run / 'validation.json').read_bytes()
+    original_patch = (run / 'task-changes.patch').read_bytes()
+    new_path = task['repo'] / 'never-reviewed.txt'
+    new_path.write_text('尚未评审的新文件\n')
+    tree = capture_worktree_tree(task['repo'], ['.'], run)
+    record['original_worktree_observation_commit'] = git_text(task['repo'], 'commit-tree', tree,
+        '-p', record['original_head'], input_bytes='替换后的完整工作树观察\n'.encode())
+    write_json(run / 'run.json', record)
+    damaged_run = (run / 'run.json').read_bytes()
+    before = canary(task['repo'])
+
+    assert task_stop_hook_payload(task, host) is None
+    unknown = resolve(task)
+    assert unknown['completion_evidence_status'] == 'unknown', unknown
+    assert not unknown.get('current_scope_reviewed')
+    assert unknown['recovery_condition']
+    assert task_stop_hook_payload_from_fresh_process(task, host) is None
+    assert resolve(task)['resolution_attempt_count'] == unknown['resolution_attempt_count']
+    assert canary(task['repo']) == before
+    assert (run / 'run.json').read_bytes() == damaged_run
+    assert (run / 'validation.json').read_bytes() == original_validation
+    assert (run / 'task-changes.patch').read_bytes() == original_patch
+    assert not capsys.readouterr().out
+
+    (run / 'run.json').write_bytes(original_run)
+    new_path.unlink()
+    recovered = resolve(task, event={'prompt': '恢复原始冻结记录后继续', 'turn_id': 'restored-observation'})
+    assert recovered['completion_evidence_status'] == 'verified', recovered
+    assert recovered['current_scope_reviewed']
+    assert task_stop_hook_payload(task, host) is None
+    assert (run / 'run.json').read_bytes() == original_run
+
+
+@pytest.mark.parametrize('association', ['linked', 'supplemented', 'unassociated'])
+@pytest.mark.parametrize('damage', [
+    'candidate_reference', 'observation_reference', 'missing_reference',
+    'candidate_parent', 'observation_parent', 'scope_content', 'patch_sha256', 'patch_content',
+])
+def test_all_completion_associations_check_frozen_material_and_recover_originals(
+        kanban_task, tmp_path, association, damage):
+    from hashlib import sha256
+
+    task = kanban_task
+    run = tmp_path / 'frozen-material-integrity-run'
+    record = create_completed_task_snapshot_with_real_git_evidence(task, run, linked=association == 'linked')
+    if association == 'supplemented':
+        supplemented = resolve(task)
+        assert supplemented['current_scope_reviewed'], supplemented
+        assert Path(supplemented['completed_run_association_path']).is_file()
+    original_run = (run / 'run.json').read_bytes()
+    original_validation = (run / 'validation.json').read_bytes()
+    original_patch = (run / 'task-changes.patch').read_bytes()
+    reference = record['snapshot_reference']
+    observation_reference = reference + '-workspace-observation'
+    original_candidate = record['candidate_commit']
+    original_observation = record['original_worktree_observation_commit']
+
+    if damage == 'candidate_reference':
+        git(task['repo'], 'update-ref', reference, record['original_head'])
+    elif damage == 'observation_reference':
+        git(task['repo'], 'update-ref', observation_reference, record['original_head'])
+    elif damage == 'missing_reference':
+        git(task['repo'], 'update-ref', '-d', observation_reference)
+    elif damage in ('candidate_parent', 'observation_parent'):
+        key = 'candidate_commit' if damage == 'candidate_parent' else 'original_worktree_observation_commit'
+        tree = git_text(task['repo'], 'rev-parse', record[key] + '^{tree}')
+        record[key] = git_text(task['repo'], 'commit-tree', tree, '-p', record['commit'],
+                              input_bytes='父提交不符的冻结对象\n'.encode())
+        git(task['repo'], 'update-ref', reference if damage == 'candidate_parent' else observation_reference, record[key])
+        write_json(run / 'run.json', record)
+    elif damage == 'scope_content':
+        task_path = task['repo'] / 'task.py'
+        original_content = task_path.read_bytes()
+        task_path.write_text('value = 99\n')
+        tree = capture_worktree_tree(task['repo'], ['.'], run)
+        task_path.write_bytes(original_content)
+        record['original_worktree_observation_commit'] = git_text(task['repo'], 'commit-tree', tree,
+            '-p', record['original_head'], input_bytes='范围内容不符的冻结观察\n'.encode())
+        git(task['repo'], 'update-ref', observation_reference, record['original_worktree_observation_commit'])
+        write_json(run / 'run.json', record)
+    elif damage == 'patch_sha256':
+        (run / 'task-changes.patch').write_bytes(original_patch + b'\n')
+    else:
+        (run / 'task-changes.patch').write_bytes(b'')
+        record['patch_sha256'] = sha256(b'').hexdigest()
+        write_json(run / 'run.json', record)
+    damaged_run = (run / 'run.json').read_bytes()
+    damaged_patch = (run / 'task-changes.patch').read_bytes()
+    before = canary(task['repo'])
+
+    assert task_stop_hook_payload(task) is None
+    unknown = resolve(task)
+    assert unknown['completion_evidence_status'] == 'unknown', unknown
+    assert not unknown.get('current_scope_reviewed')
+    assert unknown['recovery_condition']
+    assert task_stop_hook_payload_from_fresh_process(task) is None
+    assert resolve(task)['resolution_attempt_count'] == unknown['resolution_attempt_count']
+    assert canary(task['repo']) == before
+    assert (run / 'run.json').read_bytes() == damaged_run
+    assert (run / 'validation.json').read_bytes() == original_validation
+    assert (run / 'task-changes.patch').read_bytes() == damaged_patch
+
+    (run / 'run.json').write_bytes(original_run)
+    (run / 'task-changes.patch').write_bytes(original_patch)
+    git(task['repo'], 'update-ref', reference, original_candidate)
+    git(task['repo'], 'update-ref', observation_reference, original_observation)
+    recovered = resolve(task, event={'prompt': '恢复原始冻结材料后继续', 'turn_id': 'restored-frozen-material'})
+    assert recovered['completion_evidence_status'] == 'verified', recovered
+    assert recovered['current_scope_reviewed']
+    assert task_stop_hook_payload(task) is None
+    assert (run / 'run.json').read_bytes() == original_run
+    assert (run / 'validation.json').read_bytes() == original_validation
+    assert (run / 'task-changes.patch').read_bytes() == original_patch

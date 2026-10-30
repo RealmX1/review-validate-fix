@@ -400,21 +400,10 @@ def _completed_run_baseline(repo: Path, run_directory: Path, binding: dict, scop
 def _recover_completed_run_association(repo: Path, run_directory: Path, record: dict, binding: dict,
                                        original: str, entries: list[tuple], incarnation: dict) -> Path | None:
     """只在独立原始记录能重建关联时另存补证，绝不改写冻结 run。"""
-    if _associated_run_starting_point(record, run_directory, binding):
-        return None if record.get('starting_point_evidence') else _completed_run_association_path(binding, run_directory)
     original_run_bytes = (run_directory / 'run.json').read_bytes()
     original_validation_bytes = (run_directory / 'validation.json').read_bytes()
     if json.loads(original_run_bytes) != record:
         raise ValueError('补证期间精确 run 已变化，等待稳定记录后重验')
-    created = record.get('created_at')
-    if (any(record.get(key) != binding[key] for key in ('repo', 'git_directory', 'git_common_directory'))
-            or record.get('run_id') != run_directory.name or record.get('base_commit') != original
-            or not isinstance(created, (int, float)) or isinstance(created, bool) or not math.isfinite(created)
-            or not entries or entries[0][0].strip('0') or entries[0][1] != binding['creation_commit']
-            or created * 1000 < max(binding['task_created_at'], incarnation.get('startedAt', 0), entries[0][3])
-            or record.get('original_head') not in {entry[1] for entry in entries}
-            or not _is_ancestor(repo, binding['creation_commit'], record['original_head'])):
-        raise ValueError('精确注册 run 尚不能证明属于当前任务 incarnation、工作树及固定基线')
     scopes = normalized_scope_paths(record['scope_paths'])
     candidate, observation = record['candidate_commit'], record['original_worktree_observation_commit']
     reference = record['snapshot_reference']
@@ -425,8 +414,20 @@ def _recover_completed_run_association(repo: Path, run_directory: Path, record: 
         raise ValueError('精确 run 的冻结候选或原始完整工作树观察不一致')
     patch = (run_directory / 'task-changes.patch').read_bytes()
     if (hashlib.sha256(patch).hexdigest() != record['patch_sha256']
-            or patch != git(repo, 'diff', '--binary', '--full-index', '--no-ext-diff', original, candidate, '--', *scopes)):
+            or patch != git(repo, 'diff', '--binary', '--full-index', '--no-ext-diff',
+                            record['base_commit'], candidate, '--', *scopes)):
         raise ValueError('精确 run 的基线、范围和冻结补丁无法互相核对')
+    if _associated_run_starting_point(record, run_directory, binding):
+        return None if record.get('starting_point_evidence') else _completed_run_association_path(binding, run_directory)
+    created = record.get('created_at')
+    if (any(record.get(key) != binding[key] for key in ('repo', 'git_directory', 'git_common_directory'))
+            or record.get('run_id') != run_directory.name or record.get('base_commit') != original
+            or not isinstance(created, (int, float)) or isinstance(created, bool) or not math.isfinite(created)
+            or not entries or entries[0][0].strip('0') or entries[0][1] != binding['creation_commit']
+            or created * 1000 < max(binding['task_created_at'], incarnation.get('startedAt', 0), entries[0][3])
+            or record.get('original_head') not in {entry[1] for entry in entries}
+            or not _is_ancestor(repo, binding['creation_commit'], record['original_head'])):
+        raise ValueError('精确注册 run 尚不能证明属于当前任务 incarnation、工作树及固定基线')
     evidence = {'status': 'verified', 'binding': binding, 'original_start_commit': original,
                 'base_commit': original, 'observed_head': record['original_head'], 'scope_paths': scopes,
                 'source': 'registered_run_and_native_kanban_git_evidence'}
@@ -444,6 +445,30 @@ def _recover_completed_run_association(repo: Path, run_directory: Path, record: 
             'worktree_creation_reflog_entry': entries[0], 'run_created_at': created,
             'snapshot_reference': reference, 'patch_sha256': record['patch_sha256'], 'completed_commit': commit}})
     return association_path
+
+
+def _artifact_observation(path: Path, *, parse_json: bool = False) -> dict:
+    """损坏材料仍留下原始摘要；不能阻断独立的任务身份和内容观察。"""
+    observed = {}
+    try:
+        content = path.read_bytes()
+        observed['sha256'] = hashlib.sha256(content).hexdigest()
+        if parse_json:
+            value = json.loads(content)
+            if not isinstance(value, dict):
+                raise ValueError(f'需要 JSON object：{path}')
+            observed['value'] = value
+    except (OSError, ValueError) as error:
+        observed['error'] = str(error)
+    return observed
+
+
+def _run_material_observation(run_directory: Path) -> dict:
+    artifacts = {name: _artifact_observation(run_directory / f'{name}.json', parse_json=True)
+                 for name in ('run', 'validation')}
+    artifacts['frozen_patch'] = _artifact_observation(run_directory / 'task-changes.patch')
+    return {'run': artifacts['run'].get('value'), 'validation': artifacts['validation'].get('value'),
+            'artifacts': artifacts}
 
 
 def resolve_task_review_starting_point(repo: Path, task_id: str, *, scope_paths: list[str] | None = None,
@@ -468,10 +493,7 @@ def resolve_task_review_starting_point(repo: Path, task_id: str, *, scope_paths:
             sources = _source_observations(task_id)
             entries = _reflog(repo)
             head = _commit(repo, 'HEAD')
-            registered_runs = {str(path): {'run': _read_optional(path / 'run.json'),
-                                         'validation': _read_optional(path / 'validation.json'),
-                                         'frozen_patch_sha256': hashlib.sha256((path / 'task-changes.patch').read_bytes()).hexdigest()
-                                         if (path / 'task-changes.patch').exists() else None}
+            registered_runs = {str(path): _run_material_observation(path)
                                for path in registered_task_run_directories(identity, task_id)}
             # 缓存不能替代当前 project/common-dir 与目录实体身份门禁。
             binding, incarnation = _task_binding(repo, task_id, identity, sources, entries)
@@ -512,18 +534,32 @@ def resolve_task_review_starting_point(repo: Path, task_id: str, *, scope_paths:
                              if (observed['run'] or {}).get('status') == 'completed']
                 if completed:
                     newest_path, newest_observation = max(completed, key=lambda item: item[1]['run'].get('created_at', 0))
-                    attached = _read_optional(run_path / 'run.json') if run_path else None
+                    attached = (registered_runs.get(str(run_path)) or _run_material_observation(run_path))['run'] if run_path else None
                     if not attached or newest_observation['run'].get('created_at', 0) > attached.get('created_at', 0):
                         run_path = Path(newest_path)
+                elif not run_path:
+                    # 不可读记录不能证明完成；保留精确来源，只用于首次静默与后续独立内容观察。
+                    unreadable = [path for path, observed in registered_runs.items() if observed['run'] is None]
+                    if unreadable:
+                        run_path = Path(unreadable[-1])
             if run_path:
-                run_observation = {'run': _read_optional(run_path / 'run.json'), 'validation': _read_optional(run_path / 'validation.json')}
+                run_observation = registered_runs.get(str(run_path)) or _run_material_observation(run_path)
+                reference = (run_observation['run'] or {}).get('snapshot_reference')
+                if reference:
+                    references = {}
+                    for name in (reference, reference + '-workspace-observation'):
+                        try:
+                            references[name] = git_text(repo, 'rev-parse', '--verify', '--end-of-options', name)
+                        except RuntimeError as error:
+                            references[name] = {'error': str(error)}
+                    run_observation['snapshot_references'] = references
             worktree_tree = capture_worktree_tree(repo, ['.'], resolution_path.parent, head=head)
             if _commit(repo, 'HEAD') != head:
                 raise ValueError('Stop 观察期间 HEAD 变化，等待下一次稳定观察')
             observation = {'sources': sources, 'head': head, 'reflog': entries, 'starting': starting,
                            'checkpoint': checkpoint, 'scope_paths': scope_paths, 'run': run_observation, 'binding': binding,
                            'registered_runs': registered_runs, 'worktree_tree': worktree_tree,
-                           'completed_run_association': _read_optional(_completed_run_association_path(binding, run_path)) if run_path else None,
+                           'completed_run_association': _artifact_observation(_completed_run_association_path(binding, run_path)) if run_path else None,
                            'incremental_after_run': str(incremental_after_run.resolve()) if incremental_after_run else None,
                            'bound_task_id': os.environ.get('KANBAN_TASK_ID') or os.environ.get('CLINE_KANBAN_TASK_ID'),
                            'project': os.environ.get('KANBAN_PROJECT_PATH') or os.environ.get('CLINE_KANBAN_PROJECT_PATH'),
@@ -546,23 +582,30 @@ def resolve_task_review_starting_point(repo: Path, task_id: str, *, scope_paths:
                 raise ValueError('保存的固定起点不可从当前 HEAD 到达；需要可核对的历史/起点证据')
             scopes = normalized_scope_paths(scope_paths or (starting or {}).get('scope_paths') or ['.'])
             original = baseline
+            completion_error = None
             if incremental_after_run:
+                _recover_completed_run_association(repo, incremental_after_run.resolve(), run_observation['run'],
+                                                   binding, original, entries, incarnation)
                 baseline, source = _completed_run_baseline(repo, incremental_after_run.resolve(), binding, scopes, original)
             elif run_observation:
                 record = run_observation['run']
-                if record and record.get('status') == 'completed':
+                if record is None or record.get('status') == 'completed':
                     try:
+                        if record is None:
+                            raise ValueError(run_observation['artifacts']['run']['error'])
                         association_path = _recover_completed_run_association(repo, run_path, record, binding, original, entries, incarnation)
                         if association_path:
                             result['completed_run_association_path'] = str(association_path)
-                            observation['completed_run_association'] = read_json(association_path)
+                            observation['completed_run_association'] = _artifact_observation(association_path)
                     except (OSError, ValueError, RuntimeError, KeyError) as error:
+                        completion_error = str(error)
                         result['diagnostic'] = f'完成关联尚未证实：{error}'
-                evidence = _associated_run_starting_point(record, run_path, binding) if record else {}
-                if record and record.get('status') != 'completed' and (evidence.get('original_start_commit') != original
-                               or evidence.get('base_commit') != record.get('base_commit')
-                               or not _same_binding(evidence.get('binding', {}), binding)):
-                    raise ValueError('保存的精确 run 与固定起点或任务身份不匹配')
+                else:
+                    evidence = _associated_run_starting_point(record, run_path, binding)
+                    if (evidence.get('original_start_commit') != original
+                            or evidence.get('base_commit') != record.get('base_commit')
+                            or not _same_binding(evidence.get('binding', {}), binding)):
+                        raise ValueError('保存的精确 run 与固定起点或任务身份不匹配')
             discovery_incarnation = {**incarnation, 'observedTaskCommits': list(incarnation.get('observedTaskCommits', []))
                                      + (starting or {}).get('retained_task_commit_identities', [])}
             discovery_incarnation['observedTaskCommits'] = list({item['commitSha']: item for item in discovery_incarnation['observedTaskCommits']}.values())
@@ -572,8 +615,12 @@ def resolve_task_review_starting_point(repo: Path, task_id: str, *, scope_paths:
             work_status = 'present' if owned_changed else ('absent' if not changed or head == baseline or _only_base_fast_forwards(entries, baseline, head) else 'unknown')
             reviewed = False
             result['completion_evidence_status'] = 'absent'
-            if run_path and run_observation and (run_observation['run'] or {}).get('status') == 'completed':
+            unproven_or_completed_run = bool(run_path and run_observation
+                and (run_observation['run'] is None or run_observation['run'].get('status') == 'completed'))
+            if unproven_or_completed_run:
                 try:
+                    if completion_error:
+                        raise ValueError(completion_error)
                     # 提醒比较实际净变化；自动默认的全库范围不要求窄范围 run 评审未变化路径。
                     completed_base, _ = _completed_run_baseline(repo, run_path, binding, [], original)
                     coverage_paths = [path for path in git(repo, 'diff', '--no-renames', '--name-only', '-z',
@@ -608,7 +655,7 @@ def resolve_task_review_starting_point(repo: Path, task_id: str, *, scope_paths:
                 result['retained_task_commit_identities'] = starting['retained_task_commit_identities']
             if incremental_after_run:
                 result['incremental_after_run_directory'] = str(incremental_after_run.resolve())
-            if run_path and run_observation and (run_observation['run'] or {}).get('status') == 'completed':
+            if unproven_or_completed_run:
                 result['observed_completed_run_directory'] = str(run_path.resolve())
                 if result['completion_evidence_status'] == 'unknown':
                     result['new_content_since_unproven_completion'] = bool(
