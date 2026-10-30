@@ -54,6 +54,47 @@ def test_darwin_disappearing_parent_requires_fresh_snapshot(monkeypatch, query_e
     assert queried == [parent_pid, child_pid]
 
 
+@pytest.mark.parametrize(('parent_unique_id', 'supervisor_unique_id', 'unrelated'), [
+    (99, 100, True), (100, 100, False), (101, 100, False),
+    (1, 100, False), (0, 100, False), (99, None, False),
+])
+def test_darwin_orphan_origin_distinguishes_older_parent_from_unproven_descendant(
+        monkeypatch, parent_unique_id, supervisor_unique_id, unrelated):
+    supervisor_pid, orphan_pid = 800601, 800603
+    def process_info(pid, flavor, argument, pointer, size):
+        info = pointer._obj
+        if flavor == 17:
+            info.unique_process_id = 1 if pid == 1 else 102
+            info.parent_unique_process_id = parent_unique_id
+            info.process_id_version = 10 if pid == 1 else 30
+            info.original_parent_process_id_version = 20
+        else:
+            info.process_id, info.parent_process_id, info.process_group_id = pid, 1, pid
+            info.start_seconds = 100 if pid == supervisor_pid else 101
+            info.user_id, info.process_status = os.getuid(), 2
+        return size
+    def process_list(selection, user_id, destination, size):
+        if destination is not None:
+            destination[0], destination[1] = supervisor_pid, orphan_pid
+        return 2 * ctypes.sizeof(ctypes.c_int)
+    def environment_query(query, count, arguments, length, replacement, replacement_length):
+        arguments.value = b''
+        length._obj.value = 1
+        return 0
+    library = SimpleNamespace(proc_pidinfo=process_info, proc_listpids=process_list)
+    system = SimpleNamespace(sysctl=environment_query)
+    monkeypatch.setattr(observation.sys, 'platform', 'darwin')
+    monkeypatch.setattr(ctypes, 'CDLL', lambda name, **kwargs: library if name else system)
+    identity = {'pid': supervisor_pid, 'start_identity': [100, 0], 'unique_process_id': supervisor_unique_id}
+    if unrelated:
+        assert observation.owned_process_snapshot('current-execution', supervisor_pid, {},
+            supervisor_native_identity=identity) == {}
+    else:
+        with pytest.raises(RuntimeError, match=str(orphan_pid)):
+            observation.owned_process_snapshot('current-execution', supervisor_pid, {},
+                supervisor_native_identity=identity)
+
+
 def test_linux_disappearing_parent_requires_fresh_snapshot(tmp_path, monkeypatch):
     supervisor_pid, parent_pid, child_pid = 800601, 800602, 800603
     process_root = tmp_path / 'native-process-table'
@@ -140,3 +181,30 @@ def test_role_preparation_waits_for_previous_descendants(repository, tmp_path, m
     machine_evidence.prepare_isolated_workspace(run, repository, [command], artifacts)
     assert len(executions) == 1
     assert read_json(previous / 'descendant-exit-reconciliation.json')['status'] == 'exited'
+
+
+@pytest.mark.parametrize('current_start_seconds', [100, 101, None])
+def test_additional_native_identity_evidence_preserves_live_supervisor_recovery_gate(
+        tmp_path, monkeypatch, current_start_seconds):
+    run = tmp_path / 'supervisor-native-identity-recovery'
+    command_directory = run / 'machine-evidence/attempt-001/commands/command-001'
+    write_json(run / 'run.json', {})
+    register_supervised_command_directory(run, command_directory)
+    write_json(command_directory / 'command-supervision.json', {
+        'status': 'descendant_exit_unproven', 'supervisor_pid': 800601,
+        'supervisor_native_identity': {'pid': 800601, 'start_identity': [100, 0]},
+        'execution_token': 'recorded-execution', 'owned_processes': [],
+    })
+    current_identity = (None if current_start_seconds is None else {
+        'pid': 800601, 'start_identity': [current_start_seconds, 0], 'unique_process_id': 123456,
+    })
+    monkeypatch.setattr(observation, 'native_process_identity', lambda pid: current_identity)
+    monkeypatch.setattr(observation, 'owned_process_snapshot', lambda *args, **kwargs: {})
+    if current_start_seconds == 100:
+        with pytest.raises(machine_evidence.WorkspacePreparationFailed):
+            machine_evidence.ensure_previous_supervised_commands_exited(run, run / 'machine-evidence')
+        expected_status = 'pending'
+    else:
+        machine_evidence.ensure_previous_supervised_commands_exited(run, run / 'machine-evidence')
+        expected_status = 'exited'
+    assert read_json(command_directory / 'descendant-exit-reconciliation.json')['status'] == expected_status

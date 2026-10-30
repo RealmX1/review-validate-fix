@@ -77,8 +77,10 @@ def ensure_previous_supervised_commands_exited(run_directory: Path, collection_d
                 recorded = {item['pid']: item for item in facts.get('owned_processes', [])}
                 descendants = owned_process_snapshot(facts['execution_token'], facts['supervisor_pid'], recorded,
                     supervisor_native_identity=identity)
+                supervisor_still_has_recorded_start_identity = bool(current
+                    and current['pid'] == identity['pid'] and current['start_identity'] == identity['start_identity'])
                 observation.update({'owned_processes': list(descendants.values()),
-                    'status': 'pending' if current == identity or descendants else 'exited'})
+                    'status': 'pending' if supervisor_still_has_recorded_start_identity or descendants else 'exited'})
         except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
             observation['error'] = str(error)
         write_json(reconciliation_file, observation)
