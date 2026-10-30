@@ -157,7 +157,7 @@ def test_status_queries_cover_original_deadline_at_normal_frequency(tmp_path, mo
     assert result['can_dispatch'] is expected_dispatch
 
 
-@pytest.mark.parametrize('terminal_condition', [None, 'stop', 'deadline', 'already_started'])
+@pytest.mark.parametrize('terminal_condition', [None, 'stop', 'legacy_deadline', 'already_started'])
 def test_worker_resumes_own_claim_before_invocation_without_new_attempt(repository, tmp_path, terminal_condition, preserved_test_process_signal_handlers):
     run = prepare(repository, tmp_path)
     config = fake_config(tmp_path)
@@ -178,12 +178,12 @@ def test_worker_resumes_own_claim_before_invocation_without_new_attempt(reposito
     if terminal_condition == 'stop':
         from core.task_snapshot_review.execution_lifecycle import persist_execution_revocation
         persist_execution_revocation(run, '验证 Stop 优先于恢复认领')
-    elif terminal_condition == 'deadline':
+    elif terminal_condition == 'legacy_deadline':
         write_json(attempt.parent / 'role-deadline.json', {'deadline_at': time.time() - 1})
     elif terminal_condition == 'already_started':
         write_json(attempt / 'model-invocation.json', {'started_at': time.time()})
     roles.execute_role(attempt)
-    if terminal_condition:
+    if terminal_condition in {'stop', 'already_started'}:
         assert read_json(attempt / 'outcome.json')['status'] != 'completed'
         assert not (attempt / 'stdout.txt').exists()
         return

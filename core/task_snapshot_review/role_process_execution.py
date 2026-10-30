@@ -235,7 +235,7 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
             ensure_execution_not_revoked(run_directory)
             register_owned_process(run_directory, os.getpid(), "role_worker", owns_process_group=True)
             environment = role_environment(request)
-            eligibility = reviewer_eligibility(config, environment=environment, deadline_at=deadline_at, run_directory=run_directory,
+            eligibility = reviewer_eligibility(config, environment=environment, run_directory=run_directory,
                 resolved_command=request.get('preselected_formal_model_command'),
                 locked_pre_invocation_attempt_directory=attempt_directory)
             write_json(attempt_directory / 'reviewer-eligibility.json', eligibility)
@@ -246,15 +246,12 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
                 git(Path(request['repository']),'worktree','add','--detach',str(workspace),request['candidate_commit'],pass_fds=(execution_lock.fileno(),))
             elif not (attempt_directory/'model-invocation.json').exists():
                 git(workspace,'reset','--hard',request['candidate_commit'],pass_fds=(execution_lock.fileno(),))
-            prepare_isolated_workspace(run_directory, workspace, request.get("preparation_commands", []), attempt_directory, environment=environment, deadline_at=deadline_at,
+            prepare_isolated_workspace(run_directory, workspace, request.get("preparation_commands", []), attempt_directory, environment=environment,
                                        inherited_lock_descriptors=(execution_lock.fileno(),))
             prepared_status = git(workspace, "status", "--porcelain", "--untracked-files=all")
             write_json(attempt_directory / "prepared-worktree-state.json", {"status_porcelain": prepared_status.decode()})
-            remaining_seconds = deadline_at - time.time()
-            if remaining_seconds <= 0:
-                raise ValueError("准备环境后原角色总时限已经耗尽")
             command = (list(request['preselected_formal_model_command']) if request.get('preselected_formal_model_command')
-                else cli.resolve_formal_reviewer_model_command(config, command, env=environment, cwd=workspace, timeout=min(30, remaining_seconds)))
+                else cli.resolve_formal_reviewer_model_command(config, command, env=environment, cwd=workspace, timeout=30))
             resolved_model_command = list(command)
             command = cli.normalise_reviewer_command_for_output_format(command, output_format=output_format)
             if config.get("run_directory_grant_flag"):
@@ -276,11 +273,8 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
                         cli_version = (version.stdout or version.stderr).strip()[:4096]
                 except (OSError, subprocess.SubprocessError):
                     pass
-            remaining_seconds = read_json(deadline_file)["deadline_at"] - time.time()
-            if remaining_seconds <= 0:
-                raise ValueError("CLI 版本核验后原角色总时限已经耗尽")
             eligibility = reviewer_eligibility(config, environment=environment, cwd=workspace,
-                deadline_at=deadline_at, run_directory=run_directory, resolved_command=resolved_model_command,
+                run_directory=run_directory, resolved_command=resolved_model_command,
                 reserve_recovery_for=str(attempt_directory), locked_pre_invocation_attempt_directory=attempt_directory)
             write_json(attempt_directory / 'reviewer-eligibility.json', eligibility)
             if not eligibility['can_dispatch']:
@@ -289,9 +283,6 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
             ensure_execution_not_revoked(run_directory)
             if cancellation_requested:
                 raise InterruptedError('已在资格复核后取消')
-            remaining_seconds = deadline_at - time.time()
-            if remaining_seconds <= 0:
-                raise ValueError('资格复核后原角色总时限已经耗尽')
             invocation_started_at = time.time()
             write_json(attempt_directory/'model-invocation.json',{'started_at':invocation_started_at, "command": command,
                        "cli_version": cli_version, "cli_executable": executable,

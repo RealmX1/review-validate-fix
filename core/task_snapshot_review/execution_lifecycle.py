@@ -396,11 +396,6 @@ def publish_business_result(run_directory: Path, result: dict) -> dict:
                     eligibility_recovery_limits.append(recovery.get('maximum_unchanged_retries', 0))
                     if recovery.get('retry_not_before_epoch_ms'):
                         machine_retry_times.append(recovery['retry_not_before_epoch_ms'])
-        if eligibility_recovery_limits:
-            for deadline_file in run_directory.glob('*/role-deadline.json'):
-                deadline = read_json(deadline_file)['deadline_at'] * 1000
-                if deadline > time.time() * 1000:
-                    machine_retry_times.append(deadline)
         for intent in run_directory.glob("incomplete-fixer-machine-validation/round-*/collection-intent.json"):
             paths.extend([str(intent), str(intent.parent / "evidence.json")])
             collection = read_json(intent)

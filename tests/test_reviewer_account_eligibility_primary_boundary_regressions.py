@@ -86,7 +86,7 @@ def test_new_formal_failure_preserves_new_pool_and_existing_retry_budget(tmp_pat
 
 @pytest.mark.parametrize('timeout_seconds', [20, 900])
 @pytest.mark.parametrize('error_type', [ValueError, RuntimeError])
-def test_catalog_failure_schedules_recovery_before_original_deadline(repository, tmp_path, monkeypatch, timeout_seconds, error_type):
+def test_catalog_failure_schedules_bounded_recovery_without_role_runtime_limit(repository, tmp_path, monkeypatch, timeout_seconds, error_type):
     run = prepare(repository, tmp_path)
     config = {**fake_config(tmp_path), 'timeout_seconds': timeout_seconds, 'reviewer_model_selection_source': 'oh_my_pi_default_model_role'}
     epoch = [time.time()]
@@ -106,9 +106,8 @@ def test_catalog_failure_schedules_recovery_before_original_deadline(repository,
     assert not launched
     result = publish_business_result(run, {'status': 'review_incomplete'})
     retry_at = result['recovery']['retry_not_before_epoch_ms'] / 1000
-    deadline = read_json(run / 'reviewer-1/role-deadline.json')['deadline_at']
     assert epoch[0] < retry_at <= epoch[0] + 30
-    assert retry_at < deadline
+    assert not (run / 'reviewer-1/role-deadline.json').exists()
     workflow._start_role(run, record, run / 'reviewer-1', 'reviewer', [config], [])
     assert len(queries) == 1
     available[0] = True
@@ -116,35 +115,63 @@ def test_catalog_failure_schedules_recovery_before_original_deadline(repository,
     workflow._start_role(run, read_json(run / 'run.json'), run / 'reviewer-1', 'reviewer', [config], [])
     assert len(queries) == 2
     assert len(launched) == 1
-    assert read_json(run / 'reviewer-1/role-deadline.json')['deadline_at'] == deadline
+    assert not (run / 'reviewer-1/role-deadline.json').exists()
 
 
-@pytest.mark.parametrize('terminal_condition', ['stop', 'deadline'])
-def test_persisted_catalog_recovery_never_revives_stop_or_deadline(repository, tmp_path, monkeypatch, terminal_condition):
+@pytest.mark.parametrize('terminal_condition', ['stop', 'legacy_deadline'])
+def test_persisted_catalog_recovery_preserves_stop_and_ignores_retired_deadline(repository, tmp_path, monkeypatch, terminal_condition):
     from core.task_snapshot_review.execution_lifecycle import ExecutionRevoked, persist_execution_revocation
     run = prepare(repository, tmp_path)
     config = {**fake_config(tmp_path), 'timeout_seconds': 900, 'reviewer_model_selection_source': 'oh_my_pi_default_model_role'}
     epoch = [time.time()]
     monkeypatch.setattr(workflow.time, 'time', lambda: epoch[0])
     queries = []
+    available = [False]
     def unavailable_catalog(*args, **kwargs):
         queries.append(epoch[0])
+        if available[0]:
+            return config['command']
         raise ValueError('隔离目录暂时失败')
     monkeypatch.setattr(harness_cli_adapters, 'resolve_formal_reviewer_model_command', unavailable_catalog)
+    launched = []
+    monkeypatch.setattr(workflow, 'launch_role', lambda attempt, **kwargs: launched.append(attempt))
     workflow._start_role(run, read_json(run / 'run.json'), run / 'reviewer-1', 'reviewer', [config], [])
-    deadline = read_json(run / 'reviewer-1/role-deadline.json')['deadline_at']
+    epoch[0] += 31
     if terminal_condition == 'stop':
         persist_execution_revocation(run, '目录等待期间用户 Stop')
-        epoch[0] += 31
         with pytest.raises(ExecutionRevoked):
             workflow._start_role(run, read_json(run / 'run.json'), run / 'reviewer-1', 'reviewer', [config], [])
+        assert len(queries) == 1
+        assert not launched
     else:
-        epoch[0] = deadline
+        write_json(run / 'reviewer-1/role-deadline.json', {'deadline_at': 1})
+        available[0] = True
         workflow._start_role(run, read_json(run / 'run.json'), run / 'reviewer-1', 'reviewer', [config], [])
-        assert (run / 'reviewer-1/deadline-exhausted.json').exists()
-    assert len(queries) == 1
+        assert len(queries) == 2
+        assert len(launched) == 1
+        assert not (run / 'reviewer-1/deadline-exhausted.json').exists()
+        assert read_json(run / 'reviewer-1/role-deadline.json') == {'deadline_at': 1}
+
+
+def test_catalog_failure_budget_survives_restarts_without_a_role_deadline(repository, tmp_path, monkeypatch):
+    run = prepare(repository, tmp_path)
+    config = {**fake_config(tmp_path), 'reviewer_model_selection_source': 'oh_my_pi_default_model_role'}
+    epoch = [time.time()]
+    monkeypatch.setattr(workflow.time, 'time', lambda: epoch[0])
+    queries = []
+    def unavailable_catalog(*args, **kwargs):
+        queries.append(epoch[0])
+        raise ValueError('隔离目录持续失败')
+    monkeypatch.setattr(harness_cli_adapters, 'resolve_formal_reviewer_model_command', unavailable_catalog)
+    for _ in range(4):
+        workflow._start_role(run, read_json(run / 'run.json'), run / 'reviewer-1', 'reviewer', [config], [])
+        epoch[0] += 31
+    assert len(queries) == 2
     assert not list((run / 'reviewer-1').glob('attempt-*'))
-    assert read_json(run / 'reviewer-1/role-deadline.json')['deadline_at'] == deadline
+    assert not (run / 'reviewer-1/role-deadline.json').exists()
+    result = publish_business_result(run, {'status': 'review_incomplete'})
+    assert result['recovery']['maximum_unchanged_retries'] == 0
+    assert result['recovery'].get('retry_not_before_epoch_ms') is None
 
 
 def test_dynamic_model_uses_candidate_configuration_and_skips_blocked_model(repository, tmp_path, monkeypatch):

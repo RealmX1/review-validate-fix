@@ -10,7 +10,7 @@ Magpie 的部署、登录、刷新、切号及 Cline Kanban 账户管理 UI 属�
 
 ## 资格判断
 
-`reviewer_account_eligibility.py` 提供相同的判断，应用于 `default_reviewer_configurations`、`_start_role` 和 `execute_role`。正式派发前在角色锁内再次核对身份、账户状态、原截止时间及 Stop。
+`reviewer_account_eligibility.py` 提供相同的判断，应用于 `default_reviewer_configurations`、`_start_role` 和 `execute_role`。正式派发前在角色锁内再次核对身份、账户状态及 Stop。reviewer/fixer 不设置角色总时限，历史 `role-deadline.json` 保持原件但不再限制当前执行。
 
 | 状态 | 证据与行为 |
 | --- | --- |
@@ -30,9 +30,9 @@ Magpie 的部署、登录、刷新、切号及 Cline Kanban 账户管理 UI 属�
 
 动态配置在创建角色尝试前先通过非推理接口解析当前模型，再按实际模型复核额度故障；worker 派发前仍再次核对。模型目录暂不可用时保持未知并等待机器证据，其他可用配置继续，避免反复创建必然被最终门禁拒绝的工作树。
 
-选模查询在原 run 内与精确候选 commit 绑定的独立工作树中执行，解析后的正式命令持久写入尝试请求；worker 复用该命令并重新核验资格，避免主工作树的背景配置或二次目录查询改变模型。目录失败的次数、下一次检查时间和上限按配置及候选持久保存，通常在 30 秒后复查；较短角色预算使用剩余时间的一半，恢复不延长原截止时间。
+选模查询在原 run 内与精确候选 commit 绑定的独立工作树中执行，解析后的正式命令持久写入尝试请求；worker 复用该命令并重新核验资格，避免主工作树的背景配置或二次目录查询改变模型。目录失败的次数、下一次检查时间和上限按配置及候选持久保存，30 秒后允许一次未变化重查；连续两次失败后等待配置或候选证据变化，不依赖角色总时限，也不无限查询。
 
-每次状态查询最多 5 秒，并消耗原角色剩余时限。普通状态缓存 30 秒；明确不可用状态 300 秒后复核。复核次数按 30 秒的最快正常查询频率和原角色剩余时限计算，绑定原截止时间并持久保存；过期观察不能因预算耗尽继续放行，原截止时间到达后不再恢复。查询进程受所属执行登记和进程组清理保护。
+每次非推理状态查询最多 5 秒。普通状态缓存 30 秒；明确不可用状态 300 秒后复核。只有状态观察调用方显式传入 `deadline_at` 时，才按该观察预算保存有界检查次数；它不构成角色总时限。过期观察不能因预算耗尽继续放行。查询进程受所属执行登记和进程组清理保护。
 
 ## 身份、缓存与故障记忆
 
@@ -92,8 +92,8 @@ reviewer 配置可声明以下字段；同样允许通过本地 reviewer overrid
 
 ## 所属执行恢复与验收
 
-业务结果沿用 `machine_evidence_pending`、`resume_same_run`、`evidence_paths`、`retry_not_before_epoch_ms` 和 `maximum_unchanged_retries`，由现有 Cline Kanban 所属执行机制接续。观察路径包含共享记录、凭据文件、配置、缓存状态文件及当前资格判断。仅当前未完成阶段提供恢复时间，不把历史尝试的旧时间当作新恢复资格。下次唤醒也受原角色截止时间限制。
+业务结果沿用 `machine_evidence_pending`、`resume_same_run`、`evidence_paths`、`retry_not_before_epoch_ms` 和 `maximum_unchanged_retries`，由现有 Cline Kanban 所属执行机制接续。观察路径包含共享记录、凭据文件、配置、缓存状态文件及当前资格判断。仅当前未完成阶段提供恢复时间，不把历史尝试的旧时间当作新恢复资格。角色没有墙钟总时限；正式失败次数、目录重查次数、观察查询超时与显式 Stop 分别执行各自的门禁。
 
-自动验收覆盖代理 503、元数据 429/500、免费登录成功后正式认证失败、跨 run 排除、一小时到期、身份/Keychain 变化、陈旧额度、原生补证、并发恢复认领、多个重启 controller、Stop、到期与已完成席保护。完整命令为 `PYTEST_ADDOPTS='--tb=short' bash scripts/check_skill_contracts.sh`。
+自动验收覆盖代理 503、元数据 429/500、免费登录成功后正式认证失败、跨 run 排除、一小时到期、身份/Keychain 变化、陈旧额度、原生补证、并发恢复认领、多个重启 controller、Stop、显式观察预算与已完成席保护，以及历史角色截止文件不会重新启用总时限。完整命令为 `PYTEST_ADDOPTS='--tb=short' bash scripts/check_skill_contracts.sh`。
 
 免费检查仍可能漏掉首次正式调用故障，因此必须同时保留有界 fallback 和跨 run 负面证据。Magpie 的实际账号映射、切号、凭据生命周期及部署兼容性仍需后续隔离验证。

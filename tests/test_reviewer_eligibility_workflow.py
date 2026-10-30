@@ -105,18 +105,18 @@ def test_bound_account_status_restores_same_run_without_repeating_completed_seat
     assert first['disposition'] == 'machine_evidence_pending'
     completed = run / 'reviewer-1/attempt-001/outcome.json'
     completed_bytes = completed.read_bytes()
-    deadline = read_json(run / 'reviewer-2/role-deadline.json')['deadline_at']
+    assert not (run / 'reviewer-2/role-deadline.json').exists()
     assert str(Path(pending['account_status_evidence_path'])) in first['recovery']['evidence_paths']
     assert not list((run / 'reviewer-2').glob('attempt-*'))
     publish_account_status(pending, 'available')
     assert workflow.resume_review(run)['status'] == 'ready_for_validation'
     assert completed.read_bytes() == completed_bytes
     assert len(list((run / 'reviewer-1').glob('attempt-*'))) == 1
-    assert read_json(run / 'reviewer-2/role-deadline.json')['deadline_at'] == deadline
+    assert not (run / 'reviewer-2/role-deadline.json').exists()
 
 
-@pytest.mark.parametrize('terminal_condition', ['stop', 'deadline'])
-def test_recovered_account_does_not_revive_stopped_or_expired_execution(repository, tmp_path, terminal_condition):
+@pytest.mark.parametrize('terminal_condition', ['stop', 'legacy_deadline'])
+def test_recovered_account_preserves_stop_and_ignores_retired_deadline(repository, tmp_path, terminal_condition):
     from core.task_snapshot_review.execution_lifecycle import persist_execution_revocation
     run, good, pending = recovery_snapshot(repository, tmp_path)
     assert workflow.resume_review(run, reviewer_configs=[good, pending])['status'] == 'review_incomplete'
@@ -126,8 +126,8 @@ def test_recovered_account_does_not_revive_stopped_or_expired_execution(reposito
         write_json(run / 'reviewer-2/role-deadline.json', {'deadline_at': time.time() - 1})
     publish_account_status(pending, 'available')
     result = workflow.resume_review(run)
-    assert result['status'] == ('cancelled' if terminal_condition == 'stop' else 'review_incomplete')
-    assert not list((run / 'reviewer-2').glob('attempt-*'))
+    assert result['status'] == ('cancelled' if terminal_condition == 'stop' else 'ready_for_validation')
+    assert len(list((run / 'reviewer-2').glob('attempt-*'))) == (0 if terminal_condition == 'stop' else 1)
 
 
 def test_worker_rechecks_status_after_candidate_selection_before_formal_dispatch(repository, tmp_path, monkeypatch):

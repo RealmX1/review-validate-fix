@@ -227,7 +227,6 @@ def _identity(config: dict, environment: dict, resolved_command: list[str] | Non
             'evidence_path': str(root / f'{account_sha256}.json'),
             'credential_evidence_paths': sorted(credential_observations),
             'configuration_evidence_paths': configuration_paths,
-            'role_timeout_seconds': config.get('timeout_seconds', 1800),
             'credential_identity_observable': bool(credential_identity_observable),
             **({'account_status_evidence_path': str(Path(config['account_status_evidence_path']).expanduser())}
                if config.get('account_status_evidence_path') else {})}
@@ -439,7 +438,7 @@ def reviewer_eligibility(config: dict, *, environment: dict | None = None, cwd: 
     if not config.get('enabled', True):
         return {**result, 'status': 'unavailable', 'can_dispatch': False, 'reason': 'configuration_disabled'}
     if deadline_at is not None and deadline_at <= now:
-        return {**result, 'status': 'unavailable', 'can_dispatch': False, 'reason': 'role_deadline_exhausted'}
+        return {**result, 'status': 'unavailable', 'can_dispatch': False, 'reason': 'availability_observation_deadline_exhausted'}
     try:
         with _bounded_availability_lock(path.with_suffix('.lock'), deadline_at):
             record = _availability_record(path)

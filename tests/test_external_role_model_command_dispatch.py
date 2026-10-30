@@ -73,7 +73,7 @@ def test_explicit_kimi_model_does_not_refresh_catalog(monkeypatch, tmp_path, sel
     def unexpected_refresh(*args, **kwargs):
         pytest.fail("固定模型不应刷新目录")
     monkeypatch.setattr(cli, "resolve_latest_kimi_managed_stable_model", unexpected_refresh)
-    assert cli.resolve_reviewer_model_command(
+    assert cli.resolve_formal_reviewer_model_command(
         {"reviewer_model_selection_source": "kimi_latest_managed_stable_model"},
         ["kimi", *selector, "--output-format", "stream-json"], env={}, cwd=tmp_path, timeout=3,
     ) == ["kimi", "--model", "fixed-model", "--output-format", "stream-json"]
@@ -82,7 +82,7 @@ def test_explicit_kimi_model_does_not_refresh_catalog(monkeypatch, tmp_path, sel
 @pytest.mark.parametrize("selector", [["--model"], ["-m", "--continue"], ["--model="], ["-mone", "--model=two"]])
 def test_invalid_kimi_model_selectors_remain_configuration_errors(tmp_path, selector):
     with pytest.raises(ValueError, match="模型"):
-        cli.resolve_reviewer_model_command(
+        cli.resolve_formal_reviewer_model_command(
             {"reviewer_model_selection_source": "kimi_latest_managed_stable_model"},
             ["kimi", *selector], env={}, cwd=tmp_path, timeout=3,
         )
@@ -94,7 +94,7 @@ def test_native_kimi_resume_retains_session_model_without_catalog_refresh(monkey
         pytest.fail("恢复会话应保留原生模型")
     monkeypatch.setattr(cli, "resolve_latest_kimi_managed_stable_model", unexpected_refresh)
     command = ["kimi", *selector]
-    assert cli.resolve_reviewer_model_command(
+    assert cli.resolve_formal_reviewer_model_command(
         {"reviewer_model_selection_source": "kimi_latest_managed_stable_model"},
         command, env={}, cwd=tmp_path, timeout=3,
     ) == command
@@ -107,16 +107,16 @@ def test_new_kimi_role_refreshes_stable_model_and_propagates_catalog_failure(mon
         return "kimi-code/k3.1-pro"
     monkeypatch.setattr(cli, "resolve_latest_kimi_managed_stable_model", refresh)
     config = {"reviewer_model_selection_source": "kimi_latest_managed_stable_model"}
-    assert cli.resolve_reviewer_model_command(config, ["kimi"], env={"HOME": "isolated"}, cwd=tmp_path, timeout=30) == [
+    assert cli.resolve_formal_reviewer_model_command(config, ["kimi"], env={"HOME": "isolated"}, cwd=tmp_path, timeout=30) == [
         "kimi", "--model", "kimi-code/k3.1-pro"]
     assert catalog_refresh_calls == [("kimi", {"HOME": "isolated"}, 10)]
     def failed_refresh(*args, **kwargs):
         raise ValueError("Kimi 官方 OAuth 模型目录刷新失败")
     monkeypatch.setattr(cli, "resolve_latest_kimi_managed_stable_model", failed_refresh)
     with pytest.raises(ValueError, match="OAuth"):
-        cli.resolve_reviewer_model_command(config, ["kimi"], env={}, cwd=tmp_path, timeout=3)
+        cli.resolve_formal_reviewer_model_command(config, ["kimi"], env={}, cwd=tmp_path, timeout=3)
     with pytest.raises(ValueError, match="kimi"):
-        cli.resolve_reviewer_model_command(config, ["python3"], env={}, cwd=tmp_path, timeout=3)
+        cli.resolve_formal_reviewer_model_command(config, ["python3"], env={}, cwd=tmp_path, timeout=3)
 
 
 def test_kimi_catalog_selects_latest_stable_pro_without_highspeed_or_preview():
@@ -134,20 +134,22 @@ def test_omp_shared_model_resolution_only_requires_dispatched_command(monkeypatc
         return subprocess.CompletedProcess(command, 0, json.dumps({"key": "modelRoles", "value": {"default": "openai-codex/gpt-6:high"}}))
     monkeypatch.setattr(subprocess, "run", query)
     config = {"reviewer_model_selection_source": "oh_my_pi_default_model_role"}
-    assert cli.resolve_reviewer_model_command(config, ["omp", "-p"], env={}, cwd=tmp_path, timeout=3) == [
+    assert cli.resolve_formal_reviewer_model_command(config, ["omp", "-p"], env={}, cwd=tmp_path, timeout=3) == [
         "omp", "--model", "openai-codex/gpt-6:high", "-p"]
     with pytest.raises(ValueError, match="固定"):
-        cli.resolve_reviewer_model_command(config, ["omp", "-p", "--model=fixed"], env={}, cwd=tmp_path, timeout=3)
+        cli.resolve_formal_reviewer_model_command(config, ["omp", "-p", "--model=fixed"], env={}, cwd=tmp_path, timeout=3)
 
 
-@pytest.mark.parametrize("field", ["health_command", "pre_run_health", "health_timeout_seconds"])
-def test_user_override_rejects_removed_non_executed_health_options(tmp_path, field):
+@pytest.mark.parametrize("field,value", [("health_command", ["claude", "auth", "status", "--json"]),
+    ("pre_run_health", True), ("health_timeout_seconds", 1)])
+def test_user_override_accepts_non_inference_health_options(tmp_path, field, value):
     bundled = tmp_path / "bundled-kimi.json"
     write_json(bundled, {"label": "alternative-reviewer:kimi-code", "command": ["kimi"]})
     override = cli.user_local_alternative_reviewer_config_override_path("alternative-reviewer:kimi-code", user_home=tmp_path)
-    write_json(override, {"schema_version": 1, "reviewer_label": "alternative-reviewer:kimi-code", field: False})
-    with pytest.raises(ValueError, match="unsupported fields"):
-        cli.load_effective_alternative_reviewer_config(bundled, user_home=tmp_path)
+    write_json(override, {"schema_version": 1, "reviewer_label": "alternative-reviewer:kimi-code", field: value})
+    config, receipt = cli.load_effective_alternative_reviewer_config(bundled, user_home=tmp_path)
+    assert config[field] == value
+    assert receipt['fields'] == [field]
 
 
 def test_user_environment_override_still_reaches_effective_configuration(tmp_path):

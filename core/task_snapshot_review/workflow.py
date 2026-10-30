@@ -26,6 +26,7 @@ from .reviewer_account_eligibility import (
 )
 
 FORMAL_MODEL_CATALOG_RECHECK_INTERVAL_SECONDS = 30
+FORMAL_MODEL_CATALOG_MAXIMUM_CONSECUTIVE_QUERY_FAILURES = 2
 
 
 def skill_directory() -> Path:
@@ -190,24 +191,21 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
                 fix_application_base_commit = progress_intent["before"]
     for config in configurations:
         ensure_execution_not_revoked(run_directory)
-        eligibility = reviewer_eligibility(config, deadline_at=read_json(deadline_file)['deadline_at'],
-                                           run_directory=run_directory)
+        eligibility = reviewer_eligibility(config, run_directory=run_directory)
         eligibility_observations.append(eligibility)
         if not eligibility['can_dispatch'] and not (
                 config.get('reviewer_model_selection_source') and eligibility['reason'] == 'persistent_usage_limit'):
             continue
         if config.get('reviewer_model_selection_source'):
             from .harness_cli_adapters import resolve_formal_reviewer_model_command
-            deadline_at = read_json(deadline_file)['deadline_at']
-            remaining_seconds = deadline_at - time.time()
             model_selection_observation_file = (role_directory / 'formal-model-selection-observations'
                 / f'{candidate_commit}-{configuration_digest(config)}.json')
             model_selection_observation = (read_json(model_selection_observation_file)
                 if model_selection_observation_file.exists() else {
                     'consecutive_query_failure_count': 0,
-                    'recheck_interval_seconds': min(FORMAL_MODEL_CATALOG_RECHECK_INTERVAL_SECONDS, max(0.01, remaining_seconds / 2))})
+                    'recheck_interval_seconds': FORMAL_MODEL_CATALOG_RECHECK_INTERVAL_SECONDS})
             model_selection_observation.setdefault('maximum_consecutive_query_failures',
-                int(max(0, remaining_seconds) // model_selection_observation['recheck_interval_seconds']) + 1)
+                FORMAL_MODEL_CATALOG_MAXIMUM_CONSECUTIVE_QUERY_FAILURES)
             previous_model_selection_eligibility = model_selection_observation.get('eligibility', {})
             if (previous_model_selection_eligibility.get('reason') == 'formal_model_selection_evidence_pending'
                     and (time.time() < model_selection_observation.get('retry_not_before', 0)
@@ -220,11 +218,9 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
                     model_selection_workspace.parent.mkdir(exist_ok=True)
                     git(Path(record['repo']), 'worktree', 'add', '--detach', str(model_selection_workspace), candidate_commit)
                 command = resolve_formal_reviewer_model_command(config, list(config['command']),
-                    env=reviewer_execution_environment(config), cwd=model_selection_workspace,
-                    timeout=min(30, max(0.01, deadline_at - time.time())))
+                    env=reviewer_execution_environment(config), cwd=model_selection_workspace, timeout=30)
                 ensure_execution_not_revoked(run_directory)
-                eligibility = reviewer_eligibility(config, resolved_command=command,
-                    deadline_at=read_json(deadline_file)['deadline_at'], run_directory=run_directory)
+                eligibility = reviewer_eligibility(config, resolved_command=command, run_directory=run_directory)
                 chosen_formal_model_command = command
                 model_selection_observation['consecutive_query_failure_count'] = 0
             except ExecutionRevoked:
@@ -232,8 +228,8 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
             except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as error:
                 ensure_execution_not_revoked(run_directory)
                 model_selection_observation['consecutive_query_failure_count'] += 1
-                retry_at = min(time.time() + model_selection_observation['recheck_interval_seconds'], deadline_at)
-                retry_available = (retry_at < deadline_at and model_selection_observation['consecutive_query_failure_count']
+                retry_at = time.time() + model_selection_observation['recheck_interval_seconds']
+                retry_available = (model_selection_observation['consecutive_query_failure_count']
                     < model_selection_observation['maximum_consecutive_query_failures'])
                 eligibility = {**eligibility, 'status': 'unknown', 'can_dispatch': False,
                     'reason': 'formal_model_selection_evidence_pending', 'error_type': type(error).__name__,
@@ -699,8 +695,6 @@ def _resume_review_iteration(run_directory: Path, *, reviewer_configs: list[dict
             reviewer_configs = [*reviewer_configs, *default_reviewer_configurations(harness_constraint="codex_external_cli",
                 eligibility_observations=candidate_eligibility_observations)]
         write_json(run_directory / 'reviewer-candidate-eligibility.json', {'observations': candidate_eligibility_observations})
-        if candidate_eligibility_observations:
-            record.setdefault('default_reviewer_timeout_seconds', candidate_eligibility_observations[0]['role_timeout_seconds'])
         write_json(configurations_file, {"configurations": [persistent_configuration(config) for config in reviewer_configs],
                                          "uses_default_reviewer_pool": uses_default_reviewer_pool})
         reviewer_count = record["reviewer_count"]
