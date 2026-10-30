@@ -220,7 +220,11 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
             ensure_execution_not_revoked(run_directory)
             register_owned_process(run_directory, os.getpid(), "role_worker", owns_process_group=True)
             if not workspace.exists():
-                git(Path(request['repository']),'worktree','add','--detach',str(workspace),request['candidate_commit'],pass_fds=(execution_lock.fileno(),))
+                # 并发同名工作树登记会读到 Git 尚未写完的 commondir；仅串行化登记。
+                with exclusive_lock(run_directory / "worktree-registration.lock") as registration_lock:
+                    ensure_execution_not_revoked(run_directory)
+                    git(Path(request['repository']),'worktree','add','--detach',str(workspace),request['candidate_commit'],
+                        pass_fds=(execution_lock.fileno(), registration_lock.fileno()))
             elif not (attempt_directory/'model-invocation.json').exists():
                 git(workspace,'reset','--hard',request['candidate_commit'],pass_fds=(execution_lock.fileno(),))
             environment = role_environment(request)

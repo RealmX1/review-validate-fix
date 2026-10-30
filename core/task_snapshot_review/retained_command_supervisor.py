@@ -13,9 +13,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from core.task_snapshot_review.execution_lifecycle import ensure_execution_not_revoked, ExecutionRevoked
 from core.task_snapshot_review.native_owned_process_observation import (
     REGISTERED_COMMAND_PROCESS_OWNERSHIP_SCOPE, REGISTERED_COMMAND_PROCESS_LIFETIME_CONTRACT,
-    native_process_identity, owned_process_snapshot, terminate_observed_owned_processes,
+    native_process_identity, native_process_start_identity_matches, owned_process_snapshot, terminate_observed_owned_processes,
 )
 from core.task_snapshot_review.persistent_artifacts import exclusive_lock, read_json, write_json
+
+
+def _valid_reconciled_process_identity(identity: object) -> bool:
+    # macOS/Linux pid_t 为有符号 32 位，超范围整数会被 ctypes 截断。
+    if (not isinstance(identity, dict) or type(identity.get('pid')) is not int
+            or not 0 < identity['pid'] <= 2**31 - 1):
+        return False
+    start = identity.get('start_identity')
+    return (isinstance(start, str) and start.isascii() and start.isdigit()
+        or isinstance(start, list) and len(start) == 2
+        and all(type(value) is int and value >= 0 for value in start) and start[1] < 1_000_000)
 
 
 def terminate_supervised_command_descendants(command_directory: Path) -> list[dict]:
@@ -25,13 +36,35 @@ def terminate_supervised_command_descendants(command_directory: Path) -> list[di
         recorded.setdefault(facts['command_pid'], facts['command_native_identity'])
     observation_error = None
     try:
+        reconciliation_file = command_directory / 'descendant-exit-reconciliation.json'
+        if reconciliation_file.exists():
+            reconciled = read_json(reconciliation_file).get('owned_processes', [])
+            if not isinstance(reconciled, list):
+                raise ValueError('追加对账 owned_processes 必须是身份列表')
+            for item in reconciled:
+                if not _valid_reconciled_process_identity(item):
+                    observation_error = '追加对账包含无效原生进程身份'
+                    continue
+                previous = recorded.get(item['pid'])
+                if previous:
+                    if previous['start_identity'] == item['start_identity']:
+                        continue
+                    # 同 PID 的补证不能抹去原登记；只选择当前仍匹配的启动身份。
+                    try:
+                        current = native_process_identity(item['pid'])
+                    except (OSError, RuntimeError) as error:
+                        observation_error = str(error)
+                        continue
+                    if not native_process_start_identity_matches(current, item):
+                        continue
+                recorded[item['pid']] = item
         supervisor_identity = facts.get('supervisor_native_identity')
         if supervisor_identity:
             recorded.update(owned_process_snapshot(facts['supervisor_pid'], recorded,
                 supervisor_native_identity=supervisor_identity))
         else:
             observation_error = '缺少监督者原生启动身份，无法补查未登记后代'
-    except (OSError, RuntimeError) as error:
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
         recorded.update(getattr(error, 'observed_owned_processes', {}))
         observation_error = str(error)
     observations = terminate_observed_owned_processes(recorded)
