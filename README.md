@@ -14,6 +14,8 @@ rvf review-task-snapshot --repo /path/to/worktree --base-ref main \
 
 `--base-ref` 只解析一次；`--scope` 明确声明任务改动，背景 staged/unstaged/untracked WIP 保持原样。需求文件保留用户原话、有效授权及必要实现上下文。运行材料默认写入 `~/.rvf/user-local-data/task-snapshot-reviews/`；重启接续同一 run。两位 reviewer 各使用独立新进程与工作树，一个 fixer 合并处理匿名发现。每个 CLI 最多原路重试一次，再使用其他可用配置；未完成和真实红测不会计为成功。
 
+外部 CLI 只为实际派发命令选模，不执行额外的健康探针。用户配置 `~/.rvf/alternative-reviewer-config-overrides/<reviewer-id>.json` 保留 `schema_version: 1`、对应的 `reviewer_label`，只允许通过 `env_set` 覆盖环境变量；旧的 `health_command`、`pre_run_health`、`health_timeout_seconds` 已删除，需从配置中移除。
+
 最终验证的 JSON 是 argv 数组列表，例如 `[["python3","-m","pytest","-q","tests"]]`；实施计划是条目字符串列表。准备命令、机器上下文和 Kanban 托管选项也在启动时登记，详见 [skill](plugins/review-validate-fix/skills/review-validate-fix/SKILL.md)。无 finding 的红测仍自动进入修复，默认最多三轮语义修复；重启用 `rvf resume-task-review --run-dir <精确目录>` 接续已冻结材料，已完成 reviewer 不重跑。
 
 RVF 顺利完成并经主 Agent 最终审阅后，默认自主精确暂存并 commit；用户明确的不得提交等限制优先。普通 elevation 不阻止提交，涉及回滚或大范围重写的 elevation 才交具体判断。提交后用 `resume-task-review --run-dir <精确目录> --closeout-report <JSON>` 核对实际提交，立即展示计划 implementation 完成度、工作 recap、验证、commit 和遗留，先于 base-branch-sync。RVF 不 rewind、不创建独立 land 会话；同步根据实际 Git 状态及既有授权独立运行。

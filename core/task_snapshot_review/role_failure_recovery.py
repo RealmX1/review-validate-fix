@@ -28,11 +28,11 @@ def classify_role_failure(stdout: str, stderr: str, returncode: int, output_form
     # stderr 只有在进程失败时才可作为兜底，绝不扫描正常评审正文。
     error_text = json.dumps(native_errors, ensure_ascii=False) if native_errors else stderr
     lower = error_text.lower()
-    if any(word in lower for word in ("authentication", "failed to authenticate", "oauth session expired", "not logged in", "please run /login", "unauthorized", "invalid api key", "invalid_api_key", '"code": 401', "http 401", "login required")):
+    if any(word in lower for word in ("authentication", "failed to authenticate", "oauth session expired", "not logged in", "please run /login", "unauthorized", "invalid api key", "invalid_api_key", '"code": 401', "http 401", "login required", "has no credential configured")):
         category = "authentication"
     elif looks_like_usage_limit(error_text) or any(str(item.get("error", {}).get("code")) == "429" for item in native_errors if isinstance(item.get("error"), dict)):
         category = "usage_limit"
-    elif any(word in lower for word in ("unknown option", "unknown argument", "invalid configuration", "model not found", "unrecognized arguments")):
+    elif any(word in lower for word in ("unknown option", "unknown argument", "invalid configuration", "model not found", "unrecognized arguments", "is not configured in config.toml")):
         category = "configuration"
     elif any(word in lower for word in ("permission denied", "operation not permitted", "sandbox", "loopback", "eacces")):
         category = "deterministic"
@@ -52,7 +52,7 @@ def native_invocation_facts(stdout: str) -> dict:
             continue
         if not isinstance(event, dict):
             continue
-        if event.get("type") not in {"system", "init", "thread.started", "turn.completed", "result", "session_start", "session", "message_end"}:
+        if event.get("type") not in {"system", "init", "thread.started", "turn.completed", "result", "session_start", "session", "session.resume_hint", "message_end"}:
             continue
         for key in ("session_id", "sessionId", "thread_id"):
             if isinstance(event.get(key), str):

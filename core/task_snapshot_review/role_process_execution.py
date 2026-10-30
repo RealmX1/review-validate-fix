@@ -228,7 +228,7 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
                                        inherited_lock_descriptors=(execution_lock.fileno(),))
             prepared_status = git(workspace, "status", "--porcelain", "--untracked-files=all")
             write_json(attempt_directory / "prepared-worktree-state.json", {"status_porcelain": prepared_status.decode()})
-            command, _ = cli.resolve_reviewer_model_commands(config, command, config.get("health_command"), env=environment, cwd=workspace, timeout=30)
+            command = cli.resolve_reviewer_model_command(config, command, env=environment, cwd=workspace, timeout=30)
             command = cli.normalise_reviewer_command_for_output_format(command, output_format=output_format)
             if config.get("run_directory_grant_flag"):
                 command = cli.ensure_run_directory_grant_argument(command, attempt_directory, grant_flag=config["run_directory_grant_flag"])

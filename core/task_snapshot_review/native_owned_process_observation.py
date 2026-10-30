@@ -29,11 +29,15 @@ class BsdUniqueProcessInfo(ctypes.Structure):
         ('reserved_three', ctypes.c_uint64)]
 
 
-def darwin_process_was_started_by_launchd(library, pid: int) -> bool:
+def darwin_process_has_unrelated_origin(library, pid: int, supervisor_unique_process_id: int | None) -> bool:
     process, launchd = BsdUniqueProcessInfo(), BsdUniqueProcessInfo()
-    # 原始父进程版本在 reparent 后保持不变；仅排除可证明确由 launchd 新启动的服务。
-    if (library.proc_pidinfo(pid, 17, 0, ctypes.byref(process), ctypes.sizeof(process)) != ctypes.sizeof(process)
-            or library.proc_pidinfo(1, 17, 0, ctypes.byref(launchd), ctypes.sizeof(launchd)) != ctypes.sizeof(launchd)):
+    if library.proc_pidinfo(pid, 17, 0, ctypes.byref(process), ctypes.sizeof(process)) != ctypes.sizeof(process):
+        return False
+    # 内核按创建顺序分配 uniqueid；父进程早于监督者则不可能是本次执行的后代。
+    # reparent 后 exec 可把 parent_uniqueid 改为 1，不能据此排除清空环境的后代。
+    if supervisor_unique_process_id and 1 < process.parent_unique_process_id < supervisor_unique_process_id:
+        return True
+    if library.proc_pidinfo(1, 17, 0, ctypes.byref(launchd), ctypes.sizeof(launchd)) != ctypes.sizeof(launchd):
         return False
     return process.original_parent_process_id_version == launchd.process_id_version
 
@@ -51,7 +55,15 @@ def native_process_identity(pid: int) -> dict | None:
             raise RuntimeError(f'原生进程启动身份不可用：pid={pid}, errno={observed_errno}')
         if info.process_status == 5:
             return None
-        return {'pid': pid, 'start_identity': [info.start_seconds, info.start_microseconds]}
+        unique = BsdUniqueProcessInfo()
+        ctypes.set_errno(0)
+        if library.proc_pidinfo(pid, 17, 0, ctypes.byref(unique), ctypes.sizeof(unique)) != ctypes.sizeof(unique):
+            observed_errno = ctypes.get_errno()
+            if observed_errno in {errno.ESRCH, errno.ENOENT}:
+                return None
+            raise RuntimeError(f'原生进程唯一身份不可用：pid={pid}, errno={observed_errno}')
+        return {'pid': pid, 'start_identity': [info.start_seconds, info.start_microseconds],
+                'unique_process_id': unique.unique_process_id}
     if sys.platform.startswith('linux'):
         try:
             fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
@@ -157,7 +169,7 @@ def native_process_snapshot(execution_token: str, supervisor_pid: int, previousl
             record['execution_token_matches'] = belongs(arguments.raw[:length.value])
             # 清空环境的脱离 session 后代与无关新孤儿无法区分；缺少 token 不是退出证明。
             record['execution_ownership_unknown'] = (not record['execution_token_matches']
-                and not darwin_process_was_started_by_launchd(library, pid))
+                and not darwin_process_has_unrelated_origin(library, pid, supervisor_native_identity.get('unique_process_id')))
             records[pid] = record
             if record['execution_token_matches']:
                 proven_owned_process_ids.add(pid)

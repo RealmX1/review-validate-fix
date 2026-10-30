@@ -22,17 +22,5 @@
     "PI_CODING_AGENT_DIR",
     "PI_TIMING"
   ],
-  "health_command": [
-    "omp",
-    "-p",
-    "--mode",
-    "json",
-    "--no-session",
-    "--no-extensions",
-    "--auto-approve",
-    "--thinking",
-    "xhigh",
-    "Reply with exactly: OK"
-  ],
   "reviewer_model_selection_source": "oh_my_pi_default_model_role"
 }

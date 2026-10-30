@@ -29,6 +29,10 @@ fixer 的 completed 表示发现的语义处置和必要的针对性验证完成
 
 准备、机器补验和权威最终验证均由独立监督者等待所属后代。原生启动身份和继承的随机执行归属覆盖新 session 后代；`ps` 不可用时使用平台原生查询。短暂查询失败只作有界复核，持续缺证保存命令退出事实、后代退出未知与恢复条件，不能把未知写成通过或耗尽整个角色期限后冒充命令失败。
 
+macOS 同时保存监督者的内核 `uniqueid`。新孤儿缺少执行 token 时，只排除原始父版本证明由 launchd 启动、或父 `uniqueid` 非 1 且早于监督者的无关进程，避免并发后台进程把成功准备误报为后代退出未知。`uniqueid` 按进程创建顺序递增；reparent 后 exec 可能将父 `uniqueid` 改为 1，因此不能仅凭当前父为 launchd 排除清空环境的所属后代；缺少归属证据仍保留 unknown。依据：[XNU 创建身份](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_fork.c)、[父身份保存](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_proc.c)。
+
+接续时按 `pid` 与 `start_identity` 核对监督者是否仍存活；附加的 `uniqueid` 证据不改变该启动身份，不能因记录字段增多而将仍存活的监督者写成已退出。
+
 观测缺证不终止尚在执行的已登记命令；有界复核后，以直接子进程退出这一新事实触发再次核验。退出证明仍未知时不写通过，也不派发下一份命令。Stop 可使用尚未回收的 Popen 直接子进程句柄这一独立归属证据；其他后代仍核对原生启动身份。原生 Popen 启动失败单独保存未派发事实及 errno，重采可据此安全恢复，不把缺少监督文件直接解释为退出。
 
 使用 `--kanban-task-id` 与 `--kanban-project-path` 将同一 run 委托给通用 `kanban task command-execution`。执行记录先冻结 incarnation、主会话、工作树、材料、恢复动作及稳定结果 ID，宿主负责等待与原生接受补证。`cancel-task-review` 先写持久撤销，再仅取消匹配启动身份的所属进程；原生共享宿主取消证据未知时保留 unknown。Stop 后不能以自动恢复再次派发。
