@@ -126,3 +126,76 @@ def test_additional_native_identity_evidence_preserves_live_supervisor_recovery_
         machine_evidence.ensure_previous_supervised_commands_exited(run, run / 'machine-evidence')
         expected_status = 'exited'
     assert read_json(command_directory / 'descendant-exit-reconciliation.json')['status'] == expected_status
+
+
+@pytest.mark.parametrize('discovery_query_fails', [False, True])
+def test_reconciliation_retains_discovered_child_after_parent_exit_and_query_failure(
+        tmp_path, monkeypatch, darwin_owned_process_queries, discovery_query_fails):
+    state = darwin_owned_process_queries
+    run = tmp_path / 'reconciliation-owned-child-recovery'
+    command_directory = run / 'commands/attempt-001/command-001'
+    register_supervised_command_directory(run, command_directory)
+    parent_identity = observation.native_process_identity(state.child_pid)
+    supervision_file = command_directory / 'command-supervision.json'
+    write_json(supervision_file, {
+        'process_ownership_scope': observation.REGISTERED_COMMAND_PROCESS_OWNERSHIP_SCOPE,
+        'command_process_lifetime_contract': observation.REGISTERED_COMMAND_PROCESS_LIFETIME_CONTRACT,
+        'status': 'running', 'supervisor_pid': state.supervisor_pid,
+        'supervisor_native_identity': state.identity,
+        'command_pid': state.child_pid, 'command_native_identity': parent_identity,
+        'owned_processes': [parent_identity],
+    })
+    original = supervision_file.read_bytes()
+    del state.processes[state.supervisor_pid]
+    state.processes[state.orphan_pid] = (state.child_pid, state.orphan_pid, 102)
+    reconciliation_file = command_directory / 'descendant-exit-reconciliation.json'
+    scoped_query = observation.darwin_scoped_process_ids
+
+    def fail_after_child_discovery(selection, scope_id):
+        if scope_id == state.orphan_pid:
+            raise RuntimeError('新发现子进程的后续归属查询暂不可用')
+        return scoped_query(selection, scope_id)
+
+    with monkeypatch.context() as discovery:
+        if discovery_query_fails:
+            discovery.setattr(observation, 'darwin_scoped_process_ids', fail_after_child_discovery)
+        with pytest.raises(machine_evidence.WorkspacePreparationFailed):
+            machine_evidence.ensure_previous_supervised_commands_exited(run, run / 'commands')
+    first = read_json(reconciliation_file)
+    assert first['status'] == ('unknown' if discovery_query_fails else 'pending')
+    assert state.orphan_pid in {item['pid'] for item in first['owned_processes']}
+
+    del state.processes[state.child_pid]
+    state.processes[state.orphan_pid] = (1, state.orphan_pid, 102)
+    with pytest.raises(machine_evidence.WorkspacePreparationFailed):
+        machine_evidence.ensure_previous_supervised_commands_exited(run, run / 'commands')
+    orphaned_child = read_json(reconciliation_file)
+    assert orphaned_child['status'] == 'pending'
+    assert {item['pid'] for item in orphaned_child['owned_processes']} == {state.orphan_pid}
+
+    native_identity = observation.native_process_identity
+
+    def unavailable_supervisor_identity(pid):
+        if pid == state.supervisor_pid:
+            raise RuntimeError('监督者启动身份查询暂不可用')
+        return native_identity(pid)
+
+    with monkeypatch.context() as unavailable:
+        unavailable.setattr(observation, 'native_process_identity', unavailable_supervisor_identity)
+        with pytest.raises(machine_evidence.WorkspacePreparationFailed):
+            machine_evidence.ensure_previous_supervised_commands_exited(run, run / 'commands')
+    unavailable_facts = read_json(reconciliation_file)
+    assert unavailable_facts['status'] == 'unknown'
+    assert state.orphan_pid in {item['pid'] for item in unavailable_facts['owned_processes']}
+
+    with pytest.raises(machine_evidence.WorkspacePreparationFailed):
+        machine_evidence.ensure_previous_supervised_commands_exited(run, run / 'commands')
+    live_child = read_json(reconciliation_file)
+    assert live_child['status'] == 'pending'
+    assert {item['pid'] for item in live_child['owned_processes']} == {state.orphan_pid}
+
+    state.processes[state.orphan_pid] = (1, state.orphan_pid, 202)
+    machine_evidence.ensure_previous_supervised_commands_exited(run, run / 'commands')
+    assert read_json(reconciliation_file)['status'] == 'exited'
+    assert state.unrelated_pid not in state.inspected
+    assert supervision_file.read_bytes() == original

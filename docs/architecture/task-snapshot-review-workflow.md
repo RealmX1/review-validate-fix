@@ -35,6 +35,8 @@ macOS 使用 `PROC_PGRP_ONLY`、`PROC_PPID_ONLY` 限定查询，并保留监督�
 
 接续时按 `pid` 与 `start_identity` 核对监督者是否仍存活；附加的 `uniqueid` 证据不改变该启动身份，不能因记录字段增多而将仍存活的监督者写成已退出。
 
+`descendant-exit-reconciliation.json` 中新发现的所属后代身份会与原始监督登记合并，成为下一次对账的输入。查询失败时保留此前身份和本次查询已证明的部分归属事实，状态仍为 unknown；后续按原生启动身份重新核验，不能因父进程退出或后代脱离 session 而丢失已观察身份。只有核验所属进程退出或 PID 启动身份变化后才能移除该身份、解除防重复派发门禁；原始 `command-supervision.json` 不变。
+
 观测缺证不终止尚在执行的已登记命令；有界复核后，以直接子进程退出这一新事实触发再次核验。退出证明仍未知时不写通过，也不派发下一份命令。Stop 可使用尚未回收的 Popen 直接子进程句柄这一独立归属证据；其他后代仍核对原生启动身份。原生 Popen 启动失败单独保存未派发事实及 errno，重采可据此安全恢复，不把缺少监督文件直接解释为退出。
 
 使用 `--kanban-task-id` 与 `--kanban-project-path` 将同一 run 委托给通用 `kanban task command-execution`。执行记录先冻结 incarnation、主会话、工作树、材料、恢复动作及稳定结果 ID，宿主负责等待与原生接受补证。`cancel-task-review` 先写持久撤销，再仅取消匹配启动身份的所属进程；原生共享宿主取消证据未知时保留 unknown。Stop 后不能以自动恢复再次派发。

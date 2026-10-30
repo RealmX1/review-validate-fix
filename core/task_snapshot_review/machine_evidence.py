@@ -53,12 +53,15 @@ def ensure_previous_supervised_commands_exited(run_directory: Path, collection_d
             continue
         supervision_file = command_directory / 'command-supervision.json'
         reconciliation_file = command_directory / 'descendant-exit-reconciliation.json'
-        if reconciliation_file.exists() and read_json(reconciliation_file).get('status') == 'exited':
+        previous = read_json(reconciliation_file) if reconciliation_file.exists() else {}
+        if previous.get('status') == 'exited':
             continue
         observation = {'status': 'unknown', 'observed_at': time.time(),
             'recovery_condition': 'previous_supervisor_and_descendants_exit_proven',
             'action': 'resume_same_run', 'supervision_file': str(supervision_file)}
+        recorded = {}
         try:
+            recorded = {item['pid']: item for item in previous.get('owned_processes', [])}
             if not supervision_file.exists():
                 execution = read_json(command_directory / 'execution.json')
                 if execution.get('status') == 'launch_failed' and execution.get('execution_started') is False:
@@ -86,7 +89,8 @@ def ensure_previous_supervised_commands_exited(run_directory: Path, collection_d
                     raise RuntimeError('缺少上一监督者原生启动身份')
                 observation['status'] = 'exited'
             else:
-                recorded = {item['pid']: item for item in facts.get('owned_processes', [])}
+                for item in facts.get('owned_processes', []):
+                    recorded.setdefault(item['pid'], item)
                 if facts.get('command_native_identity'):
                     recorded.setdefault(facts['command_pid'], facts['command_native_identity'])
                 elif facts.get('command_pid') and facts['command_pid'] not in recorded and facts.get('command_returncode') is None:
@@ -98,7 +102,8 @@ def ensure_previous_supervised_commands_exited(run_directory: Path, collection_d
                 observation.update({'owned_processes': list(descendants.values()),
                     'status': 'pending' if supervisor_still_has_recorded_start_identity or descendants else 'exited'})
         except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
-            observation['error'] = str(error)
+            recorded.update(getattr(error, 'observed_owned_processes', {}))
+            observation.update({'error': str(error), 'owned_processes': list(recorded.values())})
         write_json(reconciliation_file, observation)
         if observation['status'] != 'exited':
             error = WorkspacePreparationFailed(reconciliation_file)
