@@ -34,6 +34,5 @@
     "xhigh",
     "Reply with exactly: OK"
   ],
-  "reviewer_model_selection_source": "oh_my_pi_default_model_role",
-  "timeout_seconds": 900
+  "reviewer_model_selection_source": "oh_my_pi_default_model_role"
 }

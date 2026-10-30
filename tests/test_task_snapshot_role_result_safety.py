@@ -50,7 +50,6 @@ def _request(attempt, repo, program, *, role="reviewer", output_format="text", e
             "command": [sys.executable, "-c", program],
             "output_format": output_format,
             "credential_environment_variable_names": sorted(env or {}),
-            "timeout_seconds": 20,
         },
     }
     write_json(attempt / "request.json", request)

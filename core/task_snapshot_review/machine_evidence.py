@@ -91,7 +91,7 @@ def ensure_previous_supervised_commands_exited(run_directory: Path, collection_d
 
 
 def execute_registered_commands(run_directory: Path, workspace: Path, commands: list[list[str]],
-                                artifacts: Path, purpose: str, *, environment: dict | None = None, deadline_at: float | None = None,
+                                artifacts: Path, purpose: str, *, environment: dict | None = None,
                                 inherited_lock_descriptors: tuple[int, ...] = (),
                                 excluded_preparation_paths: list[str] | None = None,
                                 expected_source_tree: str | None = None) -> dict:
@@ -103,8 +103,6 @@ def execute_registered_commands(run_directory: Path, workspace: Path, commands: 
     for index, command in enumerate(commands):
         ensure_execution_not_revoked(run_directory)
         verified_execution_plan(run_directory)
-        if deadline_at is not None and deadline_at <= time.time():
-            raise subprocess.TimeoutExpired(command, 0)
         command_directory = artifacts / f"command-{index + 1:03d}"
         command_directory.mkdir(parents=True, exist_ok=True)
         source_tree_before = (capture_worktree_tree(workspace, ["."], command_directory,
@@ -124,13 +122,11 @@ def execute_registered_commands(run_directory: Path, workspace: Path, commands: 
             with exclusive_lock(run_directory / "execution-revocation.lock"):
                 verified_execution_plan(run_directory)
                 ensure_execution_not_revoked(run_directory)
-                if deadline_at is not None and deadline_at <= time.time():
-                    raise subprocess.TimeoutExpired(command, 0)
                 launch_command = command
                 if inherited_lock_descriptors:
                     register_supervised_command_directory(run_directory, command_directory)
                     launch_command = [sys.executable, str(Path(__file__).with_name("retained_command_supervisor.py")),
-                        str(run_directory), str(command_directory), str(deadline_at),
+                        str(run_directory), str(command_directory),
                         json.dumps(list(inherited_lock_descriptors)), json.dumps(command)]
                 try:
                     process = subprocess.Popen(launch_command, cwd=workspace, env=environment, stdout=stdout, stderr=stderr,
@@ -148,19 +144,13 @@ def execute_registered_commands(run_directory: Path, workspace: Path, commands: 
                 except (OSError, subprocess.SubprocessError, RuntimeError) as error:
                     record["process_identity_error"] = str(error)
                 write_json(command_directory / "execution.json", record)
-                try:
-                    returncode = wait_for_owned_process(process, run_directory, timeout=None if deadline_at is None else max(0, deadline_at - time.time()))
-                except subprocess.TimeoutExpired:
-                    returncode = 124
-                if deadline_at is not None and time.time() >= deadline_at:
-                    returncode = 124
+                returncode = wait_for_owned_process(process, run_directory, timeout=None)
             finally:
                 if process.poll() is None:
                     (os.kill if inherited_lock_descriptors else os.killpg)(process.pid, signal.SIGTERM)
                     try:
-                        # 仅等待撤销清理确认；命令的执行期限没有延长。
-                        process.wait(timeout=0.75 if inherited_lock_descriptors else
-                            (5 if deadline_at is None else max(0, min(5, deadline_at - time.time()))))
+                        # 此处只限制取消后的清理等待，不限制命令执行时间。
+                        process.wait(timeout=0.75 if inherited_lock_descriptors else 5)
                     except subprocess.TimeoutExpired:
                         supervision_file = command_directory / 'command-supervision.json'
                         if inherited_lock_descriptors and supervision_file.exists():
@@ -195,7 +185,7 @@ def execute_registered_commands(run_directory: Path, workspace: Path, commands: 
 
 
 def prepare_isolated_workspace(run_directory: Path, workspace: Path, commands: list[list[str]], artifacts: Path,
-                               *, environment: dict | None = None, deadline_at: float | None = None,
+                               *, environment: dict | None = None,
                                inherited_lock_descriptors: tuple[int, ...] = ()) -> None:
     if not commands:
         return
@@ -205,7 +195,7 @@ def prepare_isolated_workspace(run_directory: Path, workspace: Path, commands: l
     previously_created = set(read_json(preparation_paths_file)["paths"]) if preparation_paths_file.exists() else set()
     try:
         result = execute_registered_commands(run_directory, workspace, commands, artifacts / "preparation", "workspace_preparation",
-            environment=environment, deadline_at=deadline_at, inherited_lock_descriptors=inherited_lock_descriptors)
+            environment=environment, inherited_lock_descriptors=inherited_lock_descriptors)
     finally:
         after = set(git(workspace, "ls-files", "--others", "--exclude-standard", "-z").decode().split("\0")) - {""}
         write_json(preparation_paths_file, {"paths": sorted(previously_created | (after - before))})
@@ -282,7 +272,7 @@ def _terminate_retained_collection_commands(directory: Path, reason: str) -> Non
 
 
 @contextmanager
-def _bounded_incomplete_fixer_collection_lock(run_directory: Path, directory: Path, deadline_at: float):
+def _cancellable_incomplete_fixer_collection_lock(run_directory: Path, directory: Path):
     with (directory / "collection.lock").open("a+b") as handle:
         while True:
             try:
@@ -290,35 +280,26 @@ def _bounded_incomplete_fixer_collection_lock(run_directory: Path, directory: Pa
             except ExecutionRevoked:
                 _terminate_retained_collection_commands(directory, "execution_revoked")
                 raise
-            if time.time() >= deadline_at:
-                _terminate_retained_collection_commands(directory, "original_deadline_exhausted")
-                yield None
-                return
             try:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
-                time.sleep(min(0.05, max(0, deadline_at - time.time())))
+                time.sleep(0.05)
         try:
             yield handle
         finally:
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def collect_incomplete_fixer_machine_validation(run_directory: Path, record: dict, candidate_commit: str,
-                                               deadline_at: float) -> Path | None:
+def collect_incomplete_fixer_machine_validation(run_directory: Path, record: dict, candidate_commit: str) -> Path | None:
     plan = verified_execution_plan(run_directory, record)
     commands = plan.get("validation_commands", [])
     if not commands:
         return None
     directory = run_directory / "incomplete-fixer-machine-validation" / f"round-{record['semantic_repair_rounds_used']:03d}"
     directory.mkdir(parents=True, exist_ok=True)
-    with _bounded_incomplete_fixer_collection_lock(run_directory, directory, deadline_at) as collection_lock:
-        if collection_lock is None:
-            return None
+    with _cancellable_incomplete_fixer_collection_lock(run_directory, directory) as collection_lock:
         ensure_execution_not_revoked(run_directory)
-        if deadline_at <= time.time():
-            return None
         ensure_previous_supervised_commands_exited(run_directory, run_directory / 'incomplete-fixer-machine-validation')
         repo = Path(record["repo"])
         tested_tree = git_text(repo, "rev-parse", candidate_commit + "^{tree}")
@@ -342,7 +323,7 @@ def collect_incomplete_fixer_machine_validation(run_directory: Path, record: dic
             write_json(run_directory / 'run.json', record)
             append_stage_event(run_directory, 'semantic_repair_tree_changed', tested_tree=tested_tree,
                 semantic_repair_round=record['semantic_repair_rounds_used'])
-            return collect_incomplete_fixer_machine_validation(run_directory, record, candidate_commit, deadline_at)
+            return collect_incomplete_fixer_machine_validation(run_directory, record, candidate_commit)
         if intent.get("evidence_sha256"):
             accepted_evidence_file = Path(intent['published_evidence_path'])
             if not accepted_evidence_file.exists() or hashlib.sha256(accepted_evidence_file.read_bytes()).hexdigest() != intent["evidence_sha256"]:
@@ -358,7 +339,7 @@ def collect_incomplete_fixer_machine_validation(run_directory: Path, record: dic
                 return accepted_evidence_file
             if unchanged_recovery_evidence:
                 intent['unchanged_recovery_probe_used'] = True
-        # 失败后仅在恢复证据变化时重采；中断与环境恢复共享有界次数，原期限不变。
+        # 失败后仅在恢复证据变化时重采；中断与环境恢复共享有界次数，等待时间不消耗重试资格。
         if intent["collection_attempt_count"] >= 3:
             return None
         intent["collection_attempt_count"] += 1
@@ -369,25 +350,16 @@ def collect_incomplete_fixer_machine_validation(run_directory: Path, record: dic
         attempt_directory.mkdir()
         workspace = attempt_directory / "workspace"
         git(repo, "worktree", "add", "--detach", str(workspace), intent["tested_commit"])
-        try:
-            prepare_isolated_workspace(run_directory, workspace, plan.get("preparation_commands", []), attempt_directory,
-                deadline_at=deadline_at, inherited_lock_descriptors=(collection_lock.fileno(),))
-        except subprocess.TimeoutExpired:
-            _terminate_retained_collection_commands(directory, 'original_deadline_exhausted')
-            return None
+        prepare_isolated_workspace(run_directory, workspace, plan.get("preparation_commands", []), attempt_directory,
+            inherited_lock_descriptors=(collection_lock.fileno(),))
         preparation_paths = attempt_directory / "preparation-created-untracked-paths.json"
         excluded = read_json(preparation_paths)["paths"] if preparation_paths.exists() else None
         before = capture_worktree_tree(workspace, ["."], attempt_directory, excluded_preparation_paths=excluded)
         result = {"status": "candidate_changed", "commands": []}
         if before == tested_tree:
-            try:
-                result = execute_registered_commands(run_directory, workspace, commands, attempt_directory / "commands",
-                    "incomplete_fixer_machine_validation", deadline_at=deadline_at,
-                    inherited_lock_descriptors=(collection_lock.fileno(),), excluded_preparation_paths=excluded,
-                    expected_source_tree=tested_tree)
-            except subprocess.TimeoutExpired:
-                _terminate_retained_collection_commands(directory, 'original_deadline_exhausted')
-                return None
+            result = execute_registered_commands(run_directory, workspace, commands, attempt_directory / "commands",
+                "incomplete_fixer_machine_validation", inherited_lock_descriptors=(collection_lock.fileno(),),
+                excluded_preparation_paths=excluded, expected_source_tree=tested_tree)
         after = capture_worktree_tree(workspace, ["."], attempt_directory, excluded_preparation_paths=excluded)
         if after != tested_tree:
             result["status"] = "candidate_changed"

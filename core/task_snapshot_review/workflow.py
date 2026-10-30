@@ -168,16 +168,6 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
     if completed and not force_new:
         return completed, None
     role_directory.mkdir(exist_ok=True)
-    deadline_file = role_directory / "role-deadline.json"
-    if not configurations and not deadline_file.exists():
-        # 首次派发即开始计时，配置缺失也消耗默认总预算。
-        write_json(deadline_file, {"deadline_at": time.time() + 1800})
-    if deadline_file.exists() and read_json(deadline_file)["deadline_at"] <= time.time():
-        write_json(role_directory / "deadline-exhausted.json", {
-            "status": "incomplete", "recovery": {"category": "deadline_exhausted", "maximum_same_configuration_retries": 0},
-            "deadline_at": read_json(deadline_file)["deadline_at"], "observed_at": time.time(),
-        })
-        return None, None
     attempts = sorted(role_directory.glob("attempt-*"))
     if any(process_lock_is_held(attempt) for attempt in attempts):
         return None, None
@@ -229,6 +219,8 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
                     and read_json(attempt/'request.json').get('context_response_sha256') == record.get('context_response_sha256')
                     and read_json(attempt/'request.json').get('shared_machine_evidence_recovery_sha256') == record.get('shared_machine_evidence_recovery_sha256')
                     and not ((attempt / "outcome.json").exists() and read_json(attempt / "outcome.json").get("recovery", {}).get("category") == "workspace_preparation")
+                    # 历史超时原件保留，但不消耗当前无总时限执行的故障重试资格。
+                    and not ((attempt / "outcome.json").exists() and read_json(attempt / "outcome.json").get("recovery", {}).get("category") == "deadline_exhausted")
                     and not ((attempt/'outcome.json').exists() and read_json(attempt/'outcome.json').get('status')=='cancelled')]
         if any((attempt / "outcome.json").exists() and read_json(attempt / "outcome.json").get("retryable") is False for attempt in matching):
             continue
@@ -236,9 +228,10 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
             chosen = config
             break
     if chosen is None:
+        write_json(role_directory / "progress.json", {"status": "waiting", "last_observed_at": time.time(),
+            "waiting_reason": "registered_configuration_or_recovery_evidence_required",
+            "recovery_condition": "configuration_credentials_machine_evidence_changed_or_retry_due"})
         return None, None
-    if not deadline_file.exists():
-        write_json(deadline_file, {"deadline_at": time.time() + float(chosen.get("timeout_seconds", 1800))})
     if role == "fixer" and record.get("execution_plan_sha256"):
         plan = read_json(run_directory / "execution-plan.json")
         # CLI 传输失败复用同一语义轮；完成后再修复才消耗下一轮，配置变化不重置预算。
@@ -290,8 +283,6 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
         inputs += f"机器上下文与预登记命令：{run_directory / 'execution-plan.json'}。共享机器事实按需读取 {run_directory / 'machine-evidence'}，只适用于各证据声明的完整树和环境。\n"
     if record.get('context_response_sha256'):
         inputs+=f"通用补证：{request['context_response_file']}；历次通用补证原件按需读取 {run_directory/'context-response-originals-by-sha256'}，不改变冻结需求与范围，不包含另一腿的结论。\n"
-    remaining = max(0, read_json(deadline_file)["deadline_at"] - time.time())
-    inputs += f"角色剩余总时限约 {remaining:.0f} 秒；请在 {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(time.time() + remaining * 0.7))} 前收束审计并输出 JSON，预留原生 CLI 结束时间。到收束点仍有缺口就返回 incomplete 与已有发现，不延长或重置总时限。\n"
     prompt = template.strip() + "\n" + inputs + f"\n结果可写入 {result_file}，或在最终回复中只输出结果 JSON。\n"
     write_bytes(attempt_directory / "prompt.md", prompt.encode())
     write_json(attempt_directory / "request.json", request)
@@ -540,7 +531,7 @@ def _validate(run_directory: Path, record: dict, commands: list[list[str]], lock
                 ensure_execution_not_revoked(run_directory)
                 register_supervised_command_directory(run_directory, logs)
                 launch_command = [sys.executable, str(Path(__file__).with_name('retained_command_supervisor.py')),
-                    str(run_directory), str(logs), 'None', json.dumps([lock_handle.fileno()]), json.dumps(commands[i])]
+                    str(run_directory), str(logs), json.dumps([lock_handle.fileno()]), json.dumps(commands[i])]
                 try:
                     process = subprocess.Popen(launch_command, cwd=workspace, stdout=stdout, stderr=stderr, pass_fds=(lock_handle.fileno(),), start_new_session=True)
                 except OSError as error:
@@ -691,13 +682,12 @@ def _resume_review_iteration(run_directory: Path, *, reviewer_configs: list[dict
                     if progress:
                         intent = _snapshot_fixer_progress(run_directory, record, progress)
                         if progress["result"].get("completion_blocker") == "registered_machine_validation" and record.get("execution_plan_sha256"):
-                            deadline = read_json(run_directory / "fixer/role-deadline.json")["deadline_at"]
-                            evidence = collect_incomplete_fixer_machine_validation(run_directory, record, intent["after"], deadline)
+                            evidence = collect_incomplete_fixer_machine_validation(run_directory, record, intent["after"])
                             if evidence is not None and record.get("incomplete_fixer_machine_validation_evidence") != str(evidence):
                                 previous = verified_context_response_original_path(run_directory, record.get("context_response_sha256"))
                                 response = (f"执行器已对保留修复树运行启动时冻结的最终验证，原始 incomplete 不变，语义结论仍由本角色判断。\n"
                                     f"机器原件：{evidence}\n原通用补证：{previous or '无'}\n"
-                                    "核对完整树、命令、cwd 和日志后接续；不在受限沙箱重复同一机器命令，不延长原总时限。\n").encode()
+                                    "核对完整树、命令、cwd 和日志后接续；不在受限沙箱重复同一机器命令。\n").encode()
                                 digest = hashlib.sha256(response).hexdigest()
                                 original = run_directory / "context-response-originals-by-sha256" / f"{digest}.md"
                                 write_bytes(original, response)
