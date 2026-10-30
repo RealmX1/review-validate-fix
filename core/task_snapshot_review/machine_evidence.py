@@ -40,7 +40,9 @@ def verified_execution_plan(run_directory: Path, record: dict | None = None) -> 
 
 
 def ensure_previous_supervised_commands_exited(run_directory: Path, collection_directory: Path) -> None:
-    from .native_owned_process_observation import native_process_identity, owned_process_snapshot
+    from .native_owned_process_observation import (
+        REGISTERED_COMMAND_PROCESS_OWNERSHIP_SCOPE, REGISTERED_COMMAND_PROCESS_LIFETIME_CONTRACT, native_process_identity, owned_process_snapshot,
+    )
     registry = run_directory / 'registered-supervised-command-directories.json'
     for registered_directory in read_json(registry)['command_directories'] if registry.exists() else []:
         command_directory = Path(registered_directory).resolve()
@@ -51,12 +53,15 @@ def ensure_previous_supervised_commands_exited(run_directory: Path, collection_d
             continue
         supervision_file = command_directory / 'command-supervision.json'
         reconciliation_file = command_directory / 'descendant-exit-reconciliation.json'
-        if reconciliation_file.exists() and read_json(reconciliation_file).get('status') == 'exited':
+        previous = read_json(reconciliation_file) if reconciliation_file.exists() else {}
+        if previous.get('status') == 'exited':
             continue
         observation = {'status': 'unknown', 'observed_at': time.time(),
             'recovery_condition': 'previous_supervisor_and_descendants_exit_proven',
             'action': 'resume_same_run', 'supervision_file': str(supervision_file)}
+        recorded = {}
         try:
+            recorded = {item['pid']: item for item in previous.get('owned_processes', [])}
             if not supervision_file.exists():
                 execution = read_json(command_directory / 'execution.json')
                 if execution.get('status') == 'launch_failed' and execution.get('execution_started') is False:
@@ -66,6 +71,16 @@ def ensure_previous_supervised_commands_exited(run_directory: Path, collection_d
             facts = read_json(supervision_file)
             if facts.get('status') == 'completed':
                 continue
+            if (facts.get('process_ownership_scope') != REGISTERED_COMMAND_PROCESS_OWNERSHIP_SCOPE or
+                    facts.get('command_process_lifetime_contract') != REGISTERED_COMMAND_PROCESS_LIFETIME_CONTRACT):
+                raise RuntimeError('历史未完成命令缺少受控进程契约，不能自动补写为已退出')
+            if facts.get('command_execution_started') is False and not facts.get('command_pid'):
+                observation.update({'status': 'not_started', 'native_launch_error': facts['command_native_launch_error']})
+                write_json(reconciliation_file, observation)
+                continue
+            if (facts.get('command_launch_intent_recorded') and not facts.get('command_pid')
+                    and facts.get('command_returncode') is None):
+                raise RuntimeError('命令派发登记中断，缺少直接命令身份或退出事实')
             current = native_process_identity(facts['supervisor_pid'])
             identity = facts.get('supervisor_native_identity')
             if not identity:
@@ -74,15 +89,21 @@ def ensure_previous_supervised_commands_exited(run_directory: Path, collection_d
                     raise RuntimeError('缺少上一监督者原生启动身份')
                 observation['status'] = 'exited'
             else:
-                recorded = {item['pid']: item for item in facts.get('owned_processes', [])}
-                descendants = owned_process_snapshot(facts['execution_token'], facts['supervisor_pid'], recorded,
+                for item in facts.get('owned_processes', []):
+                    recorded.setdefault(item['pid'], item)
+                if facts.get('command_native_identity'):
+                    recorded.setdefault(facts['command_pid'], facts['command_native_identity'])
+                elif facts.get('command_pid') and facts['command_pid'] not in recorded and facts.get('command_returncode') is None:
+                    raise RuntimeError('缺少直接命令的已登记原生身份或退出事实')
+                descendants = owned_process_snapshot(facts['supervisor_pid'], recorded,
                     supervisor_native_identity=identity)
                 supervisor_still_has_recorded_start_identity = bool(current
                     and current['pid'] == identity['pid'] and current['start_identity'] == identity['start_identity'])
                 observation.update({'owned_processes': list(descendants.values()),
                     'status': 'pending' if supervisor_still_has_recorded_start_identity or descendants else 'exited'})
         except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
-            observation['error'] = str(error)
+            recorded.update(getattr(error, 'observed_owned_processes', {}))
+            observation.update({'error': str(error), 'owned_processes': list(recorded.values())})
         write_json(reconciliation_file, observation)
         if observation['status'] != 'exited':
             error = WorkspacePreparationFailed(reconciliation_file)

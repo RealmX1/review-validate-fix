@@ -11,6 +11,7 @@ import pytest
 
 from core.task_snapshot_review import execution_lifecycle, native_owned_process_observation, retained_command_supervisor
 from core.task_snapshot_review.persistent_artifacts import read_json, write_json
+from test_owned_command_process_scope import darwin_owned_process_queries
 
 
 def wait_until(predicate, timeout=2):
@@ -23,7 +24,7 @@ def wait_until(predicate, timeout=2):
 
 
 @pytest.mark.parametrize('exit_recorded_parent', [False, True])
-def test_stop_rediscovers_unrecorded_detached_child_after_supervisor_crash(tmp_path, exit_recorded_parent):
+def test_stop_rediscovers_child_from_recorded_parent_or_child_identity_after_crash(tmp_path, exit_recorded_parent):
     run = tmp_path / 'supervisor-crash-recovery'
     command_directory = run / 'commands/command-001'
     command_directory.mkdir(parents=True)
@@ -53,6 +54,8 @@ def test_stop_rediscovers_unrecorded_detached_child_after_supervisor_crash(tmp_p
         os.kill(supervisor.pid, signal.SIGKILL)
         supervisor.wait(timeout=1)
         if exit_recorded_parent:
+            facts['owned_processes'].append(native_owned_process_observation.native_process_identity(child_pid))
+            write_json(supervision_file, facts)
             os.kill(facts['command_pid'], signal.SIGKILL)
             wait_until(lambda: native_owned_process_observation.native_process_identity(facts['command_pid']) is None)
         evidence = execution_lifecycle.revoke_execution(run, '监督者崩溃后取消未登记后代')
@@ -82,7 +85,7 @@ def test_persistent_observation_failure_has_cleanup_budget_independent_of_role_d
         'from pathlib import Path; from unittest.mock import patch\n'
         'from core.task_snapshot_review import retained_command_supervisor as supervisor\n'
         'attempts=0\n'
-        'def observe(*args):\n'
+        'def observe(*args,**kwargs):\n'
         ' global attempts\n'
         ' attempts+=1\n'
         ' if attempts>1: raise RuntimeError("派发后原生归属查询持续失败")\n'
@@ -129,17 +132,14 @@ def test_candidate_source_supervision_file_is_never_cancellation_evidence(tmp_pa
         unrelated.wait()
 
 
-def test_reused_supervisor_pid_cannot_anchor_foreign_process_group(monkeypatch):
-    supervisor_pid, foreign_child_pid, owned_orphan_pid = 800501, 800502, 800503
-    snapshot = {
-        supervisor_pid: {'pid': supervisor_pid, 'parent_pid': 1, 'process_group_id': supervisor_pid,
-            'start_identity': [200, 0], 'execution_token_matches': False},
-        foreign_child_pid: {'pid': foreign_child_pid, 'parent_pid': supervisor_pid, 'process_group_id': supervisor_pid,
-            'start_identity': [201, 0], 'execution_token_matches': False},
-        owned_orphan_pid: {'pid': owned_orphan_pid, 'parent_pid': 1, 'process_group_id': owned_orphan_pid,
-            'start_identity': [102, 0], 'execution_token_matches': True},
-    }
-    monkeypatch.setattr(native_owned_process_observation, 'native_process_snapshot', lambda *args, **kwargs: snapshot)
-    owned = native_owned_process_observation.owned_process_snapshot('original-execution', supervisor_pid, {},
-        supervisor_native_identity={'pid': supervisor_pid, 'start_identity': [100, 0]})
-    assert set(owned) == {owned_orphan_pid}
+def test_reused_supervisor_pid_cannot_anchor_foreign_process_group(monkeypatch, darwin_owned_process_queries):
+    state = darwin_owned_process_queries
+    state.processes[state.supervisor_pid] = (1, state.supervisor_pid, 200)
+    previous = {state.orphan_pid: {'pid': state.orphan_pid, 'start_identity': [102, 0]}}
+    owned = native_owned_process_observation.owned_process_snapshot(state.supervisor_pid, previous,
+        supervisor_native_identity=state.identity)
+    signals = []
+    monkeypatch.setattr(os, 'kill', lambda *args: signals.append(args))
+    native_owned_process_observation.terminate_observed_owned_processes(owned)
+    assert [pid for pid, _ in signals] == [state.orphan_pid]
+    assert state.child_pid not in state.inspected

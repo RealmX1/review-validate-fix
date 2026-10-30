@@ -41,21 +41,62 @@ def test_successful_machine_output_change_resumes_incomplete_role(repository, tm
 
 
 def test_unrelated_environment_does_not_reset_credential_cooldown(repository, tmp_path, monkeypatch):
+    from core.task_snapshot_review.reviewer_account_eligibility import reviewer_eligibility
+
     run = shared_snapshot(repository, tmp_path, [[sys.executable, "-c", "pass"]])
-    config = {"command": [sys.executable, "-c", "import sys; print('Invalid API key', file=sys.stderr); sys.exit(1)"], "output_format": "text"}
+    command_execution_log = tmp_path / "credential-failure-command-executions.log"
+    command = ("import os,sys\nfrom pathlib import Path\n"
+               f"with Path({str(command_execution_log)!r}).open('a') as executions:\n"
+               "    executions.write(os.environ['RVF_ROLE_INPUT']+'\\n')\n"
+               "print('Invalid API key', file=sys.stderr)\nsys.exit(1)\n")
+    config = {"command": [sys.executable, "-c", command], "output_format": "text"}
+
+    def actual_invocation_count():
+        executed_role_inputs = command_execution_log.read_text().splitlines()
+        invocation_role_inputs = [read_json(path.parent / "request.json")["input_file"]
+                                  for path in run.glob("reviewer-*/attempt-*/model-invocation.json")]
+        assert sorted(executed_role_inputs) == sorted(invocation_role_inputs)
+        return len(executed_role_inputs)
+
     assert resume_review(run, reviewer_configs=[config, config])["status"] == "review_incomplete"
+    original_invocation_count = actual_invocation_count()
+    # 两个 reviewer 并发时，首次认证失败前可能已有一个或两个调用启动。
+    assert original_invocation_count in (1, 2)
+    evidence = Path(reviewer_eligibility(config)["evidence_path"])
+    original_failure = read_json(evidence)["negative_evidence"]["account"]
+    assert original_failure["failure_count"] == original_invocation_count
+
     monkeypatch.setenv("UNRELATED_MACHINE_OBSERVATION", "changed")
     assert resume_review(run)["status"] == "review_incomplete"
-    assert len(list(run.glob("reviewer-*/attempt-*/request.json"))) == 2
-    for path in run.glob("reviewer-*/attempt-*/outcome.json"):
-        outcome = read_json(path)
-        outcome["retry_not_before"] = time.time() - 1
-        write_json(path, outcome)
-    resume_review(run)
-    assert len(list(run.glob("reviewer-*/attempt-*/request.json"))) == 4
+    assert actual_invocation_count() == original_invocation_count
+    assert read_json(evidence)["negative_evidence"]["account"] == original_failure
+
+    def assert_recovery_budget_exhausted(result):
+        assert result["status"] == "review_incomplete"
+        assert actual_invocation_count() == 2
+        assert read_json(evidence)["negative_evidence"]["account"]["failure_count"] == 2
+        eligibility = reviewer_eligibility(config)
+        assert eligibility["status"] == "unavailable"
+        assert not eligibility["can_dispatch"]
+        assert eligibility["reason"] == "persistent_authentication"
+        assert eligibility["recovery"]["maximum_unchanged_retries"] == 0
+        assert result["recovery"]["maximum_unchanged_retries"] == 0
+
+    availability = read_json(evidence)
+    availability["negative_evidence"]["account"]["retry_not_before"] = time.time() - 1
+    write_json(evidence, availability)
+    remaining_invocation_budget = 2 - original_invocation_count
+    assert reviewer_eligibility(config)["recovery"]["maximum_unchanged_retries"] == remaining_invocation_budget
+    assert_recovery_budget_exhausted(resume_review(run))
+
+    availability = read_json(evidence)
+    availability["negative_evidence"]["account"]["retry_not_before"] = time.time() - 1
+    write_json(evidence, availability)
+    assert_recovery_budget_exhausted(resume_review(run))
+    assert read_json(evidence)["negative_evidence"]["account"] == availability["negative_evidence"]["account"]
     monkeypatch.setenv("UNRELATED_MACHINE_OBSERVATION", "changed-again")
-    resume_review(run)
-    assert len(list(run.glob("reviewer-*/attempt-*/request.json"))) == 4
+    assert_recovery_budget_exhausted(resume_review(run))
+    assert read_json(evidence)["negative_evidence"]["account"] == availability["negative_evidence"]["account"]
 
 
 @pytest.mark.parametrize("drift_kind", ["environment", "dependency"])

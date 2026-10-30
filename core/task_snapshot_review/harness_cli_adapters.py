@@ -24,8 +24,19 @@ OUTPUT_FORMAT_KIMI_STREAM_JSON = 'kimi_stream_json'
 OUTPUT_FORMAT_OH_MY_PI_JSON = 'oh_my_pi_json'
 USER_LOCAL_ALTERNATIVE_REVIEWER_CONFIG_OVERRIDE_RELATIVE_DIRECTORY = Path('.rvf') / 'alternative-reviewer-config-overrides'
 USER_LOCAL_ALTERNATIVE_REVIEWER_CONFIG_OVERRIDE_SCHEMA_VERSION = 1
-USER_LOCAL_ALTERNATIVE_REVIEWER_CONFIG_OVERRIDE_ALLOWED_FIELDS = {'env_set'}
+USER_LOCAL_ALTERNATIVE_REVIEWER_CONFIG_OVERRIDE_ALLOWED_FIELDS = {
+    'env_set', 'health_command', 'health_timeout_seconds', 'pre_run_health', 'credential_evidence_paths',
+    'account_identity', 'credential_source_identity', 'route_identity', 'account_status_evidence_path',
+    'credential_identity_source',
+    'model_scope_identity',
+}
 STRUCTURED_REVIEWER_OUTPUT_PROTOCOL_CONTROL_FIELD_NAMES = {'event', 'kind', 'name', 'role', 'status', 'subtype', 'type'}
+CODEX_GLOBAL_AND_EXEC_OPTIONS_WITH_ARGUMENT_VALUES = {
+    '-a', '--add-dir', '--ask-for-approval', '-c', '-C', '--cd', '--config', '--disable', '--enable',
+    '-i', '--image', '--local-provider', '-m', '--model', '-p', '--profile', '--remote',
+    '--remote-auth-token-env', '-s', '--sandbox', '--thread-source', '--cyber-access-program',
+    '--output-schema', '--color', '-o', '--output-last-message',
+}
 
 def load_config(path: Path) -> dict[str, Any]:
     with path.open(encoding='utf-8') as handle:
@@ -143,7 +154,6 @@ def is_oh_my_pi_print_command(command: list[str]) -> bool:
 def codex_subcommand_index(command: list[str]) -> int | None:
     if not command or Path(command[0]).name != 'codex':
         return None
-    options_with_values = {'-a', '--add-dir', '--ask-for-approval', '-c', '-C', '--cd', '--config', '--disable', '--enable', '-i', '--image', '--local-provider', '-m', '--model', '-p', '--profile', '--remote', '--remote-auth-token-env', '-s', '--sandbox'}
     index = 1
     while index < len(command):
         item = command[index]
@@ -151,7 +161,7 @@ def codex_subcommand_index(command: list[str]) -> int | None:
             return index
         if item == '--':
             return None
-        if item in options_with_values:
+        if item in CODEX_GLOBAL_AND_EXEC_OPTIONS_WITH_ARGUMENT_VALUES:
             index += 2
             continue
         if item.startswith('--') and '=' in item:
@@ -368,7 +378,7 @@ def normalise_reviewer_command_for_output_format(argv: list[str], output_format:
         return ensure_oh_my_pi_json_command(argv)
     return list(argv)
 
-def resolve_reviewer_model_command(config: dict[str, Any], command: list[str], *, env: dict[str, str], cwd: Path, timeout: int) -> list[str]:
+def resolve_formal_reviewer_model_command(config: dict[str, Any], command: list[str], *, env: dict[str, str], cwd: Path, timeout: int) -> list[str]:
     source = config.get('reviewer_model_selection_source')
     if source != 'kimi_latest_managed_stable_model':
         return resolve_oh_my_pi_default_model_command(config, command, env=env, cwd=cwd, timeout=timeout)
