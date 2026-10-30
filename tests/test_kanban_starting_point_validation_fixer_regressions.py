@@ -211,6 +211,77 @@ def test_identical_native_user_prompts_retry_restored_git_object_once(kanban_tas
     assert recovered['resolution_attempt_count'] == missing['resolution_attempt_count'] + 1
     assert resolve(task, event=event)['resolution_attempt_count'] == recovered['resolution_attempt_count']
 
+@pytest.mark.parametrize('custom_home', [True, False])
+def test_kimi_equal_native_prompts_recover_once_per_submitted_message(kanban_task, tmp_path, monkeypatch, custom_home):
+    task = kanban_task
+    commit_task(task)
+    home = tmp_path / 'kimi-home' if custom_home else Path.home() / '.kimi-code'
+    if custom_home:
+        monkeypatch.setenv('KIMI_CODE_HOME', str(home))
+    else:
+        monkeypatch.delenv('KIMI_CODE_HOME', raising=False)
+    session_id = 'session_native-equal-prompts'
+    journal = home / 'server/events' / f'{session_id}.jsonl'
+    journal.parent.mkdir(parents=True)
+    event = {'hook_event_name': 'UserPromptSubmit', 'session_id': session_id, 'cwd': str(task['repo']),
+             'client_type': 'kimi_code_cli', 'prompt': [{'type': 'text', 'text': '继续'}], 'is_steer': False}
+    adapter = resolve_hook_host_adapter('kimi_code')
+
+    def append_event(payload):
+        with journal.open('a') as handle:
+            handle.write(json.dumps({'kind': 'event', 'envelope': {
+                'session_id': session_id, 'type': payload['type'], 'payload': payload}}) + '\n')
+
+    def submit(prompt_id):
+        append_event({'type': 'prompt.submitted', 'agentId': 'main', 'sessionId': session_id,
+                      'promptId': prompt_id, 'userMessageId': prompt_id, 'status': 'running',
+                      'content': event['prompt']})
+
+    def prompt():
+        assert handle_hook(event, event_name='UserPromptSubmit', host_adapter=adapter) is None
+        return resolve(task)
+
+    common = Path(git_text(task['repo'], 'rev-parse', '--path-format=absolute', '--git-common-dir'))
+    original_object = common / 'objects' / task['initial'][:2] / task['initial'][2:]
+    saved_bytes = original_object.read_bytes()
+    original_object.unlink()
+    try:
+        submit('msg_first')
+        missing = prompt()
+        assert missing['status'] == 'unknown'
+        append_event({'type': 'turn.step.completed', 'agentId': 'main'})
+        assert prompt()['resolution_attempt_count'] == missing['resolution_attempt_count']
+        assert stop(task, 'kimi_code') is None
+    finally:
+        original_object.write_bytes(saved_bytes)
+    # 对象恢复不改变 HEAD/reflog/来源观察；同一条 hook 仍然不能重验。
+    assert prompt()['resolution_attempt_count'] == missing['resolution_attempt_count']
+    # 记录缺失/损坏、其他 agent/session、通知、排队项和不匹配文本都不是新的真实回合。
+    journal.unlink()
+    assert prompt()['resolution_attempt_count'] == missing['resolution_attempt_count']
+    journal.write_text('{partial-record\n')
+    invalid_submissions = [
+        {'agentId': 'subagent'},
+        {'sessionId': 'another-session'},
+        {'type': 'context.spliced'},
+        {'status': 'queued'},
+        {'content': [{'type': 'text', 'text': '其他文本'}]},
+    ]
+    for override in invalid_submissions:
+        append_event({'type': 'prompt.submitted', 'agentId': 'main', 'sessionId': session_id,
+                      'promptId': 'msg_not_current', 'status': 'running', 'content': event['prompt'], **override})
+        assert prompt()['resolution_attempt_count'] == missing['resolution_attempt_count']
+    submit('msg_second')
+    recovered = prompt()
+    assert recovered['status'] == 'verified', recovered
+    assert recovered['base_commit'] == task['initial']
+    assert recovered['committed_work_status'] == 'present'
+    assert recovered['resolution_attempt_count'] == missing['resolution_attempt_count'] + 1
+    assert prompt()['resolution_attempt_count'] == recovered['resolution_attempt_count']
+    assert stop(task, 'kimi_code')['hookSpecificOutput']['permissionDecision'] == 'deny'
+    assert stop(task, 'kimi_code') is None
+
+
 
 def test_native_rename_patch_id_survives_message_only_amend(kanban_task):
     task = kanban_task
