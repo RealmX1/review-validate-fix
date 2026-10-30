@@ -1,4 +1,4 @@
-"""环境清空、后代缺证重采与 Linux 无关权限的回归。"""
+"""受控后台命令、后代缺证重采与 Linux 查询范围的回归。"""
 import json
 import os
 from pathlib import Path
@@ -25,7 +25,7 @@ def test_clean_environment_detached_descendant_never_yields_premature_completion
     child_code = (f'from pathlib import Path; import os,time; Path({str(child_pid_file)!r}).write_text(str(os.getpid())); '
                   f'time.sleep(1.5); Path({str(side_effect)!r}).touch()')
     command = [sys.executable, '-B', '-c',
-               f'import subprocess,sys; subprocess.Popen([sys.executable,"-B","-c",{child_code!r}],start_new_session=True,env={{}})']
+               f'import subprocess,sys; subprocess.Popen([sys.executable,"-B","-c",{child_code!r}],start_new_session=True,env={{}}).wait()']
     supervisor = subprocess.Popen([sys.executable, '-B', retained_command_supervisor.__file__, str(run),
         str(command_directory), '[]', json.dumps(command)], start_new_session=True)
     try:
@@ -64,6 +64,8 @@ def test_recollection_waits_for_prior_unproven_descendants(repository, tmp_path,
     write_json(command_directory / 'command-supervision.json', {
         'execution_token': 'retained-execution', 'supervisor_pid': 99999999,
         'supervisor_native_identity': {**observation.native_process_identity(os.getpid()), 'pid': 99999999},
+        'process_ownership_scope': observation.REGISTERED_COMMAND_PROCESS_OWNERSHIP_SCOPE,
+        'command_process_lifetime_contract': observation.REGISTERED_COMMAND_PROCESS_LIFETIME_CONTRACT,
         'status': 'descendant_exit_unproven', 'owned_processes': [child_identity]})
     from core.task_snapshot_review.persistent_artifacts import git_text
     write_json(collection / 'collection-intent.json', {
@@ -89,33 +91,31 @@ def test_recollection_waits_for_prior_unproven_descendants(repository, tmp_path,
         child.wait()
 
 
-@pytest.mark.parametrize(('started_at', 'parent_pid', 'ownership_unknown'), [(100, 1, False), (201, 800001, False), (201, 1, True)])
-def test_linux_environment_permissions_only_block_necessary_ownership_queries(tmp_path, monkeypatch, started_at, parent_pid, ownership_unknown):
-    proc_root = tmp_path / 'proc-fixture'
+@pytest.mark.parametrize(('started_at', 'parent_pid'), [(100, 1), (201, 800001), (201, 1)])
+def test_linux_never_reads_unrelated_process_environment(tmp_path, monkeypatch, started_at, parent_pid):
+    proc_root = tmp_path / 'owned-process-fixture'
     supervisor_pid, unrelated_pid = 800001, 800777
     for pid, process_started_at, process_parent_pid in ((supervisor_pid, 200, 1), (unrelated_pid, started_at, parent_pid)):
         directory = proc_root / str(pid)
-        directory.mkdir(parents=True)
+        task = directory / 'task' / str(pid)
+        task.mkdir(parents=True)
         fields = ['S', str(process_parent_pid), str(pid), *(['0'] * 16), str(process_started_at)]
         (directory / 'stat').write_text(f'{pid} (fixture) ' + ' '.join(fields))
-    original_path = Path
-    monkeypatch.setattr(observation, 'Path', lambda path: proc_root if path == '/proc' else original_path(path))
+        (task / 'children').write_text(str(unrelated_pid) if pid == supervisor_pid and parent_pid == supervisor_pid else '')
+    def scoped_path(value):
+        assert value.startswith('/proc/')
+        assert 'environ' not in value
+        if parent_pid != supervisor_pid:
+            assert str(unrelated_pid) not in value
+        return proc_root / value.removeprefix('/proc/')
+    monkeypatch.setattr(observation, 'Path', scoped_path)
     monkeypatch.setattr(observation.sys, 'platform', 'linux')
-    queried = []
     def denied_environment(path):
-        queried.append(path)
-        raise PermissionError('无关服务的环境不可读取')
+        pytest.fail('不得读取进程环境')
     monkeypatch.setattr(Path, 'read_bytes', denied_environment)
-    def observe():
-        return observation.owned_process_snapshot('execution', supervisor_pid, {},
-            supervisor_native_identity={'pid': supervisor_pid, 'start_identity': '200'})
-    if ownership_unknown:
-        with pytest.raises(RuntimeError, match=str(unrelated_pid)):
-            observe()
-        assert queried == [proc_root / str(unrelated_pid) / 'environ']
-    else:
-        assert set(observe()) == ({unrelated_pid} if parent_pid == supervisor_pid else set())
-        assert queried == []
+    owned = observation.owned_process_snapshot(supervisor_pid, {},
+        supervisor_native_identity={'pid': supervisor_pid, 'start_identity': '200'})
+    assert set(owned) == ({unrelated_pid} if parent_pid == supervisor_pid else set())
 
 
 def test_final_validation_cannot_pass_before_clean_environment_descendant_exits(repository, tmp_path, monkeypatch):
@@ -127,7 +127,7 @@ def test_final_validation_cannot_pass_before_clean_environment_descendant_exits(
     child_code = (f'from pathlib import Path; import os,time; Path({str(child_pid_file)!r}).write_text(str(os.getpid())); '
                   'time.sleep(1.5); Path("task.py").write_text("value = 99\\n")')
     command = [sys.executable, '-B', '-c',
-        f'import subprocess,sys; subprocess.Popen([sys.executable,"-B","-c",{child_code!r}],start_new_session=True,env={{}})']
+        f'import subprocess,sys; subprocess.Popen([sys.executable,"-B","-c",{child_code!r}],start_new_session=True,env={{}}).wait()']
     run = tmp_path / 'authoritative-clean-environment-validation'
     record = create_snapshot(repository, base_ref='HEAD', scope_paths=['task.py'], requirements=b'exact validation tree',
         run_directory=run, execution_plan={'fix': True, 'validation_commands': [command]})
@@ -151,7 +151,7 @@ def test_final_validation_cannot_pass_before_clean_environment_descendant_exits(
 def test_unknown_ownership_preserves_proven_owned_descendants_for_cancellation(tmp_path, monkeypatch):
     child = subprocess.Popen([sys.executable, '-B', '-c', 'import time; time.sleep(30)'], start_new_session=True)
     identity = observation.native_process_identity(child.pid)
-    error = RuntimeError('另一个新孤儿的归属未知')
+    error = RuntimeError('已登记后代的原生查询失败')
     error.observed_owned_processes = {child.pid: identity}
     write_json(tmp_path / 'command-supervision.json', {'execution_token': 'owned-execution',
         'supervisor_pid': 99999999, 'supervisor_native_identity': {'pid': 99999999, 'start_identity': [1, 0]},

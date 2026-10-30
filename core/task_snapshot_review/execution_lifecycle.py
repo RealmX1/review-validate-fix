@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 from .persistent_artifacts import exclusive_lock, read_json, write_json
+from .native_owned_process_observation import native_process_identity, native_process_start_identity_matches, owned_process_snapshot
 
 
 class ExecutionRevoked(InterruptedError):
@@ -72,16 +73,24 @@ def owned_process_start_time_and_group_match(current: dict, recorded: dict) -> b
 
 
 def register_owned_process(run_directory: Path, pid: int, purpose: str, *, owns_process_group: bool = False) -> None:
+    native_identity = None
+    native_identity_error = None
+    try:
+        native_identity = native_process_identity(pid)
+    except (OSError, RuntimeError) as error:
+        native_identity_error = str(error)
     try:
         identity = process_start_identity(pid)
     except (OSError, subprocess.SubprocessError, RuntimeError) as error:
         identity = {"pid": pid, "start_and_command": None, "identity_evidence_unavailable": str(error)}
-    if identity is None:
+    if identity is None and native_identity is None and native_identity_error is None:
         return
+    identity = identity or {"pid": pid, "start_and_command": None}
     with exclusive_lock(run_directory / "owned-processes.lock"):
         path = run_directory / "owned-processes.json"
         records = read_json(path).get("processes", []) if path.exists() else []
         records.append({**identity, "purpose": purpose, "owns_process_group": owns_process_group,
+                        "native_identity": native_identity, "native_identity_error": native_identity_error,
                         "registered_at": time.time(), "is_active_registration": True})
         write_json(path, {"processes": records})
 
@@ -144,15 +153,18 @@ def revoke_execution(run_directory: Path, reason: str) -> dict:
         if process["pid"] == os.getpid() or process.get("is_active_registration") is not True:
             continue
         try:
-            if not process.get("start_and_command"):
+            native_identity = process.get('native_identity')
+            if not native_identity and not process.get("start_and_command"):
                 raise RuntimeError("缺少原进程身份，保留取消未知并等待等价证据")
-            current = process_start_identity(process["pid"])
+            current = native_process_identity(process['pid']) if native_identity else process_start_identity(process["pid"])
             if current is None:
                 status = "local_process_exited"
-            elif not owned_process_start_time_and_group_match(current, process):
+            elif not (native_process_start_identity_matches(current, native_identity) if native_identity
+                    else owned_process_start_time_and_group_match(current, process)):
                 status = "identity_changed_no_signal"
             else:
-                (os.killpg if process["owns_process_group"] else os.kill)(process["pid"], signal.SIGTERM)
+                owns_group = process['owns_process_group'] and (not native_identity or current['process_group_id'] == process['pid'])
+                (os.killpg if owns_group else os.kill)(process["pid"], signal.SIGTERM)
                 status = "termination_requested"
         except (OSError, subprocess.SubprocessError, RuntimeError):
             status = "unknown"
@@ -163,13 +175,16 @@ def revoke_execution(run_directory: Path, reason: str) -> dict:
         remaining = []
         for item in pending:
             try:
-                current = process_start_identity(item["pid"])
+                native_identity = item.get('native_identity')
+                current = native_process_identity(item['pid']) if native_identity else process_start_identity(item["pid"])
                 if current is None:
                     item["local_cancellation_status"] = "local_process_exited"
-                elif not owned_process_start_time_and_group_match(current, item):
+                elif not (native_process_start_identity_matches(current, native_identity) if native_identity
+                        else owned_process_start_time_and_group_match(current, item)):
                     item["local_cancellation_status"] = "identity_changed_no_signal"
                 elif time.monotonic() >= deadline:
-                    (os.killpg if item["owns_process_group"] else os.kill)(item["pid"], signal.SIGKILL)
+                    owns_group = item['owns_process_group'] and (not native_identity or current['process_group_id'] == item['pid'])
+                    (os.killpg if owns_group else os.kill)(item["pid"], signal.SIGKILL)
                     item["local_cancellation_status"] = "force_termination_requested"
                 else:
                     remaining.append(item)
@@ -251,9 +266,11 @@ def wait_for_owned_process(process: subprocess.Popen, run_directory: Path, *, ti
     next_observation = 0
     observation_failures = 0
     recovery_identity = None
+    ownership_observation_deferred_until_process_exit = False
     while True:
         ensure_execution_not_revoked(run_directory)
-        observe_owned_process_group_descendants(run_directory, process.pid)
+        if not ownership_observation_deferred_until_process_exit:
+            ownership_observation_deferred_until_process_exit = observe_owned_process_group_descendants(run_directory, process.pid) is False
         if progress_file is not None and time.monotonic() >= next_observation:
             current_identity = progress_observation_recovery_identity(progress_file)
             if current_identity != recovery_identity:
@@ -267,6 +284,8 @@ def wait_for_owned_process(process: subprocess.Popen, run_directory: Path, *, ti
             next_observation = time.monotonic() + 1
         try:
             returncode = process.wait(timeout=min(0.2, max(0.001, deadline - time.monotonic())) if deadline else 0.2)
+            if ownership_observation_deferred_until_process_exit:
+                observe_owned_process_group_descendants(run_directory, process.pid)
             if progress_file is not None:
                 record_owned_process_wait_observation(progress_file, process.pid)
             return returncode
@@ -275,29 +294,50 @@ def wait_for_owned_process(process: subprocess.Popen, run_directory: Path, *, ti
                 raise
 
 
-def observe_owned_process_group_descendants(run_directory: Path, group_id: int) -> None:
+def observe_owned_process_group_descendants(run_directory: Path, group_id: int) -> bool:
+    path = run_directory / 'owned-processes.json'
+    recovery_file = run_directory / f'owned-process-observation-{group_id}.json'
     try:
-        table = subprocess.run(["ps", "-axo", "pid=,pgid=,lstart=,command="], capture_output=True, text=True, timeout=5)
-        if table.returncode:
-            return
+        records = read_json(path).get('processes', []) if path.exists() else []
+        root = next((item for item in reversed(records) if item['pid'] == group_id
+            and item.get('owns_process_group') and item.get('is_active_registration')), None)
+        if root is None:
+            return True
+        if not root.get('native_identity'):
+            raise RuntimeError('所属进程缺少已登记的原生启动身份')
+        previous = {item['pid']: item['native_identity'] for item in records
+            if item.get('ownership_root_pid') == group_id and item.get('native_identity')}
+        observation_error = None
+        try:
+            snapshot = owned_process_snapshot(group_id, previous, supervisor_native_identity=root['native_identity'])
+        except (OSError, RuntimeError) as error:
+            snapshot = getattr(error, 'observed_owned_processes', {})
+            observation_error = error
         descendants = []
-        for line in table.stdout.splitlines():
-            fields = line.split(None, 7)
-            if len(fields) == 8 and fields[1] == str(group_id) and fields[0] != str(group_id):
-                descendants.append({"pid": int(fields[0]), "start_and_command": " ".join([*fields[2:7], fields[1], *fields[7].split()]),
-                                    "purpose": "owned_process_group_descendant", "owns_process_group": False,
-                                    "registered_at": time.time(), "is_active_registration": True})
-        if not descendants:
-            return
+        for pid, native_identity in snapshot.items():
+            try:
+                identity = process_start_identity(pid)
+            except (OSError, subprocess.SubprocessError, RuntimeError):
+                identity = None
+            descendants.append({**(identity or {'pid': pid, 'start_and_command': None}),
+                'native_identity': native_identity, 'ownership_root_pid': group_id,
+                'purpose': 'owned_process_group_descendant', 'owns_process_group': False,
+                'registered_at': time.time(), 'is_active_registration': True})
         with exclusive_lock(run_directory / "owned-processes.lock"):
-            path = run_directory / "owned-processes.json"
             records = read_json(path).get("processes", []) if path.exists() else []
-            known = {(item["pid"], item["start_and_command"]) for item in records}
-            added = [item for item in descendants if (item["pid"], item["start_and_command"]) not in known]
+            known = {(item['pid'], json.dumps((item.get('native_identity') or {}).get('start_identity'))) for item in records}
+            added = [item for item in descendants if (item['pid'], json.dumps(item['native_identity']['start_identity'])) not in known]
             if added:
                 write_json(path, {"processes": [*records, *added]})
-    except (OSError, subprocess.SubprocessError):
-        return
+        if observation_error:
+            raise observation_error
+        if recovery_file.exists():
+            write_json(recovery_file, {'status': 'recovered', 'observed_at': time.time()})
+        return True
+    except (OSError, subprocess.SubprocessError, RuntimeError) as error:
+        write_json(recovery_file, {'status': 'unknown', 'error': str(error), 'observed_at': time.time(),
+            'recovery_condition': 'owned_process_identity_or_native_observation_changed', 'maximum_unchanged_retries': 1})
+        return False
 
 
 def append_stage_event(run_directory: Path, event: str, **facts) -> None:

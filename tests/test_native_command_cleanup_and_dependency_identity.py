@@ -1,6 +1,4 @@
 """原生查询缺证、跨 session 清理和依赖身份失效的独立回归。"""
-import ctypes
-import errno
 import json
 import os
 from pathlib import Path
@@ -8,7 +6,6 @@ import signal
 import subprocess
 import sys
 import time
-from types import SimpleNamespace
 
 import pytest
 
@@ -17,31 +14,17 @@ from core.task_snapshot_review import retained_command_supervisor
 from core.task_snapshot_review.persistent_artifacts import exclusive_lock, read_json, write_json
 from core.task_snapshot_review.task_snapshot import create_snapshot
 from test_task_snapshot_review_workflow import repository
+from test_owned_command_process_scope import darwin_owned_process_queries
 
 
 @pytest.mark.parametrize('previously_observed', [False, True])
-def test_process_info_error_preserves_exit_unknown(monkeypatch, previously_observed):
-    supervisor_pid, owned_pid = os.getpid(), 800101
-    def process_info(pid, flavor, argument, pointer, size):
-        if pid == owned_pid:
-            ctypes.set_errno(errno.EIO)
-            return 0
-        info = pointer._obj
-        info.process_id, info.parent_process_id = pid, 1
-        info.process_group_id, info.start_seconds = pid, 100
-        info.user_id, info.process_status = os.getuid(), 2
-        return size
-    def process_list(selection, user_id, destination, size):
-        assert selection == 4 and user_id == os.getuid()
-        if destination is not None:
-            destination[0], destination[1] = supervisor_pid, owned_pid
-        return 2 * ctypes.sizeof(ctypes.c_int)
-    library = SimpleNamespace(proc_pidinfo=process_info, proc_listpids=process_list)
-    monkeypatch.setattr(native_owned_process_observation.sys, 'platform', 'darwin')
-    monkeypatch.setattr(ctypes, 'CDLL', lambda *args, **kwargs: library)
-    with pytest.raises(RuntimeError, match='800101'):
-        native_owned_process_observation.owned_process_snapshot('owned-token', supervisor_pid,
-            {owned_pid: {'pid': owned_pid, 'start_identity': [101, 0]}} if previously_observed else {})
+def test_process_info_error_preserves_exit_unknown(darwin_owned_process_queries, previously_observed):
+    state = darwin_owned_process_queries
+    state.denied.add(state.child_pid)
+    with pytest.raises(RuntimeError, match=str(state.child_pid)):
+        native_owned_process_observation.owned_process_snapshot(state.supervisor_pid,
+            {state.child_pid: {'pid': state.child_pid, 'start_identity': [101, 0]}} if previously_observed else {},
+            supervisor_native_identity=state.identity)
 
 
 def test_changed_external_dependency_invalidates_unproven_pass(repository, tmp_path, monkeypatch):
@@ -69,7 +52,7 @@ def test_changed_external_dependency_invalidates_unproven_pass(repository, tmp_p
     assert initial.read_bytes() == initial_bytes
 
 
-def test_native_observation_outage_does_not_abandon_known_detached_child(tmp_path):
+def test_stop_during_native_observation_outage_does_not_abandon_known_detached_child(tmp_path):
     run = tmp_path / 'native-query-outage-cleanup'
     run.mkdir()
     write_json(run / 'run.json', {})
@@ -77,16 +60,18 @@ def test_native_observation_outage_does_not_abandon_known_detached_child(tmp_pat
     artifacts.mkdir()
     started, late_effect = run / 'detached-child-pid', run / 'forbidden-late-effect'
     child_code = f'from pathlib import Path; import os,time; Path({str(started)!r}).write_text(str(os.getpid())); time.sleep(1.2); Path({str(late_effect)!r}).touch()'
-    command = [sys.executable, '-B', '-c', f'import subprocess,sys; subprocess.Popen([sys.executable,"-B","-c",{child_code!r}],start_new_session=True)']
+    command = [sys.executable, '-B', '-c', f'import subprocess,sys; subprocess.Popen([sys.executable,"-B","-c",{child_code!r}],start_new_session=True).wait()']
     script = (
         'import time; from pathlib import Path; from unittest.mock import patch\n'
         'from core.task_snapshot_review import retained_command_supervisor as supervisor\n'
+        'from core.task_snapshot_review.persistent_artifacts import write_json\n'
         'original=supervisor.owned_process_snapshot\nobserved_at=None\n'
-        'def observe(*args):\n'
+        'def observe(*args,**kwargs):\n'
         ' global observed_at\n'
         ' if observed_at is not None and time.monotonic()-observed_at<0.57: raise RuntimeError("原生查询暂不可用")\n'
-        ' result=original(*args)\n'
-        f' if Path({str(started)!r}).exists() and result and observed_at is None: observed_at=time.monotonic()\n'
+        ' result=original(*args,**kwargs)\n'
+        f' if Path({str(started)!r}).exists() and int(Path({str(started)!r}).read_text()) in result and observed_at is None:\n'
+        f'  observed_at=time.monotonic(); write_json(Path({str(run / "execution-revocation.json")!r}),{{"reason":"已知后代查询故障时 Stop"}})\n'
         ' return result\n'
         'with patch.object(supervisor,"owned_process_snapshot",side_effect=observe):\n'
         f' raise SystemExit(supervisor.supervise_registered_command(Path({str(run)!r}),Path({str(artifacts)!r}),(),{command!r}))\n'
@@ -146,7 +131,7 @@ def test_registered_command_waits_for_healthy_detached_descendant_completion(tmp
     write_json(run / 'run.json', {})
     started, late_effect = run / 'child-pid', run / 'forbidden-late-effect'
     code = f'from pathlib import Path; import os,time; Path({str(started)!r}).write_text(str(os.getpid())); time.sleep(0.85); Path({str(late_effect)!r}).touch()'
-    command = [sys.executable, '-B', '-c', f'import subprocess,sys; subprocess.Popen([sys.executable,"-B","-c",{code!r}],start_new_session=True)']
+    command = [sys.executable, '-B', '-c', f'import subprocess,sys; subprocess.Popen([sys.executable,"-B","-c",{code!r}],start_new_session=True).wait()']
     monkeypatch.setattr(execution_lifecycle, 'process_start_identity', lambda *args, **kwargs: None)
     monkeypatch.setattr(execution_lifecycle, 'observe_owned_process_group_descendants', lambda *args: None)
     with exclusive_lock(run / 'collection.lock') as lock:

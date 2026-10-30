@@ -1,4 +1,4 @@
-"""使用原生进程身份和继承的执行归属识别跨 session 后代，不依赖 ps。"""
+"""只观测已登记身份、自有进程组及其子链，不枚举全局进程。"""
 from __future__ import annotations
 
 import ctypes
@@ -8,8 +8,10 @@ from pathlib import Path
 import signal
 import sys
 
-REGISTERED_COMMAND_OWNERSHIP_ENVIRONMENT_KEY = "RVF_REGISTERED_COMMAND_EXECUTION_OWNERSHIP"
-DARWIN_PROCESS_LIST_SELECTION_BY_USER_ID = 4
+REGISTERED_COMMAND_PROCESS_OWNERSHIP_SCOPE = 'registered_process_identities_owned_groups_and_descendant_chains'
+REGISTERED_COMMAND_PROCESS_LIFETIME_CONTRACT = 'wait_for_background_work_or_register_separate_supervised_commands'
+DARWIN_PROCESS_LIST_SELECTION_BY_PROCESS_GROUP_ID = 2
+DARWIN_PROCESS_LIST_SELECTION_BY_PARENT_PROCESS_ID = 6
 
 
 class BsdProcessInfo(ctypes.Structure):
@@ -27,19 +29,6 @@ class BsdUniqueProcessInfo(ctypes.Structure):
         ('parent_unique_process_id', ctypes.c_uint64), ('process_id_version', ctypes.c_int32),
         ('original_parent_process_id_version', ctypes.c_int32), ('reserved_two', ctypes.c_uint64),
         ('reserved_three', ctypes.c_uint64)]
-
-
-def darwin_process_has_unrelated_origin(library, pid: int, supervisor_unique_process_id: int | None) -> bool:
-    process, launchd = BsdUniqueProcessInfo(), BsdUniqueProcessInfo()
-    if library.proc_pidinfo(pid, 17, 0, ctypes.byref(process), ctypes.sizeof(process)) != ctypes.sizeof(process):
-        return False
-    # 内核按创建顺序分配 uniqueid；父进程早于监督者则不可能是本次执行的后代。
-    # reparent 后 exec 可把 parent_uniqueid 改为 1，不能据此排除清空环境的后代。
-    if supervisor_unique_process_id and 1 < process.parent_unique_process_id < supervisor_unique_process_id:
-        return True
-    if library.proc_pidinfo(1, 17, 0, ctypes.byref(launchd), ctypes.sizeof(launchd)) != ctypes.sizeof(launchd):
-        return False
-    return process.original_parent_process_id_version == launchd.process_id_version
 
 
 def native_process_identity(pid: int) -> dict | None:
@@ -63,11 +52,13 @@ def native_process_identity(pid: int) -> dict | None:
                 return None
             raise RuntimeError(f'原生进程唯一身份不可用：pid={pid}, errno={observed_errno}')
         return {'pid': pid, 'start_identity': [info.start_seconds, info.start_microseconds],
-                'unique_process_id': unique.unique_process_id}
+                'unique_process_id': unique.unique_process_id,
+                'parent_pid': info.parent_process_id, 'process_group_id': info.process_group_id}
     if sys.platform.startswith('linux'):
         try:
             fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
-            return None if fields[0] == 'Z' else {'pid': pid, 'start_identity': fields[19]}
+            return None if fields[0] == 'Z' else {'pid': pid, 'start_identity': fields[19],
+                'parent_pid': int(fields[1]), 'process_group_id': int(fields[2])}
         except (FileNotFoundError, ProcessLookupError):
             return None
     raise RuntimeError('当前平台没有可用的原生进程身份查询')
@@ -95,153 +86,101 @@ def terminate_observed_owned_processes(processes: dict[int, dict]) -> list[dict]
     return observations
 
 
-def native_process_snapshot(execution_token: str, supervisor_pid: int, previously_observed_owned_processes: dict[int, dict],
-                            *, supervisor_native_identity: dict | None = None) -> dict[int, dict]:
-    token = execution_token.encode()
-    prefix = REGISTERED_COMMAND_OWNERSHIP_ENVIRONMENT_KEY.encode() + b"="
+def darwin_scoped_process_ids(selection: int, scope_id: int) -> list[int]:
+    if selection not in {DARWIN_PROCESS_LIST_SELECTION_BY_PROCESS_GROUP_ID,
+            DARWIN_PROCESS_LIST_SELECTION_BY_PARENT_PROCESS_ID} or scope_id <= 1:
+        raise ValueError('进程查询必须限定到自有进程组或已核验的父 PID')
+    library = ctypes.CDLL('/usr/lib/libproc.dylib', use_errno=True)
+    library.proc_listpids.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_int]
+    capacity = 256
+    for _ in range(3):
+        process_ids = (ctypes.c_int * capacity)()
+        ctypes.set_errno(0)
+        observed_bytes = library.proc_listpids(selection, scope_id, process_ids, ctypes.sizeof(process_ids))
+        observed_errno = ctypes.get_errno()
+        if observed_bytes < 0 or observed_bytes == 0 and observed_errno or observed_bytes % ctypes.sizeof(ctypes.c_int):
+            raise RuntimeError(f'限定范围的原生进程列表不可用：scope={scope_id}, errno={observed_errno}')
+        if observed_bytes < ctypes.sizeof(process_ids):
+            return [pid for pid in process_ids[:observed_bytes // ctypes.sizeof(ctypes.c_int)] if pid > 0]
+        capacity *= 2
+    raise RuntimeError(f'限定范围的原生进程列表不完整：scope={scope_id}')
 
-    def belongs(environment: bytes) -> bool:
-        return any(token in entry[len(prefix):].split(b":") for entry in environment.split(b"\0") if entry.startswith(prefix))
 
-    records = {}
-    if sys.platform == "darwin":
-        library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-        library.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
-        if supervisor_native_identity is None:
-            supervisor_native_identity = native_process_identity(supervisor_pid)
-        if supervisor_native_identity is None or supervisor_native_identity.get('pid') != supervisor_pid:
-            raise RuntimeError("监督者原生启动身份不可用")
-        supervisor_start_identity = tuple(supervisor_native_identity['start_identity'])
-        system = ctypes.CDLL(None, use_errno=True)
-        # 先由内核限定用户，避免把其他用户的权限拒绝误判为所属后代缺证。
-        capacity = library.proc_listpids(DARWIN_PROCESS_LIST_SELECTION_BY_USER_ID, os.getuid(), None, 0)
-        if capacity <= 0:
-            raise RuntimeError("原生进程列表不可用")
-        process_ids = (ctypes.c_int * (capacity // ctypes.sizeof(ctypes.c_int) * 2 + 128))()
-        observed_bytes = library.proc_listpids(DARWIN_PROCESS_LIST_SELECTION_BY_USER_ID, os.getuid(), process_ids, ctypes.sizeof(process_ids))
-        if observed_bytes <= 0 or observed_bytes >= ctypes.sizeof(process_ids) or observed_bytes % ctypes.sizeof(ctypes.c_int):
-            raise RuntimeError("原生进程列表不完整")
-        count = observed_bytes // ctypes.sizeof(ctypes.c_int)
-        process_information = {}
-        for pid in process_ids[:count]:
-            info = BsdProcessInfo()
-            ctypes.set_errno(0)
-            if library.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info)) != ctypes.sizeof(info):
-                observed_errno = ctypes.get_errno()
-                if observed_errno not in {errno.ESRCH, errno.ENOENT}:
-                    raise RuntimeError(f'原生进程退出未知：pid={pid}, errno={observed_errno}')
-                continue
-            if info.user_id != os.getuid() or info.process_status == 5:
-                continue
-            process_information[pid] = info
-        supervisor = process_information.get(supervisor_pid)
-        supervisor_identity_matches = bool(supervisor and
-            (supervisor.start_seconds, supervisor.start_microseconds) == supervisor_start_identity)
-        proven_owned_process_ids = {supervisor_pid} if supervisor_identity_matches else set()
-        def extend_owned_process_ids_by_parent_chain():
-            while True:
-                additions = {pid for pid, info in process_information.items() if pid not in proven_owned_process_ids and (
-                    supervisor_identity_matches and info.process_group_id == supervisor_pid or info.parent_process_id in proven_owned_process_ids
-                    or pid in previously_observed_owned_processes and [info.start_seconds, info.start_microseconds] == previously_observed_owned_processes[pid]['start_identity'])}
-                if not additions:
-                    return
-                proven_owned_process_ids.update(additions)
-        def native_identity_record(pid, info):
-            return {"pid": pid, "parent_pid": info.parent_process_id, "process_group_id": info.process_group_id,
-                    "start_identity": [info.start_seconds, info.start_microseconds], "execution_token_matches": False}
-        extend_owned_process_ids_by_parent_chain()
-        for pid, info in process_information.items():
-            record = native_identity_record(pid, info)
-            if pid in proven_owned_process_ids:
-                records[pid] = record
-                continue
-            # 已知父链不属本次执行的进程无需读取环境；孤儿或缺失父链才依赖继承归属补证。
-            if ((info.start_seconds, info.start_microseconds) < supervisor_start_identity
-                    or info.parent_process_id > 1 and info.parent_process_id in process_information):
-                continue
-            query = (ctypes.c_int * 3)(1, 49, pid)
-            arguments = ctypes.create_string_buffer(262144)
-            length = ctypes.c_size_t(len(arguments))
-            if system.sysctl(query, 3, arguments, ctypes.byref(length), None, 0):
-                observed_errno = ctypes.get_errno()
-                # 父进程退出也会使旧表中的子进程跳过查询；必须重采完整父链。
-                raise RuntimeError(f"原生执行归属查询不可用：pid={pid}, errno={observed_errno}")
-            record['execution_token_matches'] = belongs(arguments.raw[:length.value])
-            # 清空环境的脱离 session 后代与无关新孤儿无法区分；缺少 token 不是退出证明。
-            record['execution_ownership_unknown'] = (not record['execution_token_matches']
-                and not darwin_process_has_unrelated_origin(library, pid, supervisor_native_identity.get('unique_process_id')))
-            records[pid] = record
-            if record['execution_token_matches']:
-                proven_owned_process_ids.add(pid)
-        extend_owned_process_ids_by_parent_chain()
-        for pid in proven_owned_process_ids:
-            if pid in process_information and pid not in records:
-                records[pid] = native_identity_record(pid, process_information[pid])
-        return records
-    if sys.platform.startswith("linux"):
-        process_directories = {}
-        for entry in Path("/proc").iterdir():
-            if not entry.name.isdigit():
+def linux_owned_process_child_ids(pid: int) -> list[int]:
+    # task 子链只用于发现；线程退出或空列表不能抹去已登记身份。
+    children = set()
+    try:
+        for task in Path(f'/proc/{pid}/task').iterdir():
+            if not task.name.isdigit():
                 continue
             try:
-                if entry.stat().st_uid != os.getuid():
-                    continue
-                fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
-                if fields[0] == "Z":
-                    continue
-                pid = int(entry.name)
-                records[pid] = {"pid": pid, "parent_pid": int(fields[1]), "process_group_id": int(fields[2]),
-                    "start_identity": fields[19], "execution_token_matches": False}
-                process_directories[pid] = entry
+                children.update(int(value) for value in (task / 'children').read_text().split())
             except (FileNotFoundError, ProcessLookupError):
                 continue
-        supervisor_native_identity = supervisor_native_identity or native_process_identity(supervisor_pid)
-        if supervisor_native_identity is None or supervisor_native_identity.get('pid') != supervisor_pid:
-            raise RuntimeError("监督者原生启动身份不可用")
-        supervisor_start_identity = supervisor_native_identity['start_identity']
-        supervisor_identity_matches = records.get(supervisor_pid, {}).get('start_identity') == supervisor_start_identity
-        proven_owned_process_ids = {supervisor_pid} if supervisor_identity_matches else set()
-        while True:
-            additions = {pid for pid, item in records.items() if pid not in proven_owned_process_ids and (
-                supervisor_identity_matches and item['process_group_id'] == supervisor_pid
-                or item['parent_pid'] in proven_owned_process_ids
-                or pid in previously_observed_owned_processes and item['start_identity'] == previously_observed_owned_processes[pid]['start_identity'])}
-            if not additions:
-                break
-            proven_owned_process_ids.update(additions)
-        for pid, item in records.items():
-            if (pid in proven_owned_process_ids or int(item['start_identity']) < int(supervisor_start_identity)
-                    or item['parent_pid'] > 1 and item['parent_pid'] in records):
+    except (FileNotFoundError, ProcessLookupError):
+        return []
+    except OSError as error:
+        raise RuntimeError(f'已登记进程的子链查询不可用：pid={pid}') from error
+    return sorted(children)
+
+
+def native_process_start_identity_matches(current: dict | None, recorded: dict) -> bool:
+    return bool(current and current['pid'] == recorded['pid'] and current['start_identity'] == recorded['start_identity'])
+
+
+def native_process_snapshot(supervisor_pid: int, previously_observed_owned_processes: dict[int, dict],
+                            *, supervisor_native_identity: dict | None = None) -> dict[int, dict]:
+    supervisor_native_identity = supervisor_native_identity or native_process_identity(supervisor_pid)
+    if supervisor_native_identity is None or supervisor_native_identity.get('pid') != supervisor_pid:
+        raise RuntimeError('监督者原生启动身份不可用')
+    records = {}
+    try:
+        expected = {**previously_observed_owned_processes, supervisor_pid: supervisor_native_identity}
+        supervisor_pid_reused = False
+        for pid, recorded in expected.items():
+            current = native_process_identity(pid)
+            if native_process_start_identity_matches(current, recorded):
+                records[pid] = current
+            elif pid == supervisor_pid and current:
+                supervisor_pid_reused = True
+        pending = list(records)
+        observed_groups = set()
+        for pid in pending:
+            parent = records[pid]
+            if not native_process_start_identity_matches(native_process_identity(pid), parent):
                 continue
-            try:
-                item['execution_token_matches'] = belongs((process_directories[pid] / 'environ').read_bytes())
-                item['execution_ownership_unknown'] = not item['execution_token_matches']
-            except (FileNotFoundError, ProcessLookupError) as error:
-                raise RuntimeError(f'原生进程父链已变化，需重新采集：pid={pid}') from error
-            except PermissionError as error:
-                raise RuntimeError(f'必要的原生执行归属查询不可用：pid={pid}') from error
+            discoveries = []
+            if sys.platform == 'darwin':
+                group_id = parent['process_group_id']
+                if (group_id == pid or group_id == supervisor_pid and not supervisor_pid_reused) and group_id not in observed_groups:
+                    discoveries.append(('group', group_id, darwin_scoped_process_ids(
+                        DARWIN_PROCESS_LIST_SELECTION_BY_PROCESS_GROUP_ID, group_id)))
+                    observed_groups.add(group_id)
+                discoveries.append(('parent', pid, darwin_scoped_process_ids(
+                    DARWIN_PROCESS_LIST_SELECTION_BY_PARENT_PROCESS_ID, pid)))
+            elif sys.platform.startswith('linux'):
+                discoveries.append(('parent', pid, linux_owned_process_child_ids(pid)))
+            else:
+                raise RuntimeError('当前平台没有可用的原生后代归属查询')
+            if not native_process_start_identity_matches(native_process_identity(pid), parent):
+                raise RuntimeError(f'发现子链期间所属父身份变化，需重新采集：pid={pid}')
+            for relationship, scope_id, candidates in discoveries:
+                for candidate_pid in candidates:
+                    if candidate_pid in records or candidate_pid == supervisor_pid:
+                        continue
+                    current = native_process_identity(candidate_pid)
+                    if current is None or candidate_pid in expected and not native_process_start_identity_matches(current, expected[candidate_pid]):
+                        continue
+                    if current['process_group_id' if relationship == 'group' else 'parent_pid'] == scope_id:
+                        records[candidate_pid] = current
+                        pending.append(candidate_pid)
         return records
-    raise RuntimeError("当前平台没有可用的原生后代归属查询")
+    except (OSError, RuntimeError) as error:
+        error.observed_owned_processes = {pid: item for pid, item in records.items() if pid != supervisor_pid}
+        raise
 
 
-def owned_process_snapshot(execution_token: str, supervisor_pid: int, previously_observed_owned_processes: dict[int, dict],
+def owned_process_snapshot(supervisor_pid: int, previously_observed_owned_processes: dict[int, dict],
                            *, supervisor_native_identity: dict | None = None) -> dict[int, dict]:
-    snapshot = native_process_snapshot(execution_token, supervisor_pid, previously_observed_owned_processes,
-        supervisor_native_identity=supervisor_native_identity)
-    supervisor_identity_matches = (supervisor_native_identity is None or
-        snapshot.get(supervisor_pid, {}).get('start_identity') == supervisor_native_identity['start_identity'])
-    owned = {pid: item for pid, item in snapshot.items() if pid != supervisor_pid and (
-        item["execution_token_matches"] or supervisor_identity_matches and item["process_group_id"] == supervisor_pid
-        or pid in previously_observed_owned_processes and item["start_identity"] == previously_observed_owned_processes[pid]["start_identity"])}
-    while True:
-        added = {pid: item for pid, item in snapshot.items() if pid != supervisor_pid and pid not in owned
-                 and item["parent_pid"] in ({supervisor_pid, *owned} if supervisor_identity_matches else owned)}
-        if not added:
-            unproven = [item for pid, item in snapshot.items() if pid not in owned and pid != supervisor_pid
-                        and item.get('execution_ownership_unknown')]
-            if unproven:
-                error = RuntimeError(f'新孤儿进程归属未知，不能证明所属后代退出：{unproven}')
-                error.observed_owned_processes = owned
-                raise error
-            return owned
-        owned.update(added)
+    return {pid: item for pid, item in native_process_snapshot(supervisor_pid, previously_observed_owned_processes,
+        supervisor_native_identity=supervisor_native_identity).items() if pid != supervisor_pid}
