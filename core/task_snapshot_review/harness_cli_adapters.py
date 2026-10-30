@@ -365,11 +365,7 @@ def finalize_reviewer_command_for_prompt_delivery(command: list[str], *, prompt_
     raise ValueError(f'unsupported prompt_delivery: {prompt_delivery}')
 
 def normalise_reviewer_command_for_output_format(argv: list[str], output_format: str) -> list[str]:
-    """按 output_format 把一条 reviewer 命令规整成「真正会被执行的那一条」。
-
-    派发命令与健康探针共用本函数——这样「探针和评审走同一条路径」是**构造出来的**，
-    而不是靠运维记得在两处各抄一遍 flag（抄漏一个就换一道门，正是 cursor 那次故障的形状）。
-    """
+    """按 output_format 规整实际派发的 reviewer 命令。"""
     if output_format == OUTPUT_FORMAT_CLAUDE_STREAM_JSON and is_claude_print_command(argv):
         return ensure_claude_stream_json_command(argv)
     if output_format == OUTPUT_FORMAT_CURSOR_STREAM_JSON and is_cursor_print_command(argv):
@@ -388,32 +384,6 @@ def resolve_formal_reviewer_model_command(config: dict[str, Any], command: list[
         return resolve_oh_my_pi_default_model_command(config, command, env=env, cwd=cwd, timeout=timeout)
     if not is_kimi_prompt_command(command):
         raise ValueError('Kimi 动态选模要求正式评审使用 kimi')
-
-    def extract_native_resume_selector(argv: list[str]) -> tuple[list[str], list[str], list[str]]:
-        selector_tokens: list[str] = []
-        canonical_selector: list[str] = []
-        without_resume = [argv[0]]
-        index = 1
-        while index < len(argv):
-            item = argv[index]
-            if item in {'-c', '--continue'}:
-                selector_tokens.append(item)
-                canonical_selector.append('--continue')
-            elif item in {'-S', '--session'}:
-                selector_tokens.append(item)
-                canonical_selector.append('--session')
-                if index + 1 < len(argv) and (not argv[index + 1].startswith('-')):
-                    index += 1
-                    selector_tokens.append(argv[index])
-                    canonical_selector.append(argv[index])
-            elif item.startswith('--session=') or (item.startswith('-S') and len(item) > 2):
-                selector_tokens.append(item)
-                canonical_selector.extend(['--session', item.split('=', 1)[1] if item.startswith('--session=') else item[2:]])
-            else:
-                without_resume.append(item)
-            index += 1
-        return (selector_tokens, canonical_selector, without_resume)
-    resume_tokens, _, _ = extract_native_resume_selector(command)
 
     def extract_explicit_model_selector(argv: list[str]) -> tuple[str | None, list[str]]:
         selectors = []
@@ -437,7 +407,11 @@ def resolve_formal_reviewer_model_command(config: dict[str, Any], command: list[
         return (selectors[0] if selectors else None, without_model)
     selected_model, command_without_model = extract_explicit_model_selector(command)
     if selected_model is None:
-        if resume_tokens:
+        has_native_resume_selector = any(
+            item in {'-c', '--continue', '-S', '--session'} or item.startswith('--session=')
+            or (item.startswith('-S') and len(item) > 2) for item in command_without_model[1:]
+        )
+        if has_native_resume_selector:
             return command
         selected_model = resolve_latest_kimi_managed_stable_model(command[0], env=env, timeout=min(timeout, 10))
     return [command[0], '--model', selected_model, *command_without_model[1:]]

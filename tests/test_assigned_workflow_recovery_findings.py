@@ -104,7 +104,6 @@ def test_role_only_preparation_failure_recovers_without_configuration_change(rep
     assert workflow.resume_review(run, reviewer_configs=[config, config])["status"] == "review_incomplete"
     assert len(list(run.glob("reviewer-*/attempt-*/request.json"))) == 2
     assert not list(run.glob("reviewer-*/attempt-*/model-invocation.json"))
-    deadlines = {path: read_json(path) for path in run.glob("reviewer-*/role-deadline.json")}
     repeated = workflow.resume_review(run)
     assert repeated["status"] == "review_incomplete"
     assert len(list(run.glob("reviewer-*/attempt-*/request.json"))) == 4
@@ -112,7 +111,7 @@ def test_role_only_preparation_failure_recovers_without_configuration_change(rep
     marker.touch()
     assert workflow.resume_review(run)["status"] == "ready_to_commit"
     assert len(list(run.glob("reviewer-*/attempt-*/request.json"))) == 6
-    assert all(read_json(path) == deadline for path, deadline in deadlines.items())
+    assert not list(run.glob("reviewer-*/role-deadline.json"))
 
 
 def test_revocation_and_real_patch_entry_are_serialized(repository, tmp_path, monkeypatch):

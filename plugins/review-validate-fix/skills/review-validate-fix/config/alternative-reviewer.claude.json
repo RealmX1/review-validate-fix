@@ -20,6 +20,10 @@
   ],
   "pre_run_health": true,
   "credential_identity_source": "claude_secure_storage",
-  "health_command": ["claude", "auth", "status", "--json"],
-  "timeout_seconds": 900
+  "health_command": [
+    "claude",
+    "auth",
+    "status",
+    "--json"
+  ]
 }

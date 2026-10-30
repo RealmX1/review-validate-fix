@@ -21,15 +21,16 @@ def handle_hook(event: dict, *, event_name: str, host_adapter) -> dict | None:
     if os.environ.get("RVF_SUPPRESS_STOP_HOOK") == "1":
         return None
     if event_name == "UserPromptSubmit":
-        prompt = event.get("prompt", "")
+        prompt = host_adapter.normalized_user_prompt_text(event.get("prompt", ""))
         task_id = os.environ.get('KANBAN_TASK_ID') or os.environ.get('CLINE_KANBAN_TASK_ID')
-        if task_id and isinstance(prompt, str) and prompt.strip():
+        if task_id and prompt.strip():
             try:
-                resolve_task_review_starting_point(Path(event.get('cwd') or os.getcwd()), task_id, event=event)
+                resolve_task_review_starting_point(Path(event.get('cwd') or os.getcwd()), task_id,
+                                                  event=host_adapter.user_prompt_recovery_event(event, prompt))
             except Exception as error:
                 # 当前用户的显式入口独立于机器补证；诊断只进入开发者 stderr。
                 print(f'RVF hook 补证诊断：{type(error).__name__}: {error}', file=sys.stderr)
-        if not isinstance(prompt, str) or not re.match(r"^\s*(?:\$|/|:)review-validate-fix(?:\s|$)", prompt):
+        if not re.match(r"^\s*(?:\$|/|:)review-validate-fix(?:\s|$)", prompt):
             return None
         return host_adapter.user_prompt_context_payload(
             "本次用户明确调用 RVF。读取 review-validate-fix skill，使用固定任务基线和显式范围运行 "

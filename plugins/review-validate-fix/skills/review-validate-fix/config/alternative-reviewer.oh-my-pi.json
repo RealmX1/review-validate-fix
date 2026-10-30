@@ -22,6 +22,5 @@
     "PI_CODING_AGENT_DIR",
     "PI_TIMING"
   ],
-  "reviewer_model_selection_source": "oh_my_pi_default_model_role",
-  "timeout_seconds": 900
+  "reviewer_model_selection_source": "oh_my_pi_default_model_role"
 }
