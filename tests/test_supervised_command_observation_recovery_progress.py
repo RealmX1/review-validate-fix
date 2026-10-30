@@ -79,7 +79,7 @@ def test_stop_cancels_direct_child_handle_during_native_query_outage(tmp_path):
         '    if calls==1: return {}\n'
         '    raise RuntimeError("派发后原生观测不可用")\n'
         'with patch.object(supervisor,"owned_process_snapshot",side_effect=unavailable_after_dispatch):\n'
-        f'    raise SystemExit(supervisor.supervise_registered_command(Path({str(run)!r}),Path({str(observations)!r}),{time.time()+10},(),{command!r}))\n'
+        f'    raise SystemExit(supervisor.supervise_registered_command(Path({str(run)!r}),Path({str(observations)!r}),(),{command!r}))\n'
     )
     process = subprocess.Popen([sys.executable, '-B', '-c', driver], start_new_session=True)
     try:
@@ -112,8 +112,8 @@ def test_native_spawn_failure_can_retry_without_inventing_exit_evidence(reposito
     with monkeypatch.context() as failed_launch:
         failed_launch.setattr(machine_evidence.subprocess, 'Popen', temporarily_unavailable)
         with pytest.raises(OSError):
-            machine_evidence.collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'], time.time()+10)
-    evidence = machine_evidence.collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'], time.time()+10)
+            machine_evidence.collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'])
+    evidence = machine_evidence.collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'])
     assert read_json(evidence)['status'] == 'passed'
     first = run / 'incomplete-fixer-machine-validation/round-001/attempt-001/commands/command-001'
     execution = read_json(first / 'execution.json')

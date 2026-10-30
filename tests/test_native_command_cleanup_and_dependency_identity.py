@@ -58,12 +58,11 @@ def test_changed_external_dependency_invalidates_unproven_pass(repository, tmp_p
         return original_execute(*args, **kwargs)
     monkeypatch.setattr(machine_evidence, 'execute_registered_commands', execute_without_native_supervision)
     monkeypatch.setattr(execution_lifecycle, 'observe_owned_process_group_descendants', lambda *args: None)
-    deadline = time.time() + 15
-    initial = machine_evidence.collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'], deadline)
+    initial = machine_evidence.collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'])
     initial_bytes = initial.read_bytes()
     assert read_json(initial)['status'] == 'passed'
     dependency.write_text('changed')
-    current = machine_evidence.collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'], deadline)
+    current = machine_evidence.collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'])
     assert current != initial
     assert read_json(current)['status'] == 'failed'
     assert read_json(current)['collection_attempt'] == 2
@@ -90,7 +89,7 @@ def test_native_observation_outage_does_not_abandon_known_detached_child(tmp_pat
         f' if Path({str(started)!r}).exists() and result and observed_at is None: observed_at=time.monotonic()\n'
         ' return result\n'
         'with patch.object(supervisor,"owned_process_snapshot",side_effect=observe):\n'
-        f' raise SystemExit(supervisor.supervise_registered_command(Path({str(run)!r}),Path({str(artifacts)!r}),{time.time()+1.0},(),{command!r}))\n'
+        f' raise SystemExit(supervisor.supervise_registered_command(Path({str(run)!r}),Path({str(artifacts)!r}),(),{command!r}))\n'
     )
     process = subprocess.Popen([sys.executable, '-B', '-c', script], start_new_session=True)
     try:
@@ -141,7 +140,7 @@ def test_reused_native_owned_pid_does_not_receive_cancellation(monkeypatch):
 
 
 @pytest.mark.parametrize('case', range(3))
-def test_registered_deadline_waits_for_detached_descendant_cleanup(tmp_path, monkeypatch, case):
+def test_registered_command_waits_for_healthy_detached_descendant_completion(tmp_path, monkeypatch, case):
     run = tmp_path / 'registered-deadline-cleanup'
     run.mkdir()
     write_json(run / 'run.json', {})
@@ -152,12 +151,12 @@ def test_registered_deadline_waits_for_detached_descendant_cleanup(tmp_path, mon
     monkeypatch.setattr(execution_lifecycle, 'observe_owned_process_group_descendants', lambda *args: None)
     with exclusive_lock(run / 'collection.lock') as lock:
         result = machine_evidence.execute_registered_commands(run, tmp_path, [command], run / 'commands', 'workspace_preparation',
-            inherited_lock_descriptors=(lock.fileno(),), deadline_at=time.time() + 0.5)
+            inherited_lock_descriptors=(lock.fileno(),))
     try:
-        assert result['commands'][0]['returncode'] == 124
+        assert result['commands'][0]['returncode'] == 0
         assert started.exists()
         time.sleep(0.9)
-        assert not late_effect.exists()
+        assert late_effect.exists()
     finally:
         if started.exists():
             try:

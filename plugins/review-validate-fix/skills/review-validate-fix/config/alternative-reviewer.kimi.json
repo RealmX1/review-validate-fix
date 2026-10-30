@@ -24,6 +24,5 @@
     "KIMI_CODE_OAUTH_HOST",
     "KIMI_OAUTH_HOST",
     "KIMI_CODE_EXPERIMENTAL_FLAG"
-  ],
-  "timeout_seconds": 900
+  ]
 }

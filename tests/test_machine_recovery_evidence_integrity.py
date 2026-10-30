@@ -94,17 +94,28 @@ def test_changed_environment_revokes_commit_eligibility_and_enters_validation_re
     assert read_json(run / "validation.json")["status"] == "failed"
 
 
-def test_expired_role_without_outcome_is_a_durable_judgment_result(repository, tmp_path):
+def test_historical_timeout_does_not_override_current_success(repository, tmp_path):
+    from core.task_snapshot_review.workflow import configuration_digest
     run = automatic_snapshot(repository, tmp_path, commands=[[sys.executable, "-c", "pass"]])
-    for role in ("reviewer-1", "reviewer-2"):
-        write_json(run / role / "role-deadline.json", {"deadline_at": time.time() - 1})
     config = fake_config(tmp_path)
+    history = {}
+    for role in ("reviewer-1", "reviewer-2"):
+        attempt = run / role / "attempt-001"
+        write_json(attempt / "request.json", {"configuration_digest": configuration_digest(config),
+            "candidate_commit": read_json(run / "run.json")["candidate_commit"], "config": config, "findings": []})
+        outcome = {"status": "failed", "returncode": 124, "retryable": False, "recovery": {"category": "deadline_exhausted"}}
+        write_json(attempt / "outcome.json", outcome)
+        write_json(attempt.parent / "deadline-exhausted.json", outcome)
+        for path in (attempt / "outcome.json", attempt.parent / "deadline-exhausted.json"):
+            history[path] = path.read_bytes()
     result = resume_review(run, reviewer_configs=[config, config])
-    assert result["status"] == "review_incomplete"
-    assert result["disposition"] == "agent_judgment_required"
-    assert not result["closeout"]["automatic_commit_allowed"]
-    assert list(run.glob("reviewer-*/deadline-exhausted.json"))
-    assert resume_review(run)["disposition"] == "agent_judgment_required"
+    assert result["status"] == "ready_to_commit"
+    assert result["disposition"] == "agent_review_ready"
+    assert result["closeout"]["automatic_commit_allowed"]
+    assert all(path.read_bytes() == content for path, content in history.items())
+    assert len(list(run.glob("reviewer-*/attempt-*"))) == 4
+    assert resume_review(run)["status"] == "ready_to_commit"
+    assert len(list(run.glob("reviewer-*/attempt-*"))) == 4
 
 
 def test_shared_command_mutation_cannot_publish_candidate_pass(repository, tmp_path):

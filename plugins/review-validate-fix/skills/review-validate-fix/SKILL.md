@@ -7,7 +7,7 @@ description: 用户明确调用 RVF，或主会话依据任务授权选择执行
 
 一次冻结材料启动 → 工具完成独立双审、必要修复及完整树验证 → 一次结果交回 → 主 Agent 审阅、提交并展示收尾。保留 SANTA-method 与角色独立上下文；默认一个匿名 fixer，最多三轮语义修复。
 
-**临时三路外审至 2026-11-02 00:00 America/New_York（UTC 05:00）：** 正式创建的新 run（含 prepare-only、Kanban 托管）最低三席，普通席及 fallback 排除 Codex CLI，最后一席只运行独立工作树和上下文中的外部 `codex exec`；主会话是 Codex 也不改用 internal subagent。oh-my-pi 正常参与普通席。`--reviewer-count` 是总数，至少提升为三；显式配置仍须符合各席约束，未提供 Codex 配置时补用已启用的默认 Codex 配置。必选席缺 CLI、认证或额度失败不降级为其他 harness，其他席继续；保存恢复条件并复用原预算和总时限。全部席完成后综合所有发现与重复发现的补充证据，再进入现有 validate/fix。截止后创建恢复正常双路及 Codex 普通候选资格；既有 run 保持创建时的数量与约束，到期后接续也不减席。
+**临时三路外审至 2026-11-02 00:00 America/New_York（UTC 05:00）：** 正式创建的新 run（含 prepare-only、Kanban 托管）最低三席，普通席及 fallback 排除 Codex CLI，最后一席只运行独立工作树和上下文中的外部 `codex exec`；主会话是 Codex 也不改用 internal subagent。oh-my-pi 正常参与普通席。`--reviewer-count` 是总数，至少提升为三；显式配置仍须符合各席约束，未提供 Codex 配置时补用已启用的默认 Codex 配置。必选席缺 CLI、认证或额度失败不降级为其他 harness，其他席继续；保存恢复条件并复用原故障重试与语义修复预算。全部席完成后综合所有发现与重复发现的补充证据，再进入现有 validate/fix。截止后创建恢复正常双路及 Codex 普通候选资格；既有 run 保持创建时的数量与约束，到期后接续也不减席。
 
 1. 核对任务需求、有效授权和实际 Git 工作树。选择固定基线及明确任务路径，背景 WIP 保持原样。将用户原话和必要实现说明保存为一份持久需求文件。Kanban 新的一段实现开始前，可用 `rvf record-kanban-task-review-start --repo <工作树> --task-id <task-id> --base-ref <实现前固定 SHA> --scope <路径> ...` 明确保存起点；prompt、换会话和吸收 base 都不会推进它。未记录时仅使用可证明的任务创建/checkpoint 起点，不猜 live main。
 2. 准备最终验证命令的 JSON argv 数组列表，一次执行 `rvf review-task-snapshot --repo <工作树> --base-ref <基线> --scope <相对路径> ... --requirements-file <文件> --fix --validation-commands <文件>`。隔离环境需要准备时附 `--preparation-commands <argv JSON>`；可附 `--machine-context-file <JSON>`、`--machine-evidence-commands <argv JSON>` 和 `--implementation-plan-file <条目字符串列表 JSON>`。材料冻结到精确 run；`--reviewer-config <JSON>`、`--fixer-config <JSON>` 在启动时选择 CLI。所有分配 reviewer 必须实际完成，缺腿不能降为通过。
@@ -20,8 +20,8 @@ description: 用户明确调用 RVF，或主会话依据任务授权选择执行
 
 主 Agent 统一收集 reviewers、fixer 与自己发现的有价值问题。显式要求或既有问题收集授权适用时，用 `rvf collect-issues --list-repository <owner/repo>` 查询开放和关闭问题，匹配稳定 `problem_key` 后 `rvf collect-issues --report <JSON>`；格式按需读 `references/github-issue-observation-report.md`。失败保留持久材料，不阻断提交或同步。
 
-重启只接续原 run。瞬时故障同配置最多重试一次；确定性故障转已登记配置。配置错误等配置变化，认证和额度同配置最多在 300 秒后复核一次。语义预算与原总时限不随重启或切换重置。Stop 先持久撤销，不能自动恢复已撤销执行；本地进程退出与原生取消接受分别记录。机器信息缺口自主补证，只有真实价值取舍、新权限或人独有信息才需用户决定。用户的提交、同步、push 和部署限制继续有效。
+重启只接续原 run。瞬时故障同配置最多重试一次；确定性故障转已登记配置。配置错误等配置变化，认证和额度同配置最多在 300 秒后复核一次。语义预算不随重启或切换重置；角色没有总运行时限，准备、fallback 与补验也不继承墙钟期限。Stop 先持久撤销，不能自动恢复已撤销执行；本地进程退出与原生取消接受分别记录。机器信息缺口自主补证，只有真实价值取舍、新权限或人独有信息才需用户决定。用户的提交、同步、push 和部署限制继续有效。
 
-CLI 配置可登记 `credential_evidence_paths`，仅将内容摘要作为新凭据恢复证据，不保存凭据原文；Codex 与 Claude 的常用凭据文件默认登记。预算耗尽是需要主 Agent 审阅的有界终局，不伪装成可无限等待的机器恢复。角色输入给出收束时间并预留原生结束时间；限时未完成的腿仍是未完成。优先把耗时且可共享的检查登记到 `--machine-evidence-commands`，由宿主单次采集，两个 reviewer 分别读取事实并作出判断。
+CLI 配置可登记 `credential_evidence_paths`，仅将内容摘要作为新凭据恢复证据，不保存凭据原文；Codex 与 Claude 的常用凭据文件默认登记。语义修复轮数耗尽仍需主 Agent 审阅；运行较久或持续静默只用于观察，不终止角色、不压缩审阅范围。进度原件保存进程身份、最近观察与输出活动、等待原因和恢复条件。历史超时原件保留，新 attempt 以自己的正常结束和有效结果计完成。优先把耗时且可共享的检查登记到 `--machine-evidence-commands`，由宿主单次采集，两个 reviewer 分别读取事实并作出判断。
 
 常规回执只给业务处置、必要下一步与持久目录；详细日志按需读取。`rvf analyze --run-dir <目录> --run-dir <另一目录>` 只读展示原始/有效恢复状态、依据和分项量测，不是交付门禁。磁盘副本、调用次数与 token 收益分别证明；缺少 native usage 时保持未知。

@@ -13,7 +13,7 @@ from pathlib import Path
 
 from . import harness_cli_adapters as cli
 from .persistent_artifacts import exclusive_lock, git, git_text, read_json, write_bytes, write_json
-from .execution_lifecycle import ExecutionRevoked, ensure_execution_not_revoked, register_owned_process, wait_for_owned_process
+from .execution_lifecycle import ExecutionRevoked, ensure_execution_not_revoked, register_owned_process, wait_for_owned_process, process_start_identity, persist_role_progress_observation
 from .role_failure_recovery import classify_role_failure, native_invocation_facts
 from .machine_evidence import WorkspacePreparationFailed, prepare_isolated_workspace
 
@@ -201,7 +201,9 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
         command = list(config["command"])
         output_format = config.get("output_format", "text")
         started_at = time.time()
-        write_json(attempt_directory / "progress.json", {"status": "running", "pid": os.getpid(), "started_at": started_at})
+        persist_role_progress_observation(attempt_directory / "progress.json", {"status": "running", "pid": os.getpid(), "started_at": started_at,
+            "last_observed_at": started_at, "waiting_reason": "isolated_workspace_preparation",
+            "recovery_condition": "registered_preparation_completed_or_persistent_stop"})
         outcome = {"status": "failed", "started_at": started_at}
         active_process=None
         cancellation_requested=False
@@ -216,26 +218,17 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
         signal.signal(signal.SIGINT,cancel_role)
         try:
             ensure_execution_not_revoked(run_directory)
-            deadline_file = attempt_directory.parent / "role-deadline.json"
-            if not deadline_file.exists():
-                write_json(deadline_file, {"deadline_at": started_at + float(config.get("timeout_seconds", 1800))})
-            deadline_at = read_json(deadline_file)["deadline_at"]
-            if deadline_at <= time.time():
-                raise ValueError("原角色总时限已经耗尽，配置切换不重置时限")
             register_owned_process(run_directory, os.getpid(), "role_worker", owns_process_group=True)
             if not workspace.exists():
                 git(Path(request['repository']),'worktree','add','--detach',str(workspace),request['candidate_commit'],pass_fds=(execution_lock.fileno(),))
             elif not (attempt_directory/'model-invocation.json').exists():
                 git(workspace,'reset','--hard',request['candidate_commit'],pass_fds=(execution_lock.fileno(),))
             environment = role_environment(request)
-            prepare_isolated_workspace(run_directory, workspace, request.get("preparation_commands", []), attempt_directory, environment=environment, deadline_at=deadline_at,
+            prepare_isolated_workspace(run_directory, workspace, request.get("preparation_commands", []), attempt_directory, environment=environment,
                                        inherited_lock_descriptors=(execution_lock.fileno(),))
             prepared_status = git(workspace, "status", "--porcelain", "--untracked-files=all")
             write_json(attempt_directory / "prepared-worktree-state.json", {"status_porcelain": prepared_status.decode()})
-            remaining_seconds = deadline_at - time.time()
-            if remaining_seconds <= 0:
-                raise ValueError("准备环境后原角色总时限已经耗尽")
-            command = cli.resolve_reviewer_model_command(config, command, env=environment, cwd=workspace, timeout=min(30, remaining_seconds))
+            command = cli.resolve_reviewer_model_command(config, command, env=environment, cwd=workspace, timeout=30)
             command = cli.normalise_reviewer_command_for_output_format(command, output_format=output_format)
             if config.get("run_directory_grant_flag"):
                 command = cli.ensure_run_directory_grant_argument(command, attempt_directory, grant_flag=config["run_directory_grant_flag"])
@@ -246,27 +239,20 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
             write_bytes(attempt_directory / "stdin.txt", stdin_text.encode())
             if cancellation_requested:
                 raise InterruptedError('已在派发模型前取消')
-            remaining_seconds = read_json(deadline_file)["deadline_at"] - time.time()
-            if remaining_seconds <= 0:
-                outcome["recovery"] = {"category": "deadline_exhausted", "maximum_same_configuration_retries": 0}
-                raise ValueError("原角色总时限已经耗尽，配置切换不重置时限")
             import shutil
             executable = shutil.which(command[0])
             cli_version = None
             if executable and Path(executable).name in {"codex", "claude", "kimi", "cursor-agent", "agent", "omp", "python", "python3"}:
                 try:
-                    version = subprocess.run([executable, "--version"], capture_output=True, text=True, env=environment, timeout=min(3, remaining_seconds))
+                    version = subprocess.run([executable, "--version"], capture_output=True, text=True, env=environment, timeout=3)
                     if version.returncode == 0:
                         cli_version = (version.stdout or version.stderr).strip()[:4096]
                 except (OSError, subprocess.SubprocessError):
                     pass
-            remaining_seconds = read_json(deadline_file)["deadline_at"] - time.time()
-            if remaining_seconds <= 0:
-                raise ValueError("CLI 版本核验后原角色总时限已经耗尽")
             write_json(attempt_directory/'model-invocation.json',{'started_at':time.time(), "command": command,
                        "cli_version": cli_version, "cli_executable": executable,
                        "cli_executable_sha256": hashlib.sha256(Path(executable).read_bytes()).hexdigest() if executable else None,
-                       "output_format": output_format, "deadline_at": read_json(deadline_file)["deadline_at"]})
+                       "output_format": output_format})
             with (attempt_directory / "stdin.txt").open("rb") as stdin, (attempt_directory / "stdout.txt").open("wb") as stdout, (attempt_directory / "stderr.txt").open("wb") as stderr:
                 # harness 继承同一把锁；worker 意外退出时，恢复方先等待真实子进程结束。
                 process = subprocess.Popen(command, stdin=stdin, stdout=stdout, stderr=stderr, cwd=workspace,
@@ -275,16 +261,14 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
                 register_owned_process(run_directory, process.pid, "role_cli", owns_process_group=True)
                 if cancellation_requested:
                     cancel_role(signal.SIGTERM,None)
+                progress = {}
                 try:
-                    returncode = wait_for_owned_process(process, run_directory, timeout=remaining_seconds)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGTERM)
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        os.killpg(process.pid, signal.SIGKILL)
-                        process.wait()
-                    returncode = 124
+                    progress["process_identity"] = process_start_identity(process.pid)
+                except (OSError, subprocess.SubprocessError, RuntimeError) as error:
+                    progress["identity_observation_error"] = str(error)
+                persist_role_progress_observation(attempt_directory / "progress.json", progress)
+                returncode = wait_for_owned_process(process, run_directory, timeout=None,
+                    progress_file=attempt_directory / "progress.json")
             raw_output = (attempt_directory / "stdout.txt").read_text(errors="replace")
             raw_error = (attempt_directory / "stderr.txt").read_text(errors="replace")
             outcome["returncode"] = returncode
@@ -315,8 +299,6 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
             if isinstance(error, (ExecutionRevoked, InterruptedError)):
                 outcome.update({"status": "cancelled", "retryable": False, "native_cancellation_status": "unknown"})
             outcome["error"] = str(error)
-            if not cancellation_requested and (attempt_directory.parent / "role-deadline.json").exists() and read_json(attempt_directory.parent / "role-deadline.json")["deadline_at"] <= time.time():
-                outcome.update({"recovery": {"category": "deadline_exhausted", "maximum_same_configuration_retries": 0}, "retryable": False})
             outcome.setdefault("retryable", False)
         finally:
             if active_process is not None and active_process.poll() is None:
@@ -335,6 +317,8 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
                 outcome["error"] = cli.redact_configured_environment_variable_values(outcome["error"], redactions)
             outcome["finished_at"] = time.time()
             write_json(attempt_directory / "outcome.json", cli.redact_configured_environment_variable_values_in_json_value(outcome, redactions))
+            persist_role_progress_observation(attempt_directory / "progress.json", {
+                "status": outcome["status"], "last_observed_at": outcome["finished_at"], "waiting_reason": None})
 
 
 def launch_role(attempt_directory: Path, *, environment_overrides: dict | None = None) -> subprocess.Popen:
