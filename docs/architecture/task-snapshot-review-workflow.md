@@ -27,9 +27,11 @@ RVF 的流程为：一次固定材料启动 → 两路独立 reviewer → 来源
 
 fixer 的 completed 表示发现的语义处置和必要的针对性验证完成；执行器应用补丁后仍须统一运行完整最终验证。只有决定处置所必需的具体机器事实无法在既有权限和等价来源下取得、且可由已登记命令补齐时，才使用 `completion_blocker: registered_machine_validation` 的 incomplete；尚未执行整套 final 本身不构成语义未完成。执行器在保留修复树上自动补验，保存完整树、cwd、准备环境及日志，再交回同一 fixer 独立收束，不把原始 incomplete 改成 completed。中断和环境恢复共享每个语义轮最多三次采集的预算；失败后按恢复证据变化或一次定时探测有界接续，环境变化也使既有通过证据失效。所有 attempt 原件保留，全部动作继续受进程归属核验和持久撤销约束，没有角色总时限；语义缺口不触发这一机器补证。
 
-准备、机器补验和权威最终验证均由独立监督者等待所属后代。原生启动身份和继承的随机执行归属覆盖新 session 后代；`ps` 不可用时使用平台原生查询。短暂查询失败只作有界复核，持续缺证保存命令退出事实、后代退出未知与恢复条件，不能把未知写成通过或耗尽整个角色期限后冒充命令失败。
+准备、机器补验和权威最终验证均采用受控命令契约：命令必须等待自己的后台工作；需要独立存活的工作须通过已有受监督命令入口单独登记。监督者只跟踪直接 `Popen` 句柄、身份匹配的已登记 PID、自有进程组及其子链。已观察的子进程之后脱离 session 仍按保存的启动身份跟踪；未登记且在被观察前就脱离父链、进程组的任意后代不在保证范围内。
 
-macOS 同时保存监督者的内核 `uniqueid`。新孤儿缺少执行 token 时，只排除原始父版本证明由 launchd 启动、或父 `uniqueid` 非 1 且早于监督者的无关进程，避免并发后台进程把成功准备误报为后代退出未知。`uniqueid` 按进程创建顺序递增；reparent 后 exec 可能将父 `uniqueid` 改为 1，因此不能仅凭当前父为 launchd 排除清空环境的所属后代；缺少归属证据仍保留 unknown。依据：[XNU 创建身份](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_fork.c)、[父身份保存](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_proc.c)。
+macOS 使用 `PROC_PGRP_ONLY`、`PROC_PPID_ONLY` 限定查询，并保留监督者内核 `uniqueid` 和启动身份。Linux 只读取已知 PID 的身份及其 `/proc/<pid>/task/<tid>/children` 子链；子链仅作发现证据，空列表不能否定已登记的活跃身份。角色等待、机器证据、最终验证及 Stop 复用该范围，不枚举全 UID、全 PID 或 `/proc` 根目录，不读取无关进程环境。依据：[Apple libproc 限定父 PID 和进程组查询](https://github.com/apple-oss-distributions/xnu/blob/main/libsyscall/wrappers/libproc/libproc.c)。
+
+新 `command-supervision.json` 固定保存 `process_ownership_scope` 与 `command_process_lifetime_contract`，没有可切换的全局扫描模式。`command_returncode` 保存原生命令结果，`owned_process_exit_status` 单独保存所属进程退出事实；真实非零退出仍是验证失败。完成退出证明后才检查候选树变化。历史失败原件保持不变；未完成旧运行缺少新契约时，追加缺证对账，不将其自动改写为成功。命令派发意图已保存但直接命令登记中断时也保留未知，禁止重复派发。
 
 接续时按 `pid` 与 `start_identity` 核对监督者是否仍存活；附加的 `uniqueid` 证据不改变该启动身份，不能因记录字段增多而将仍存活的监督者写成已退出。
 
