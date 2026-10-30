@@ -79,6 +79,57 @@ def test_detached_descendant_cannot_write_after_explicit_signal_or_persistent_st
                 pass
 
 
+@pytest.mark.parametrize('injection_phase', ['before_launch', 'running'])
+def test_sigterm_during_owned_query_is_not_swallowed_as_observation_error(tmp_path, injection_phase):
+    run = tmp_path / 'signal-during-owned-query'
+    artifacts = run / 'command-evidence'
+    artifacts.mkdir(parents=True)
+    write_json(run / 'run.json', {})
+    command_started = tmp_path / 'command-started'
+    signal_injected = tmp_path / 'signal-injected'
+    command = [sys.executable, '-B', '-c',
+        f'from pathlib import Path; import time; Path({str(command_started)!r}).touch(); time.sleep(30)']
+    script = f'''
+import os, signal
+from pathlib import Path
+from core.task_snapshot_review import retained_command_supervisor as supervisor
+original_snapshot = supervisor.owned_process_snapshot
+injected = False
+def snapshot(supervisor_pid, owned, **kwargs):
+    global injected
+    if not injected and ({injection_phase!r} == 'before_launch' or owned):
+        injected = True
+        Path({str(signal_injected)!r}).touch()
+        os.kill(os.getpid(), signal.SIGTERM)
+    return original_snapshot(supervisor_pid, owned, **kwargs)
+supervisor.owned_process_snapshot = snapshot
+raise SystemExit(supervisor.supervise_registered_command(
+    Path({str(run)!r}), Path({str(artifacts)!r}), (), {command!r}))
+'''
+    process = subprocess.Popen([sys.executable, '-B', '-c', script], start_new_session=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        process.wait(timeout=3)
+        assert signal_injected.exists()
+        facts = read_json(artifacts / 'command-supervision.json')
+        assert facts['status'] == 'termination_requested'
+        assert process.returncode == -signal.SIGKILL
+        if injection_phase == 'before_launch':
+            assert not facts.get('command_execution_started')
+            assert not command_started.exists()
+        else:
+            assert facts['command_execution_started']
+            from core.task_snapshot_review.native_owned_process_observation import native_process_identity
+            limit = time.monotonic() + 3
+            while native_process_identity(facts['command_pid']) is not None:
+                assert time.monotonic() < limit
+                time.sleep(0.01)
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+
+
 @pytest.mark.parametrize('command_exit_code', [0, 7])
 def test_ps_failure_uses_native_evidence_without_waiting_for_deadline(tmp_path, monkeypatch, command_exit_code):
     executable_directory = tmp_path / 'unavailable-process-query-executables'

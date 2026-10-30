@@ -91,6 +91,7 @@ def supervise_registered_command(run_directory: Path, command_directory: Path, i
     child = None
     owned = {}
     ownership_observation_deferred_until_command_exit = False
+    termination_requested = False
 
     def observe_owned_processes():
         for attempt in range(5):
@@ -110,8 +111,14 @@ def supervise_registered_command(run_directory: Path, command_directory: Path, i
                 time.sleep(0.05)
 
     def request_termination(*_):
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        raise ExecutionRevoked('监督者收到取消信号')
+        # ExecutionRevoked 也是 OSError；异步抛出会被查询或 Popen 的错误处理吞掉。
+        nonlocal termination_requested
+        termination_requested = True
+
+    def ensure_command_not_cancelled():
+        if termination_requested:
+            raise ExecutionRevoked('监督者收到取消信号')
+        ensure_execution_not_revoked(run_directory)
 
     def terminate_owned_processes():
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -161,12 +168,13 @@ def supervise_registered_command(run_directory: Path, command_directory: Path, i
 
     signal.signal(signal.SIGTERM, request_termination)
     try:
+        ensure_command_not_cancelled()
         # 启动前确认等价原生查询可用，查询失败保存恢复条件。
         facts['supervisor_native_identity'] = native_process_identity(os.getpid())
         write_json(supervision_file, facts)
         observe_owned_processes()
         with exclusive_lock(run_directory / 'execution-revocation.lock'):
-            ensure_execution_not_revoked(run_directory)
+            ensure_command_not_cancelled()
             facts['command_launch_intent_recorded'] = True
             write_json(supervision_file, facts)
             try:
@@ -178,7 +186,7 @@ def supervise_registered_command(run_directory: Path, command_directory: Path, i
         facts.update({'status': 'running', 'command_pid': child.pid, 'command_execution_started': True})
         write_json(supervision_file, facts)
         while True:
-            ensure_execution_not_revoked(run_directory)
+            ensure_command_not_cancelled()
             returncode = child.poll()
             if not ownership_observation_deferred_until_command_exit or returncode is not None:
                 try:
@@ -190,6 +198,7 @@ def supervise_registered_command(run_directory: Path, command_directory: Path, i
                     # 已登记的活跃命令继续执行；子进程退出是重新核验的事实触发条件。
                     ownership_observation_deferred_until_command_exit = True
                     facts['last_ownership_observation_error'] = str(error)
+            ensure_command_not_cancelled()
             facts['ownership_observation_deferred_until_command_exit'] = ownership_observation_deferred_until_command_exit
             facts.update({'command_returncode': returncode, 'owned_processes': list(owned.values())})
             write_json(supervision_file, facts)

@@ -43,6 +43,8 @@ Stop 同样合并追加对账中的已证明身份，逐个核对当前原生启
 
 观测缺证不终止尚在执行的已登记命令；有界复核后，以直接子进程退出这一新事实触发再次核验。退出证明仍未知时不写通过，也不派发下一份命令。Stop 可使用尚未回收的 Popen 直接子进程句柄这一独立归属证据；其他后代仍核对原生启动身份。原生 Popen 启动失败单独保存未派发事实及 errno，重采可据此安全恢复，不把缺少监督文件直接解释为退出。
 
+独立监督者的 SIGTERM handler 只记录取消请求，在启动门禁和观测循环的安全检查点进入同一取消清理流程，不从信号处理器异步抛出 `ExecutionRevoked`。该异常继承 `OSError`，若在原生查询或 `Popen` 内抛出，可能被当作查询失败吞掉；只记录请求也避免中断子进程登记或锁的临界区。观测结束后再次检查取消，启动前收到的请求不得继续派发命令。
+
 使用 `--kanban-task-id` 与 `--kanban-project-path` 将同一 run 委托给通用 `kanban task command-execution`。执行记录先冻结 incarnation、主会话、工作树、材料、恢复动作及稳定结果 ID，宿主负责等待与原生接受补证。`cancel-task-review` 先写持久撤销，再仅取消匹配启动身份的所属进程；原生共享宿主取消证据未知时保留 unknown。Stop 后不能以自动恢复再次派发。
 
 本工作流默认在 RVF 顺利完成且主 Agent 最终审阅通过后自主 commit 收尾；明确只读、不得提交等限制继续优先。`elevated` 处置必须注明 `elevation_impact: none|rollback|broad_rewrite`；普通 elevation 不单独阻止提交，后两类形成具体判断请求。主 Agent 提交后以 `--closeout-report` 保存逐项计划状态、证据与工作 recap，原 run 核实真实提交并立即输出收尾，先于任何 base-branch-sync。未提供实施证据时计划完成情况是 unknown，而非从 RVF 成功推定。
