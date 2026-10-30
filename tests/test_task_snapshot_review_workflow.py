@@ -62,7 +62,7 @@ def fake_config(tmp_path, *, findings=None, fail_first=False, malformed=False, f
            "if not marker.exists():\n marker.write_text('failed'); print('transient failure',file=sys.stderr); sys.exit(7)\n" if fail_first else "")
         + ("print('malformed result')\n" if malformed else "print(json.dumps(result,ensure_ascii=False))\n")
     )
-    config = {"command": [sys.executable, str(script)], "output_format": "text", "timeout_seconds": 20}
+    config = {"command": [sys.executable, str(script)], "output_format": "text"}
     return config
 
 
@@ -289,7 +289,7 @@ def test_changed_main_worktree_blocks_only_patch_application_and_retains_fixer_r
 def plain_reviewer_config(tmp_path, name="plain-reviewer.py"):
     script = tmp_path / name
     script.write_text("import json\nprint(json.dumps({'status':'completed','findings':[],'audit_summary':'已检查'}))\n")
-    return {"command": [sys.executable, str(script)], "output_format": "text", "timeout_seconds": 20}
+    return {"command": [sys.executable, str(script)], "output_format": "text"}
 
 
 def test_deleted_scoped_file_survives_snapshot_validation_and_completion(repository, tmp_path):

@@ -1,4 +1,4 @@
-"""独立监督所属命令及跨 session 后代，保留原期限与持久撤销。"""
+"""独立监督所属命令及跨 session 后代，保留进程归属与持久撤销。"""
 from __future__ import annotations
 
 import json
@@ -40,8 +40,7 @@ def terminate_supervised_command_descendants(command_directory: Path) -> list[di
     return observations
 
 
-def supervise_registered_command(run_directory: Path, command_directory: Path, deadline_at: float | None,
-                                 inherited_descriptors: tuple[int, ...], command: list[str]) -> int:
+def supervise_registered_command(run_directory: Path, command_directory: Path, inherited_descriptors: tuple[int, ...], command: list[str]) -> int:
     process_group_id = os.getpgrp()
     if process_group_id != os.getpid():
         raise ValueError('独立监督者必须拥有自己的进程组')
@@ -51,7 +50,7 @@ def supervise_registered_command(run_directory: Path, command_directory: Path, d
         environment.get(REGISTERED_COMMAND_OWNERSHIP_ENVIRONMENT_KEY), execution_token)))
     supervision_file = command_directory / 'command-supervision.json'
     facts = {'status': 'starting', 'supervisor_pid': os.getpid(), 'process_group_id': process_group_id,
-             'deadline_at': deadline_at, 'argv': command, 'execution_token': execution_token}
+             'argv': command, 'execution_token': execution_token}
     write_json(supervision_file, facts)
     child = None
     owned = {}
@@ -64,7 +63,7 @@ def supervise_registered_command(run_directory: Path, command_directory: Path, d
             except (OSError, RuntimeError) as error:
                 owned.update(getattr(error, 'observed_owned_processes', {}))
                 facts['owned_processes'] = list(owned.values())
-                if attempt == 4 or deadline_at is not None and time.time() + 0.05 >= deadline_at:
+                if attempt == 4:
                     raise
                 time.sleep(0.05)
 
@@ -112,21 +111,17 @@ def supervise_registered_command(run_directory: Path, command_directory: Path, d
 
     signal.signal(signal.SIGTERM, request_termination)
     try:
-        # 启动前确认等价原生查询可用，查询失败不能耗尽角色时限。
+        # 启动前确认等价原生查询可用，查询失败保存恢复条件。
         observe_owned_processes()
         facts['supervisor_native_identity'] = native_process_identity(os.getpid())
         write_json(supervision_file, facts)
         with exclusive_lock(run_directory / 'execution-revocation.lock'):
             ensure_execution_not_revoked(run_directory)
-            if deadline_at is not None and time.time() >= deadline_at:
-                return 124
             child = subprocess.Popen(command, pass_fds=inherited_descriptors, env=environment)
         facts.update({'status': 'running', 'command_pid': child.pid})
         write_json(supervision_file, facts)
         while True:
             ensure_execution_not_revoked(run_directory)
-            if deadline_at is not None and time.time() >= deadline_at:
-                raise subprocess.TimeoutExpired(command, 0)
             returncode = child.poll()
             if not ownership_observation_deferred_until_command_exit or returncode is not None:
                 try:
@@ -145,8 +140,8 @@ def supervise_registered_command(run_directory: Path, command_directory: Path, d
                 facts.update({'status': 'completed', 'returncode': returncode})
                 write_json(supervision_file, facts)
                 return returncode
-            time.sleep(0.02 if deadline_at is None else min(0.02, max(0, deadline_at - time.time())))
-    except (ExecutionRevoked, subprocess.TimeoutExpired):
+            time.sleep(0.02)
+    except ExecutionRevoked:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         facts.update({'status': 'termination_requested', 'command_returncode': child.poll() if child else None})
         write_json(supervision_file, facts)
@@ -165,4 +160,4 @@ def supervise_registered_command(run_directory: Path, command_directory: Path, d
 
 if __name__ == '__main__':
     sys.exit(supervise_registered_command(Path(sys.argv[1]), Path(sys.argv[2]),
-        None if sys.argv[3] == 'None' else float(sys.argv[3]), tuple(json.loads(sys.argv[4])), json.loads(sys.argv[5])))
+        tuple(json.loads(sys.argv[3])), json.loads(sys.argv[4])))

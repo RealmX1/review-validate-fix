@@ -27,7 +27,7 @@ def test_clean_environment_detached_descendant_never_yields_premature_completion
     command = [sys.executable, '-B', '-c',
                f'import subprocess,sys; subprocess.Popen([sys.executable,"-B","-c",{child_code!r}],start_new_session=True,env={{}})']
     supervisor = subprocess.Popen([sys.executable, '-B', retained_command_supervisor.__file__, str(run),
-        str(command_directory), str(time.time() + 5), '[]', json.dumps(command)], start_new_session=True)
+        str(command_directory), '[]', json.dumps(command)], start_new_session=True)
     try:
         supervisor.wait(timeout=4)
         facts = read_json(command_directory / 'command-supervision.json')
@@ -68,14 +68,14 @@ def test_recollection_waits_for_prior_unproven_descendants(repository, tmp_path,
     monkeypatch.setattr(machine_evidence, 'execute_registered_commands', lambda *args, **kwargs: dispatched.append(args) or {'status': 'passed', 'commands': []})
     try:
         with pytest.raises(machine_evidence.WorkspacePreparationFailed) as pending:
-            machine_evidence.collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'], time.time() + 10)
+            machine_evidence.collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'])
         assert pending.value.recovery['trigger'] == 'previous_supervisor_and_descendants_exit_proven'
         assert dispatched == []
         assert read_json(collection / 'collection-intent.json')['collection_attempt_count'] == 1
         assert not (collection / 'attempt-002').exists()
         child.kill()
         child.wait()
-        result = machine_evidence.collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'], time.time() + 10)
+        result = machine_evidence.collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'])
         assert read_json(result)['status'] == 'passed'
         assert len(dispatched) == 1
     finally:

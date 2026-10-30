@@ -31,6 +31,5 @@
     "stream-json",
     "-p",
     "Reply with exactly: OK"
-  ],
-  "timeout_seconds": 900
+  ]
 }

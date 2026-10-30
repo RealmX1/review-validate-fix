@@ -13,19 +13,19 @@ RVF 的流程为：一次固定材料启动 → 两路独立 reviewer → 来源
 
 ### 临时 Codex 必选外部席
 
-2026-11-02 00:00 America/New_York（UTC 05:00）前，正式创建入口将总数最低提升为三，`run.json` 冻结 `reviewer_count` 和逐席 `reviewer_harness_constraints`。普通席的约束是 `non_codex_external_cli`，最后一席是 `codex_external_cli`；更大显式数量仍表示总数，其中一席固定 Codex。`--prepare-only` 与 Kanban 所属执行在同一入口冻结分配。 普通席仅接受直接可识别的 Claude、Cursor、Kimi、oh-my-pi 命令；Python、Node、shell 及无法识别的自定义包装器保留为配置缺失，不参与普通席或 fallback。首次派发时若该席没有可用配置，仍建立默认 1800 秒总时限，之后恢复配置沿用该截止时间。
+2026-11-02 00:00 America/New_York（UTC 05:00）前，正式创建入口将总数最低提升为三，`run.json` 冻结 `reviewer_count` 和逐席 `reviewer_harness_constraints`。普通席的约束是 `non_codex_external_cli`，最后一席是 `codex_external_cli`；更大显式数量仍表示总数，其中一席固定 Codex。`--prepare-only` 与 Kanban 所属执行在同一入口冻结分配。 普通席仅接受直接可识别的 Claude、Cursor、Kimi、oh-my-pi 命令；Python、Node、shell 及无法识别的自定义包装器保留为配置缺失，不参与普通席或 fallback。首次派发时若该席没有可用配置，保存等待条件；配置或 CLI 恢复后自动接续，不消耗墙钟预算。
 
-派发和全部 fallback 都先过滤本席允许的实际 CLI 命令，再沿用优先级、额度池偏好和独立进程规则。oh-my-pi 不因使用相同额度池而被排除。显式配置同样受约束；缺少 Codex 配置时追加已启用的默认外部 Codex 配置。Codex 席仅接受 `codex exec`，不会转给 internal subagent 或其他 harness，主会话为 Codex 也一样。缺 CLI 时保存逐席 `reviewer_configuration_recovery`，其余席继续；认证、额度、重试、原总时限与撤销沿用角色执行契约。环境或配置恢复后接续精确 run，已完成席不重复。
+派发和全部 fallback 都先过滤本席允许的实际 CLI 命令，再沿用优先级、额度池偏好和独立进程规则。oh-my-pi 不因使用相同额度池而被排除。显式配置同样受约束；缺少 Codex 配置时追加已启用的默认外部 Codex 配置。Codex 席仅接受 `codex exec`，不会转给 internal subagent 或其他 harness，主会话为 Codex 也一样。缺 CLI 时保存逐席 `reviewer_configuration_recovery`，其余席继续；认证、额度、故障重试与撤销沿用角色执行契约。环境或配置恢复后接续精确 run，已完成席不重复。
 
 所有已分配席完成后，`anonymous_findings` 合并全部报告，保留每份独有发现和重复问题的补充证据；不采用多数票。到期后新 run 使用 `any_external_cli`，恢复正常双路和 Codex 普通候选资格。接续只读创建时约束，不重新计算临时政策；既有分配不变。
 
-自动推进入口在 `review-task-snapshot` 同时接受 `--fix`、`--validation-commands`、`--preparation-commands`、`--machine-context-file`、`--machine-evidence-commands` 和 `--implementation-plan-file`。材料按摘要冻结到 `execution-plan.json`，后续只接续精确 run。默认最多三轮语义修复（包含首次 finding 修复），CLI 传输重试另计；预算与角色原总时限持久保存。完成 reviewer 的上下文与判断不共享，仅共享绑定完整树、cwd、命令、工具链和依赖身份的机器事实。依赖身份缺证时重新采集。
+自动推进入口在 `review-task-snapshot` 同时接受 `--fix`、`--validation-commands`、`--preparation-commands`、`--machine-context-file`、`--machine-evidence-commands` 和 `--implementation-plan-file`。材料按摘要冻结到 `execution-plan.json`，后续只接续精确 run。默认最多三轮语义修复（包含首次 finding 修复），CLI 传输重试另计；语义修复预算持久保存，角色运行不设总时限。完成 reviewer 的上下文与判断不共享，仅共享绑定完整树、cwd、命令、工具链和依赖身份的机器事实。依赖身份缺证时重新采集。
 
 `findings=[]` 的最终验证失败也会进入 validation repair；fixer request 包含原失败命令、日志和真实 `tested_commit`，补丁从该被测基线计算。隔离准备命令不能改写候选源码，其生成物不混入任务修复。安全的外部 HEAD 前移自动合并已评审任务补丁并重验；新的未评审 hunk 或不能安全合并的内容保留原件并形成具体处置。
 
 `business-result.json` 区分 `agent_review_ready`、`agent_judgment_required`、`machine_evidence_pending` 与 `cancelled`，退出码不授予业务资格。机器等待包含缺证、等价来源、证据路径、触发条件、恢复动作和有界次数。原生错误优先，文本兜底仅扫描失败进程的 stderr；正常正文的额度关键词不是额度错误。认证/额度同配置 300 秒后最多复核一次；新凭据或配置摘要允许恢复，不能无限重试。
 
-fixer 的 completed 表示发现的语义处置和必要的针对性验证完成；执行器应用补丁后仍须统一运行完整最终验证。只有决定处置所必需的具体机器事实无法在既有权限和等价来源下取得、且可由已登记命令补齐时，才使用 `completion_blocker: registered_machine_validation` 的 incomplete；尚未执行整套 final 本身不构成语义未完成。执行器在保留修复树上自动补验，保存完整树、cwd、准备环境及日志，再交回同一 fixer 独立收束，不把原始 incomplete 改成 completed。中断和环境恢复共享每个语义轮最多三次采集的预算；失败后按恢复证据变化或一次定时探测有界接续，环境变化也使既有通过证据失效。所有 attempt 原件保留，全部动作继续受原角色总时限和持久撤销约束；语义缺口不触发这一机器补证。
+fixer 的 completed 表示发现的语义处置和必要的针对性验证完成；执行器应用补丁后仍须统一运行完整最终验证。只有决定处置所必需的具体机器事实无法在既有权限和等价来源下取得、且可由已登记命令补齐时，才使用 `completion_blocker: registered_machine_validation` 的 incomplete；尚未执行整套 final 本身不构成语义未完成。执行器在保留修复树上自动补验，保存完整树、cwd、准备环境及日志，再交回同一 fixer 独立收束，不把原始 incomplete 改成 completed。中断和环境恢复共享每个语义轮最多三次采集的预算；失败后按恢复证据变化或一次定时探测有界接续，环境变化也使既有通过证据失效。所有 attempt 原件保留，全部动作继续受进程归属核验和持久撤销约束，没有角色总时限；语义缺口不触发这一机器补证。
 
 准备、机器补验和权威最终验证均由独立监督者等待所属后代。原生启动身份和继承的随机执行归属覆盖新 session 后代；`ps` 不可用时使用平台原生查询。短暂查询失败只作有界复核，持续缺证保存命令退出事实、后代退出未知与恢复条件，不能把未知写成通过或耗尽整个角色期限后冒充命令失败。
 
@@ -90,3 +90,13 @@ base-branch-sync 根据实际 Git 状态、任务授权和必要验证保全 WIP
 自动化覆盖固定基线与显式范围、背景 staged/unstaged/untracked WIP 保全、独立双审、单腿失败、异常格式、有界替代、重启接续、匿名合并修复、安全应用、真实红测、提交后登记中断、base 漂移及 GitHub 去重/关闭匹配/并发/断网/未知结果对账。
 
 角色说明以约 2,000 字符为设计目标，实际需求及 diff 不受长度门禁限制。需求、范围、diff、findings 各保存一份，prompt 引用必要材料；不要求重复阅读。部署和诊断说明按需读取。
+
+## Agent 运行、取消与观察
+
+所有内置 reviewer、标准自定义角色与 Validate-Fixer 均没有总墙钟上限。配置中的角色 `timeout_seconds`、角色截止文件、定时收束提示及其向准备命令、补验锁和独立监督者的传递已移除。CLI 模型解析和版本查询仍保留各自的操作超时；取消后的退出等待与信号升级也继续有界。
+
+角色的 `progress.json` 持久保存进程启动身份、最近观察、输出字节数和最近输出活动、等待原因及恢复条件。静默与运行较久只形成观察，不作为故障或终止依据。控制器恢复优先读取执行锁、原生正常结束事件与结果原件；活角色不重复派发，已完成席不重跑。机器缺证仍走等价原生进程与命令日志补验，失败保留未知和有界恢复条件。
+
+历史 `deadline-exhausted.json`、`role-deadline.json` 与失败 outcome 不改写；旧 `deadline_exhausted` 不再消耗新执行资格或把成功结果升级成人工处置。新 attempt 必须独立通过正常结束、结果结构和候选完整树核验。持久 Stop 优先于恢复，身份未知或 PID 已复用不能发送信号。
+
+进度原件属于辅助观察：读取、写入或输出 stat 暂时失败只降级观察，不改变角色 outcome，也不终止健康 CLI。相同证据下最多复核三次；输出活动、存储元数据/可用空间变化或进程退出触发补查。故障恢复条件另存 `progress-observation-recovery.json`，同时保留原生进程登记、stdout/stderr 和真实 outcome 作为等价来源；正常结果发布仍必须通过既有必要门禁。

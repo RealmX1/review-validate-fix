@@ -186,13 +186,90 @@ def revoke_execution(run_directory: Path, reason: str) -> dict:
     return evidence
 
 
-def wait_for_owned_process(process: subprocess.Popen, run_directory: Path, *, timeout: float | None = None) -> int:
+def persist_role_progress_observation(progress_file: Path, observation: dict) -> bool:
+    recovery_file = progress_file.with_name("progress-observation-recovery.json")
+    try:
+        try:
+            previous = read_json(progress_file) if progress_file.exists() else {}
+        except (OSError, ValueError):
+            previous = {}
+        if not isinstance(previous, dict):
+            previous = {}
+        write_json(progress_file, {**previous, **observation})
+    except (OSError, ValueError, TypeError) as error:
+        try:
+            write_json(recovery_file, {"status": "unknown", "error_type": type(error).__name__,
+                "waiting_reason": "progress_observation_storage_unavailable", "observed_at": time.time(),
+                "equivalent_sources": ["owned-processes.json", "stdout.txt", "stderr.txt", "outcome.json"],
+                "recovery_condition": "progress_storage_or_output_activity_changed_or_process_exited",
+                "maximum_unchanged_retries": 3})
+        except (OSError, ValueError, TypeError):
+            pass
+        return False
+    try:
+        if recovery_file.exists() and read_json(recovery_file).get("status") != "recovered":
+            write_json(recovery_file, {"status": "recovered", "observed_at": time.time()})
+    except (OSError, ValueError, TypeError):
+        pass
+    return True
+
+
+def progress_observation_recovery_identity(progress_file: Path) -> tuple:
+    observations = []
+    for path in (progress_file, progress_file.parent, progress_file.parent / "stdout.txt", progress_file.parent / "stderr.txt"):
+        try:
+            metadata = path.stat()
+            observations.append((metadata.st_dev, metadata.st_ino, metadata.st_mode,
+                None if path == progress_file.parent else (metadata.st_size, metadata.st_mtime_ns)))
+        except OSError as error:
+            observations.append(type(error).__name__)
+    try:
+        observations.append(os.statvfs(progress_file.parent).f_bavail)
+    except OSError as error:
+        observations.append(type(error).__name__)
+    return tuple(observations)
+
+
+def record_owned_process_wait_observation(progress_file: Path, process_pid: int) -> bool:
+    try:
+        streams = {name: (progress_file.parent / f"{name}.txt").stat()
+                   for name in ("stdout", "stderr") if (progress_file.parent / f"{name}.txt").exists()}
+        output_activity = [metadata.st_mtime for metadata in streams.values() if metadata.st_size]
+        return persist_role_progress_observation(progress_file, {"process_pid": process_pid, "last_observed_at": time.time(),
+            "last_output_activity_at": max(output_activity) if output_activity else None,
+            "output_bytes": {name: metadata.st_size for name, metadata in streams.items()},
+            "waiting_reason": "owned_process_running", "recovery_condition": "native_process_exit_or_persistent_stop"})
+    except OSError:
+        return persist_role_progress_observation(progress_file, {"process_pid": process_pid,
+            "last_observed_at": time.time(), "waiting_reason": "output_activity_observation_unavailable",
+            "recovery_condition": "output_activity_or_native_process_evidence_changed"})
+
+
+def wait_for_owned_process(process: subprocess.Popen, run_directory: Path, *, timeout: float | None = None,
+                           progress_file: Path | None = None) -> int:
     deadline = time.monotonic() + timeout if timeout is not None else None
+    next_observation = 0
+    observation_failures = 0
+    recovery_identity = None
     while True:
         ensure_execution_not_revoked(run_directory)
         observe_owned_process_group_descendants(run_directory, process.pid)
+        if progress_file is not None and time.monotonic() >= next_observation:
+            current_identity = progress_observation_recovery_identity(progress_file)
+            if current_identity != recovery_identity:
+                observation_failures = 0
+                recovery_identity = current_identity
+            if observation_failures < 3:
+                observed = record_owned_process_wait_observation(progress_file, process.pid)
+                observation_failures = 0 if observed else observation_failures + 1
+                # 写入本身改变 inode，比较写入后的证据以限制相同故障重试。
+                recovery_identity = progress_observation_recovery_identity(progress_file)
+            next_observation = time.monotonic() + 1
         try:
-            return process.wait(timeout=min(0.2, max(0.001, deadline - time.monotonic())) if deadline else 0.2)
+            returncode = process.wait(timeout=min(0.2, max(0.001, deadline - time.monotonic())) if deadline else 0.2)
+            if progress_file is not None:
+                record_owned_process_wait_observation(progress_file, process.pid)
+            return returncode
         except subprocess.TimeoutExpired:
             if deadline and time.monotonic() >= deadline:
                 raise
@@ -281,8 +358,6 @@ def publish_business_result(run_directory: Path, result: dict) -> dict:
     if execution_is_revoked(run_directory):
         disposition = "cancelled"
     elif (record.get("repair_budget_exhausted")
-          or any(read_json(path).get("recovery", {}).get("category") == "deadline_exhausted" for path in [
-              *run_directory.glob("*/attempt-*/outcome.json"), *run_directory.glob("*/deadline-exhausted.json")])
           or any(item.get("elevation_impact") in {"rollback", "broad_rewrite"} for item in closeout["elevations"])):
         disposition = "agent_judgment_required"
     elif result["status"] in {"ready_to_commit", "completed"}:
@@ -297,6 +372,7 @@ def publish_business_result(run_directory: Path, result: dict) -> dict:
         paths = [str(path.parent / "outcome.json") for path in attempts]
         paths.extend(str(path.parent / filename) for path in attempts for filename in
                      ("stdout.txt", "stderr.txt", "model-invocation.json", "progress.json"))
+        paths.extend(str(path) for path in run_directory.glob("*/progress.json"))
         machine_retry_times = []
         for intent in run_directory.glob("incomplete-fixer-machine-validation/round-*/collection-intent.json"):
             paths.extend([str(intent), str(intent.parent / "evidence.json")])

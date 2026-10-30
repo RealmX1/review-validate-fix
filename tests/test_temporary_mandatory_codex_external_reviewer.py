@@ -92,7 +92,7 @@ def codex_cli_substitute(tmp_path, *, failure=None, findings=None):
         + (f"print({failure!r},file=sys.stderr); sys.exit(1)\n" if failure else
            f"print(json.dumps({dict(status='completed', audit_summary='独立 Codex 外部执行', findings=findings or [])!r}))\n"))
     executable.chmod(0o700)
-    return {'command': [str(executable), 'exec', '-'], 'output_format': 'text', 'timeout_seconds': 40}
+    return {'command': [str(executable), 'exec', '-'], 'output_format': 'text'}
 
 
 def test_expired_prepared_run_keeps_codex_and_merges_every_report(repository, tmp_path, monkeypatch):
@@ -219,14 +219,14 @@ def test_default_ordinary_pool_preserves_oh_my_pi_and_quota_preference(tmp_path,
     assert [config['command'][0] for config in workflow.default_reviewer_configurations()] == ['codex', 'claude', 'omp']
 
 
-def test_missing_codex_deadline_survives_late_configuration(repository, tmp_path, monkeypatch):
+def test_missing_codex_recovers_after_old_runtime_threshold_without_repeating_completed_seats(repository, tmp_path, monkeypatch):
     run = create_via_cli(repository, tmp_path, monkeypatch)
     ordinary = fake_config(tmp_path)
     monkeypatch.setattr(workflow, 'default_reviewer_configurations', lambda **kwargs: [])
     assert workflow.resume_review(run, reviewer_configs=[ordinary, ordinary])['status'] == 'review_incomplete'
-    deadline = read_json(run / 'reviewer-3/role-deadline.json')
-    with monkeypatch.context() as clock:
-        clock.setattr(workflow, 'time', SimpleNamespace(time=lambda: deadline['deadline_at'] + 1))
-        assert workflow.resume_review(run, reviewer_configs=[ordinary, codex_cli_substitute(tmp_path)])['status'] == 'review_incomplete'
-    assert read_json(run / 'reviewer-3/role-deadline.json') == deadline
-    assert not list((run / 'reviewer-3').glob('attempt-*'))
+    assert not (run / 'reviewer-3/role-deadline.json').exists()
+    completed = {path: path.read_bytes() for path in run.glob('reviewer-*/attempt-*/outcome.json')}
+    write_json(run / 'reviewer-3/role-deadline.json', {'deadline_at': 1})
+    assert workflow.resume_review(run, reviewer_configs=[ordinary, codex_cli_substitute(tmp_path)])['status'] == 'ready_for_validation'
+    assert all(path.read_bytes() == original for path, original in completed.items())
+    assert len(list((run / 'reviewer-3').glob('attempt-*'))) == 1

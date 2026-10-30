@@ -24,24 +24,24 @@ def isolate_unavailable_host_process_queries(monkeypatch):
     monkeypatch.setattr(execution_lifecycle, 'observe_owned_process_group_descendants', lambda *args: None)
 
 
-def launch_supervisor(run, command, deadline):
+def launch_supervisor(run, command):
     run.mkdir()
     write_json(run / 'run.json', {})
     artifacts = run / 'registered-command-observations'
     artifacts.mkdir()
     process = subprocess.Popen([sys.executable, '-B', retained_command_supervisor.__file__, str(run), str(artifacts),
-        str(deadline), '[]', json.dumps(command)], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        '[]', json.dumps(command)], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return process, artifacts
 
 
 @pytest.mark.parametrize('revoke', [False, True])
-def test_detached_descendant_cannot_write_after_original_deadline_or_stop(tmp_path, revoke):
+def test_detached_descendant_cannot_write_after_explicit_signal_or_persistent_stop(tmp_path, revoke):
     run = tmp_path / 'detached-session-supervision'
     started = tmp_path / 'detached-process-started'
     side_effect = tmp_path / 'forbidden-late-side-effect'
     detached_code = f"from pathlib import Path; import os,time; Path({str(started)!r}).write_text(str(os.getpid())); time.sleep(1.3); Path({str(side_effect)!r}).touch()"
     command = [sys.executable, '-B', '-c', f'import subprocess,sys; subprocess.Popen([sys.executable,"-B","-c",{detached_code!r}],start_new_session=True)']
-    process, artifacts = launch_supervisor(run, command, time.time() + 0.8)
+    process, artifacts = launch_supervisor(run, command)
     try:
         limit = time.monotonic() + 0.7
         while not started.exists() and time.monotonic() < limit:
@@ -49,6 +49,8 @@ def test_detached_descendant_cannot_write_after_original_deadline_or_stop(tmp_pa
         assert started.exists()
         if revoke:
             write_json(run / 'execution-revocation.json', {'reason': '自动化 Stop 验证'})
+        else:
+            process.send_signal(signal.SIGTERM)
         process.wait(timeout=1.4)
         facts = read_json(artifacts / 'command-supervision.json')
         assert facts['status'] == 'termination_requested'
@@ -74,7 +76,7 @@ def test_ps_failure_uses_native_evidence_without_waiting_for_deadline(tmp_path, 
     ps.chmod(0o755)
     monkeypatch.setenv('PATH', str(executable_directory))
     run = tmp_path / 'native-query-fallback'
-    process, artifacts = launch_supervisor(run, [sys.executable, '-B', '-c', 'pass'], time.time() + 10)
+    process, artifacts = launch_supervisor(run, [sys.executable, '-B', '-c', 'pass'])
     process.wait(timeout=2)
     facts = read_json(artifacts / 'command-supervision.json')
     assert process.returncode == 0
@@ -94,7 +96,7 @@ def test_unavailable_native_query_retains_unknown_without_running_command(tmp_pa
         'from core.task_snapshot_review import retained_command_supervisor as s; '
         f'command={[sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).touch()"]!r}; '
         'patcher=patch.object(s,"owned_process_snapshot",side_effect=RuntimeError("原生查询不可用")); patcher.start(); '
-        f'raise SystemExit(s.supervise_registered_command(Path({str(run)!r}),Path({str(artifacts)!r}),{time.time()+10},(),command))'
+        f'raise SystemExit(s.supervise_registered_command(Path({str(run)!r}),Path({str(artifacts)!r}),(),command))'
     )
     process = subprocess.Popen([sys.executable, '-B', '-c', script], start_new_session=True)
     process.wait(timeout=2)
@@ -127,15 +129,14 @@ def test_failed_same_tree_validation_retries_when_environment_recovers(repositor
     record = create_snapshot(repository, base_ref='HEAD', scope_paths=['task.py'], requirements=b'bounded recovery',
         run_directory=run, execution_plan={'fix': True, 'validation_commands': [command]})
     record['semantic_repair_rounds_used'] = 1
-    deadline = time.time() + 15
     monkeypatch.setenv('RVF_TEST_SERVICE_AVAILABLE', 'no')
-    failed_path = collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'], deadline)
+    failed_path = collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'])
     failed = read_json(failed_path)
     failed_original = Path(failed['original']).read_bytes()
     assert failed['status'] == 'failed'
-    assert collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'], deadline) == failed_path
+    assert collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit']) == failed_path
     monkeypatch.setenv('RVF_TEST_SERVICE_AVAILABLE', 'yes')
-    recovered_path = collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'], deadline)
+    recovered_path = collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'])
     recovered = read_json(recovered_path)
     assert recovered_path != failed_path
     assert recovered['status'] == 'passed'
@@ -158,10 +159,9 @@ def test_workflow_resumes_original_fixer_after_same_tree_environment_recovery(re
     script.write_text(script.read_text().replace("status='incomplete' if mode=='always_machine' else 'completed'", "status='completed' if proof['status']=='passed' else 'incomplete'"))
     monkeypatch.setenv('RVF_TEST_SERVICE_AVAILABLE', 'no')
     assert resume_review(run, reviewer_configs=[reviewer, reviewer], fixer_config=fixer)['status'] == 'fix_incomplete'
-    original_deadline = read_json(run / 'fixer/role-deadline.json')
     monkeypatch.setenv('RVF_TEST_SERVICE_AVAILABLE', 'yes')
     assert resume_review(run)['status'] == 'ready_to_commit'
-    assert read_json(run / 'fixer/role-deadline.json') == original_deadline
+    assert not (run / 'fixer/role-deadline.json').exists()
     assert len(list(run.glob('reviewer-*/attempt-*/request.json'))) == 2
     assert len(list(run.glob('fixer/attempt-*/request.json'))) == 3
 
@@ -173,8 +173,7 @@ def test_service_recovery_without_environment_change_gets_one_scheduled_probe(re
     record = create_snapshot(repository, base_ref='HEAD', scope_paths=['task.py'], requirements=b'bounded service probe',
         run_directory=run, execution_plan={'fix': True, 'validation_commands': [command]})
     record['semantic_repair_rounds_used'] = 1
-    deadline = time.time() + 15
-    initial = collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'], deadline)
+    initial = collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'])
     initial_bytes = initial.read_bytes()
     intent_path = run / 'incomplete-fixer-machine-validation/round-001/collection-intent.json'
     intent = read_json(intent_path)
@@ -182,16 +181,16 @@ def test_service_recovery_without_environment_change_gets_one_scheduled_probe(re
     intent['retry_not_before'] = time.time() - 1
     write_json(intent_path, intent)
     service_available.touch()
-    recovered = collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'], deadline)
+    recovered = collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'])
     assert recovered != initial
     assert read_json(recovered)['status'] == 'passed'
     assert read_json(intent_path)['unchanged_recovery_probe_used'] is True
     assert initial.read_bytes() == initial_bytes
-    refreshed = collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'], deadline)
+    refreshed = collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'])
     assert refreshed != recovered
     assert read_json(refreshed)['status'] == 'passed'
     assert read_json(refreshed)['collection_attempt'] == 3
-    assert collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'], deadline) is None
+    assert collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit']) is None
 
 
 def test_passed_retained_validation_is_recollected_after_environment_changes(repository, tmp_path, monkeypatch):
@@ -200,13 +199,12 @@ def test_passed_retained_validation_is_recollected_after_environment_changes(rep
     record = create_snapshot(repository, base_ref='HEAD', scope_paths=['task.py'], requirements=b'fresh environment evidence',
         run_directory=run, execution_plan={'fix': True, 'validation_commands': [command]})
     record['semantic_repair_rounds_used'] = 1
-    deadline = time.time() + 15
     monkeypatch.setenv('RVF_TEST_REQUIRED_SERVICE', 'ready')
-    original = collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'], deadline)
+    original = collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'])
     original_bytes = original.read_bytes()
     assert read_json(original)['status'] == 'passed'
     monkeypatch.setenv('RVF_TEST_REQUIRED_SERVICE', 'unavailable')
-    current = collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'], deadline)
+    current = collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'])
     assert current != original
     assert read_json(current)['status'] == 'failed'
     assert original.read_bytes() == original_bytes
@@ -230,7 +228,7 @@ def test_transient_native_observation_recovers_before_command_dispatch(tmp_path)
         '    return {}\n'
         'with patch.object(supervisor,"owned_process_snapshot",side_effect=observe):\n'
         f'    raise SystemExit(supervisor.supervise_registered_command(Path({str(run)!r}),Path({str(artifacts)!r}),'
-        f'{time.time()+10},(),{[sys.executable, "-B", "-c", f"from pathlib import Path; Path({str(marker)!r}).touch()"]!r}))\n'
+        f'(),{[sys.executable, "-B", "-c", f"from pathlib import Path; Path({str(marker)!r}).touch()"]!r}))\n'
     )
     process = subprocess.Popen([sys.executable, '-B', '-c', script], start_new_session=True)
     process.wait(timeout=2)

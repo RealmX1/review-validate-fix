@@ -39,7 +39,7 @@ def test_stop_rediscovers_unrecorded_detached_child_after_supervisor_crash(tmp_p
     )
     command = [sys.executable, '-B', '-c', parent_code]
     supervisor = subprocess.Popen([sys.executable, '-B', retained_command_supervisor.__file__, str(run),
-        str(command_directory), str(time.time() + 20), '[]', json.dumps(command)], start_new_session=True)
+        str(command_directory), '[]', json.dumps(command)], start_new_session=True)
     facts = {}
     try:
         supervision_file = command_directory / 'command-supervision.json'
@@ -89,7 +89,7 @@ def test_persistent_observation_failure_has_cleanup_budget_independent_of_role_d
         ' return {}\n'
         'with patch.object(supervisor,"owned_process_snapshot",side_effect=observe):\n'
         f' supervisor.supervise_registered_command(Path({str(run)!r}),Path({str(command_directory)!r}),'
-        f'{time.time()+30},(),{[sys.executable, "-B", "-c", "pass"]!r})\n'
+        f'(),{[sys.executable, "-B", "-c", "pass"]!r})\n'
     )
     started_at = time.monotonic()
     supervisor = subprocess.Popen([sys.executable, '-B', '-c', script], start_new_session=True)
