@@ -55,6 +55,11 @@ def test_recollection_waits_for_prior_unproven_descendants(repository, tmp_path,
     command_directory.mkdir(parents=True)
     child = subprocess.Popen([sys.executable, '-B', '-c', 'import time; time.sleep(30)'], start_new_session=True)
     child_identity = observation.native_process_identity(child.pid)
+    # 本用例核验已登记子进程的门禁；真实 PID 和启动身份查询限定于本测试创建的子进程。
+    def observe_registered_test_child(*observation_arguments, **observation_options):
+        current_identity = observation.native_process_identity(child.pid)
+        return {child.pid: child_identity} if current_identity == child_identity else {}
+    monkeypatch.setattr(observation, 'owned_process_snapshot', observe_registered_test_child)
     write_json(run / 'registered-supervised-command-directories.json', {'command_directories': [str(command_directory)]})
     write_json(command_directory / 'command-supervision.json', {
         'execution_token': 'retained-execution', 'supervisor_pid': 99999999,

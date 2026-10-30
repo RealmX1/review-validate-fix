@@ -414,6 +414,42 @@ def publish_business_result(run_directory: Path, result: dict) -> dict:
                      ("stdout.txt", "stderr.txt", "model-invocation.json", "progress.json"))
         paths.extend(str(path) for path in run_directory.glob("*/progress.json"))
         machine_retry_times = []
+        eligibility_recovery_limits = [0] if result['status'] == 'review_incomplete' else []
+        pending_reviewer_directories = set()
+        pending_harness_constraints = set()
+        if result['status'] == 'review_incomplete':
+            from .workflow import _role_result
+            for index, constraint in enumerate(record.get('reviewer_harness_constraints',
+                    ['any_external_cli'] * record['reviewer_count'])):
+                role_directory = run_directory / f'reviewer-{index + 1}'
+                if _role_result(role_directory) is None:
+                    pending_reviewer_directories.add(role_directory)
+                    pending_harness_constraints.add(constraint)
+        eligibility_files = ([run_directory / 'reviewer-candidate-eligibility.json',
+                              *run_directory.glob('reviewer-*/reviewer-eligibility.json')]
+                             if result['status'] == 'review_incomplete' else
+                             [run_directory / 'fixer/reviewer-eligibility.json'] if result['status'] == 'fix_incomplete' else [])
+        for eligibility_file in eligibility_files:
+            if not eligibility_file.exists():
+                continue
+            paths.append(str(eligibility_file))
+            payload = read_json(eligibility_file)
+            for eligibility in payload.get('observations', [payload]):
+                paths.extend(eligibility.get('credential_evidence_paths', []))
+                paths.extend(eligibility.get('configuration_evidence_paths', []))
+                if eligibility.get('evidence_path'):
+                    paths.append(eligibility['evidence_path'])
+                if eligibility.get('account_status_evidence_path'):
+                    paths.append(eligibility['account_status_evidence_path'])
+                applicable_to_pending_role = (result['status'] != 'review_incomplete'
+                    or eligibility_file.parent in pending_reviewer_directories
+                    or eligibility_file.name == 'reviewer-candidate-eligibility.json'
+                        and pending_harness_constraints.intersection(eligibility.get('reviewer_harness_constraints', [])))
+                if applicable_to_pending_role and eligibility.get('can_dispatch') is False:
+                    recovery = eligibility.get('recovery', {})
+                    eligibility_recovery_limits.append(recovery.get('maximum_unchanged_retries', 0))
+                    if recovery.get('maximum_unchanged_retries', 0) > 0 and recovery.get('retry_not_before_epoch_ms'):
+                        machine_retry_times.append(recovery['retry_not_before_epoch_ms'])
         for intent in run_directory.glob("incomplete-fixer-machine-validation/round-*/collection-intent.json"):
             paths.extend([str(intent), str(intent.parent / "evidence.json")])
             collection = read_json(intent)
@@ -425,12 +461,19 @@ def publish_business_result(run_directory: Path, result: dict) -> dict:
         paths.extend(path for path in configurations if path)
         paths.extend(str(run_directory / filename) for filename in ("reviewer-configurations.json", "fixer-configuration.json", "context-response-originals-by-sha256"))
         latest_attempts = {path.parent.parent: path.parent for path in attempts}
-        failures = [read_json(attempt / "outcome.json") for attempt in latest_attempts.values() if (attempt / "outcome.json").exists()]
+        failures = [read_json(attempt / "outcome.json") for role_directory, attempt in latest_attempts.items()
+                    if (attempt / "outcome.json").exists()
+                    and (result['status'] != 'review_incomplete' or role_directory in pending_reviewer_directories)]
         retry_times = machine_retry_times + [item["retry_not_before"] * 1000 for item in failures if item.get("retry_not_before") and
-                       item.get("recovery", {}).get("category") in {"authentication", "usage_limit", "workspace_preparation"}]
+                       item.get("recovery", {}).get("category") == "workspace_preparation"]
+        if retry_times:
+            eligibility_recovery_limits.append(1)
         result["recovery"] = {**record.get("recovery", {"missing_evidence": result["status"],
             "equivalent_sources": ["role_native_output", "registered_configuration", "validation_command_logs"],
             "trigger": "evidence_or_configuration_changed", "action": "resume_same_run", "maximum_unchanged_retries": 1}),
+            **({'maximum_unchanged_retries': max(eligibility_recovery_limits)} if eligibility_recovery_limits else {}),
             "evidence_paths": sorted(set(paths)), **({"retry_not_before_epoch_ms": min(retry_times)} if retry_times else {})}
+        if result['status'] == 'review_incomplete' and not retry_times:
+            result['recovery'].pop('retry_not_before_epoch_ms', None)
     write_json(run_directory / "business-result.json", result)
     return result

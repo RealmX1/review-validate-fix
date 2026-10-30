@@ -24,6 +24,8 @@ RVF 顺利完成并经主 Agent 最终审阅后，默认自主精确暂存并 co
 
 `rvf analyze --run-dir <目录> --run-dir <另一目录>` 只读复盘原始状态、恢复依据和分项量测，缺失 usage 保持 unknown，不作为完成门禁。Cline Kanban 只提供通用任务、会话、所属命令执行及可靠结果交回。
 
+外审默认使用零推理资格检查；正式调用成功证据复用一小时，认证、封禁及额度故障跨 run 保存。未知状态允许有界正式尝试，明确不可用时其他席继续；恢复保留原时限及已完成结果。配置、证据范围与恢复契约见[账户资格门禁](docs/architecture/reviewer-account-eligibility.md)。
+
 开发验证：`bash scripts/check_skill_contracts.sh`。本机安装使用 [rvf-local-deploy](plugins/review-validate-fix/skills/rvf-local-deploy/SKILL.md)，只从已核对的 local main 构建独立 release，再通过宿主官方插件 CLI 安装。
 
 [流程与组件接口](docs/architecture/task-snapshot-review-workflow.md) · [Hook 受众契约](docs/architecture/stop-hook-output-audience-contract.md)
