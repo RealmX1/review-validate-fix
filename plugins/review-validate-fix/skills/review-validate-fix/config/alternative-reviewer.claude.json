@@ -17,5 +17,13 @@
   "output_format": "claude_stream_json",
   "env_unset": [
     "ANTHROPIC_API_KEY"
+  ],
+  "pre_run_health": true,
+  "credential_identity_source": "claude_secure_storage",
+  "health_command": [
+    "claude",
+    "auth",
+    "status",
+    "--json"
   ]
 }

@@ -28,7 +28,11 @@ def classify_role_failure(stdout: str, stderr: str, returncode: int, output_form
     # stderr 只有在进程失败时才可作为兜底，绝不扫描正常评审正文。
     error_text = json.dumps(native_errors, ensure_ascii=False) if native_errors else stderr
     lower = error_text.lower()
-    if any(word in lower for word in ("authentication", "failed to authenticate", "oauth session expired", "not logged in", "please run /login", "unauthorized", "invalid api key", "invalid_api_key", '"code": 401', "http 401", "login required", "has no credential configured")):
+    if any(word in lower for word in ('account banned', 'account has been banned', 'account is banned',
+                                      'account suspended', 'account has been suspended', 'account disabled', 'account has been disabled',
+                                      'account is disabled', 'organization has been disabled')):
+        category = 'account_banned'
+    elif any(word in lower for word in ("authentication", "failed to authenticate", "oauth session expired", "not logged in", "please run /login", "unauthorized", "invalid api key", "invalid_api_key", '"code": 401', "http 401", "login required", "has no credential configured")):
         category = "authentication"
     elif looks_like_usage_limit(error_text) or any(str(item.get("error", {}).get("code")) == "429" for item in native_errors if isinstance(item.get("error"), dict)):
         category = "usage_limit"
@@ -39,7 +43,7 @@ def classify_role_failure(stdout: str, stderr: str, returncode: int, output_form
     else:
         category = "transient"
     return {"category": category, "source": "native_error_event" if native_errors else "failed_process_stderr",
-            "native_errors": native_errors, "retry_not_before_seconds": 300 if category in {"authentication", "usage_limit"} else 0,
+            "native_errors": native_errors, "retry_not_before_seconds": 300 if category in {"authentication", 'account_banned', "usage_limit"} else 0,
             "maximum_same_configuration_retries": 1 if category in {"transient", "authentication", "usage_limit"} else 0}
 
 

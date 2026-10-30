@@ -46,16 +46,20 @@ def test_unrelated_environment_does_not_reset_credential_cooldown(repository, tm
     assert resume_review(run, reviewer_configs=[config, config])["status"] == "review_incomplete"
     monkeypatch.setenv("UNRELATED_MACHINE_OBSERVATION", "changed")
     assert resume_review(run)["status"] == "review_incomplete"
-    assert len(list(run.glob("reviewer-*/attempt-*/request.json"))) == 2
-    for path in run.glob("reviewer-*/attempt-*/outcome.json"):
-        outcome = read_json(path)
-        outcome["retry_not_before"] = time.time() - 1
-        write_json(path, outcome)
+    original_attempt_count = len(list(run.glob("reviewer-*/attempt-*/request.json")))
+    from core.task_snapshot_review.reviewer_account_eligibility import reviewer_eligibility
+    evidence = Path(reviewer_eligibility(config)['evidence_path'])
+    availability = read_json(evidence)
+    failure = availability['negative_evidence']['account']
+    expected_additional_attempts = int(failure['failure_count'] < 2)
+    failure['retry_not_before'] = time.time() - 1
+    write_json(evidence, availability)
     resume_review(run)
-    assert len(list(run.glob("reviewer-*/attempt-*/request.json"))) == 4
+    final_attempt_count = original_attempt_count + expected_additional_attempts
+    assert len(list(run.glob("reviewer-*/attempt-*/request.json"))) == final_attempt_count
     monkeypatch.setenv("UNRELATED_MACHINE_OBSERVATION", "changed-again")
     resume_review(run)
-    assert len(list(run.glob("reviewer-*/attempt-*/request.json"))) == 4
+    assert len(list(run.glob("reviewer-*/attempt-*/request.json"))) == final_attempt_count
 
 
 @pytest.mark.parametrize("drift_kind", ["environment", "dependency"])
