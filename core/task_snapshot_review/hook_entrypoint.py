@@ -41,10 +41,31 @@ def handle_hook(event: dict, *, event_name: str, host_adapter) -> dict | None:
     identity = repository_identity(repo)
     repo = Path(identity["repo"])
     task_id = os.environ.get('KANBAN_TASK_ID') or os.environ.get('CLINE_KANBAN_TASK_ID')
-    from .active_run_observation import workspace_matches_registered_run
-    if workspace_matches_registered_run(repo, task_id):
+    evidence = resolve_task_review_starting_point(repo, task_id)
+    if evidence.get('current_scope_reviewed'):
         return None
-    if git(repo, "status", "--porcelain", "--untracked-files=all"):
+    dirty = git(repo, 'status', '--porcelain', '--untracked-files=all')
+    if evidence['status'] == 'verified':
+        if evidence['completion_evidence_status'] == 'unknown':
+            print(f"RVF hook 完成覆盖诊断：{evidence.get('diagnostic', '等待补证')}", file=sys.stderr)
+            if not evidence.get('new_content_since_unproven_completion'):
+                return None
+        from .active_run_observation import workspace_matches_registered_run
+        if workspace_matches_registered_run(repo, task_id):
+            return None
+        if not dirty and evidence['committed_work_status'] != 'present':
+            return None
+        fingerprint = hashlib.sha256(json.dumps({
+            'binding': evidence['binding'], 'base_commit': evidence['base_commit'],
+            'scope_paths': evidence['scope_paths'], 'worktree_tree': evidence['observed_worktree_tree'],
+        }, sort_keys=True).encode()).hexdigest()
+    elif dirty:
+        from .active_run_observation import registered_task_run_directories, workspace_matches_registered_run
+        if any(read_json(path / 'run.json').get('status') == 'completed' for path in registered_task_run_directories(identity, task_id)):
+            print(f"RVF hook 完成关联诊断：{evidence.get('diagnostic', '等待补证')}", file=sys.stderr)
+            return None
+        if workspace_matches_registered_run(repo, task_id):
+            return None
         changes = git(repo, "diff", "--binary", "--full-index", "--no-ext-diff", "HEAD")
         untracked = git(repo, "ls-files", "--others", "--exclude-standard", "-z")
         for value in untracked.decode().split("\0"):
@@ -53,11 +74,7 @@ def handle_hook(event: dict, *, event_name: str, host_adapter) -> dict | None:
                 changes += value.encode() + b"\0" + (os.readlink(path).encode() if path.is_symlink() else path.read_bytes())
         fingerprint = hashlib.sha256(git(repo, 'rev-parse', 'HEAD') + changes).hexdigest()
     else:
-        evidence = resolve_task_review_starting_point(repo, task_id)
-        if evidence['status'] != 'verified' or evidence['committed_work_status'] != 'present' or evidence.get('current_scope_reviewed'):
-            return None
-        changes = git(repo, 'diff', '--binary', '--full-index', '--no-ext-diff', evidence['base_commit'], 'HEAD', '--', *evidence['scope_paths'])
-        fingerprint = hashlib.sha256(json.dumps(evidence['binding'], sort_keys=True).encode() + evidence['base_commit'].encode() + changes).hexdigest()
+        return None
     key = hashlib.sha256((identity['git_directory'] + '\0' + task_id).encode()).hexdigest()
     state = resolved_rvf_user_local_data_paths().runtime_state_root / "task-review-decisions" / f"{key}.json"
     with exclusive_lock(state.with_suffix(".lock")):

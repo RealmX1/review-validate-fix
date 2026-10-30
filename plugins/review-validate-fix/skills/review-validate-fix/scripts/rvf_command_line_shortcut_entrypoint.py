@@ -13,7 +13,7 @@ from pathlib import Path
 import _rvf_pyroot
 from core.rvf_user_local_data_paths import resolved_rvf_user_local_data_paths
 from core.task_snapshot_review.github_issue_observations import collect_report, flush_pending_reports, list_repository_issues, schedule_pending_issue_delivery
-from core.task_snapshot_review.persistent_artifacts import read_json, write_json
+from core.task_snapshot_review.persistent_artifacts import git_text, read_json, write_json
 from core.task_snapshot_review.task_snapshot import create_snapshot, reviewer_allocation_for_new_run
 from core.task_snapshot_review.workflow import resume_review, load_reviewer_configuration
 from core.task_snapshot_review.execution_lifecycle import revoke_execution, persist_execution_revocation
@@ -88,6 +88,7 @@ def main(argv=None) -> int:
     try:
         if arguments.command == "review-task-snapshot":
             evidence = None
+            review_task_id = arguments.base_from_kanban_task or os.environ.get('KANBAN_TASK_ID') or os.environ.get('CLINE_KANBAN_TASK_ID') or arguments.kanban_task_id
             if arguments.incremental_after_run and not arguments.base_from_kanban_task:
                 parser.error('--incremental-after-run 需要 --base-from-kanban-task')
             if arguments.base_from_kanban_task:
@@ -96,6 +97,15 @@ def main(argv=None) -> int:
                 if evidence['status'] != 'verified':
                     print(json.dumps(evidence, ensure_ascii=False))
                     return 2
+            else:
+                arguments.base_ref = git_text(arguments.repo, 'rev-parse', '--verify', '--end-of-options', f'{arguments.base_ref}^{{commit}}')
+                if review_task_id:
+                    try:
+                        resolved = resolve_task_review_starting_point(arguments.repo, review_task_id, scope_paths=arguments.scope)
+                        if resolved['status'] == 'verified' and resolved['base_commit'] == arguments.base_ref:
+                            evidence = resolved
+                    except (OSError, ValueError, RuntimeError) as error:
+                        print(f'RVF 入口关联补证诊断：{error}', file=sys.stderr)
             run = arguments.run_directory or root / "task-snapshot-reviews" / f"task-review-{uuid.uuid4().hex}"
             reviewer_count, reviewer_harness_constraints = reviewer_allocation_for_new_run(arguments.reviewer_count)
             record = create_snapshot(arguments.repo, base_ref=evidence['base_commit'] if evidence else arguments.base_ref, scope_paths=arguments.scope,
@@ -110,7 +120,7 @@ def main(argv=None) -> int:
                                          **({"machine_context": json.loads(arguments.machine_context_file.read_text())} if arguments.machine_context_file else {}),
                                          **({"implementation_plan": json.loads(arguments.implementation_plan_file.read_text())} if arguments.implementation_plan_file else {})})
             if evidence:
-                attach_task_review_run(arguments.repo, arguments.base_from_kanban_task, run)
+                attach_task_review_run(arguments.repo, review_task_id, run)
             result = {"status":record["status"],"run_directory":str(run.resolve()),"reviewer_count":record["reviewer_count"]}
             active_run_directory = run.resolve()
             reviewer_configs = [load_reviewer_configuration(path) for path in arguments.reviewer_config] if arguments.reviewer_config else None
