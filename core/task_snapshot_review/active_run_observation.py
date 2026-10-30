@@ -17,7 +17,7 @@ def _registry_path(identity: dict, task_id: str) -> Path:
 
 
 def register_exact_task_run(run_directory: Path, record: dict) -> None:
-    task_id = os.environ.get("KANBAN_TASK_ID") or os.environ.get("CLINE_KANBAN_TASK_ID")
+    task_id = record.get('starting_point_evidence', {}).get('binding', {}).get('task_id') or os.environ.get("KANBAN_TASK_ID") or os.environ.get("CLINE_KANBAN_TASK_ID")
     if not task_id:
         return
     registry = _registry_path(record, task_id)
@@ -28,13 +28,50 @@ def register_exact_task_run(run_directory: Path, record: dict) -> None:
                                   "run_directories": [*runs, str(run_directory)]})
 
 
-def workspace_matches_registered_run(repo: Path, task_id: str) -> bool:
-    identity = repository_identity(repo)
+def registered_task_run_directories(identity: dict, task_id: str) -> list[Path]:
     registry = _registry_path(identity, task_id)
     if not registry.exists():
-        return False
-    for run_path in read_json(registry).get("run_directories", []):
-        run = Path(run_path)
+        return []
+    registered = read_json(registry)
+    if registered.get('task_id') != task_id or registered.get('git_directory') != identity['git_directory']:
+        raise ValueError('精确 run 注册表与当前 task/worktree 不匹配')
+    paths = registered.get('run_directories')
+    if not isinstance(paths, list) or any(not isinstance(path, str) or not Path(path).is_absolute() for path in paths):
+        raise ValueError('精确 run 注册表路径损坏')
+    return [Path(path) for path in paths]
+
+
+def expected_run_worktree_tree(repo: Path, record: dict, artifacts: Path, *, head: str) -> str:
+    """先替换已审范围，再合入 HEAD，避免原始任务 WIP 与最终修复互相冲突。"""
+    candidate = record.get('validated_candidate_commit', record['candidate_commit'])
+    observation = record['original_worktree_observation_commit']
+    scope = record.get('effective_scope_paths', record['scope_paths'])
+    index = artifacts / f'hook-content-observation-{uuid.uuid4().hex}.index'
+    try:
+        environment = {'GIT_INDEX_FILE': str(index)}
+        git(repo, 'read-tree', observation, environment=environment)
+        overlay = git(repo, 'diff', '--binary', '--full-index', '--no-ext-diff', observation, candidate, '--', *scope)
+        if overlay:
+            git(repo, 'apply', '--cached', '-', input_bytes=overlay, environment=environment)
+        expected = git_text(repo, 'write-tree', environment=environment)
+        if head == record['original_head']:
+            return expected
+        # 固定合成提交时间，重复 hook 不产生内容相同的新 Git 对象。
+        expected_commit = git_text(repo, 'commit-tree', expected, '-p', record['original_head'],
+            input_bytes='RVF 完整工作树预期观察\n'.encode(), environment={
+                'GIT_AUTHOR_NAME': 'RVF Snapshot', 'GIT_AUTHOR_EMAIL': 'snapshot@rvf.local',
+                'GIT_COMMITTER_NAME': 'RVF Snapshot', 'GIT_COMMITTER_EMAIL': 'snapshot@rvf.local',
+                'GIT_AUTHOR_DATE': '@0 +0000', 'GIT_COMMITTER_DATE': '@0 +0000'})
+        return git_text(repo, 'merge-tree', '--write-tree', f"--merge-base={record['original_head']}",
+                        expected_commit, head).splitlines()[0]
+    finally:
+        index.unlink(missing_ok=True)
+        index.with_suffix('.index.lock').unlink(missing_ok=True)
+
+
+def workspace_matches_registered_run(repo: Path, task_id: str) -> bool:
+    identity = repository_identity(repo)
+    for run in registered_task_run_directories(identity, task_id):
         try:
             record = read_json(run / "run.json")
             if any(record.get(key) != value for key, value in identity.items()) or not record.get("original_worktree_observation_commit"):
@@ -52,25 +89,9 @@ def workspace_matches_registered_run(repo: Path, task_id: str) -> bool:
                     continue
                 if set(current_task.get("task_owned_commit_shas", [])) - set(record["starting_point_evidence"].get("task_owned_commit_shas", [])):
                     continue
-            merged = git_text(repo, "merge-tree", "--write-tree", f"--merge-base={record['original_head']}",
-                              record["original_worktree_observation_commit"], head).splitlines()[0]
-            candidate = record.get("validated_candidate_commit", record["candidate_commit"])
-            candidate_base = record.get("candidate_base_head", record["original_head"])
-            if candidate_base != head:
-                candidate = git_text(repo, "merge-tree", "--write-tree", f"--merge-base={candidate_base}", candidate, head).splitlines()[0]
-            scope = record.get("effective_scope_paths", record["scope_paths"])
-            index = run / f"hook-content-observation-{uuid.uuid4().hex}.index"
-            try:
-                environment = {"GIT_INDEX_FILE": str(index)}
-                git(repo, "read-tree", merged, environment=environment)
-                overlay = git(repo, "diff", "--binary", "--full-index", merged, candidate, "--", *scope)
-                if overlay:
-                    git(repo, "apply", "--cached", "-", input_bytes=overlay, environment=environment)
-                expected = git_text(repo, "write-tree", environment=environment)
-                if capture_worktree_tree(repo, ["."], run, head=head) == expected:
-                    return True
-            finally:
-                index.unlink(missing_ok=True)
+            expected = expected_run_worktree_tree(repo, record, run, head=head)
+            if capture_worktree_tree(repo, ['.'], run, head=head) == expected:
+                return True
         except (OSError, RuntimeError, ValueError, KeyError):
             continue
     return False
