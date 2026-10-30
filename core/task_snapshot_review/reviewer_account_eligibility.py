@@ -158,16 +158,44 @@ def _without_native_session_selectors(command: list[str]) -> list[str]:
     return remaining
 
 
-def _account_identity_command(command: list[str]) -> list[str]:
+def _normalized_model_identity_command(command: list[str]) -> list[str]:
     command = _without_native_session_selectors(command)
+    remaining = [command[0]]
+    model_selectors = []
+    positional_arguments = []
+    short_model_selector_supported = Path(command[0]).name in {'codex', 'kimi'}
+    index = 1
+    while index < len(command):
+        item = command[index]
+        if item == '--':
+            positional_arguments = command[index:]
+            break
+        if item == '--model' or item == '-m' and short_model_selector_supported:
+            model_selectors.extend(['--model', *command[index + 1:index + 2]])
+            index += 2
+            continue
+        if item.startswith('--model='):
+            model_selectors.extend(['--model', item.split('=', 1)[1]])
+        elif short_model_selector_supported and item.startswith('-m') and len(item) > 2:
+            model_selectors.extend(['--model', item[2:]])
+        else:
+            remaining.append(item)
+        index += 1
+    return [*remaining, *model_selectors, *positional_arguments]
+
+
+def _account_identity_command(command: list[str]) -> list[str]:
+    command = _normalized_model_identity_command(command)
     remaining = []
     index = 0
     while index < len(command):
-        if command[index] == '--model' or command[index] == '-m' and Path(command[0]).name in {'codex', 'kimi'}:
+        if command[index] == '--':
+            remaining.extend(command[index:])
+            break
+        if command[index] == '--model':
             index += 2
             continue
-        if not command[index].startswith('--model='):
-            remaining.append(command[index])
+        remaining.append(command[index])
         index += 1
     return remaining
 
@@ -221,7 +249,7 @@ def _identity(config: dict, environment: dict, resolved_command: list[str] | Non
         configuration_paths.append(str(cli.user_local_alternative_reviewer_config_override_path(config['label'])))
     return {'identity_sha256': account_sha256,
             'configuration_scope_sha256': _sha256([account_sha256, configuration]),
-            'model_scope_sha256': _sha256([account_sha256, _without_native_session_selectors(resolved_command or config['command'])]),
+            'model_scope_sha256': _sha256([account_sha256, _normalized_model_identity_command(resolved_command or config['command'])]),
             'declared_model_or_quota_pool_scope_sha256s': [_sha256([account_sha256, field, config[field]]) for field in (
                 'model_scope_identity', 'underlying_provider_account_quota_pool_identity') if config.get(field)],
             'evidence_path': str(root / f'{account_sha256}.json'),
@@ -439,7 +467,26 @@ def reviewer_eligibility(config: dict, *, environment: dict | None = None, cwd: 
         return {**result, 'status': 'unavailable', 'can_dispatch': False, 'reason': 'configuration_disabled'}
     if deadline_at is not None and deadline_at <= now:
         return {**result, 'status': 'unavailable', 'can_dispatch': False, 'reason': 'availability_observation_deadline_exhausted'}
+    pending_native_failure = False
     try:
+        if run_directory is not None:
+            for outcome_file in sorted(run_directory.glob('*/attempt-*/outcome.json')):
+                outcome = read_json(outcome_file)
+                category = outcome.get('recovery', {}).get('category')
+                if not outcome.get('availability_evidence_persistence_error') or category not in PERSISTENT_FAILURE_CATEGORIES:
+                    continue
+                pending_native_failure = True
+                native_identity = read_json(outcome_file.parent / 'reviewer-eligibility.json')
+                same_account = native_identity['identity_sha256'] == identity['identity_sha256']
+                same_quota_scope = (native_identity['model_scope_sha256'] == identity['model_scope_sha256']
+                    or set(native_identity['declared_model_or_quota_pool_scope_sha256s']).intersection(
+                        identity['declared_model_or_quota_pool_scope_sha256s']))
+                if same_account and (category in ACCOUNT_FAILURE_CATEGORIES or same_quota_scope):
+                    # 已有缓存可读不代表原生故障已落盘；先幂等补记，再计算当前资格。
+                    record_formal_invocation_result(native_identity,
+                        started_at=read_json(outcome_file.parent / 'model-invocation.json')['started_at'],
+                        failure_category=category, evidence_path=str(outcome_file))
+                pending_native_failure = False
         with _bounded_availability_lock(path.with_suffix('.lock'), deadline_at):
             record = _availability_record(path)
             before = json.dumps(record, sort_keys=True)
@@ -582,7 +629,11 @@ def reviewer_eligibility(config: dict, *, environment: dict | None = None, cwd: 
     except ExecutionRevoked:
         raise
     except OSError as error:
-        return {**result, 'reason': 'account_availability_storage_unknown', 'storage_error': type(error).__name__}
+        return {**result, 'reason': 'account_availability_storage_unknown', 'storage_error': type(error).__name__,
+                **({'status': 'unavailable', 'can_dispatch': False, 'reason': 'native_failure_evidence_persistence_pending',
+                    'configuration_evidence_paths': [*identity['configuration_evidence_paths'], str(path.parent)],
+                    'recovery': {'trigger': 'account_availability_storage_writable', 'action': 'resume_same_run',
+                                 'maximum_unchanged_retries': 0}} if pending_native_failure else {})}
 
 
 def record_formal_invocation_result(eligibility: dict, *, started_at: float, success: bool = False,

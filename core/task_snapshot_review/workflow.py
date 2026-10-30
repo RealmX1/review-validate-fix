@@ -70,7 +70,9 @@ def default_reviewer_configurations(*, harness_constraint: str = "any_external_c
             config['underlying_provider_account_quota_pool_identity'] = item.get('underlying_provider_account_quota_pool_identity')
             eligibility = reviewer_eligibility(config)
             if eligibility_observations is not None:
-                eligibility_observations.append(eligibility)
+                eligibility_observations.append({**eligibility, 'reviewer_harness_constraints': [constraint
+                    for constraint in ('any_external_cli', 'non_codex_external_cli', 'codex_external_cli')
+                    if reviewer_configuration_matches_harness_constraint(config, constraint)]})
             if not eligibility['can_dispatch']:
                 continue
             available.append((item.get("underlying_provider_account_quota_pool_identity"), config))
@@ -119,6 +121,34 @@ def configuration_digest(config: dict) -> str:
     executable = shutil.which(config["command"][0])
     executable_identity = hashlib.sha256(Path(executable).read_bytes()).hexdigest() if executable else None
     return hashlib.sha256(json.dumps({"configuration": persistent_configuration(config), "executable_sha256": executable_identity}, sort_keys=True).encode()).hexdigest()
+
+
+def _formal_model_selection_source_evidence(config: dict, environment: dict, workspace: Path, eligibility: dict) -> dict:
+    home = Path(environment.get('HOME') or Path.home())
+    configuration_paths = []
+    if config.get('reviewer_model_selection_source') == 'oh_my_pi_default_model_role':
+        configuration_root = home / environment.get('PI_CONFIG_DIR', '.omp')
+        profile = environment.get('OMP_PROFILE', environment.get('PI_PROFILE', ''))
+        agent_directory = (configuration_root / 'profiles' / profile / 'agent' if profile else
+            Path(environment.get('PI_CODING_AGENT_DIR') or configuration_root / 'agent'))
+        configuration_paths = [agent_directory / name for name in ('config.yml', 'config.yaml', '.env')]
+        # 项目内来源由精确 candidate_commit 约束；这里只散列可独立变化的用户配置。
+        configuration_paths.extend(Path(name) for name in environment.get('PI_CONFIG_FILES', '').split(os.pathsep)
+            if name and (Path(name).is_absolute() or name.startswith('~/')
+                         or not (workspace / name).resolve().is_relative_to(workspace.resolve())))
+    elif config.get('reviewer_model_selection_source') == 'kimi_latest_managed_stable_model':
+        configuration_paths = [Path(environment.get('KIMI_CODE_HOME') or home / '.kimi-code') / 'config.toml']
+    observations = {}
+    for path in configuration_paths:
+        if str(path).startswith('~/'):
+            path = home / str(path)[2:]
+        if not path.is_absolute():
+            path = workspace / path
+        try:
+            observations[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError as error:
+            observations[str(path)] = type(error).__name__
+    return {'identity_sha256': eligibility['identity_sha256'], 'native_configuration_evidence_sha256s': observations}
 
 
 def _role_attempt_status(attempt: Path) -> str | None:
@@ -198,12 +228,17 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
             continue
         if config.get('reviewer_model_selection_source'):
             from .harness_cli_adapters import resolve_formal_reviewer_model_command
+            model_selection_workspace = run_directory / 'formal-model-selection-candidate-workspaces' / candidate_commit
+            environment = reviewer_execution_environment(config)
+            source_evidence = _formal_model_selection_source_evidence(config, environment, model_selection_workspace, eligibility)
+            source_evidence_sha256 = hashlib.sha256(json.dumps(source_evidence, sort_keys=True).encode()).hexdigest()
             model_selection_observation_file = (role_directory / 'formal-model-selection-observations'
-                / f'{candidate_commit}-{configuration_digest(config)}.json')
+                / f'{candidate_commit}-{configuration_digest(config)}-{source_evidence_sha256}.json')
             model_selection_observation = (read_json(model_selection_observation_file)
                 if model_selection_observation_file.exists() else {
                     'consecutive_query_failure_count': 0,
                     'recheck_interval_seconds': FORMAL_MODEL_CATALOG_RECHECK_INTERVAL_SECONDS})
+            model_selection_observation['source_evidence'] = source_evidence
             model_selection_observation.setdefault('maximum_consecutive_query_failures',
                 FORMAL_MODEL_CATALOG_MAXIMUM_CONSECUTIVE_QUERY_FAILURES)
             previous_model_selection_eligibility = model_selection_observation.get('eligibility', {})
@@ -213,12 +248,11 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
                 eligibility_observations[-1] = previous_model_selection_eligibility
                 continue
             try:
-                model_selection_workspace = run_directory / 'formal-model-selection-candidate-workspaces' / candidate_commit
                 if not model_selection_workspace.exists():
                     model_selection_workspace.parent.mkdir(exist_ok=True)
                     git(Path(record['repo']), 'worktree', 'add', '--detach', str(model_selection_workspace), candidate_commit)
                 command = resolve_formal_reviewer_model_command(config, list(config['command']),
-                    env=reviewer_execution_environment(config), cwd=model_selection_workspace, timeout=30)
+                    env=environment, cwd=model_selection_workspace, timeout=30)
                 ensure_execution_not_revoked(run_directory)
                 eligibility = reviewer_eligibility(config, resolved_command=command, run_directory=run_directory)
                 chosen_formal_model_command = command
@@ -237,6 +271,9 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
                                  'maximum_unchanged_retries': int(retry_available),
                                  **({'retry_not_before_epoch_ms': retry_at * 1000} if retry_available else {})}}
                 model_selection_observation['retry_not_before'] = retry_at
+            eligibility['configuration_evidence_paths'] = sorted(set([
+                *eligibility.get('configuration_evidence_paths', []),
+                *source_evidence['native_configuration_evidence_sha256s'], str(model_selection_observation_file)]))
             model_selection_observation['eligibility'] = eligibility
             write_json(model_selection_observation_file, model_selection_observation)
             eligibility_observations[-1] = eligibility
@@ -248,11 +285,6 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
             and read_json(attempt / "request.json")["configuration_digest"] == identity]
         if any(outcome.get("recovery", {}).get("category") in {"configuration", "deterministic"}
                for _, outcome in matching_configuration_attempt_outcomes):
-            continue
-        if (eligibility.get('storage_error') or not Path(eligibility['evidence_path']).exists()) and any(outcome.get('availability_evidence_persistence_error')
-               and outcome.get('recovery', {}).get('category') in {'authentication', 'account_banned', 'usage_limit'}
-               for _, outcome in matching_configuration_attempt_outcomes):
-            # 共享存储暂不可写时仍以本 run 的原生失败为依据，不重复消耗模型请求。
             continue
         # 准备失败只在每次 controller 接续时复核一次，不占用模型传输重试预算。
         if any(outcome.get("recovery", {}).get("category") == "workspace_preparation"
