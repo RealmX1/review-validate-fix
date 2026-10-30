@@ -235,7 +235,7 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
             remaining_seconds = deadline_at - time.time()
             if remaining_seconds <= 0:
                 raise ValueError("准备环境后原角色总时限已经耗尽")
-            command, _ = cli.resolve_reviewer_model_commands(config, command, config.get("health_command"), env=environment, cwd=workspace, timeout=min(30, remaining_seconds))
+            command = cli.resolve_reviewer_model_command(config, command, env=environment, cwd=workspace, timeout=min(30, remaining_seconds))
             command = cli.normalise_reviewer_command_for_output_format(command, output_format=output_format)
             if config.get("run_directory_grant_flag"):
                 command = cli.ensure_run_directory_grant_argument(command, attempt_directory, grant_flag=config["run_directory_grant_flag"])

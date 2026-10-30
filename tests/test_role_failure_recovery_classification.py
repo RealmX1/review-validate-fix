@@ -1,5 +1,7 @@
 """只在可信原生错误或非零退出的 stderr 中分类故障。"""
-from core.task_snapshot_review.role_failure_recovery import classify_role_failure
+import json
+
+from core.task_snapshot_review.role_failure_recovery import classify_role_failure, native_invocation_facts
 
 
 def test_model_body_quota_words_are_not_availability_facts():
@@ -43,3 +45,26 @@ def test_supported_kimi_and_omp_terminal_errors_enter_usage_cooldown():
         failure = classify_role_failure(output, "", 0, format_name)
         assert failure["category"] == "usage_limit"
         assert failure["retry_not_before_seconds"] == 300
+
+
+def test_native_kimi_resume_event_preserves_session_identity_without_inventing_model():
+    output = '{"role":"meta","type":"session.resume_hint","session_id":"session-native-kimi","content":"kimi -r session-native-kimi"}'
+    assert native_invocation_facts(output) == {
+        "native_session_ids": ["session-native-kimi"], "actual_models": None, "native_usage": None,
+    }
+
+
+def test_native_kimi_invalid_model_is_configuration_failure_without_unchanged_retry():
+    stderr = 'error: failed to run prompt: Model "invalid-model" is not configured in config.toml.'
+    failure = classify_role_failure('', stderr, 1, 'kimi_stream_json')
+    assert failure['category'] == 'configuration'
+    assert failure['maximum_same_configuration_retries'] == 0
+    assert classify_role_failure(json.dumps({'role': 'assistant', 'content': stderr}), '', 0, 'kimi_stream_json') is None
+
+
+def test_native_kimi_missing_credentials_waits_for_bounded_credential_recheck():
+    stderr = 'error: failed to run prompt: provider managed:kimi-code has no credential configured'
+    failure = classify_role_failure('', stderr, 1, 'kimi_stream_json')
+    assert failure['category'] == 'authentication'
+    assert failure['maximum_same_configuration_retries'] == 1
+    assert failure['retry_not_before_seconds'] == 300
