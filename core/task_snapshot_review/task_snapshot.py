@@ -70,6 +70,7 @@ def capture_worktree_tree(repo: Path, scope_paths: list[str], artifacts: Path, *
 
 def create_snapshot(repo: Path, *, base_ref: str, scope_paths: list[str], requirements: bytes, run_directory: Path,
                     reviewer_count: int = 2, starting_point_evidence: dict | None = None,
+                    decision_fact_starting_point_evidence: dict | None = None,
                     execution_plan: dict | None = None, reviewer_harness_constraints: list[str] | None = None) -> dict:
     from .execution_lifecycle import normalized_execution_plan, runtime_environment_identity
     plan = normalized_execution_plan(execution_plan) if execution_plan is not None else None
@@ -146,14 +147,24 @@ def create_snapshot(repo: Path, *, base_ref: str, scope_paths: list[str], requir
         record["semantic_repair_rounds_used"] = 0
     if starting_point_evidence is not None:
         record['starting_point_evidence'] = json.loads(json.dumps(starting_point_evidence))
+    from .task_review_decision_facts import collect_task_review_decision_facts
+    fact_evidence = starting_point_evidence or decision_fact_starting_point_evidence
+    decision_facts = collect_task_review_decision_facts(repo,
+        task_id=(fact_evidence or {}).get('binding', {}).get('task_id')
+            or os.environ.get('KANBAN_TASK_ID') or os.environ.get('CLINE_KANBAN_TASK_ID'),
+        starting_point_evidence=fact_evidence, snapshot_record=record,
+        observed_worktree_tree=observed_worktree_tree)
+    write_json(run_directory / 'decision-facts.json', decision_facts)
+    record['decision_facts_sha256'] = hashlib.sha256((run_directory / 'decision-facts.json').read_bytes()).hexdigest()
     write_json(run_directory / "run.json", record)
     packet = (
         "# 固定任务评审输入\n\n"
         f"基线：`{baseline}`\n候选：`{candidate_commit}`\n\n"
         "任务范围：\n" + "\n".join(f"- `{path}`" for path in scope_paths) + "\n\n"
         "需求原文读取同目录 `requirements.md`，完整任务改动读取同目录 `task-changes.patch`。"
+        "共用决策事实读取同目录 `decision-facts.json`；它绑定本候选与原始完整工作树，不代替语义评审。"
         "当前目录是候选的独立工作树。超大文件、二进制及生成物可用 Git 的基线/候选对象按需读取，"
-        "不截断正式范围；需求与 diff 不在其他输入中重复内联。\n"
+        "不截断正式范围；需求与 diff 不在其他输入中重复内联。\n\n" + decision_facts['summary'] + '\n'
     )
     write_bytes(run_directory / "review-input.md", packet.encode())
     record["review_input_sha256"] = hashlib.sha256(packet.encode()).hexdigest()

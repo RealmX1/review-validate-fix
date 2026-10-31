@@ -348,6 +348,8 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
         "semantic_repair_round": record.get("semantic_repair_rounds_used") if role == "fixer" else None,
         "preparation_recovery_cycle": record.get("preparation_recovery_cycle"),
         "shared_machine_evidence": record.get("shared_machine_evidence"),
+        'decision_facts_file': str(run_directory / 'decision-facts.json'),
+        'decision_facts_sha256': record['decision_facts_sha256'],
         "shared_machine_evidence_recovery_sha256": record.get("shared_machine_evidence_recovery_sha256"),
         "incomplete_fixer_machine_validation_evidence": record.get("incomplete_fixer_machine_validation_evidence") if role == "fixer" else None,
         "context_response_sha256": record.get('context_response_sha256'),
@@ -369,6 +371,8 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
             inputs += f"机器验证失败（不属于 reviewer finding）：{run_directory / 'validation.json'}；当前基线为真实 tested_commit，读取失败命令与日志并修复，然后由执行器重新验证。\n"
     if record.get("execution_plan_sha256"):
         inputs += f"机器上下文与预登记命令：{run_directory / 'execution-plan.json'}。共享机器事实按需读取 {run_directory / 'machine-evidence'}，只适用于各证据声明的完整树和环境。\n"
+    inputs += (f"共用决策事实：{request['decision_facts_file']}，仅适用于原始候选 {record['candidate_commit']} "
+               "及各事实声明的范围；修复后的新候选须另行验证，语义判断仍由本角色完成。\n")
     if record.get('context_response_sha256'):
         inputs+=f"通用补证：{request['context_response_file']}；历次通用补证原件按需读取 {run_directory/'context-response-originals-by-sha256'}，不改变冻结需求与范围，不包含另一腿的结论。\n"
     prompt = template.strip() + "\n" + inputs + f"\n结果可写入 {result_file}，或在最终回复中只输出结果 JSON。\n"
@@ -700,6 +704,8 @@ def _resume_review_iteration(run_directory: Path, *, reviewer_configs: list[dict
         verified_context_response_original_path(run_directory, record.get('context_response_sha256'))
         if hashlib.sha256((run_directory / "review-input.md").read_bytes()).hexdigest() != record["review_input_sha256"]:
             raise ValueError("固定评审输入已改变；为新输入创建快照")
+        if hashlib.sha256((run_directory / 'decision-facts.json').read_bytes()).hexdigest() != record['decision_facts_sha256']:
+            raise ValueError('固定决策事实已改变；保留原 run 并为新输入创建快照')
         if hashlib.sha256((run_directory / "requirements.md").read_bytes()).hexdigest() != record["requirements_sha256"] or hashlib.sha256((run_directory / "task-changes.patch").read_bytes()).hexdigest() != record["patch_sha256"]:
             raise ValueError("固定评审输入已改变；保留原 run 并为新输入创建快照")
         configurations_file = run_directory / "reviewer-configurations.json"

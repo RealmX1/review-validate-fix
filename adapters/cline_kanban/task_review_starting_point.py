@@ -214,7 +214,7 @@ def _read_optional(path: Path) -> dict | None:
     return read_json(path) if path.exists() else None
 
 
-def _real_prompt_identity(event: dict) -> str | None:
+def real_user_prompt_observation_identity(event: dict) -> str | None:
     if not isinstance(event.get('prompt'), str) or not event['prompt'].strip():
         return None
     identity = {key: event.get(key) for key in ('prompt', 'turn_id', 'prompt_id', 'event_id', 'session_id')}
@@ -467,8 +467,42 @@ def _run_material_observation(run_directory: Path) -> dict:
     artifacts = {name: _artifact_observation(run_directory / f'{name}.json', parse_json=True)
                  for name in ('run', 'validation')}
     artifacts['frozen_patch'] = _artifact_observation(run_directory / 'task-changes.patch')
+    command_revocation = (artifacts['run'].get('value') or {}).get('command_execution_revocation_file')
+    try:
+        revoked = ((run_directory / 'execution-revocation.json').exists()
+                   or bool(command_revocation and isinstance(command_revocation, str) and Path(command_revocation).exists()))
+        revocation_status = ('revoked' if revoked else 'not_observed'
+                             if command_revocation is None or isinstance(command_revocation, str) else 'unknown')
+    except OSError:
+        revocation_status = 'unknown'
     return {'run': artifacts['run'].get('value'), 'validation': artifacts['validation'].get('value'),
-            'artifacts': artifacts}
+            'artifacts': artifacts, 'execution_revocation_status': revocation_status}
+
+
+def _decision_fact_sources(source: dict, registered_runs: dict) -> dict:
+    entry = source['entry'] or {}
+    return {
+        'task_card_title': source['cards'][0].get('title'),
+        'provenance_file': str(Path(source['directory']) / 'task-commit-integration-provenance.json'),
+        'workspace_snapshot': entry.get('lastWorkspaceGitSnapshot'),
+        'retained_committed_history': entry.get('retainedCommittedLineChangeHistory'),
+        'commit_statistics_by_sha': entry.get('committedLineChangeStatisticsByCommitSha', {}),
+        # 只传递扁平事实，避免将旧 run 的起点材料递归复制到后续 run。
+        'registered_runs': {path: {
+            'status': (observed['run'] or {}).get('status', 'unknown'),
+            'execution_revocation_status': observed['execution_revocation_status'],
+            'identity': {key: (observed['run'] or {}).get(key)
+                         for key in ('repo', 'git_directory', 'git_common_directory')},
+            'candidate_commit': (observed['run'] or {}).get('validated_candidate_commit',
+                                (observed['run'] or {}).get('candidate_commit')),
+            'completed_commit': (observed['run'] or {}).get('commit'),
+            'validation': observed['validation'],
+            'raw_material_paths': {name: str(Path(path) / filename) for name, filename in
+                                   (('run', 'run.json'), ('validation', 'validation.json'), ('frozen_patch', 'task-changes.patch'))},
+            'artifacts': {name: {key: value for key, value in artifact.items() if key != 'value'}
+                          for name, artifact in observed['artifacts'].items()},
+        } for path, observed in registered_runs.items()},
+    }
 
 
 def resolve_task_review_starting_point(repo: Path, task_id: str, *, scope_paths: list[str] | None = None,
@@ -478,7 +512,7 @@ def resolve_task_review_starting_point(repo: Path, task_id: str, *, scope_paths:
     repo = Path(identity['repo'])
     starting_path, resolution_path, lock = _storage_paths(identity, task_id)
     event = event or {}
-    prompt_identity = _real_prompt_identity(event)
+    prompt_identity = real_user_prompt_observation_identity(event)
     with exclusive_lock(lock):
         try:
             prior = _read_optional(resolution_path) or {}
@@ -498,6 +532,15 @@ def resolve_task_review_starting_point(repo: Path, task_id: str, *, scope_paths:
             # 缓存不能替代当前 project/common-dir 与目录实体身份门禁。
             binding, incarnation = _task_binding(repo, task_id, identity, sources, entries)
             result['binding'] = binding
+            result['observed_head'] = head
+            result['decision_fact_sources'] = _decision_fact_sources(sources[0], registered_runs)
+            base_ref_tip = None
+            if result['decision_fact_sources']['retained_committed_history']:
+                try:
+                    base_ref_tip = _commit(repo, binding['base_ref'])
+                except RuntimeError:
+                    pass
+            result['decision_fact_sources']['observed_base_ref_tip'] = base_ref_tip
             try:
                 starting = _read_optional(starting_path)
             except (ValueError, OSError) as error:
@@ -554,11 +597,13 @@ def resolve_task_review_starting_point(repo: Path, task_id: str, *, scope_paths:
                             references[name] = {'error': str(error)}
                     run_observation['snapshot_references'] = references
             worktree_tree = capture_worktree_tree(repo, ['.'], resolution_path.parent, head=head)
+            result['observed_worktree_tree'] = worktree_tree
             if _commit(repo, 'HEAD') != head:
                 raise ValueError('Stop 观察期间 HEAD 变化，等待下一次稳定观察')
             observation = {'sources': sources, 'head': head, 'reflog': entries, 'starting': starting,
                            'checkpoint': checkpoint, 'scope_paths': scope_paths, 'run': run_observation, 'binding': binding,
                            'registered_runs': registered_runs, 'worktree_tree': worktree_tree,
+                           'base_ref_tip': base_ref_tip,
                            'completed_run_association': _artifact_observation(_completed_run_association_path(binding, run_path)) if run_path else None,
                            'incremental_after_run': str(incremental_after_run.resolve()) if incremental_after_run else None,
                            'bound_task_id': os.environ.get('KANBAN_TASK_ID') or os.environ.get('CLINE_KANBAN_TASK_ID'),
@@ -649,6 +694,8 @@ def resolve_task_review_starting_point(repo: Path, task_id: str, *, scope_paths:
                           observed_worktree_tree=worktree_tree,
                           recorded_scope_paths=starting.get('scope_paths'), current_scope_reviewed=reviewed,
                           task_owned_commit_shas=owned, owned_changed_paths=owned_changed, committed_work_status=work_status)
+            result['history_task_owned_commit_shas'] = (owned if baseline == original else
+                _owned_commits(repo, original, head, discovery_incarnation, entries))
             if starting.get('fixed_run_directory'):
                 result['fixed_run_directory'] = starting['fixed_run_directory']
             if starting.get('retained_task_commit_identities'):

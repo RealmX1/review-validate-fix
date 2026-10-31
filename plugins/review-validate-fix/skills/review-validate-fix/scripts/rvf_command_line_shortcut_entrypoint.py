@@ -15,6 +15,7 @@ from core.rvf_user_local_data_paths import resolved_rvf_user_local_data_paths
 from core.task_snapshot_review.github_issue_observations import collect_report, flush_pending_reports, list_repository_issues, schedule_pending_issue_delivery
 from core.task_snapshot_review.persistent_artifacts import git_text, read_json, write_json
 from core.task_snapshot_review.task_snapshot import create_snapshot, reviewer_allocation_for_new_run
+from core.task_snapshot_review.task_review_decision_facts import collect_task_review_decision_facts
 from core.task_snapshot_review.workflow import resume_review, load_reviewer_configuration
 from core.task_snapshot_review.execution_lifecycle import revoke_execution, persist_execution_revocation
 from core.task_snapshot_review.trajectory_analysis import analyze_runs
@@ -88,6 +89,7 @@ def main(argv=None) -> int:
     try:
         if arguments.command == "review-task-snapshot":
             evidence = None
+            decision_fact_evidence = None
             review_task_id = arguments.base_from_kanban_task or os.environ.get('KANBAN_TASK_ID') or os.environ.get('CLINE_KANBAN_TASK_ID') or arguments.kanban_task_id
             if arguments.incremental_after_run and not arguments.base_from_kanban_task:
                 parser.error('--incremental-after-run 需要 --base-from-kanban-task')
@@ -95,6 +97,12 @@ def main(argv=None) -> int:
                 evidence = resolve_task_review_starting_point(arguments.repo, arguments.base_from_kanban_task,
                     scope_paths=arguments.scope, incremental_after_run=arguments.incremental_after_run)
                 if evidence['status'] != 'verified':
+                    try:
+                        facts = collect_task_review_decision_facts(Path(evidence['repo']), task_id=review_task_id,
+                                                                  starting_point_evidence=evidence)
+                        evidence.update(decision_facts_file=facts['artifact_path'], decision_facts_summary=facts['summary'])
+                    except (OSError, ValueError, RuntimeError) as error:
+                        print(f'RVF 入口事实采集诊断：{error}', file=sys.stderr)
                     print(json.dumps(evidence, ensure_ascii=False))
                     return 2
             else:
@@ -102,6 +110,7 @@ def main(argv=None) -> int:
                 if review_task_id:
                     try:
                         resolved = resolve_task_review_starting_point(arguments.repo, review_task_id, scope_paths=arguments.scope)
+                        decision_fact_evidence = resolved
                         if resolved['status'] == 'verified' and resolved['base_commit'] == arguments.base_ref:
                             evidence = resolved
                     except (OSError, ValueError, RuntimeError) as error:
@@ -112,6 +121,7 @@ def main(argv=None) -> int:
                                      requirements=arguments.requirements_file.read_bytes(), run_directory=run,
                                      reviewer_count=reviewer_count, reviewer_harness_constraints=reviewer_harness_constraints,
                                      starting_point_evidence=evidence,
+                                     decision_fact_starting_point_evidence=decision_fact_evidence,
                                      execution_plan={"fix": arguments.fix,
                                          "validation_commands": json.loads(arguments.validation_commands.read_text()) if arguments.validation_commands else [],
                                          "preparation_commands": json.loads(arguments.preparation_commands.read_text()) if arguments.preparation_commands else [],
@@ -137,6 +147,8 @@ def main(argv=None) -> int:
                     project_path=arguments.kanban_project_path, kanban_cli=arguments.kanban_cli, entrypoint=Path(__file__).resolve())
             elif not arguments.prepare_only:
                 result = resume_review(run, reviewer_configs=reviewer_configs, fixer_config=fixer_config)
+            result.update(decision_facts_file=str(run.resolve() / 'decision-facts.json'),
+                          decision_facts_summary=read_json(run / 'decision-facts.json')['summary'])
         elif arguments.command == 'record-kanban-task-review-start':
             result = record_task_review_start(arguments.repo, arguments.task_id,
                                               base_ref=arguments.base_ref, scope_paths=arguments.scope)

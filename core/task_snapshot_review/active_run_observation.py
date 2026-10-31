@@ -69,7 +69,7 @@ def expected_run_worktree_tree(repo: Path, record: dict, artifacts: Path, *, hea
         index.with_suffix('.index.lock').unlink(missing_ok=True)
 
 
-def workspace_matches_registered_run(repo: Path, task_id: str) -> bool:
+def workspace_matches_registered_run(repo: Path, task_id: str, *, starting_point_evidence: dict | None = None) -> bool:
     identity = repository_identity(repo)
     for run in registered_task_run_directories(identity, task_id):
         try:
@@ -81,16 +81,17 @@ def workspace_matches_registered_run(repo: Path, task_id: str) -> bool:
             revoked = execution_is_revoked(run)
             if record.get("status") == "completed" or (not revoked and not git(repo, "status", "--porcelain", "--untracked-files=all")):
                 continue
-            head = git_text(repo, "rev-parse", "HEAD")
+            head = (starting_point_evidence or {}).get('observed_head') or git_text(repo, "rev-parse", "HEAD")
             if head != record["original_head"] and record.get("starting_point_evidence"):
                 from adapters.cline_kanban.task_review_starting_point import resolve_task_review_starting_point
-                current_task = resolve_task_review_starting_point(repo, task_id)
+                current_task = starting_point_evidence or resolve_task_review_starting_point(repo, task_id)
                 if current_task.get("status") != "verified":
                     continue
                 if set(current_task.get("task_owned_commit_shas", [])) - set(record["starting_point_evidence"].get("task_owned_commit_shas", [])):
                     continue
             expected = expected_run_worktree_tree(repo, record, run, head=head)
-            if capture_worktree_tree(repo, ['.'], run, head=head) == expected:
+            observed_tree = (starting_point_evidence or {}).get('observed_worktree_tree')
+            if (observed_tree or capture_worktree_tree(repo, ['.'], run, head=head)) == expected:
                 return True
         except (OSError, RuntimeError, ValueError, KeyError):
             continue
