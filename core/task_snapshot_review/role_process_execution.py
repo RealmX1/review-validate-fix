@@ -137,6 +137,16 @@ def _validated_role_payload(request: dict, raw_output: str, redactions: dict) ->
             extracted_payload = None
         payload = artifact_payload if artifact_payload is not None else extracted_payload
     validate_role_result(payload, request["role"], request.get("findings", []))
+    if request["role"] == "fixer":
+        responses = payload.get("context_supplement_responses", [])
+        if not isinstance(responses, list) or any(not isinstance(item, dict)
+                or item.get("status") not in {"confirmed", "refuted", "not_applicable", "unresolved"}
+                or not isinstance(item.get("reason"), str) or not item["reason"].strip() for item in responses):
+            raise ValueError("主会话事实补充需要独立验真状态与依据")
+        identities = [item.get("supplement_id") for item in responses]
+        expected = {item["supplement_id"] for item in request.get("main_agent_context_supplements", [])}
+        if payload["status"] == "completed" and (len(identities) != len(set(identities)) or set(identities) != expected):
+            raise ValueError("Validate-Fixer 必须逐份回应全部已分配主会话事实补充")
     return cli.redact_configured_environment_variable_values_in_json_value(payload, redactions)
 
 

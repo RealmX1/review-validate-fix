@@ -107,11 +107,13 @@ def finish_owned_process_registration(run_directory: Path, pid: int, purpose: st
         write_json(path, {"processes": records})
 
 
-def persist_execution_revocation(run_directory: Path, reason: str) -> None:
+def persist_execution_revocation(run_directory: Path, reason: str, *, source: str = "execution_revocation_observation",
+                                 request_basis: str | None = None) -> None:
     with exclusive_lock(run_directory / "execution-revocation.lock"):
         path = run_directory / "execution-revocation.json"
         if not path.exists():
-            write_json(path, {"reason": reason, "revoked_at": time.time()})
+            write_json(path, {"reason": reason, "revoked_at": time.time(), "source": source,
+                              "scope": "exact_rvf_run", "request_basis": request_basis or reason})
 
 
 def register_supervised_command_directory(run_directory: Path, command_directory: Path) -> None:
@@ -126,8 +128,40 @@ def register_supervised_command_directory(run_directory: Path, command_directory
             write_json(registry, {'command_directories': [*directories, str(directory)]})
 
 
-def revoke_execution(run_directory: Path, reason: str) -> dict:
-    persist_execution_revocation(run_directory, reason)
+def withdraw_current_continuation_delivery(run_directory: Path) -> None:
+    """明确撤销后收回当前投递资格。历史修订目录与消费回执保持原样。"""
+    manifest_file = run_directory / "agent-continuation-notices.json"
+    if manifest_file.exists():
+        manifest = read_json(manifest_file)
+        if manifest.get("notices"):
+            write_json(manifest_file, {"notices": []})
+    business_file = run_directory / "business-result.json"
+    if business_file.exists():
+        result = read_json(business_file)
+        closeout = result.get("closeout")
+        changed = result.get("disposition") != "cancelled" or "agentContinuationNotice" in result or (
+            isinstance(closeout, dict) and closeout.get("automatic_commit_allowed") is not False)
+        if changed:
+            result["status"] = "cancelled"
+            result["disposition"] = "cancelled"
+            result.pop("agentContinuationNotice", None)
+            if isinstance(closeout, dict):
+                result["closeout"] = {**closeout, "automatic_commit_allowed": False}
+            write_json(business_file, result)
+    record_file = run_directory / "run.json"
+    if record_file.exists():
+        record = read_json(record_file)
+        if record.get("status") != "cancelled":
+            record["status"] = "cancelled"
+            write_json(record_file, record)
+
+
+def revoke_execution(run_directory: Path, reason: str, *, source: str = "execution_revocation_observation",
+                     request_basis: str | None = None) -> dict:
+    # 与结果发布共用补充锁，避免撤销落在最后一次检查和清单写回之间。
+    with exclusive_lock(run_directory / "main-agent-context-supplements.lock"):
+        persist_execution_revocation(run_directory, reason, source=source, request_basis=request_basis)
+        withdraw_current_continuation_delivery(run_directory)
     # 监督者已退出也不能丢弃跨 session 后代；原生启动身份重新核验后才发送信号。
     from .retained_command_supervisor import terminate_supervised_command_descendants
     supervised_descendants = []
@@ -393,10 +427,38 @@ def review_closeout(record: dict, run_directory: Path) -> dict:
 
 
 def publish_business_result(run_directory: Path, result: dict) -> dict:
+    from .main_agent_context_supplements import (
+        pending_main_agent_context_supplements, publish_context_supplements_pending,
+        MainAgentContextEvidenceUnavailable, reconcile_interrupted_context_registration_locked,
+    )
+    with exclusive_lock(run_directory / "main-agent-context-supplements.lock"):
+        reconcile_interrupted_context_registration_locked(run_directory)
+        try:
+            if not execution_is_revoked(run_directory) and pending_main_agent_context_supplements(run_directory):
+                if result["status"] in {"ready_to_commit", "completed", "context_supplements_pending"}:
+                    return publish_context_supplements_pending(run_directory)
+        except MainAgentContextEvidenceUnavailable as error:
+            record = read_json(run_directory / "run.json")
+            record.update({"status": "machine_evidence_pending", "recovery": {"missing_evidence": str(error),
+                "equivalent_sources": ["registered_supplement_identity", "sha256_bound_original"],
+                "trigger": "context_supplement_original_evidence_changed", "action": "resume_same_run", "maximum_unchanged_retries": 0}})
+            write_json(run_directory / "run.json", record)
+            result = {"status": "machine_evidence_pending", "run_directory": str(run_directory)}
+            manifest_file = run_directory / "agent-continuation-notices.json"
+            if manifest_file.exists():
+                write_json(manifest_file, {"notices": [n for n in read_json(manifest_file)["notices"] if n["stage"] != "final_agent_review"]})
+        return _publish_business_result_under_context_lock(run_directory, result)
+
+
+def _publish_business_result_under_context_lock(run_directory: Path, result: dict) -> dict:
     record = read_json(run_directory / "run.json")
     closeout = review_closeout(record, run_directory)
     if execution_is_revoked(run_directory):
         disposition = "cancelled"
+        result = {**result, "status": "cancelled"}
+        if record["status"] != "cancelled":
+            record["status"] = "cancelled"
+            write_json(run_directory / "run.json", record)
     elif (record.get("repair_budget_exhausted")
           or any(item.get("elevation_impact") in {"rollback", "broad_rewrite"} for item in closeout["elevations"])):
         disposition = "agent_judgment_required"
@@ -459,6 +521,8 @@ def publish_business_result(run_directory: Path, result: dict) -> dict:
         configurations = [read_json(path).get("config", {}).get("configuration_file_path") for path in attempts]
         paths.extend(str(Path(evidence).expanduser()) for path in attempts for evidence in read_json(path).get("config", {}).get("credential_evidence_paths", []))
         paths.extend(path for path in configurations if path)
+        paths.extend(str(path) for path in run_directory.glob("main-agent-context-originals-by-sha256/*.md"))
+        paths.extend(str(run_directory / name) for name in ("main-agent-context-supplements", "main-agent-context-originals-by-sha256", "reviewer-findings.json"))
         paths.extend(str(run_directory / filename) for filename in ("reviewer-configurations.json", "fixer-configuration.json", "context-response-originals-by-sha256"))
         latest_attempts = {path.parent.parent: path.parent for path in attempts}
         failures = [read_json(attempt / "outcome.json") for role_directory, attempt in latest_attempts.items()
@@ -475,5 +539,28 @@ def publish_business_result(run_directory: Path, result: dict) -> dict:
             "evidence_paths": sorted(set(paths)), **({"retry_not_before_epoch_ms": min(retry_times)} if retry_times else {})}
         if result['status'] == 'review_incomplete' and not retry_times:
             result['recovery'].pop('retry_not_before_epoch_ms', None)
+    if disposition in {"agent_review_ready", "agent_judgment_required"} and not execution_is_revoked(run_directory):
+        from .agent_review_summary_artifacts import publish_agent_review_summary
+        notice = publish_agent_review_summary(run_directory, record, result)
+        if notice and not execution_is_revoked(run_directory):
+            result["agentContinuationNotice"] = notice
+        else:
+            disposition = "cancelled"
+            result.pop("agentContinuationNotice", None)
+    if "agentContinuationNotice" not in result or disposition == "cancelled" or execution_is_revoked(run_directory):
+        result.pop("agentContinuationNotice", None)
+        if execution_is_revoked(run_directory):
+            disposition = "cancelled"
+        manifest_file = run_directory / "agent-continuation-notices.json"
+        if manifest_file.exists():
+            notices = read_json(manifest_file)["notices"]
+            write_json(manifest_file, {"notices": [] if disposition == "cancelled" else [n for n in notices if n["stage"] != "final_agent_review"]})
+    if disposition == "cancelled":
+        result = {**result, "status": "cancelled", "disposition": "cancelled"}
+        if isinstance(result.get("closeout"), dict):
+            result["closeout"] = {**result["closeout"], "automatic_commit_allowed": False}
+        if record.get("status") != "cancelled":
+            record["status"] = "cancelled"
+            write_json(run_directory / "run.json", record)
     write_json(run_directory / "business-result.json", result)
     return result

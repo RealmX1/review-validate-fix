@@ -15,6 +15,7 @@ from test_task_snapshot_review_workflow import ROOT, canary, fake_config, plain_
 from core.task_snapshot_review.persistent_artifacts import exclusive_lock, git, git_text, read_json, write_json
 from core.task_snapshot_review.task_snapshot import create_snapshot
 from core.task_snapshot_review.workflow import default_reviewer_configurations, resume_review
+from core.task_snapshot_review.execution_lifecycle import persist_execution_revocation
 
 
 def has_native_process_ownership_evidence_recovery_condition(workflow_resume_result):
@@ -159,9 +160,10 @@ def test_cancellation_during_initial_three_reviewer_dispatch_reaps_started_worke
     process = subprocess.Popen([sys.executable, str(driver)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
         assert process.stdout.readline().strip() == 'STARTUP_WINDOW'
+        persist_execution_revocation(run, '明确撤销初始派发中的 RVF')
         process.terminate()
         stdout, stderr = process.communicate(timeout=15)
-        assert process.returncode == 130, (stdout, stderr)
+        assert process.returncode == 0, (stdout, stderr)
     finally:
         if process.poll() is None:
             process.kill()

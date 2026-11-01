@@ -38,6 +38,7 @@ def test_failed_kanban_registration_reuses_frozen_binding_on_plain_resume(reposi
             signal.signal(number, handler)
     assert "managed_execution_started" in capsys.readouterr().out
     assert read_json(run / "kanban-command-execution-specification.json")["resumeCommandPreservesBusinessSingleFlight"] is True
+    assert read_json(run / "kanban-command-execution-specification.json")["producerExecutionRevocationFile"] == str(run / "execution-revocation.json")
     assert len(list((run / "kanban-command-execution-registration-attempts").glob("attempt-*.json"))) == 2
     assert not list(run.glob("reviewer-*/attempt-*"))
 
