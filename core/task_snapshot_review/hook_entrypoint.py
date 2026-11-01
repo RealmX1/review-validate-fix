@@ -13,7 +13,9 @@ from core.stop_hook_output_audience import (
     STOP_HOOK_OUTPUT_AUDIENCE_AGENT_MUST_ACT_NOW,
 )
 from .persistent_artifacts import exclusive_lock, git, read_json, repository_identity, write_json
-from .task_review_decision_facts import collect_task_review_decision_facts, decision_state_path
+from .task_review_decision_facts import (
+    collect_task_review_decision_facts, decision_state_path, unscoped_decision_directory,
+)
 from adapters.cline_kanban.task_review_starting_point import (
     real_user_prompt_observation_identity, resolve_task_review_starting_point,
 )
@@ -37,9 +39,11 @@ def handle_hook(event: dict, *, event_name: str, host_adapter) -> dict | None:
         explicit = bool(re.match(r"^\s*(?:\$|/|:)review-validate-fix(?:\s|$)", prompt))
         repo = Path(event.get('cwd') or os.getcwd())
         evidence, packet, recovery_event = None, None, None
+        if prompt.strip():
+            # 无任务 ID 时也要保留真实消息身份，否则 unknown 会一直被复用。
+            recovery_event = host_adapter.user_prompt_recovery_event(event, prompt)
         if task_id and prompt.strip():
             try:
-                recovery_event = host_adapter.user_prompt_recovery_event(event, prompt)
                 evidence = resolve_task_review_starting_point(repo, task_id, event=recovery_event)
                 if explicit or decision_state_path(evidence, task_id).with_suffix('').exists():
                     packet = _collect_decision_facts(Path(evidence['repo']), task_id, evidence, recovery_event=recovery_event)
@@ -47,6 +51,8 @@ def handle_hook(event: dict, *, event_name: str, host_adapter) -> dict | None:
                 # 当前用户的显式入口独立于机器补证；诊断只进入开发者 stderr。
                 print(f'RVF hook 补证诊断：{type(error).__name__}: {error}', file=sys.stderr)
         if not explicit:
+            if packet is None and recovery_event and not task_id and unscoped_decision_directory(repo):
+                _collect_decision_facts(repo, None, None, recovery_event=recovery_event)
             return None
         if packet is None:
             packet = _collect_decision_facts(repo, task_id, evidence, recovery_event=recovery_event)

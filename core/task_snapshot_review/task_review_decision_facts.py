@@ -79,25 +79,98 @@ def _inside_scope(path: str, scope_paths: list[str]) -> bool:
     return any(parent == '.' or path == parent or path.startswith(parent.rstrip('/') + '/') for parent in scope_paths)
 
 
+def _scoped_change(item: dict, *, additions: int, deletions: int) -> dict:
+    return {**item, 'additions': additions, 'deletions': deletions}
+
+
 def _workspace_statistics(run_git, head: str, tree: str, scopes: list[str], explicit_scope: bool) -> dict:
     if not head or not tree:
         raise ValueError('尚无完整 HEAD 与工作树内容观察')
     files = _parse_numstat(run_git('diff', '--numstat', '-z', '--find-renames', '--no-ext-diff',
                                   '--no-textconv', head, tree, '--'))
+    task_items, background_items = [], []
     for item in files:
         category = _file_purpose(item['path'])
         if item['previous_path'] and _file_purpose(item['previous_path']) == 'implementation_behavior':
             category = 'implementation_behavior'
         item['purpose_hint'] = category
-        item['in_task_scope'] = (_inside_scope(item['path'], scopes)
-            or bool(item['previous_path'] and _inside_scope(item['previous_path'], scopes))) if explicit_scope else None
+        if not explicit_scope:
+            item['in_task_scope'] = None
+            continue
+        current_inside = _inside_scope(item['path'], scopes)
+        previous_inside = _inside_scope(item['previous_path'], scopes) if item['previous_path'] else current_inside
+        if current_inside == previous_inside:
+            item['in_task_scope'] = current_inside
+            item['scope_boundary'] = 'inside' if current_inside else 'outside'
+            (task_items if current_inside else background_items).append(item)
+            continue
+        # 重命名跨过显式范围时，两端都要看见；不能把范围外的一端整笔记成任务内幅度。
+        item['in_task_scope'] = False
+        item['scope_boundary'] = 'crosses_explicit_scope'
+        task_items.append(_scoped_change(item, additions=item['additions'] if current_inside else 0,
+                                         deletions=item['deletions'] if previous_inside else 0))
+        background_items.append(_scoped_change(item, additions=item['additions'] if not current_inside else 0,
+                                              deletions=item['deletions'] if not previous_inside else 0))
     return {'basis': 'HEAD 到完整工作树的净内容差异；暂存与未暂存合并计一次，包含未跟踪文件',
             'classification_notice': '分组只提示用途，Agent 仍须核对语义；不推断 session/hunk 所有权',
             'total': _totals(files), 'files': files,
             'groups': {group: _totals([item for item in files if item['purpose_hint'] == group]) for group in GROUP_LABELS},
-            'task_scope': _totals([item for item in files if item['in_task_scope']]) if explicit_scope else None,
-            'background_wip': _totals([item for item in files if not item['in_task_scope']]) if explicit_scope else None,
+            'task_scope': _totals(task_items) if explicit_scope else None,
+            'background_wip': _totals(background_items) if explicit_scope else None,
             'background_partition_status': 'verified_paths' if explicit_scope else 'unknown_without_explicit_scope'}
+
+
+def _resume_commands(registered_runs: dict, *, binding_matches: bool) -> list[str]:
+    """注册表按创建顺序追加；短摘要只展示一条，因此最新未完成候选必须排在前面。"""
+    eligible = []
+    for index, (path, run) in enumerate(registered_runs.items()):
+        if not binding_matches or not isinstance(run, dict):
+            continue
+        status = run.get('status')
+        if not isinstance(status, str) or status in {'completed', 'unknown'}:
+            continue
+        if run.get('execution_revocation_status') != 'not_observed':
+            continue
+        created = run.get('created_at')
+        timestamp = created if isinstance(created, (int, float)) and not isinstance(created, bool) else None
+        eligible.append((timestamp is not None, timestamp or 0, index, path))
+    eligible.sort(reverse=True)
+    return [f'rvf resume-task-review --run-dir {shlex.quote(path)}' for *_, path in eligible]
+
+
+def _remember_unscoped_repository(repo: Path, directory: Path) -> None:
+    index_path = directory.parent / 'unscoped-repo-index.json'
+    try:
+        with exclusive_lock(index_path.with_suffix('.lock')):
+            current = read_json(index_path) if index_path.is_file() else {}
+            if not isinstance(current, dict):
+                current = {}
+            current[str(repo.resolve())] = str(directory)
+            write_json(index_path, current)
+    except (OSError, ValueError, RuntimeError):
+        return
+
+
+def unscoped_decision_directory(start: Path) -> Path | None:
+    """无任务 ID 的缓存只在曾经采集过的仓库上补验，避免每条用户消息都查询 Git。"""
+    index_path = resolved_rvf_user_local_data_paths().runtime_state_root / 'task-review-decisions' / 'unscoped-repo-index.json'
+    if not index_path.is_file():
+        return None
+    try:
+        index = read_json(index_path)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(index, dict):
+        return None
+    current = start.expanduser().resolve()
+    for _ in range(64):
+        found = index.get(str(current))
+        if isinstance(found, str) and Path(found).is_dir():
+            return Path(found)
+        if current.parent == current:
+            return None
+        current = current.parent
+    return None
 
 
 def _valid_commit_statistics(item: object, sha: str, *, require_merge_flag: bool = True) -> bool:
@@ -188,7 +261,12 @@ def collect_task_review_decision_facts(repo: Path, *, task_id: str | None,
     def run_git(*arguments):
         measurement['statistics_git_command_count'] += 1
         return git(repo, *arguments)
-    with exclusive_lock(directory / 'decision-facts.lock'):
+    try:
+        cache_lock = exclusive_lock(directory / 'decision-facts.lock')
+        cache_lock.__enter__()
+    except OSError:
+        cache_lock = None
+    try:
         observation_error = None
         try:
             head = head or git_text(repo, 'rev-parse', 'HEAD')
@@ -264,24 +342,41 @@ def collect_task_review_decision_facts(repo: Path, *, task_id: str | None,
             if (head != evidence.get('observed_head') or tree != evidence.get('observed_worktree_tree')
                     or evidence.get('completion_evidence_status') == 'unknown'):
                 raise ValueError('完成覆盖未知或当前候选内容已变化；保留原始材料，不推断通过')
+            reviewed = bool(evidence.get('current_scope_reviewed', False))
+            if snapshot:
+                snapshot_scopes = normalized_scope_paths(snapshot.get('scope_paths') or ['.'])
+                recorded_scopes = evidence.get('scope_paths')
+                candidate = snapshot.get('candidate_commit')
+                # 正式快照的覆盖必须绑定这次基线、范围和冻结候选，不能只因 HEAD 与旧工作树相同就继承。
+                scopes_differ = bool(recorded_scopes) and snapshot_scopes != normalized_scope_paths(recorded_scopes)
+                if snapshot.get('base_commit') != evidence.get('base_commit') or scopes_differ:
+                    reviewed = False
+                elif reviewed:
+                    if not candidate or not tree:
+                        raise ValueError('缺少冻结候选或完整观察，不能继承覆盖')
+                    difference = run_git('diff', '--name-only', '-z', '--no-ext-diff', '--no-textconv',
+                                         tree, candidate, '--', *snapshot_scopes)
+                    if any(token.strip() for token in difference.split(b'\0')):
+                        raise ValueError('冻结候选与完整观察不一致；旧覆盖不能套用到未审内容')
             return {'completion_evidence_status': evidence.get('completion_evidence_status'),
-                    'current_scope_reviewed': evidence.get('current_scope_reviewed', False),
+                    'current_scope_reviewed': reviewed,
                     'registered_runs': sources.get('registered_runs', {}),
                     'completed_run_association_path': evidence.get('completed_run_association_path')}
         fact('existing_review_evidence', [binding_matches, head, tree, evidence.get('observed_head'),
              evidence.get('observed_worktree_tree'), evidence.get('completion_evidence_status'),
-             evidence.get('current_scope_reviewed'), sources.get('registered_runs')],
+             evidence.get('current_scope_reviewed'), sources.get('registered_runs'),
+             snapshot.get('base_commit'), snapshot.get('candidate_commit'), snapshot.get('scope_paths'),
+             snapshot.get('changed_paths')],
              {'resolution_file': evidence.get('recovery_record_path'), 'exact_runs': sources.get('registered_runs', {})},
-             {'head': head, 'worktree_tree': tree, 'scope_paths': scopes}, existing_review_evidence)
+             {'head': head, 'worktree_tree': tree, 'scope_paths': scopes,
+              'candidate_commit': snapshot.get('candidate_commit'), 'base_commit': snapshot.get('base_commit') or base},
+             existing_review_evidence)
         baseline_arguments = (f'--base-from-kanban-task {shlex.quote(task_id)}'
                               if binding_matches and (not snapshot or base == evidence.get('base_commit')) else
                               f'--base-ref {shlex.quote(base)}' if base else '--base-ref <固定基线>')
         guidance = {'new_run_command': f'rvf review-task-snapshot --repo {shlex.quote(str(repo))} {baseline_arguments} '
             + ' '.join(f'--scope {shlex.quote(path)}' for path in scopes) + ' --requirements-file <持久需求文件>',
-            'resume_commands': [f'rvf resume-task-review --run-dir {shlex.quote(path)}'
-                for path, run in sources.get('registered_runs', {}).items()
-                if binding_matches and isinstance(run['status'], str) and run['status'] not in {'completed', 'unknown'}
-                and run['execution_revocation_status'] == 'not_observed'],
+            'resume_commands': _resume_commands(sources.get('registered_runs', {}), binding_matches=binding_matches),
             'reuse_rule': '优先读取精确材料；仅在内容变化、来源失效或语义判断需要时补查，不重复查询全量历史或 CLI 帮助'}
         fact('command_guidance', guidance, '当前插件 CLI 契约', {'task_id': task_id, 'scope_paths': scopes}, lambda: guidance)
         observation_id = _digest(observation)
@@ -294,10 +389,24 @@ def collect_task_review_decision_facts(repo: Path, *, task_id: str | None,
                   'measurement': {**measurement, 'cache_reused': False,
                                   'collection_elapsed_ms_before_persistence': (time.monotonic() - started) * 1000}}
         packet['summary'] = render_task_review_decision_summary(packet)
-        write_json(artifact, packet)
-        write_json(directory / 'decision-facts.json', {'artifact_path': str(artifact),
-            'sha256': hashlib.sha256(artifact.read_bytes()).hexdigest()})
+        if cache_lock is None:
+            packet['measurement']['decision_cache_persistence'] = 'unavailable'
+            packet['summary'] += '\n决策缓存不可写，本份事实仍随本次调用返回，不中断正式快照。'
+            return packet
+        try:
+            write_json(artifact, packet)
+            write_json(directory / 'decision-facts.json', {'artifact_path': str(artifact),
+                'sha256': hashlib.sha256(artifact.read_bytes()).hexdigest()})
+        except OSError:
+            packet['measurement']['decision_cache_persistence'] = 'unavailable'
+            packet['summary'] += '\n决策缓存不可写，本份事实仍随本次调用返回，不中断正式快照。'
+            return packet
+        if task_id is None:
+            _remember_unscoped_repository(Path(identity['repo']), directory)
         return packet
+    finally:
+        if cache_lock is not None:
+            cache_lock.__exit__(None, None, None)
 
 
 def render_task_review_decision_summary(packet: dict) -> str:
@@ -318,8 +427,14 @@ def render_task_review_decision_summary(packet: dict) -> str:
             return f"{total['file_count']} 文件 +{total['additions']}/-{total['deletions']}，二进制 {total['binary_file_count']}"
         lines.append('当前 Dirty（HEAD → 完整工作树净内容，含未跟踪）：' + counts(value['total']) + '。')
         lines.append('；'.join(f"{label}：{counts(value['groups'][group])}" for group, label in GROUP_LABELS.items()) + '。')
-        lines.append(('任务路径内：' + counts(value['task_scope']) + '；背景 WIP：' + counts(value['background_wip']) + '。')
-                     if value['background_wip'] is not None else '背景 WIP：unknown，未声明任务路径，需核对归属。')
+        if value['background_wip'] is None:
+            lines.append('背景 WIP：unknown，未声明任务路径，需核对归属。')
+        else:
+            scope_line = '任务路径内：' + counts(value['task_scope']) + '；背景 WIP：' + counts(value['background_wip']) + '。'
+            crossing = [item for item in value['files'] if item.get('scope_boundary') == 'crosses_explicit_scope']
+            if crossing:
+                scope_line += f'其中跨范围重命名 {len(crossing)} 个，两端分别计入；范围外的一端不是任务内幅度。'
+            lines.append(scope_line)
     else:
         lines.append('当前 Dirty：unknown，其他已证实事实仍有效。')
     review = facts['existing_review_evidence']
@@ -328,5 +443,9 @@ def render_task_review_decision_summary(packet: dict) -> str:
                  if review['status'] == 'verified' else '精确评审覆盖：unknown，不能解释为通过或不存在。')
     lines.append(f"持久详单：{packet['artifact_path']}。分组是用途提示，仍须判断实际行为与风险。")
     lines.append('启动提示：' + facts['command_guidance']['value']['new_run_command'])
-    lines.extend(facts['command_guidance']['value']['resume_commands'][:1])
+    resume_commands = facts['command_guidance']['value']['resume_commands']
+    if resume_commands:
+        lines.append(resume_commands[0])
+        if len(resume_commands) > 1:
+            lines.append(f'另有 {len(resume_commands) - 1} 个更早的未完成 run；短摘要只接续最新候选。')
     return '\n'.join(lines)

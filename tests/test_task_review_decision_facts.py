@@ -426,3 +426,149 @@ def test_collector_source_change_invalidates_facts_without_new_decision(kanban_t
     changed = collect(task)
     assert changed['observation_id'] != first['observation_id']
     assert changed['facts']['workspace_change_statistics']['observation_id'] != first['facts']['workspace_change_statistics']['observation_id']
+
+
+def test_cross_scope_rename_is_counted_on_both_sides():
+    from core.task_snapshot_review.task_review_decision_facts import (
+        _workspace_statistics, render_task_review_decision_summary)
+    head, tree = 'a' * 40, 'b' * 40
+    outbound = _workspace_statistics(lambda *_args, **_kwargs: b'1\t0\t\0src/app.py\0notes/app.py\0', head, tree, ['src'], True)
+    assert outbound['total']['file_count'] == 1
+    assert outbound['task_scope'] == {'file_count': 1, 'additions': 0, 'deletions': 0, 'binary_file_count': 0}
+    assert outbound['background_wip']['file_count'] == 1
+    assert outbound['background_wip']['additions'] == 1
+    assert outbound['files'][0]['scope_boundary'] == 'crosses_explicit_scope'
+    inbound = _workspace_statistics(lambda *_args, **_kwargs: b'1\t0\t\0notes/app.py\0src/app.py\0', head, tree, ['src'], True)
+    assert inbound['task_scope']['file_count'] == 1 and inbound['task_scope']['additions'] == 1
+    assert inbound['background_wip']['file_count'] == 1 and inbound['background_wip']['additions'] == 0
+    inside = _workspace_statistics(lambda *_args, **_kwargs: b'1\t0\t\0src/a.py\0src/b.py\0', head, tree, ['src'], True)
+    assert inside['task_scope']['file_count'] == 1 and inside['background_wip']['file_count'] == 0
+    summary = render_task_review_decision_summary({'artifact_path': 'detail.json',
+        'observation': {'task_id': 'task-1', 'head': head, 'base_commit': tree},
+        'facts': {'task_commit_history_statistics': {'status': 'unknown'},
+                  'workspace_change_statistics': {'status': 'verified', 'value': outbound},
+                  'existing_review_evidence': {'status': 'unknown'},
+                  'command_guidance': {'status': 'verified', 'value': {'new_run_command': 'rvf', 'resume_commands': []}}}})
+    assert '跨范围重命名 1 个' in summary
+    assert '背景 WIP：1 文件' in summary
+
+
+def test_short_summary_resumes_the_newest_unfinished_run(kanban_task, tmp_path):
+    task = kanban_task
+    repo = task['repo']
+    (repo / 'task.py').write_text('value = 2\n')
+    older = tmp_path / 'older-review'
+    create_snapshot(repo, base_ref=task['initial'], scope_paths=['task.py'], requirements='旧候选'.encode(),
+                    run_directory=older, starting_point_evidence=resolve(task, scope_paths=['task.py']))
+    (repo / 'task.py').write_text('value = 3\n')
+    newer = tmp_path / 'newer-review'
+    create_snapshot(repo, base_ref=task['initial'], scope_paths=['task.py'], requirements='新候选'.encode(),
+                    run_directory=newer, starting_point_evidence=resolve(task, scope_paths=['task.py']))
+    packet = collect(task)
+    commands = packet['facts']['command_guidance']['value']['resume_commands']
+    assert len(commands) == 2
+    assert str(newer.resolve()) in commands[0]
+    assert str(older.resolve()) in commands[1]
+    assert str(newer.resolve()) in packet['summary']
+    assert str(older.resolve()) not in packet['summary']
+    assert '最新候选' in packet['summary']
+
+
+def test_explicit_entry_without_task_id_revalidates_on_next_real_prompt(repository, monkeypatch):
+    monkeypatch.delenv('KANBAN_TASK_ID', raising=False)
+    monkeypatch.delenv('CLINE_KANBAN_TASK_ID', raising=False)
+    (repository / 'task.py').write_text('value = 2\n')
+    import core.task_snapshot_review.task_review_decision_facts as facts_module
+    ordinary_git = facts_module.git
+    attempts = []
+    def failed_statistics(repo, *arguments, **kwargs):
+        if '--numstat' in arguments:
+            attempts.append(arguments)
+            raise RuntimeError('隔离统计暂不可用')
+        return ordinary_git(repo, *arguments, **kwargs)
+    monkeypatch.setattr(facts_module, 'git', failed_statistics)
+    adapter = resolve_hook_host_adapter('codex')
+    first = handle_hook({'cwd': str(repository), 'prompt': '/review-validate-fix', 'turn_id': 'turn-1'},
+                        event_name='UserPromptSubmit', host_adapter=adapter)
+    assert first and '当前 Dirty：unknown' in json.dumps(first, ensure_ascii=False)
+    assert len(attempts) == 1
+    ordinary = handle_hook({'cwd': str(repository), 'prompt': '继续实现', 'turn_id': 'turn-2'},
+                           event_name='UserPromptSubmit', host_adapter=adapter)
+    assert ordinary is None
+    assert len(attempts) == 2
+    monkeypatch.setattr(facts_module, 'git', ordinary_git)
+    second = handle_hook({'cwd': str(repository), 'prompt': '/review-validate-fix', 'turn_id': 'turn-3'},
+                         event_name='UserPromptSubmit', host_adapter=adapter)
+    rendered = json.dumps(second, ensure_ascii=False)
+    assert '当前 Dirty：unknown' not in rendered
+    assert 'Dirty' in rendered
+
+
+def test_changed_candidate_does_not_inherit_previous_coverage(kanban_task, tmp_path, monkeypatch):
+    task = kanban_task
+    repo = task['repo']
+    (repo / 'task.py').write_text('value = 2\n')
+    evidence = resolve(task, scope_paths=['.'])
+    evidence['current_scope_reviewed'] = True
+    evidence['completion_evidence_status'] = 'verified'
+    import core.task_snapshot_review.task_snapshot as snapshot_module
+    original_capture = snapshot_module.capture_worktree_tree
+    def capture_then_change_once(*args, **kwargs):
+        tree = original_capture(*args, **kwargs)
+        if not getattr(capture_then_change_once, 'changed', False):
+            capture_then_change_once.changed = True
+            (repo / 'task.py').write_text('value = 999\n')
+        return tree
+    monkeypatch.setattr(snapshot_module, 'capture_worktree_tree', capture_then_change_once)
+    run = tmp_path / 'changed-candidate-run'
+    record = create_snapshot(repo, base_ref=task['initial'], scope_paths=['.'], requirements='新候选'.encode(),
+                             run_directory=run, starting_point_evidence=evidence)
+    packet = read_json(run / 'decision-facts.json')
+    assert git_text(repo, 'show', f"{record['candidate_commit']}:task.py") == 'value = 999'
+    assert git_text(repo, 'show', f"{record['original_worktree_observation_commit']}:task.py") == 'value = 999'
+    assert packet['facts']['existing_review_evidence']['status'] == 'unknown'
+    assert '当前范围已覆盖' not in packet['summary']
+    assert packet['facts']['workspace_change_statistics']['value']['total']['file_count'] >= 1
+
+
+def test_explicit_older_baseline_does_not_inherit_coverage(kanban_task, tmp_path):
+    task = kanban_task
+    repo = task['repo']
+    (repo / 'inherited.py').write_text('inherited_behavior = True\n')
+    git(repo, 'add', 'inherited.py')
+    git(repo, 'commit', '-qm', 'feat: 较新基线才包含的变化')
+    reviewed_base = git_text(repo, 'rev-parse', 'HEAD')
+    evidence = resolve(task, scope_paths=['.'])
+    assert evidence['status'] == 'verified'
+    evidence['base_commit'] = reviewed_base
+    evidence['current_scope_reviewed'] = True
+    evidence['completion_evidence_status'] = 'verified'
+    run = tmp_path / 'older-baseline-run'
+    record = create_snapshot(repo, base_ref=task['initial'], scope_paths=['.'], requirements='扩大显式基线'.encode(),
+                             run_directory=run, decision_fact_starting_point_evidence=evidence)
+    packet = read_json(run / 'decision-facts.json')
+    assert 'inherited.py' in record['changed_paths']
+    review = packet['facts']['existing_review_evidence']
+    assert review['status'] == 'verified'
+    assert review['value']['current_scope_reviewed'] is False
+    assert '当前范围已覆盖' not in packet['summary']
+
+
+def test_corrupt_decision_cache_does_not_abort_snapshot(kanban_task, tmp_path):
+    from core.task_snapshot_review.persistent_artifacts import repository_identity
+    from core.task_snapshot_review.task_review_decision_facts import decision_state_path
+    task = kanban_task
+    evidence = resolve(task, scope_paths=['task.py'])
+    cache = decision_state_path(repository_identity(task['repo']), 'task-1').with_suffix('')
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text('目录位置被普通文件占用')
+    (task['repo'] / 'task.py').write_text('value = 2\n')
+    run = tmp_path / 'cache-fault-run'
+    record = create_snapshot(task['repo'], base_ref=task['initial'], scope_paths=['task.py'],
+                             requirements='缓存故障仍要创建快照'.encode(), run_directory=run,
+                             starting_point_evidence=evidence)
+    assert record['status'] == 'review_pending'
+    assert (run / 'run.json').is_file()
+    dirty = read_json(run / 'decision-facts.json')['facts']['workspace_change_statistics']
+    assert dirty['status'] == 'verified'
+    assert dirty['value']['total']['file_count'] == 1

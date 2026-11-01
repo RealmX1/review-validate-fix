@@ -490,6 +490,7 @@ def _decision_fact_sources(source: dict, registered_runs: dict) -> dict:
         # 只传递扁平事实，避免将旧 run 的起点材料递归复制到后续 run。
         'registered_runs': {path: {
             'status': (observed['run'] or {}).get('status', 'unknown'),
+            'created_at': (observed['run'] or {}).get('created_at'),
             'execution_revocation_status': observed['execution_revocation_status'],
             'identity': {key: (observed['run'] or {}).get(key)
                          for key in ('repo', 'git_directory', 'git_common_directory')},
