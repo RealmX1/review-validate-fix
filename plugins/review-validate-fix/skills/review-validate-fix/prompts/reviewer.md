@@ -15,3 +15,5 @@
 ```
 
 无发现时 `findings: []`。仍有证据缺口时使用 `status: incomplete`，保留已有 findings 并附 `requests`；正常退出与结果内容共同决定完成状态。自然语言、工具输出及旧结果都不能代替本次实际完成的评审。
+
+缺少已登记命令的宿主机器事实时，在 `requests` 中使用结构化请求：`{"kind":"machine_evidence","binding":request.machine_evidence_request_binding,"registered_command_references":[{"command_collection":"validation_commands","command_index":0}]}`。`binding` 必须逐字段复制当前 request；`command_index` 为零基索引，集合仅可选 `machine_evidence_commands` 或 `validation_commands`。文本请求和额外 argv 不授予执行资格。宿主只补这些机器事实；读取 `request.reviewer_machine_evidence` 的完整树、环境、命令、日志与退出码后，独立接续本席审阅，保留原 incomplete 和发现。

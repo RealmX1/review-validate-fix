@@ -236,3 +236,24 @@ def publish_agent_review_summary(run_directory: Path, record: dict, result: dict
         write_json(manifest_file, {"notices": [item for item in notices if item.get("noticeId") != notice["noticeId"]]})
         return None
     return notice
+
+
+def publish_machine_evidence_wait_notices(run_directory: Path, record: dict, pending: list[dict]) -> None:
+    ensure_execution_not_revoked(run_directory)
+    manifest_file = run_directory / "agent-continuation-notices.json"
+    manifest = read_json(manifest_file) if manifest_file.exists() else {"notices": []}
+    notices = [notice for notice in manifest["notices"] if notice["stage"] != "machine_evidence_waiting"]
+    for item in pending:
+        if not item.get("requires_main_agent_handoff"):
+            continue
+        identity = item["missing_evidence_identity"]
+        summary = run_directory / "machine-evidence-waiting-handoffs" / identity / "recovery-summary.json"
+        write_json(summary, {"run_id": record["run_id"], **item,
+            "authorization": "继续本任务既有机器核验授权；不要求用户代替机器查证，不扩大执行权限"})
+        notice = {"noticeId": f"rvf-{record['run_id']}-machine-{identity}", "stage": "machine_evidence_waiting",
+            "text": f"【RVF 后台事件】机器补证仍在等待，自动补证当前缺少可执行来源或已达到本输入预算。\n"
+                f"主 Agent 按既有授权核对持久缺证与恢复条件：{summary}\n"
+                "该事件不表示评审完成；新机器证据到达后自动接续缺失席。Stop 与撤销继续有效。"}
+        notices.append(notice)
+    ensure_execution_not_revoked(run_directory)
+    write_json(manifest_file, {"notices": _without_consumed_notices(run_directory, notices)})

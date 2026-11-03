@@ -118,6 +118,10 @@ def test_revocation_and_real_patch_entry_are_serialized(repository, tmp_path, mo
     run = tmp_path / "patch-revocation"
     write_json(run / "run.json", {"status": "fix_pending"})
     (repository / "task.py").write_text("value = 2\n")
+    before_commit = workflow.git_text(repository, "rev-parse", "HEAD")
+    after_tree = workflow.capture_worktree_tree(repository, ["task.py"], run)
+    after_commit = workflow.git_text(repository, "commit-tree", after_tree, "-p", before_commit,
+        input_bytes="test: 冻结撤销互斥验收的真实修复树\n".encode())
     patch = git(repository, "diff", "--binary", "--full-index")
     git(repository, "checkout", "--", "task.py")
     attempt = run / "fixer/attempt-001"
@@ -143,9 +147,9 @@ def test_revocation_and_real_patch_entry_are_serialized(repository, tmp_path, mo
             assert not (run / "execution-revocation.json").exists()
         return actual_git(repo, *arguments, **kwargs)
     monkeypatch.setattr(workflow, "git", inspect_apply)
-    monkeypatch.setattr(workflow, "_snapshot_fixer_progress", lambda *_: {"before": "before", "after": "after", "paths": ["task.py"], "requires_changes": True})
-    monkeypatch.setattr(workflow, "_matches_tree", lambda _repo, commit, *_: commit == "before")
-    record = {"repo": str(repository), "original_head": workflow.git_text(repository, "rev-parse", "HEAD"), "scope_paths": ["task.py"]}
+    monkeypatch.setattr(workflow, "_snapshot_fixer_progress", lambda *_: {"before": before_commit, "after": after_commit, "paths": ["task.py"], "requires_changes": True})
+    monkeypatch.setattr(workflow, "_matches_tree", lambda _repo, commit, *_: commit == before_commit)
+    record = {"repo": str(repository), "original_head": before_commit, "candidate_commit": before_commit, "scope_paths": ["task.py"]}
     try:
         assert workflow._prepare_and_apply_fix(run, record, {"attempt_directory": str(attempt)})
         revocation_future.result(timeout=5)

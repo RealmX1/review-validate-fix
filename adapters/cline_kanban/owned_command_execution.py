@@ -29,6 +29,8 @@ def start_managed_review(run_directory: Path, task_id: str, *, project_path: Pat
     spec = {"command": [sys.executable, str(entrypoint), "resume-task-review", "--run-dir", str(run_directory)],
             "resumeCommand": [sys.executable, str(entrypoint), "resume-task-review", "--run-dir", str(run_directory)],
             "resumeCommandPreservesBusinessSingleFlight": True,
+            "readOnlyRecoveryEvidenceObservationCommand": [sys.executable, str(entrypoint), "observe-task-review-recovery-evidence", "--run-dir", str(run_directory)],
+            "recoveryEvidenceObservationMode": "semantic_observation_only",
             "ownerSessionInterruptPolicy": "preserve_execution",
             "continuationNoticesFile": str(run_directory / "agent-continuation-notices.json"),
             "producerExecutionRevocationFile": str(run_directory / "execution-revocation.json"),

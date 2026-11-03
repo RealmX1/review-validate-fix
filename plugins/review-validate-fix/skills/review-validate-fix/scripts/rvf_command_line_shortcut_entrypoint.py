@@ -69,6 +69,14 @@ def main(argv=None) -> int:
     resume.add_argument("--validation-commands", type=Path, help="最终验证 argv 数组列表 JSON")
     resume.add_argument('--context-response-file',type=Path,help='为缺失席补充通用机器证据，保持各路独立')
     resume.add_argument('--closeout-report', type=Path, help='主 Agent 最终审阅的计划实施、recap 与遗留事项 JSON')
+    observation = commands.add_parser("observe-task-review-recovery-evidence", help="只读返回精确 run 的实质恢复摘要，缺证保留 unknown")
+    observation.add_argument("--run-dir", type=Path, required=True)
+    machine_request = commands.add_parser("register-reviewer-machine-evidence-request", help="追加与原始缺证请求绑定的冻结命令引用，不改 reviewer 原件")
+    machine_request.add_argument("--run-dir", type=Path, required=True)
+    machine_request.add_argument("--source-role-result-file", type=Path, required=True)
+    machine_request.add_argument("--source-role-result-sha256", required=True)
+    machine_request.add_argument("--source-request-index", type=int, required=True)
+    machine_request.add_argument("--request-file", type=Path, required=True)
     supplement = commands.add_parser("submit-review-context", help="独立登记主会话事实补充，不等待后台 controller，也不重跑 reviewer")
     supplement.add_argument("--run-dir", type=Path, required=True)
     supplement.add_argument("--supplement-id", required=True)
@@ -162,6 +170,14 @@ def main(argv=None) -> int:
         elif arguments.command == 'record-kanban-task-review-start':
             result = record_task_review_start(arguments.repo, arguments.task_id,
                                               base_ref=arguments.base_ref, scope_paths=arguments.scope)
+        elif arguments.command == "observe-task-review-recovery-evidence":
+            from core.task_snapshot_review.review_recovery_evidence_observation import observe_task_review_recovery_evidence
+            result = observe_task_review_recovery_evidence(arguments.run_dir)
+        elif arguments.command == "register-reviewer-machine-evidence-request":
+            from core.task_snapshot_review.reviewer_machine_evidence_recovery import register_reviewer_machine_evidence_request
+            result = register_reviewer_machine_evidence_request(arguments.run_dir,
+                source_role_result_file=arguments.source_role_result_file, source_role_result_sha256=arguments.source_role_result_sha256,
+                source_request_index=arguments.source_request_index, request=read_json(arguments.request_file))
         elif arguments.command == "resume-task-review":
             active_run_directory = arguments.run_dir.expanduser().resolve()
             binding_file = active_run_directory / "kanban-command-execution-binding.json"

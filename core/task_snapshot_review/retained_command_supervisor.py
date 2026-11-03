@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import signal
@@ -203,6 +204,14 @@ def supervise_registered_command(run_directory: Path, command_directory: Path, i
             facts.update({'command_returncode': returncode, 'owned_processes': list(owned.values())})
             write_json(supervision_file, facts)
             if returncode is not None and not ownership_observation_deferred_until_command_exit and not owned:
+                execution_file = command_directory / "execution.json"
+                execution = read_json(execution_file) if execution_file.exists() else {}
+                if execution.get("source_tree_before"):
+                    from core.task_snapshot_review.task_snapshot import capture_worktree_tree
+                    facts["source_tree_after"] = capture_worktree_tree(Path.cwd(), ["."], command_directory,
+                        excluded_preparation_paths=execution.get("excluded_preparation_paths"))
+                facts.update({stream + "_sha256": hashlib.sha256((command_directory / (stream + ".txt")).read_bytes()).hexdigest()
+                    for stream in ("stdout", "stderr") if (command_directory / (stream + ".txt")).exists()})
                 facts.update({'status': 'completed', 'returncode': returncode, 'owned_process_exit_status': 'exited'})
                 write_json(supervision_file, facts)
                 return returncode

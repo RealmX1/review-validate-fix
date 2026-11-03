@@ -113,11 +113,74 @@ def ensure_previous_supervised_commands_exited(run_directory: Path, collection_d
             raise error
 
 
+def command_launch_was_not_started(execution: dict) -> bool:
+    return execution.get("status") == "launch_failed" and execution.get("execution_started") is False
+
+
+def unstarted_launch_retries_exhausted(directory: Path) -> bool:
+    """同一次尝试里，已证明未启动的派发最多三次。"""
+    return len(list((directory / "unstarted-launch-failures").glob("*.json"))) >= 2
+
+
+def archive_unstarted_command_launch(directory: Path) -> None:
+    execution_file = directory / "execution.json"
+    execution = read_json(execution_file)
+    if not command_launch_was_not_started(execution):
+        raise WorkspacePreparationFailed(execution_file)
+    archive = directory / "unstarted-launch-failures"
+    archive.mkdir(exist_ok=True)
+    write_json(archive / f"{len(list(archive.glob('*.json'))) + 1:03d}.json", execution)
+    execution_file.unlink()
+
+
+def unknown_registered_command_directory(run_directory: Path, argv: list[str]) -> Path | None:
+    """同一 run 内，结果尚未证明的命令不能因请求组合不同而再次派发。"""
+    registry_file = run_directory / "registered-supervised-command-directories.json"
+    if not registry_file.exists():
+        return None
+    for registered in read_json(registry_file)["command_directories"]:
+        directory = Path(registered)
+        execution_file = directory / "execution.json"
+        if not execution_file.is_file():
+            continue
+        try:
+            execution = read_json(execution_file)
+        except (OSError, ValueError):
+            continue
+        if execution.get("argv") != argv or command_launch_was_not_started(execution):
+            continue
+        supervision_file = directory / "command-supervision.json"
+        if not supervision_file.is_file():
+            return directory
+        try:
+            supervision = read_json(supervision_file)
+        except (OSError, ValueError):
+            return directory
+        if supervision.get("status") != "completed" or supervision.get("argv") != argv:
+            return directory
+    return None
+
+
+def _dispatched_registered_command_argvs(attempt: Path) -> list[list[str]]:
+    argvs = []
+    for pattern in ("commands/**/execution.json", "preparation/**/execution.json",
+                    "commands/**/unstarted-launch-failures/*.json", "preparation/**/unstarted-launch-failures/*.json"):
+        for path in attempt.glob(pattern):
+            try:
+                argv = read_json(path).get("argv")
+            except (OSError, ValueError):
+                continue
+            if isinstance(argv, list):
+                argvs.append(argv)
+    return argvs
+
+
 def execute_registered_commands(run_directory: Path, workspace: Path, commands: list[list[str]],
                                 artifacts: Path, purpose: str, *, environment: dict | None = None,
                                 inherited_lock_descriptors: tuple[int, ...] = (),
                                 excluded_preparation_paths: list[str] | None = None,
-                                expected_source_tree: str | None = None) -> dict:
+                                expected_source_tree: str | None = None,
+                                command_index_offset: int = 0) -> dict:
     plan = verified_execution_plan(run_directory)
     registered = [*plan.get("preparation_commands", []), *plan.get("machine_evidence_commands", []), *plan.get("validation_commands", [])]
     if plan and any(command not in registered for command in commands):
@@ -126,14 +189,20 @@ def execute_registered_commands(run_directory: Path, workspace: Path, commands: 
     for index, command in enumerate(commands):
         ensure_execution_not_revoked(run_directory)
         verified_execution_plan(run_directory)
-        command_directory = artifacts / f"command-{index + 1:03d}"
+        # 角色准备在各自隔离工作区并行执行；未知结果去重只约束共享和 reviewer 机器命令。
+        if purpose != "workspace_preparation":
+            unknown_directory = unknown_registered_command_directory(run_directory, command)
+            if unknown_directory is not None:
+                raise WorkspacePreparationFailed(unknown_directory / "execution.json")
+        command_directory = artifacts / f"command-{index + 1 + command_index_offset:03d}"
         command_directory.mkdir(parents=True, exist_ok=True)
         source_tree_before = (capture_worktree_tree(workspace, ["."], command_directory,
             excluded_preparation_paths=excluded_preparation_paths)
-            if purpose in {"shared_machine_evidence", "incomplete_fixer_machine_validation"} else None)
+            if purpose in {"shared_machine_evidence", "incomplete_fixer_machine_validation", "reviewer_requested_machine_evidence"} else None)
         record = {"argv": command, "cwd": str(workspace), "started_at": time.time(), "status": "running"}
         if source_tree_before is not None:
             record["source_tree_before"] = source_tree_before
+            record["excluded_preparation_paths"] = excluded_preparation_paths
             if expected_source_tree is not None and source_tree_before != expected_source_tree:
                 record.update({"status": "candidate_changed", "execution_started": False})
                 write_json(command_directory / "execution.json", record)
@@ -229,10 +298,129 @@ def prepare_isolated_workspace(run_directory: Path, workspace: Path, commands: l
         raise ValueError("准备命令修改了候选源码；不能把准备环境冒充被评审树")
 
 
+def prepare_or_reconcile_registered_machine_command_workspace(run_directory: Path, workspace: Path,
+        commands: list[list[str]], artifacts: Path, *, environment: dict,
+        inherited_lock_descriptors: tuple[int, ...]) -> dict | None:
+    if not commands:
+        return None
+    ensure_previous_supervised_commands_exited(run_directory, artifacts)
+    preparation_file = artifacts / "workspace-preparation.json"
+    if not preparation_file.exists():
+        executions = sorted(artifacts.glob("preparation/command-*/execution.json"))
+        if executions:
+            exclusions_file = artifacts / "preparation-created-untracked-paths.json"
+            if list(artifacts.glob("commands/**/execution.json")) and not exclusions_file.exists():
+                raise WorkspacePreparationFailed(exclusions_file)
+            completed = []
+            result = None
+            for index, execution_file in enumerate(executions):
+                execution = read_json(execution_file)
+                if command_launch_was_not_started(execution):
+                    if unstarted_launch_retries_exhausted(execution_file.parent):
+                        raise WorkspacePreparationFailed(execution_file)
+                    archive_unstarted_command_launch(execution_file.parent)
+                    remaining = execute_registered_commands(run_directory, workspace, commands[index:],
+                        artifacts / "preparation", "workspace_preparation", environment=environment,
+                        inherited_lock_descriptors=inherited_lock_descriptors, command_index_offset=index)
+                    result = {**remaining, "commands": [*completed, *remaining["commands"]]}
+                    break
+                native_file = execution_file.parent / "command-supervision.json"
+                native = read_json(native_file) if native_file.exists() else {}
+                if (index >= len(commands) or execution_file.parent.name != f"command-{index + 1:03d}"
+                        or native.get("status") != "completed" or native.get("argv") != commands[index]):
+                    raise WorkspacePreparationFailed(execution_file)
+                for stream in ("stdout", "stderr"):
+                    if native.get(stream + "_sha256") != hashlib.sha256((execution_file.parent / (stream + ".txt")).read_bytes()).hexdigest():
+                        raise WorkspacePreparationFailed(native_file)
+                completed.append({**execution, "returncode": native["returncode"],
+                    "status": "passed" if native["returncode"] == 0 else "failed"})
+                if native["returncode"]:
+                    break
+            if result is None:
+                result = {"status": "failed" if completed[-1]["returncode"] else "passed", "commands": completed}
+                if result["status"] == "passed" and len(completed) < len(commands):
+                    remaining = execute_registered_commands(run_directory, workspace, commands[len(completed):],
+                        artifacts / "preparation", "workspace_preparation", environment=environment,
+                        inherited_lock_descriptors=inherited_lock_descriptors, command_index_offset=len(completed))
+                    result = {**remaining, "commands": [*completed, *remaining["commands"]]}
+            write_json(artifacts / "workspace-preparation-reconciliation.json", result)
+            write_json(preparation_file, result)
+            if not exclusions_file.exists():
+                created = git(workspace, "ls-files", "--others", "--exclude-standard", "-z").decode().split("\0")
+                write_json(exclusions_file, {"paths": sorted(path for path in created if path)})
+        else:
+            try:
+                prepare_isolated_workspace(run_directory, workspace, commands, artifacts,
+                    environment=environment, inherited_lock_descriptors=inherited_lock_descriptors)
+            except WorkspacePreparationFailed:
+                if not preparation_file.exists():
+                    raise
+    result = read_json(preparation_file)
+    if ([command["argv"] for command in result["commands"]] != commands[:len(result["commands"])]
+            or result["status"] == "passed" and len(result["commands"]) != len(commands)):
+        raise WorkspacePreparationFailed(preparation_file)
+    if git(workspace, "diff", "HEAD", "--name-only"):
+        raise ValueError("准备命令修改了候选源码；不能把准备环境冒充被评审树")
+    return result
+
+
+def _reject_shared_command_log_mismatch(attempt: Path, cached: dict, commands: list[list[str]]) -> None:
+    for index, command in enumerate(cached.get("commands", [])):
+        directory = attempt / "commands" / f"command-{index + 1:03d}"
+        try:
+            mismatched = index >= len(commands) or command.get("argv") != commands[index] or any(
+                command.get(stream + "_sha256") != hashlib.sha256((directory / (stream + ".txt")).read_bytes()).hexdigest()
+                for stream in ("stdout", "stderr"))
+        except OSError:
+            raise WorkspacePreparationFailed(directory) from None
+        if mismatched:
+            raise WorkspacePreparationFailed(directory)
+
+
+def _shared_cached_pass_is_currently_qualified(attempt: Path, cached: dict, commands: list[list[str]], identity: dict) -> bool:
+    """复用共享通过前核对完整树、命令、环境、依赖证明、当前准备产物和日志，不改写原件。"""
+    if cached.get("status") != "passed":
+        return False
+    # 依赖内容未证明时，历史通过不能取得当前资格，预算耗尽后也不交回。
+    if not cached.get("dependency_identity_proven"):
+        return False
+    runtime = cached.get("runtime_environment")
+    if (cached.get("tested_tree") != identity["tested_tree"]
+            or runtime != cached.get("host_recovery_inputs_after") or runtime != identity["runtime_environment"]):
+        return False
+    recorded = cached.get("commands", [])
+    if [item.get("argv") for item in recorded] != commands:
+        return False
+    for index, command in enumerate(recorded):
+        if (command.get("status") != "passed" or command.get("returncode") != 0
+                or command.get("source_tree_before") != identity["tested_tree"]
+                or command.get("source_tree_after") != identity["tested_tree"]):
+            return False
+        dependencies = command.get("prepared_workspace_dependency_identity")
+        cwd = command.get("cwd")
+        if not isinstance(dependencies, dict) or not cwd:
+            return False
+        try:
+            observed = prepared_workspace_dependency_identity(Path(cwd), dependencies.get("preparation_created_paths"))
+        except (OSError, RuntimeError, ValueError):
+            return False
+        if observed != dependencies:
+            return False
+        directory = attempt / "commands" / f"command-{index + 1:03d}"
+        try:
+            if any(command.get(stream + "_sha256") != hashlib.sha256(
+                    (directory / (stream + ".txt")).read_bytes()).hexdigest() for stream in ("stdout", "stderr")):
+                return False
+        except OSError:
+            return False
+    return True
+
+
 def collect_shared_machine_evidence(run_directory: Path, record: dict, plan: dict) -> dict | None:
     commands = plan.get("machine_evidence_commands", [])
     if not commands:
         return None
+    from .review_recovery_evidence_observation import registered_host_recovery_inputs
     with exclusive_lock(run_directory / "machine-evidence.lock") as collection_lock:
         root = run_directory / "machine-evidence"
         root.mkdir(exist_ok=True)
@@ -242,26 +430,225 @@ def collect_shared_machine_evidence(run_directory: Path, record: dict, plan: dic
             executable = shutil.which(command[0])
             commands_identity.append({"argv": command, "executable": executable,
                 "executable_sha256": hashlib.sha256(Path(executable).read_bytes()).hexdigest() if executable else None})
+        environment = prepare_registered_machine_command_environment(run_directory)
         identity = {"tested_tree": git_text(Path(record["repo"]), "rev-parse", record["candidate_commit"] + "^{tree}"),
-                    "commands": commands_identity, "runtime_environment": runtime_environment_identity(),
+                    "commands": commands_identity, "runtime_environment": registered_host_recovery_inputs(run_directory, plan),
                     "machine_context": plan.get("machine_context"), "preparation_commands": plan.get("preparation_commands", [])}
         digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
         previous = sorted(root.glob("attempt-*"))
-        # 调用方声明的依赖标签不是安装内容证明；跨接续重新采集，同次执行内只采集一份事实。
-        proven_dependencies = False
+        for previous_attempt in previous:
+            if not (previous_attempt / "collection-intent.json").exists():
+                raise WorkspacePreparationFailed(previous_attempt)
+            if (previous_attempt / "evidence.json").exists():
+                continue
+            # 控制器退出不等于命令没执行；从监督原件重建结果，不能重新发出同一命令。
+            from .reviewer_machine_evidence_recovery import reconciled_registered_machine_command_from_native_supervision
+            original_intent = read_json(previous_attempt / "collection-intent.json")
+            original_identity = original_intent["identity"]
+            previous_workspace = previous_attempt / "workspace"
+            if not previous_workspace.exists():
+                if original_identity != identity:
+                    raise WorkspacePreparationFailed(previous_attempt)
+                with exclusive_lock(run_directory / "execution-revocation.lock"):
+                    ensure_execution_not_revoked(run_directory)
+                    git(Path(record["repo"]), "worktree", "add", "--detach", str(previous_workspace), record["candidate_commit"])
+            preparation = prepare_or_reconcile_registered_machine_command_workspace(run_directory,
+                previous_workspace, plan.get("preparation_commands", []), previous_attempt,
+                environment=environment, inherited_lock_descriptors=(collection_lock.fileno(),))
+            if preparation and preparation["status"] != "passed":
+                from .role_failure_recovery import classify_role_failure
+                failed = previous_attempt / "preparation" / f"command-{len(preparation['commands']):03d}"
+                failure = classify_role_failure("", (failed / "stderr.txt").read_text(errors="replace"), preparation["commands"][-1]["returncode"], "text")
+                recovered = {**original_identity, "status": "failed", "commands": [], "preparation": preparation,
+                    "identity_sha256": original_intent["identity_sha256"], "dependency_identity_proven": False,
+                    "failure": failure, "original": str(previous_attempt / "evidence.json")}
+                if failure["maximum_same_configuration_retries"]:
+                    recovered["retry_not_before_epoch_ms"] = (time.time() + failure["retry_not_before_seconds"]) * 1000
+                write_json(previous_attempt / "evidence.json", recovered)
+                continue
+            excluded_file = previous_attempt / "preparation-created-untracked-paths.json"
+            excluded = read_json(excluded_file)["paths"] if excluded_file.exists() else None
+            recovered_commands = []
+            recovered_status = "passed"
+            for index, argv in enumerate(commands):
+                command_directory = previous_attempt / "commands" / f"command-{index + 1:03d}"
+                if (command_directory / "execution.json").exists():
+                    execution = read_json(command_directory / "execution.json")
+                    if command_launch_was_not_started(execution):
+                        if unstarted_launch_retries_exhausted(command_directory):
+                            raise WorkspacePreparationFailed(command_directory / "execution.json")
+                        archive_unstarted_command_launch(command_directory)
+                        if not previous_workspace.exists():
+                            git(Path(record["repo"]), "worktree", "add", "--detach", str(previous_workspace), record["candidate_commit"])
+                        remainder = execute_registered_commands(run_directory, previous_workspace, commands[index:],
+                            previous_attempt / "commands", "shared_machine_evidence", environment=environment,
+                            inherited_lock_descriptors=(collection_lock.fileno(),), excluded_preparation_paths=excluded,
+                            expected_source_tree=original_identity["tested_tree"], command_index_offset=index)
+                        recovered_commands.extend(remainder["commands"])
+                        recovered_status = remainder["status"]
+                        break
+                    recovered_command = reconciled_registered_machine_command_from_native_supervision(command_directory, argv, original_identity["tested_tree"])
+                    recovered_commands.append(recovered_command)
+                    if recovered_command["status"] != "passed":
+                        recovered_status = recovered_command["status"]
+                        break
+                else:
+                    if original_identity != identity:
+                        recovered_status = "environment_changed"
+                        break
+                    if not previous_workspace.exists():
+                        git(Path(record["repo"]), "worktree", "add", "--detach", str(previous_workspace), record["candidate_commit"])
+                    remainder = execute_registered_commands(run_directory, previous_workspace, commands[index:],
+                        previous_attempt / "commands", "shared_machine_evidence", environment=environment,
+                        inherited_lock_descriptors=(collection_lock.fileno(),), excluded_preparation_paths=excluded,
+                        expected_source_tree=original_identity["tested_tree"], command_index_offset=index)
+                    recovered_commands.extend(remainder["commands"])
+                    recovered_status = remainder["status"]
+                    break
+            current_inputs = registered_host_recovery_inputs(run_directory, plan)
+            dependency_before_file = previous_attempt / "prepared-workspace-dependency-identity-before.json"
+            dependency_before = read_json(dependency_before_file) if dependency_before_file.exists() else None
+            dependency_after = prepared_workspace_dependency_identity(previous_workspace, excluded) if previous_workspace.exists() else None
+            proven_sources = original_identity["runtime_environment"]["registered_dependency_sources"]["identity_proven"]
+            dependency_identity_proven = bool(recovered_status == "passed" and proven_sources and dependency_before
+                and dependency_before.get("identity_proven") and dependency_after == dependency_before
+                and current_inputs == original_identity["runtime_environment"])
+            if dependency_before:
+                for command in recovered_commands:
+                    command["prepared_workspace_dependency_identity"] = dependency_before
+            recovered = {**original_identity, "commands": recovered_commands,
+                "status": recovered_status,
+                "identity_sha256": original_intent["identity_sha256"], "cwd": str(previous_attempt / "workspace"),
+                "host_recovery_inputs_after": current_inputs,
+                "dependency_identity_proven": dependency_identity_proven, "original": str(previous_attempt / "evidence.json")}
+            if recovered_status == "failed":
+                from .role_failure_recovery import classify_role_failure
+                failed_index = len(recovered_commands)
+                failed = previous_attempt / "commands" / f"command-{failed_index:03d}"
+                failure = classify_role_failure("", (failed / "stderr.txt").read_text(errors="replace"), recovered_commands[-1]["returncode"], "text")
+                recovered["failure"] = failure
+                if failure["maximum_same_configuration_retries"]:
+                    recovered["retry_not_before_epoch_ms"] = (time.time() + failure["retry_not_before_seconds"]) * 1000
+            write_json(previous_attempt / "evidence.json", recovered)
+            return recovered
+        matching = [attempt for attempt in previous
+            if read_json(attempt / "collection-intent.json")["identity_sha256"] == digest]
+        qualified_passes = []
+        for attempt in matching:
+            evidence_file = attempt / "evidence.json"
+            if not evidence_file.exists():
+                continue
+            cached = read_json(evidence_file)
+            if _shared_cached_pass_is_currently_qualified(attempt, cached, commands, identity):
+                qualified_passes.append(cached)
+        if qualified_passes:
+            # 完整树、环境、依赖和日志仍匹配时直接复用，避免后一次失败替换已交付事实。
+            return qualified_passes[-1]
+        budget_exhausted = registered_machine_command_budget_is_exhausted(
+            run_directory, identity["runtime_environment"], commands)
+        if matching and (matching[-1] / "evidence.json").exists():
+            cached = read_json(matching[-1] / "evidence.json")
+            failure = cached.get("failure")
+            retry_blocked = bool(failure) and (not failure["maximum_same_configuration_retries"]
+                or time.time() * 1000 < cached.get("retry_not_before_epoch_ms", float("inf")))
+            if cached.get("status") == "passed":
+                if budget_exhausted:
+                    # 预算已用完且上面没有当前合格原件时不再派发。未证明依赖的历史通过只保留原件，不交回为当前事实。
+                    _reject_shared_command_log_mismatch(matching[-1], cached, commands)
+                    return None
+            elif budget_exhausted or retry_blocked:
+                _reject_shared_command_log_mismatch(matching[-1], cached, commands)
+                return cached
+        elif budget_exhausted:
+            return None
+        # 没有依赖内容证明时跨接续重新采集；同一次执行内只采集一份事实。
+        proven_dependencies = identity["runtime_environment"]["registered_dependency_sources"]["identity_proven"]
         attempt = root / f"attempt-{len(previous) + 1:03d}"
         workspace = attempt / "workspace"
         attempt.mkdir()
+        write_json(attempt / "collection-intent.json", {"identity": identity, "identity_sha256": digest,
+            "maximum_attempts_per_recovery_input": 3, "status": "registered"})
         git(Path(record["repo"]), "worktree", "add", "--detach", str(workspace), record["candidate_commit"])
         # 命令继承同一单飞锁；controller 崩溃后，接续必须等原命令退出才能重新采集。
         prepare_isolated_workspace(run_directory, workspace, plan.get("preparation_commands", []), attempt,
+                                   environment=environment,
                                    inherited_lock_descriptors=(collection_lock.fileno(),))
+        preparation_file = attempt / "preparation-created-untracked-paths.json"
+        excluded = read_json(preparation_file)["paths"] if preparation_file.exists() else None
+        dependency_before = prepared_workspace_dependency_identity(workspace, excluded)
+        write_json(attempt / "prepared-workspace-dependency-identity-before.json", dependency_before)
         result = execute_registered_commands(run_directory, workspace, commands, attempt / "commands", "shared_machine_evidence",
+                                             environment=environment, excluded_preparation_paths=excluded,
+                                             expected_source_tree=identity["tested_tree"],
                                              inherited_lock_descriptors=(collection_lock.fileno(),))
         evidence = {**identity, **result, "identity_sha256": digest, "cwd": str(workspace),
+                    "host_recovery_inputs_after": registered_host_recovery_inputs(run_directory, plan),
                     "dependency_identity_proven": proven_dependencies, "original": str(attempt / "evidence.json")}
+        dependency_after = prepared_workspace_dependency_identity(workspace, excluded)
+        evidence["dependency_identity_proven"] = bool(proven_dependencies and dependency_before["identity_proven"] and dependency_before == dependency_after)
+        for command in evidence["commands"]:
+            command["prepared_workspace_dependency_identity"] = dependency_before
+        if evidence["host_recovery_inputs_after"] != identity["runtime_environment"]:
+            evidence["status"] = "environment_changed"
+        if result["status"] == "failed":
+            from .role_failure_recovery import classify_role_failure
+            failed = Path(result["failed_command_directory"])
+            failure = classify_role_failure("", (failed / "stderr.txt").read_text(errors="replace"), result["commands"][-1]["returncode"], "text")
+            evidence["failure"] = failure
+            if failure["maximum_same_configuration_retries"]:
+                evidence["retry_not_before_epoch_ms"] = (time.time() + failure["retry_not_before_seconds"]) * 1000
         write_json(attempt / "evidence.json", evidence)
         return evidence
+
+
+def prepare_registered_machine_command_environment(run_directory: Path) -> dict:
+    from .review_recovery_evidence_observation import isolated_registered_machine_command_environment
+    environment = isolated_registered_machine_command_environment(run_directory / "machine-evidence-isolated-environment")
+    for key in ("HOME", "CODEX_HOME", "CODEX_SQLITE_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "TMPDIR"):
+        directory = Path(environment[key])
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if directory.is_symlink() or directory.stat().st_uid != os.getuid():
+            raise ValueError("隔离环境目录的实体或归属不匹配")
+        if key == "TMPDIR" and directory.stat().st_mode & 0o077:
+            raise ValueError("宿主命令临时 IPC 目录必须为本用户私有")
+    return environment
+
+
+def registered_machine_command_budget_is_exhausted(run_directory: Path, recovery_inputs: dict, commands: list[list[str]]) -> bool:
+    counts = {json.dumps(command): 0 for command in commands}
+    for pattern in ("machine-evidence/attempt-*/collection-intent.json",
+                    "reviewer-machine-evidence-requests/*/attempt-*/collection-intent.json"):
+        for path in run_directory.glob(pattern):
+            intent = read_json(path)
+            if intent.get("status") == "qualified_existing_facts":
+                continue
+            inputs = intent.get("host_recovery_inputs", intent.get("identity", {}).get("runtime_environment"))
+            if inputs != recovery_inputs:
+                continue
+            dispatched = {json.dumps(argv) for argv in _dispatched_registered_command_argvs(path.parent)}
+            for key in counts:
+                if key in dispatched:
+                    counts[key] += 1
+    return any(count >= 3 for count in counts.values())
+
+
+def prepared_workspace_dependency_identity(workspace: Path, preparation_created_paths: list[str] | None = None) -> dict:
+    from .review_recovery_evidence_observation import file_sha256, canonical_json_material_sha256
+    paths = set(git(workspace, "ls-files", "--others", "--ignored", "--exclude-standard", "-z").decode().split("\0"))
+    paths.update(preparation_created_paths or [])
+    files = []
+    proven = True
+    for relative in sorted(paths - {""}):
+        path = workspace / relative
+        if path.is_symlink() or not path.is_file():
+            proven = False
+            files.append([relative, "dependency_content_unproven"])
+            continue
+        resolved = path.resolve()
+        physical_source = str(resolved.relative_to(workspace.resolve())) if resolved.is_relative_to(workspace.resolve()) else str(resolved)
+        files.append([relative, physical_source, path.stat().st_mode & 0o777, file_sha256(path)])
+    return {"identity_sha256": canonical_json_material_sha256(files), "identity_proven": proven,
+        "preparation_created_paths": sorted(preparation_created_paths or [])}
 
 
 def _terminate_retained_collection_commands(directory: Path, reason: str) -> None:

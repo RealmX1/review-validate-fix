@@ -20,7 +20,10 @@ from .execution_lifecycle import (
     persist_execution_revocation,
     finish_owned_process_registration, register_supervised_command_directory,
 )
-from .machine_evidence import collect_shared_machine_evidence, collect_incomplete_fixer_machine_validation, prepare_isolated_workspace, verified_execution_plan, ensure_previous_supervised_commands_exited
+from .machine_evidence import (WorkspacePreparationFailed, collect_shared_machine_evidence, collect_incomplete_fixer_machine_validation,
+    prepare_isolated_workspace, verified_execution_plan, ensure_previous_supervised_commands_exited)
+from .reviewer_machine_evidence_recovery import collect_reviewer_machine_evidence_requests, verified_reviewer_machine_evidence_for_role
+from .review_recovery_evidence_observation import machine_evidence_request_binding
 from .reviewer_account_eligibility import (
     reviewer_eligibility, reviewer_credential_evidence_paths, reviewer_execution_environment,
 )
@@ -305,6 +308,7 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
                     and read_json(attempt / "request.json").get("findings", []) == findings
                     and read_json(attempt/'request.json').get('context_response_sha256') == record.get('context_response_sha256')
                     and read_json(attempt/'request.json').get('shared_machine_evidence_recovery_sha256') == record.get('shared_machine_evidence_recovery_sha256')
+                    and read_json(attempt/'request.json').get('reviewer_machine_evidence_recovery_sha256') == record.get('reviewer_machine_evidence_recovery_sha256_by_role', {}).get(role_directory.name)
                     and not ((attempt / "outcome.json").exists() and read_json(attempt / "outcome.json").get("recovery", {}).get("category") == "workspace_preparation")
                     and not ((attempt / 'outcome.json').exists() and read_json(attempt / 'outcome.json').get('recovery', {}).get('category')
                              in {'authentication', 'account_banned', 'usage_limit', 'reviewer_unavailable', 'deadline_exhausted'})
@@ -372,6 +376,9 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
         'decision_facts_file': str(run_directory / 'decision-facts.json'),
         'decision_facts_sha256': record['decision_facts_sha256'],
         "shared_machine_evidence_recovery_sha256": record.get("shared_machine_evidence_recovery_sha256"),
+        "machine_evidence_request_binding": machine_evidence_request_binding(run_directory, record) if record.get("execution_plan_sha256") else None,
+        "reviewer_machine_evidence": verified_reviewer_machine_evidence_for_role(run_directory, record, role_directory.name),
+        "reviewer_machine_evidence_recovery_sha256": record.get("reviewer_machine_evidence_recovery_sha256_by_role", {}).get(role_directory.name),
         "incomplete_fixer_machine_validation_evidence": record.get("incomplete_fixer_machine_validation_evidence") if role == "fixer" else None,
         "context_response_sha256": record.get('context_response_sha256'),
         "context_response_file": str(verified_context_response_original_path(run_directory, record['context_response_sha256'])) if record.get('context_response_sha256') else None,
@@ -409,6 +416,7 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
 
 def _run_roles(run_directory: Path, record: dict, roles: list[tuple[str, str, list[dict]]], findings: list[dict], *, force_new: bool = False) -> list[dict | None]:
     active = {}
+    pending_collection_error = None
     try:
         for name, role, configs in roles:
             _, process = _start_role(run_directory, record, run_directory / name, role, configs, findings, force_new=force_new)
@@ -424,6 +432,20 @@ def _run_roles(run_directory: Path, record: dict, roles: list[tuple[str, str, li
                 del active[name]
                 role_directory = run_directory / name
                 role_config = next(item for item in roles if item[0] == name)
+                if role_config[1] == "reviewer" and pending_collection_error is None:
+                    latest_reviewer = _role_result(role_directory, latest=True, include_incomplete=True)
+                    if latest_reviewer and latest_reviewer["result"].get("status") == "incomplete":
+                        try:
+                            if collect_reviewer_machine_evidence_requests(run_directory):
+                                fresh = read_json(run_directory / "run.json")
+                                for key in ("reviewer_machine_evidence", "reviewer_machine_evidence_recovery_sha256_by_role",
+                                            "reviewer_machine_evidence_history", "reviewer_machine_evidence_original_sha256s"):
+                                    if key in fresh:
+                                        record[key] = fresh[key]
+                        except WorkspacePreparationFailed as error:
+                            pending_collection_error = error
+                if pending_collection_error is not None and role_config[1] == "reviewer" and _role_result(role_directory) is None:
+                    continue
                 progress = _role_result(role_directory, latest=True, include_incomplete=True) if role_config[1] == "fixer" else None
                 if (progress and progress["result"]["status"] == "incomplete"
                         and Path(progress["attempt_directory"]) == sorted(role_directory.glob("attempt-*"))[-1]):
@@ -432,6 +454,8 @@ def _run_roles(run_directory: Path, record: dict, roles: list[tuple[str, str, li
                     _, replacement = _start_role(run_directory, record, role_directory, role_config[1], role_config[2], findings)
                     if replacement:
                         active[name] = replacement
+        if pending_collection_error is not None:
+            raise pending_collection_error
     except (KeyboardInterrupt, ExecutionRevoked) as interruption:
         if isinstance(interruption, KeyboardInterrupt) and not execution_is_revoked(run_directory):
             record['status'] = 'interrupted'
@@ -804,6 +828,10 @@ def _resume_review_iteration(run_directory: Path, *, reviewer_configs: list[dict
         if any(result is None for result in results):
             record["status"] = "review_incomplete"
             record["recovery_condition"] = "等待在运行的角色进程结束，或提供修复后的 CLI 配置；已完成的腿不会重跑"
+            write_json(run_directory / "run.json", record)
+            if collect_reviewer_machine_evidence_requests(run_directory):
+                record = read_json(run_directory / "run.json")
+                record["status"] = "machine_evidence_available"
         else:
             findings = anonymous_findings(results)
             publish_reviewer_findings_for_parallel_review(run_directory, record, findings)
@@ -914,7 +942,16 @@ def resume_review(run_directory: Path, *, reviewer_configs: list[dict] | None = 
     with exclusive_lock(run_directory / "controller.lock", blocking=False):
         record = read_json(run_directory / "run.json")
         if os.environ.get("KANBAN_COMMAND_EXECUTION_REVOCATION_FILE"):
+            previous_revocation = record.get("command_execution_revocation_file")
+            if previous_revocation and previous_revocation != os.environ["KANBAN_COMMAND_EXECUTION_REVOCATION_FILE"]:
+                raise ValueError("精确 run 不能换绑其他所属执行的撤销原件")
             record["command_execution_revocation_file"] = os.environ["KANBAN_COMMAND_EXECUTION_REVOCATION_FILE"]
+            if os.environ.get("KANBAN_COMMAND_EXECUTION_ID"):
+                identity = {"execution_id": os.environ["KANBAN_COMMAND_EXECUTION_ID"],
+                    "revocation_file": record["command_execution_revocation_file"]}
+                if record.get("command_execution_identity") and record["command_execution_identity"] != identity:
+                    raise ValueError("精确 run 不能换绑其他所属执行身份")
+                record["command_execution_identity"] = identity
             write_json(run_directory / "run.json", record)
         if execution_is_revoked(run_directory):
             revoke_execution(run_directory, "接续时补齐已撤销执行的取消证据")
@@ -948,6 +985,8 @@ def resume_review(run_directory: Path, *, reviewer_configs: list[dict] | None = 
                 fixer_config = load_reviewer_configuration(Path(fixer_config["configuration_file_path"]))
         register_owned_process(run_directory, os.getpid(), "workflow_controller")
         try:
+            collect_reviewer_machine_evidence_requests(run_directory)
+            record = read_json(run_directory / "run.json")
             pending_reviewers = any(_role_result(run_directory / f"reviewer-{index + 1}") is None for index in range(record["reviewer_count"]))
             shared_evidence = collect_shared_machine_evidence(run_directory, record, plan) if pending_reviewers else None
             if shared_evidence:
@@ -964,7 +1003,7 @@ def resume_review(run_directory: Path, *, reviewer_configs: list[dict] | None = 
                     fixer_config=fixer_config, validation_commands=validation_commands, context_response_file=context_response_file)
                 context_response_file = None
                 append_stage_event(run_directory, "workflow_progress", status=result["status"])
-                if not plan or not fix or result["status"] not in {"validation_failed", "findings_unresolved", "machine_evidence_available", "context_supplements_pending"}:
+                if not plan or result["status"] != "machine_evidence_available" and (not fix or result["status"] not in {"validation_failed", "findings_unresolved", "context_supplements_pending"}):
                     return publish_business_result(run_directory, result)
             return publish_business_result(run_directory, result)
         except ExecutionRevoked:

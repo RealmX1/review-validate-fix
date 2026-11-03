@@ -539,6 +539,18 @@ def _publish_business_result_under_context_lock(run_directory: Path, result: dic
             "evidence_paths": sorted(set(paths)), **({"retry_not_before_epoch_ms": min(retry_times)} if retry_times else {})}
         if result['status'] == 'review_incomplete' and not retry_times:
             result['recovery'].pop('retry_not_before_epoch_ms', None)
+    from .reviewer_machine_evidence_recovery import pending_reviewer_machine_evidence_requests
+    from .agent_review_summary_artifacts import publish_machine_evidence_wait_notices
+    pending_machine_requests = pending_reviewer_machine_evidence_requests(run_directory) if disposition == "machine_evidence_pending" else []
+    if disposition == "machine_evidence_pending" and pending_machine_requests:
+        result["recovery"]["pending_machine_requests"] = pending_machine_requests
+        retry_times = [item["retry_not_before_epoch_ms"] for item in pending_machine_requests if item.get("retry_not_before_epoch_ms")]
+        if retry_times:
+            result["recovery"].update({"retry_not_before_epoch_ms": min(retry_times), "maximum_unchanged_retries": 1})
+        else:
+            result["recovery"]["maximum_unchanged_retries"] = 0
+    if disposition != "cancelled" and not execution_is_revoked(run_directory):
+        publish_machine_evidence_wait_notices(run_directory, record, pending_machine_requests)
     if disposition in {"agent_review_ready", "agent_judgment_required"} and not execution_is_revoked(run_directory):
         from .agent_review_summary_artifacts import publish_agent_review_summary
         notice = publish_agent_review_summary(run_directory, record, result)
