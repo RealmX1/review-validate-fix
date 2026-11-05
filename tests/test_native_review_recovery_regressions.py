@@ -43,6 +43,43 @@ def test_failed_kanban_registration_reuses_frozen_binding_on_plain_resume(reposi
     assert not list(run.glob("reviewer-*/attempt-*"))
 
 
+@pytest.mark.parametrize("registration_alias", [False, True])
+def test_managed_runs_with_same_basename_register_independently_and_retry_once(repository, tmp_path, registration_alias):
+    from adapters.cline_kanban.owned_command_execution import start_managed_review
+    first = automatic_snapshot(repository, tmp_path / "first-parent")
+    second = automatic_snapshot(repository, tmp_path / "second-parent")
+    registry = tmp_path / "registered-command-execution-identities.json"
+    executable = tmp_path / "kanban-idempotent-registration"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import hashlib,json,sys\nfrom pathlib import Path\n"
+        f"registry=Path({str(registry)!r})\n"
+        "entries=json.loads(registry.read_text()) if registry.exists() else {}\n"
+        "key=sys.argv[sys.argv.index('--idempotency-key')+1]\n"
+        "spec=Path(sys.argv[sys.argv.index('--spec-file')+1]).read_bytes()\n"
+        "digest=hashlib.sha256(spec).hexdigest()\n"
+        "if key in entries and entries[key]!=digest:\n"
+        " print('同一幂等键不能绑定不同的执行材料',file=sys.stderr); sys.exit(1)\n"
+        "entries[key]=digest; registry.write_text(json.dumps(entries))\n"
+        "print(json.dumps({'ok':True,'execution':{'executionId':key}}))\n"
+    )
+    executable.chmod(0o755)
+    entrypoint = tmp_path / "rvf-entrypoint.py"
+    def register(run):
+        return start_managed_review(run, "same-task", project_path=repository,
+                                    kanban_cli=executable, entrypoint=entrypoint)
+    accepted = register(first)
+    repeated_directory = first
+    if registration_alias:
+        repeated_directory = tmp_path / "same-run-directory-alias"
+        repeated_directory.symlink_to(first, target_is_directory=True)
+    assert register(repeated_directory)["command_execution"] == accepted["command_execution"]
+    assert len(read_json(registry)) == 1
+    other = register(second)
+    assert other["command_execution"] != accepted["command_execution"]
+    assert len(read_json(registry)) == 2
+
+
 @pytest.mark.parametrize("ignore_sigterm", [False, True])
 def test_exited_group_leader_does_not_hide_observed_owned_descendant(tmp_path, ignore_sigterm):
     from core.task_snapshot_review.execution_lifecycle import register_owned_process, observe_owned_process_group_descendants, revoke_execution, process_start_identity

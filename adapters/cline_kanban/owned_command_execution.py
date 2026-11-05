@@ -13,6 +13,7 @@ from core.task_snapshot_review.persistent_artifacts import read_json, write_json
 
 def start_managed_review(run_directory: Path, task_id: str, *, project_path: Path | None,
                          kanban_cli: Path | None, entrypoint: Path) -> dict:
+    run_directory = run_directory.expanduser().resolve()
     if project_path is None:
         raise ValueError("Kanban 托管需要显式 --kanban-project-path 主仓库路径")
     if kanban_cli is not None:
@@ -42,8 +43,10 @@ def start_managed_review(run_directory: Path, task_id: str, *, project_path: Pat
             "label": "RVF 独立评审、修复与验证"}
     spec_file = run_directory / "kanban-command-execution-specification.json"
     write_json(spec_file, spec)
+    # run_id 仅为 basename；不同目录的同名 run 必须分别登记，同目录重试仍复用。
+    run_directory_idempotency_key = "rvf-" + hashlib.sha256(str(run_directory).encode()).hexdigest()
     response = subprocess.run([executable, "task", "command-execution", "start", "--task-id", task_id,
-        "--project-path", str(project_path.resolve()), "--idempotency-key", record["run_id"], "--spec-file", str(spec_file)],
+        "--project-path", str(project_path.resolve()), "--idempotency-key", run_directory_idempotency_key, "--spec-file", str(spec_file)],
         capture_output=True, text=True, timeout=60)
     receipt = {"returncode": response.returncode, "stdout": response.stdout, "stderr": response.stderr}
     history = run_directory / "kanban-command-execution-registration-attempts"

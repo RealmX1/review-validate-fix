@@ -338,7 +338,8 @@ def _rebind_starting_point(repo: Path, starting: dict, original_path: Path, star
 def _owned_changed_paths(repo: Path, owned: list[str], head: str, changed: list[str]) -> list[str]:
     owned_paths = set()
     for commit in owned:
-        paths = {path for path in git(repo, 'diff-tree', '--no-commit-id', '--name-only', '-r', '-z', commit).decode().split('\0') if path}
+        # 合并只发现相对所有父提交都改变的路径，避免认领从 base 导入的文件。
+        paths = {path for path in git(repo, 'diff-tree', '--cc', '--no-commit-id', '--name-only', '-r', '-z', commit).decode().split('\0') if path}
         owned_paths.update(paths)
         # 只用于发现路径；保留该路径完整净 diff，不投影 session/hunk。
         fields = git(repo, 'diff', '--name-status', '--find-renames', '-z', commit, head).decode().split('\0')

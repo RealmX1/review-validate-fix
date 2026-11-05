@@ -3,7 +3,7 @@ import pytest
 
 from adapters import resolve_hook_host_adapter
 from core.task_snapshot_review.hook_entrypoint import handle_hook
-from core.task_snapshot_review.persistent_artifacts import git, git_text
+from core.task_snapshot_review.persistent_artifacts import git, git_text, read_json, write_json
 from test_kanban_task_review_starting_point import kanban_task, commit_task, resolve, repository, completed_scoped_run
 
 
@@ -47,6 +47,32 @@ def test_clean_base_only_absorption_has_no_decision(kanban_task):
     git(task['main'], 'add', '.'); git(task['main'], 'commit', '-qm', 'test: 外部')
     git(task['repo'], 'merge', '--ff-only', 'main')
     assert stop(task) is None
+
+
+@pytest.mark.parametrize('adds_task_page', [False, True])
+def test_merge_authored_task_page_is_reviewed_without_claiming_imported_base_paths(kanban_task, adds_task_page):
+    task = kanban_task
+    commit_task(task)
+    (task['main'] / 'external.txt').write_text('仅属于 base 的内容\n')
+    git(task['main'], 'add', '--', 'external.txt')
+    git(task['main'], 'commit', '-qm', 'test: 前移 base')
+    git(task['repo'], 'merge', '--no-ff', '--no-commit', 'main')
+    (task['repo'] / 'feature-0.txt').unlink()
+    git(task['repo'], 'add', '--', 'feature-0.txt')
+    if adds_task_page:
+        (task['repo'] / 'merge-authored-task-page.txt').write_text('合并时新增的任务页\n')
+        git(task['repo'], 'add', '--', 'merge-authored-task-page.txt')
+    git(task['repo'], 'commit', '-qm', 'test: 合并时完成任务内容')
+    merge_commit = git_text(task['repo'], 'rev-parse', 'HEAD')
+    path = task['workspace'] / 'task-commit-integration-provenance.json'
+    provenance = read_json(path)
+    provenance['tasks']['task-1']['incarnations'][-1]['observedTaskCommits'].append(
+        {'commitSha': merge_commit, 'stablePatchId': None})
+    write_json(path, provenance)
+    evidence = resolve(task)
+    assert evidence['status'] == 'verified'
+    assert (evidence['committed_work_status'] == 'present') is adds_task_page
+    assert bool(stop(task)) is adds_task_page
 
 
 @pytest.mark.parametrize('prompt', ['继续实现', [{'type': 'text', 'text': '继续实现'}]])
