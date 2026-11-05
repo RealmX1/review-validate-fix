@@ -15,6 +15,5 @@
   "output_format": "codex_json",
   "env_unset": [
     "ANTHROPIC_API_KEY"
-  ],
-  "timeout_seconds": 900
+  ]
 }

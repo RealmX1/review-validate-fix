@@ -26,7 +26,8 @@ def test_credentials_follow_effective_role_environment(tmp_path, executable, env
                                     "env_unset": ["CODEX_HOME"] if "HOME" in environment else []})
     configuration = workflow.load_reviewer_configuration(configuration_file)
     credentials = tmp_path / expected
-    assert configuration["credential_evidence_paths"] == [str(credentials)]
+    assert configuration['credential_evidence_paths'][0] == str(credentials)
+    assert all(Path(path).parent == credentials.parent for path in configuration['credential_evidence_paths'])
     original_digest = workflow.configuration_digest(configuration)
     credentials.parent.mkdir(parents=True, exist_ok=True)
     credentials.write_text("已刷新测试凭据")
@@ -103,7 +104,6 @@ def test_role_only_preparation_failure_recovers_without_configuration_change(rep
     assert workflow.resume_review(run, reviewer_configs=[config, config])["status"] == "review_incomplete"
     assert len(list(run.glob("reviewer-*/attempt-*/request.json"))) == 2
     assert not list(run.glob("reviewer-*/attempt-*/model-invocation.json"))
-    deadlines = {path: read_json(path) for path in run.glob("reviewer-*/role-deadline.json")}
     repeated = workflow.resume_review(run)
     assert repeated["status"] == "review_incomplete"
     assert len(list(run.glob("reviewer-*/attempt-*/request.json"))) == 4
@@ -111,13 +111,17 @@ def test_role_only_preparation_failure_recovers_without_configuration_change(rep
     marker.touch()
     assert workflow.resume_review(run)["status"] == "ready_to_commit"
     assert len(list(run.glob("reviewer-*/attempt-*/request.json"))) == 6
-    assert all(read_json(path) == deadline for path, deadline in deadlines.items())
+    assert not list(run.glob("reviewer-*/role-deadline.json"))
 
 
 def test_revocation_and_real_patch_entry_are_serialized(repository, tmp_path, monkeypatch):
     run = tmp_path / "patch-revocation"
     write_json(run / "run.json", {"status": "fix_pending"})
     (repository / "task.py").write_text("value = 2\n")
+    before_commit = workflow.git_text(repository, "rev-parse", "HEAD")
+    after_tree = workflow.capture_worktree_tree(repository, ["task.py"], run)
+    after_commit = workflow.git_text(repository, "commit-tree", after_tree, "-p", before_commit,
+        input_bytes="test: 冻结撤销互斥验收的真实修复树\n".encode())
     patch = git(repository, "diff", "--binary", "--full-index")
     git(repository, "checkout", "--", "task.py")
     attempt = run / "fixer/attempt-001"
@@ -143,9 +147,9 @@ def test_revocation_and_real_patch_entry_are_serialized(repository, tmp_path, mo
             assert not (run / "execution-revocation.json").exists()
         return actual_git(repo, *arguments, **kwargs)
     monkeypatch.setattr(workflow, "git", inspect_apply)
-    monkeypatch.setattr(workflow, "_snapshot_fixer_progress", lambda *_: {"before": "before", "after": "after", "paths": ["task.py"], "requires_changes": True})
-    monkeypatch.setattr(workflow, "_matches_tree", lambda _repo, commit, *_: commit == "before")
-    record = {"repo": str(repository), "original_head": workflow.git_text(repository, "rev-parse", "HEAD"), "scope_paths": ["task.py"]}
+    monkeypatch.setattr(workflow, "_snapshot_fixer_progress", lambda *_: {"before": before_commit, "after": after_commit, "paths": ["task.py"], "requires_changes": True})
+    monkeypatch.setattr(workflow, "_matches_tree", lambda _repo, commit, *_: commit == before_commit)
+    record = {"repo": str(repository), "original_head": before_commit, "candidate_commit": before_commit, "scope_paths": ["task.py"]}
     try:
         assert workflow._prepare_and_apply_fix(run, record, {"attempt_directory": str(attempt)})
         revocation_future.result(timeout=5)

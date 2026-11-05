@@ -16,6 +16,7 @@ from core.task_snapshot_review.task_snapshot import create_snapshot
 from core.task_snapshot_review.workflow import _validate, resume_review
 from test_incomplete_fixer_machine_validation_recovery import review_with_registered_validation, machine_blocked_fixer
 from test_task_snapshot_review_workflow import repository
+from test_owned_command_process_scope import darwin_owned_process_queries
 
 
 @pytest.fixture(autouse=True)
@@ -24,36 +25,48 @@ def isolate_unavailable_host_process_queries(monkeypatch):
     monkeypatch.setattr(execution_lifecycle, 'observe_owned_process_group_descendants', lambda *args: None)
 
 
-def launch_supervisor(run, command, deadline):
+def launch_supervisor(run, command):
     run.mkdir()
     write_json(run / 'run.json', {})
     artifacts = run / 'registered-command-observations'
     artifacts.mkdir()
     process = subprocess.Popen([sys.executable, '-B', retained_command_supervisor.__file__, str(run), str(artifacts),
-        str(deadline), '[]', json.dumps(command)], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        '[]', json.dumps(command)], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return process, artifacts
 
 
 @pytest.mark.parametrize('revoke', [False, True])
-def test_detached_descendant_cannot_write_after_original_deadline_or_stop(tmp_path, revoke):
+def test_detached_descendant_cannot_write_after_explicit_signal_or_persistent_stop(tmp_path, revoke):
     run = tmp_path / 'detached-session-supervision'
     started = tmp_path / 'detached-process-started'
     side_effect = tmp_path / 'forbidden-late-side-effect'
-    detached_code = f"from pathlib import Path; import os,time; Path({str(started)!r}).write_text(str(os.getpid())); time.sleep(1.3); Path({str(side_effect)!r}).touch()"
-    command = [sys.executable, '-B', '-c', f'import subprocess,sys; subprocess.Popen([sys.executable,"-B","-c",{detached_code!r}],start_new_session=True)']
-    process, artifacts = launch_supervisor(run, command, time.time() + 0.8)
+    release = tmp_path / 'release-late-side-effect'
+    detached_code = (f'from pathlib import Path; import os,time; Path({str(started)!r}).write_text(str(os.getpid()))\n'
+        f'while not Path({str(release)!r}).exists(): time.sleep(0.01)\n'
+        f'Path({str(side_effect)!r}).touch()')
+    command = [sys.executable, '-B', '-c', f'import subprocess,sys; subprocess.Popen([sys.executable,"-B","-c",{detached_code!r}],start_new_session=True).wait()']
+    process, artifacts = launch_supervisor(run, command)
     try:
-        limit = time.monotonic() + 0.7
+        limit = time.monotonic() + 5
         while not started.exists() and time.monotonic() < limit:
             time.sleep(0.01)
         assert started.exists()
+        while int(started.read_text()) not in {item['pid'] for item in read_json(artifacts / 'command-supervision.json').get('owned_processes', [])}:
+            assert time.monotonic() < limit
+            time.sleep(0.01)
         if revoke:
             write_json(run / 'execution-revocation.json', {'reason': '自动化 Stop 验证'})
-        process.wait(timeout=1.4)
+        else:
+            process.send_signal(signal.SIGTERM)
+        process.wait(timeout=3)
         facts = read_json(artifacts / 'command-supervision.json')
         assert facts['status'] == 'termination_requested'
         assert process.returncode == -signal.SIGKILL
-        time.sleep(0.7)
+        from core.task_snapshot_review.native_owned_process_observation import native_process_identity
+        while native_process_identity(int(started.read_text())) is not None:
+            assert time.monotonic() < limit
+            time.sleep(0.01)
+        release.touch()
         assert not side_effect.exists()
     finally:
         if process.poll() is None:
@@ -66,7 +79,59 @@ def test_detached_descendant_cannot_write_after_original_deadline_or_stop(tmp_pa
                 pass
 
 
-def test_ps_failure_uses_native_evidence_without_waiting_for_deadline(tmp_path, monkeypatch):
+@pytest.mark.parametrize('injection_phase', ['before_launch', 'running'])
+def test_sigterm_during_owned_query_is_not_swallowed_as_observation_error(tmp_path, injection_phase):
+    run = tmp_path / 'signal-during-owned-query'
+    artifacts = run / 'command-evidence'
+    artifacts.mkdir(parents=True)
+    write_json(run / 'run.json', {})
+    command_started = tmp_path / 'command-started'
+    signal_injected = tmp_path / 'signal-injected'
+    command = [sys.executable, '-B', '-c',
+        f'from pathlib import Path; import time; Path({str(command_started)!r}).touch(); time.sleep(30)']
+    script = f'''
+import os, signal
+from pathlib import Path
+from core.task_snapshot_review import retained_command_supervisor as supervisor
+original_snapshot = supervisor.owned_process_snapshot
+injected = False
+def snapshot(supervisor_pid, owned, **kwargs):
+    global injected
+    if not injected and ({injection_phase!r} == 'before_launch' or owned):
+        injected = True
+        Path({str(signal_injected)!r}).touch()
+        os.kill(os.getpid(), signal.SIGTERM)
+    return original_snapshot(supervisor_pid, owned, **kwargs)
+supervisor.owned_process_snapshot = snapshot
+raise SystemExit(supervisor.supervise_registered_command(
+    Path({str(run)!r}), Path({str(artifacts)!r}), (), {command!r}))
+'''
+    process = subprocess.Popen([sys.executable, '-B', '-c', script], start_new_session=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        process.wait(timeout=3)
+        assert signal_injected.exists()
+        facts = read_json(artifacts / 'command-supervision.json')
+        assert facts['status'] == 'termination_requested'
+        assert process.returncode == -signal.SIGKILL
+        if injection_phase == 'before_launch':
+            assert not facts.get('command_execution_started')
+            assert not command_started.exists()
+        else:
+            assert facts['command_execution_started']
+            from core.task_snapshot_review.native_owned_process_observation import native_process_identity
+            limit = time.monotonic() + 3
+            while native_process_identity(facts['command_pid']) is not None:
+                assert time.monotonic() < limit
+                time.sleep(0.01)
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+
+
+@pytest.mark.parametrize('command_exit_code', [0, 7])
+def test_ps_failure_uses_native_evidence_without_waiting_for_deadline(tmp_path, monkeypatch, command_exit_code):
     executable_directory = tmp_path / 'unavailable-process-query-executables'
     executable_directory.mkdir()
     ps = executable_directory / 'ps'
@@ -74,12 +139,15 @@ def test_ps_failure_uses_native_evidence_without_waiting_for_deadline(tmp_path, 
     ps.chmod(0o755)
     monkeypatch.setenv('PATH', str(executable_directory))
     run = tmp_path / 'native-query-fallback'
-    process, artifacts = launch_supervisor(run, [sys.executable, '-B', '-c', 'pass'], time.time() + 10)
+    process, artifacts = launch_supervisor(run, [sys.executable, '-B', '-c', f'raise SystemExit({command_exit_code})'])
     process.wait(timeout=2)
     facts = read_json(artifacts / 'command-supervision.json')
-    assert process.returncode == 0
+    assert process.returncode == command_exit_code
     assert facts['status'] == 'completed'
-    assert facts['command_returncode'] == 0
+    assert facts['command_returncode'] == command_exit_code
+    assert facts['owned_process_exit_status'] == 'exited'
+    assert facts['process_ownership_scope'] == 'registered_process_identities_owned_groups_and_descendant_chains'
+    assert facts['command_process_lifetime_contract'] == 'wait_for_background_work_or_register_separate_supervised_commands'
 
 
 def test_unavailable_native_query_retains_unknown_without_running_command(tmp_path):
@@ -94,7 +162,7 @@ def test_unavailable_native_query_retains_unknown_without_running_command(tmp_pa
         'from core.task_snapshot_review import retained_command_supervisor as s; '
         f'command={[sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).touch()"]!r}; '
         'patcher=patch.object(s,"owned_process_snapshot",side_effect=RuntimeError("原生查询不可用")); patcher.start(); '
-        f'raise SystemExit(s.supervise_registered_command(Path({str(run)!r}),Path({str(artifacts)!r}),{time.time()+10},(),command))'
+        f'raise SystemExit(s.supervise_registered_command(Path({str(run)!r}),Path({str(artifacts)!r}),(),command))'
     )
     process = subprocess.Popen([sys.executable, '-B', '-c', script], start_new_session=True)
     process.wait(timeout=2)
@@ -108,7 +176,7 @@ def test_unavailable_native_query_retains_unknown_without_running_command(tmp_pa
 def test_authoritative_validation_waits_for_late_fork_and_rejects_source_drift(repository, tmp_path):
     (repository / 'task.py').write_text('value = 2\n')
     finished = tmp_path / 'late-validation-descendant-finished'
-    code = f"import os,time; from pathlib import Path; time.sleep(0.2); child=os.fork(); time.sleep(0.3) if child==0 else None; Path('task.py').write_text('value = 99\\n') if child==0 else None; Path({str(finished)!r}).touch() if child==0 else None"
+    code = f"import os,time; from pathlib import Path; time.sleep(0.2); child=os.fork(); time.sleep(0.3) if child==0 else os.waitpid(child,0); Path('task.py').write_text('value = 99\\n') if child==0 else None; Path({str(finished)!r}).touch() if child==0 else None"
     commands = [[sys.executable, '-B', '-c', code]]
     run = tmp_path / 'authoritative-descendant-completion'
     record = create_snapshot(repository, base_ref='HEAD', scope_paths=['task.py'], requirements=b'exact source tree',
@@ -127,15 +195,14 @@ def test_failed_same_tree_validation_retries_when_environment_recovers(repositor
     record = create_snapshot(repository, base_ref='HEAD', scope_paths=['task.py'], requirements=b'bounded recovery',
         run_directory=run, execution_plan={'fix': True, 'validation_commands': [command]})
     record['semantic_repair_rounds_used'] = 1
-    deadline = time.time() + 15
     monkeypatch.setenv('RVF_TEST_SERVICE_AVAILABLE', 'no')
-    failed_path = collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'], deadline)
+    failed_path = collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'])
     failed = read_json(failed_path)
     failed_original = Path(failed['original']).read_bytes()
     assert failed['status'] == 'failed'
-    assert collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'], deadline) == failed_path
+    assert collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit']) == failed_path
     monkeypatch.setenv('RVF_TEST_SERVICE_AVAILABLE', 'yes')
-    recovered_path = collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'], deadline)
+    recovered_path = collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'])
     recovered = read_json(recovered_path)
     assert recovered_path != failed_path
     assert recovered['status'] == 'passed'
@@ -158,10 +225,9 @@ def test_workflow_resumes_original_fixer_after_same_tree_environment_recovery(re
     script.write_text(script.read_text().replace("status='incomplete' if mode=='always_machine' else 'completed'", "status='completed' if proof['status']=='passed' else 'incomplete'"))
     monkeypatch.setenv('RVF_TEST_SERVICE_AVAILABLE', 'no')
     assert resume_review(run, reviewer_configs=[reviewer, reviewer], fixer_config=fixer)['status'] == 'fix_incomplete'
-    original_deadline = read_json(run / 'fixer/role-deadline.json')
     monkeypatch.setenv('RVF_TEST_SERVICE_AVAILABLE', 'yes')
     assert resume_review(run)['status'] == 'ready_to_commit'
-    assert read_json(run / 'fixer/role-deadline.json') == original_deadline
+    assert not (run / 'fixer/role-deadline.json').exists()
     assert len(list(run.glob('reviewer-*/attempt-*/request.json'))) == 2
     assert len(list(run.glob('fixer/attempt-*/request.json'))) == 3
 
@@ -173,8 +239,7 @@ def test_service_recovery_without_environment_change_gets_one_scheduled_probe(re
     record = create_snapshot(repository, base_ref='HEAD', scope_paths=['task.py'], requirements=b'bounded service probe',
         run_directory=run, execution_plan={'fix': True, 'validation_commands': [command]})
     record['semantic_repair_rounds_used'] = 1
-    deadline = time.time() + 15
-    initial = collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'], deadline)
+    initial = collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'])
     initial_bytes = initial.read_bytes()
     intent_path = run / 'incomplete-fixer-machine-validation/round-001/collection-intent.json'
     intent = read_json(intent_path)
@@ -182,16 +247,16 @@ def test_service_recovery_without_environment_change_gets_one_scheduled_probe(re
     intent['retry_not_before'] = time.time() - 1
     write_json(intent_path, intent)
     service_available.touch()
-    recovered = collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'], deadline)
+    recovered = collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'])
     assert recovered != initial
     assert read_json(recovered)['status'] == 'passed'
     assert read_json(intent_path)['unchanged_recovery_probe_used'] is True
     assert initial.read_bytes() == initial_bytes
-    refreshed = collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'], deadline)
+    refreshed = collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'])
     assert refreshed != recovered
     assert read_json(refreshed)['status'] == 'passed'
     assert read_json(refreshed)['collection_attempt'] == 3
-    assert collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'], deadline) is None
+    assert collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit']) is None
 
 
 def test_passed_retained_validation_is_recollected_after_environment_changes(repository, tmp_path, monkeypatch):
@@ -200,13 +265,12 @@ def test_passed_retained_validation_is_recollected_after_environment_changes(rep
     record = create_snapshot(repository, base_ref='HEAD', scope_paths=['task.py'], requirements=b'fresh environment evidence',
         run_directory=run, execution_plan={'fix': True, 'validation_commands': [command]})
     record['semantic_repair_rounds_used'] = 1
-    deadline = time.time() + 15
     monkeypatch.setenv('RVF_TEST_REQUIRED_SERVICE', 'ready')
-    original = collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'], deadline)
+    original = collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'])
     original_bytes = original.read_bytes()
     assert read_json(original)['status'] == 'passed'
     monkeypatch.setenv('RVF_TEST_REQUIRED_SERVICE', 'unavailable')
-    current = collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'], deadline)
+    current = collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'])
     assert current != original
     assert read_json(current)['status'] == 'failed'
     assert original.read_bytes() == original_bytes
@@ -223,14 +287,14 @@ def test_transient_native_observation_recovers_before_command_dispatch(tmp_path)
         'import sys; from pathlib import Path; from unittest.mock import patch\n'
         'from core.task_snapshot_review import retained_command_supervisor as supervisor\n'
         'attempts=0\n'
-        'def observe(*args):\n'
+        'def observe(*args,**kwargs):\n'
         '    global attempts\n'
         '    attempts+=1\n'
         '    if attempts<=2: raise RuntimeError("原生查询瞬时不可用")\n'
         '    return {}\n'
         'with patch.object(supervisor,"owned_process_snapshot",side_effect=observe):\n'
         f'    raise SystemExit(supervisor.supervise_registered_command(Path({str(run)!r}),Path({str(artifacts)!r}),'
-        f'{time.time()+10},(),{[sys.executable, "-B", "-c", f"from pathlib import Path; Path({str(marker)!r}).touch()"]!r}))\n'
+        f'(),{[sys.executable, "-B", "-c", f"from pathlib import Path; Path({str(marker)!r}).touch()"]!r}))\n'
     )
     process = subprocess.Popen([sys.executable, '-B', '-c', script], start_new_session=True)
     process.wait(timeout=2)
@@ -239,50 +303,78 @@ def test_transient_native_observation_recovers_before_command_dispatch(tmp_path)
     assert read_json(artifacts / 'command-supervision.json')['status'] == 'completed'
 
 
-def test_unreadable_foreign_sibling_does_not_block_owned_orphan_observation(monkeypatch):
-    import ctypes
-    from types import SimpleNamespace
+def test_unreadable_foreign_sibling_does_not_block_registered_orphan_observation(darwin_owned_process_queries):
     from core.task_snapshot_review import native_owned_process_observation as observation
-    supervisor_pid = os.getpid()
-    foreign_parent, foreign_sibling, owned_child, owned_orphan, orphan_child = 800001, 800002, 800003, 800004, 800005
-    identities = {
-        supervisor_pid: (foreign_parent, supervisor_pid, 100),
-        foreign_parent: (1, foreign_parent, 99),
-        foreign_sibling: (foreign_parent, foreign_parent, 101),
-        owned_child: (supervisor_pid, supervisor_pid, 101),
-        owned_orphan: (1, owned_orphan, 101),
-        orphan_child: (owned_orphan, orphan_child, 102),
-    }
-    queried_environment_pids = []
-    def process_info(pid, flavor, argument, pointer, size):
-        info = pointer._obj
-        info.process_id = pid
-        info.parent_process_id, info.process_group_id, info.start_seconds = identities[pid]
-        info.user_id = os.getuid()
-        info.process_status = 2
-        return size
-    def process_list(selection, user_id, destination, size):
-        assert selection == 4 and user_id == os.getuid()
-        if destination is not None:
-            for index, pid in enumerate(identities):
-                destination[index] = pid
-        return len(identities) * ctypes.sizeof(ctypes.c_int)
-    def environment_query(query, count, arguments, length, replacement, replacement_length):
-        pid = query[2]
-        queried_environment_pids.append(pid)
-        if pid == foreign_sibling:
-            ctypes.set_errno(5)
-            return -1
-        arguments.value = (observation.REGISTERED_COMMAND_OWNERSHIP_ENVIRONMENT_KEY + '=current-execution').encode()
-        length._obj.value = len(arguments.value) + 1
-        return 0
-    library = SimpleNamespace(proc_pidinfo=process_info, proc_listpids=process_list)
-    system = SimpleNamespace(sysctl=environment_query)
-    monkeypatch.setattr(observation.sys, 'platform', 'darwin')
-    monkeypatch.setattr(ctypes, 'CDLL', lambda name, **kwargs: library if name else system)
-    owned = observation.owned_process_snapshot('current-execution', supervisor_pid, {})
-    assert set(owned) == {owned_child, owned_orphan, orphan_child}
-    assert queried_environment_pids == [owned_orphan]
-    queried_environment_pids.clear()
-    assert set(observation.owned_process_snapshot('current-execution', supervisor_pid, owned)) == {owned_child, owned_orphan, orphan_child}
-    assert queried_environment_pids == []
+    state = darwin_owned_process_queries
+    state.processes[800604] = (state.orphan_pid, 800604, 103)
+    previous = {state.orphan_pid: {'pid': state.orphan_pid, 'start_identity': [102, 0]}}
+    owned = observation.owned_process_snapshot(state.supervisor_pid, previous,
+        supervisor_native_identity=state.identity)
+    assert set(owned) == {state.child_pid, state.orphan_pid, 800604}
+    assert state.unrelated_pid not in state.inspected
+    assert set(observation.owned_process_snapshot(state.supervisor_pid, owned,
+        supervisor_native_identity=state.identity)) == set(owned)
+
+
+@pytest.mark.parametrize('stop', [False, True])
+def test_observed_child_remains_owned_after_session_detach_and_direct_command_exit(tmp_path, stop):
+    from core.task_snapshot_review.native_owned_process_observation import native_process_identity
+    run = tmp_path / 'observed-before-session-detach'
+    supervision_file = run / 'registered-command-observations/command-supervision.json'
+    detached, release, side_effect = run / 'detached-child-pid', run / 'release-child', run / 'late-side-effect'
+    child_code = (
+        'import os,json,time; from pathlib import Path\n'
+        f'facts=Path({str(supervision_file)!r})\n'
+        'deadline=time.monotonic()+5\n'
+        'while os.getpid() not in {item["pid"] for item in json.loads(facts.read_text()).get("owned_processes",[])}:\n'
+        ' assert time.monotonic()<deadline\n'
+        ' time.sleep(0.01)\n'
+        f'os.setsid(); Path({str(detached)!r}).write_text(str(os.getpid()))\n'
+        f'while not Path({str(release)!r}).exists():\n'
+        ' assert time.monotonic()<deadline\n'
+        ' time.sleep(0.01)\n'
+        f'Path({str(side_effect)!r}).touch()\n'
+    )
+    parent_code = (
+        'import subprocess,sys,time; from pathlib import Path\n'
+        f'subprocess.Popen([sys.executable,"-B","-c",{child_code!r}],env={{}})\n'
+        f'while not Path({str(detached)!r}).exists(): time.sleep(0.01)\n'
+    )
+    supervisor, _ = launch_supervisor(run, [sys.executable, '-B', '-c', parent_code])
+    child_identity = None
+    try:
+        deadline = time.monotonic() + 4
+        while not detached.exists() or read_json(supervision_file).get('command_returncode') is None:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        child_identity = native_process_identity(int(detached.read_text()))
+        facts = read_json(supervision_file)
+        assert supervisor.poll() is None
+        assert facts['command_returncode'] == 0
+        assert facts['owned_process_exit_status'] == 'pending'
+        assert child_identity['process_group_id'] == child_identity['pid']
+        assert not side_effect.exists()
+        if stop:
+            write_json(run / 'execution-revocation.json', {'reason': '取消已观察后脱离的子进程'})
+        else:
+            release.touch()
+        supervisor.wait(timeout=3)
+        if stop:
+            assert not side_effect.exists()
+            assert read_json(supervision_file)['owned_process_exit_status'] != 'exited'
+            while native_process_identity(child_identity['pid']) is not None:
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+        else:
+            assert supervisor.returncode == 0
+            assert side_effect.exists()
+            assert read_json(supervision_file)['owned_process_exit_status'] == 'exited'
+    finally:
+        if supervisor.poll() is None:
+            os.killpg(supervisor.pid, signal.SIGKILL)
+        supervisor.wait()
+        if child_identity and native_process_identity(child_identity['pid']) is not None:
+            try:
+                os.kill(child_identity['pid'], signal.SIGKILL)
+            except ProcessLookupError:
+                pass

@@ -12,6 +12,8 @@
 
 每个发现须有一个处置。`elevated` 必须附 `elevation_impact: none|rollback|broad_rewrite`，说明是否会导致相关工作回滚或大范围重写；普通 elevation 不阻止顺利完成后的提交。仍需实际修复的问题不能用 elevation 伪装完成。
 
+`request.main_agent_context_supplements` 是主会话提供的事实主张。逐份读取 `context_file`，核对候选与 finding 绑定并独立验真；可以反证，不把主会话意见当成已接受结论或新增授权。返回 `context_supplement_responses: [{supplement_id, status: confirmed|refuted|not_applicable|unresolved, reason}]`，每份补充都有可复核依据。未解决的补充不能当成已经覆盖。迟到补充在保留此前修复的工作树中针对性补验，已完成 reviewer 不重跑。
+
 若 request 包含 `validation_failure`，即使匿名发现为空，也须读取失败命令、完整日志和真实 `tested_commit`，从当前被测树修复验证失败；不要伪造 reviewer finding。机器上下文、预登记准备命令和共享证据均有完整树及环境归属，不把其他候选的成功当成本次通过。
 
 工作未完成时使用 `status: incomplete` 并保留实际进度。修复写入当前工作树，由脚本保存真实增量、核对主工作树前后像并应用；并发冲突保留原补丁。执行器自动重验，主 Agent 保留最终审阅和按授权提交。

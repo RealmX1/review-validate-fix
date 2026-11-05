@@ -18,5 +18,12 @@
   "env_unset": [
     "ANTHROPIC_API_KEY"
   ],
-  "timeout_seconds": 900
+  "pre_run_health": true,
+  "credential_identity_source": "claude_secure_storage",
+  "health_command": [
+    "claude",
+    "auth",
+    "status",
+    "--json"
+  ]
 }

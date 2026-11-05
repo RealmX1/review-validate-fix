@@ -29,7 +29,7 @@ def validation_fixer(tmp_path, *, changes=True, elevation_impact=None):
         + ("pathlib.Path('task.py').write_text('value = 3\\n')\n" if changes else "")
         + f"impact={elevation_impact!r}\n"
         "print(json.dumps({'status':'completed','dispositions':[{'finding_id':item['finding_id'], 'status':'elevated' if impact else 'fixed', 'reason':'可复核处置依据', **({'elevation_impact':impact} if impact else {})} for item in request['findings']]}))\n")
-    return {"command": [sys.executable, str(script)], "output_format": "text", "timeout_seconds": 20}
+    return {"command": [sys.executable, str(script)], "output_format": "text"}
 
 
 def test_empty_findings_validation_failure_repairs_actual_tested_commit_automatically(repository, tmp_path):
@@ -65,7 +65,7 @@ def test_repair_budget_survives_resume_and_configuration_changes(repository, tmp
     assert result["disposition"] == "agent_judgment_required"
     assert read_json(run / "run.json")["semantic_repair_rounds_used"] == 3
     assert len(list(run.glob("fixer/attempt-*/request.json"))) == 3
-    result = resume_review(run, fixer_config={**fixer, "timeout_seconds": 21})
+    result = resume_review(run, fixer_config={**fixer, "env_unset": ["UNRELATED_ENVIRONMENT"]})
     assert result["disposition"] == "agent_judgment_required"
     assert len(list(run.glob("fixer/attempt-*/request.json"))) == 3
 
@@ -92,16 +92,18 @@ def test_persistent_revocation_prevents_restart_dispatch(repository, tmp_path):
     assert not list(run.glob("reviewer-*/attempt-*"))
 
 
-def test_expired_role_deadline_does_not_create_fallback_attempts(repository, tmp_path):
-    from core.task_snapshot_review.workflow import _start_role
-    run = automatic_snapshot(repository, tmp_path)
-    role_directory = run / "reviewer-1"
-    role_directory.mkdir()
-    write_json(role_directory / "role-deadline.json", {"deadline_at": 1})
+def test_expired_role_deadline_preserves_history_and_allows_current_execution(repository, tmp_path):
+    run = automatic_snapshot(repository, tmp_path, commands=[[sys.executable, "-c", "pass"]])
+    historical_files = {}
+    for role in ("reviewer-1", "reviewer-2"):
+        path = run / role / "role-deadline.json"
+        write_json(path, {"deadline_at": 1})
+        historical_files[path] = path.read_bytes()
     config = fake_config(tmp_path)
-    result, process = _start_role(run, read_json(run / "run.json"), role_directory, "reviewer", [config], [])
-    assert result is None and process is None
-    assert not list(role_directory.glob("attempt-*"))
+    assert resume_review(run, reviewer_configs=[config, config])["status"] == "ready_to_commit"
+    assert all(path.read_bytes() == original for path, original in historical_files.items())
+    assert resume_review(run)["status"] == "ready_to_commit"
+    assert len(list(run.glob("reviewer-*/attempt-*"))) == 2
 
 
 def test_completed_closeout_covers_every_frozen_implementation_item(repository, tmp_path):

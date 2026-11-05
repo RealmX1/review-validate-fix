@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 from .persistent_artifacts import exclusive_lock, read_json, write_json
+from .native_owned_process_observation import native_process_identity, native_process_start_identity_matches, owned_process_snapshot
 
 
 class ExecutionRevoked(InterruptedError):
@@ -72,16 +73,24 @@ def owned_process_start_time_and_group_match(current: dict, recorded: dict) -> b
 
 
 def register_owned_process(run_directory: Path, pid: int, purpose: str, *, owns_process_group: bool = False) -> None:
+    native_identity = None
+    native_identity_error = None
+    try:
+        native_identity = native_process_identity(pid)
+    except (OSError, RuntimeError) as error:
+        native_identity_error = str(error)
     try:
         identity = process_start_identity(pid)
     except (OSError, subprocess.SubprocessError, RuntimeError) as error:
         identity = {"pid": pid, "start_and_command": None, "identity_evidence_unavailable": str(error)}
-    if identity is None:
+    if identity is None and native_identity is None and native_identity_error is None:
         return
+    identity = identity or {"pid": pid, "start_and_command": None}
     with exclusive_lock(run_directory / "owned-processes.lock"):
         path = run_directory / "owned-processes.json"
         records = read_json(path).get("processes", []) if path.exists() else []
         records.append({**identity, "purpose": purpose, "owns_process_group": owns_process_group,
+                        "native_identity": native_identity, "native_identity_error": native_identity_error,
                         "registered_at": time.time(), "is_active_registration": True})
         write_json(path, {"processes": records})
 
@@ -98,11 +107,13 @@ def finish_owned_process_registration(run_directory: Path, pid: int, purpose: st
         write_json(path, {"processes": records})
 
 
-def persist_execution_revocation(run_directory: Path, reason: str) -> None:
+def persist_execution_revocation(run_directory: Path, reason: str, *, source: str = "execution_revocation_observation",
+                                 request_basis: str | None = None) -> None:
     with exclusive_lock(run_directory / "execution-revocation.lock"):
         path = run_directory / "execution-revocation.json"
         if not path.exists():
-            write_json(path, {"reason": reason, "revoked_at": time.time()})
+            write_json(path, {"reason": reason, "revoked_at": time.time(), "source": source,
+                              "scope": "exact_rvf_run", "request_basis": request_basis or reason})
 
 
 def register_supervised_command_directory(run_directory: Path, command_directory: Path) -> None:
@@ -117,8 +128,40 @@ def register_supervised_command_directory(run_directory: Path, command_directory
             write_json(registry, {'command_directories': [*directories, str(directory)]})
 
 
-def revoke_execution(run_directory: Path, reason: str) -> dict:
-    persist_execution_revocation(run_directory, reason)
+def withdraw_current_continuation_delivery(run_directory: Path) -> None:
+    """明确撤销后收回当前投递资格。历史修订目录与消费回执保持原样。"""
+    manifest_file = run_directory / "agent-continuation-notices.json"
+    if manifest_file.exists():
+        manifest = read_json(manifest_file)
+        if manifest.get("notices"):
+            write_json(manifest_file, {"notices": []})
+    business_file = run_directory / "business-result.json"
+    if business_file.exists():
+        result = read_json(business_file)
+        closeout = result.get("closeout")
+        changed = result.get("disposition") != "cancelled" or "agentContinuationNotice" in result or (
+            isinstance(closeout, dict) and closeout.get("automatic_commit_allowed") is not False)
+        if changed:
+            result["status"] = "cancelled"
+            result["disposition"] = "cancelled"
+            result.pop("agentContinuationNotice", None)
+            if isinstance(closeout, dict):
+                result["closeout"] = {**closeout, "automatic_commit_allowed": False}
+            write_json(business_file, result)
+    record_file = run_directory / "run.json"
+    if record_file.exists():
+        record = read_json(record_file)
+        if record.get("status") != "cancelled":
+            record["status"] = "cancelled"
+            write_json(record_file, record)
+
+
+def revoke_execution(run_directory: Path, reason: str, *, source: str = "execution_revocation_observation",
+                     request_basis: str | None = None) -> dict:
+    # 与结果发布共用补充锁，避免撤销落在最后一次检查和清单写回之间。
+    with exclusive_lock(run_directory / "main-agent-context-supplements.lock"):
+        persist_execution_revocation(run_directory, reason, source=source, request_basis=request_basis)
+        withdraw_current_continuation_delivery(run_directory)
     # 监督者已退出也不能丢弃跨 session 后代；原生启动身份重新核验后才发送信号。
     from .retained_command_supervisor import terminate_supervised_command_descendants
     supervised_descendants = []
@@ -144,15 +187,18 @@ def revoke_execution(run_directory: Path, reason: str) -> dict:
         if process["pid"] == os.getpid() or process.get("is_active_registration") is not True:
             continue
         try:
-            if not process.get("start_and_command"):
+            native_identity = process.get('native_identity')
+            if not native_identity and not process.get("start_and_command"):
                 raise RuntimeError("缺少原进程身份，保留取消未知并等待等价证据")
-            current = process_start_identity(process["pid"])
+            current = native_process_identity(process['pid']) if native_identity else process_start_identity(process["pid"])
             if current is None:
                 status = "local_process_exited"
-            elif not owned_process_start_time_and_group_match(current, process):
+            elif not (native_process_start_identity_matches(current, native_identity) if native_identity
+                    else owned_process_start_time_and_group_match(current, process)):
                 status = "identity_changed_no_signal"
             else:
-                (os.killpg if process["owns_process_group"] else os.kill)(process["pid"], signal.SIGTERM)
+                owns_group = process['owns_process_group'] and (not native_identity or current['process_group_id'] == process['pid'])
+                (os.killpg if owns_group else os.kill)(process["pid"], signal.SIGTERM)
                 status = "termination_requested"
         except (OSError, subprocess.SubprocessError, RuntimeError):
             status = "unknown"
@@ -163,13 +209,16 @@ def revoke_execution(run_directory: Path, reason: str) -> dict:
         remaining = []
         for item in pending:
             try:
-                current = process_start_identity(item["pid"])
+                native_identity = item.get('native_identity')
+                current = native_process_identity(item['pid']) if native_identity else process_start_identity(item["pid"])
                 if current is None:
                     item["local_cancellation_status"] = "local_process_exited"
-                elif not owned_process_start_time_and_group_match(current, item):
+                elif not (native_process_start_identity_matches(current, native_identity) if native_identity
+                        else owned_process_start_time_and_group_match(current, item)):
                     item["local_cancellation_status"] = "identity_changed_no_signal"
                 elif time.monotonic() >= deadline:
-                    (os.killpg if item["owns_process_group"] else os.kill)(item["pid"], signal.SIGKILL)
+                    owns_group = item['owns_process_group'] and (not native_identity or current['process_group_id'] == item['pid'])
+                    (os.killpg if owns_group else os.kill)(item["pid"], signal.SIGKILL)
                     item["local_cancellation_status"] = "force_termination_requested"
                 else:
                     remaining.append(item)
@@ -186,41 +235,143 @@ def revoke_execution(run_directory: Path, reason: str) -> dict:
     return evidence
 
 
-def wait_for_owned_process(process: subprocess.Popen, run_directory: Path, *, timeout: float | None = None) -> int:
+def persist_role_progress_observation(progress_file: Path, observation: dict) -> bool:
+    recovery_file = progress_file.with_name("progress-observation-recovery.json")
+    try:
+        try:
+            previous = read_json(progress_file) if progress_file.exists() else {}
+        except (OSError, ValueError):
+            previous = {}
+        if not isinstance(previous, dict):
+            previous = {}
+        write_json(progress_file, {**previous, **observation})
+    except (OSError, ValueError, TypeError) as error:
+        try:
+            write_json(recovery_file, {"status": "unknown", "error_type": type(error).__name__,
+                "waiting_reason": "progress_observation_storage_unavailable", "observed_at": time.time(),
+                "equivalent_sources": ["owned-processes.json", "stdout.txt", "stderr.txt", "outcome.json"],
+                "recovery_condition": "progress_storage_or_output_activity_changed_or_process_exited",
+                "maximum_unchanged_retries": 3})
+        except (OSError, ValueError, TypeError):
+            pass
+        return False
+    try:
+        if recovery_file.exists() and read_json(recovery_file).get("status") != "recovered":
+            write_json(recovery_file, {"status": "recovered", "observed_at": time.time()})
+    except (OSError, ValueError, TypeError):
+        pass
+    return True
+
+
+def progress_observation_recovery_identity(progress_file: Path) -> tuple:
+    observations = []
+    for path in (progress_file, progress_file.parent, progress_file.parent / "stdout.txt", progress_file.parent / "stderr.txt"):
+        try:
+            metadata = path.stat()
+            observations.append((metadata.st_dev, metadata.st_ino, metadata.st_mode,
+                None if path == progress_file.parent else (metadata.st_size, metadata.st_mtime_ns)))
+        except OSError as error:
+            observations.append(type(error).__name__)
+    try:
+        observations.append(os.statvfs(progress_file.parent).f_bavail)
+    except OSError as error:
+        observations.append(type(error).__name__)
+    return tuple(observations)
+
+
+def record_owned_process_wait_observation(progress_file: Path, process_pid: int) -> bool:
+    try:
+        streams = {name: (progress_file.parent / f"{name}.txt").stat()
+                   for name in ("stdout", "stderr") if (progress_file.parent / f"{name}.txt").exists()}
+        output_activity = [metadata.st_mtime for metadata in streams.values() if metadata.st_size]
+        return persist_role_progress_observation(progress_file, {"process_pid": process_pid, "last_observed_at": time.time(),
+            "last_output_activity_at": max(output_activity) if output_activity else None,
+            "output_bytes": {name: metadata.st_size for name, metadata in streams.items()},
+            "waiting_reason": "owned_process_running", "recovery_condition": "native_process_exit_or_persistent_stop"})
+    except OSError:
+        return persist_role_progress_observation(progress_file, {"process_pid": process_pid,
+            "last_observed_at": time.time(), "waiting_reason": "output_activity_observation_unavailable",
+            "recovery_condition": "output_activity_or_native_process_evidence_changed"})
+
+
+def wait_for_owned_process(process: subprocess.Popen, run_directory: Path, *, timeout: float | None = None,
+                           progress_file: Path | None = None) -> int:
     deadline = time.monotonic() + timeout if timeout is not None else None
+    next_observation = 0
+    observation_failures = 0
+    recovery_identity = None
+    ownership_observation_deferred_until_process_exit = False
     while True:
         ensure_execution_not_revoked(run_directory)
-        observe_owned_process_group_descendants(run_directory, process.pid)
+        if not ownership_observation_deferred_until_process_exit:
+            ownership_observation_deferred_until_process_exit = observe_owned_process_group_descendants(run_directory, process.pid) is False
+        if progress_file is not None and time.monotonic() >= next_observation:
+            current_identity = progress_observation_recovery_identity(progress_file)
+            if current_identity != recovery_identity:
+                observation_failures = 0
+                recovery_identity = current_identity
+            if observation_failures < 3:
+                observed = record_owned_process_wait_observation(progress_file, process.pid)
+                observation_failures = 0 if observed else observation_failures + 1
+                # 写入本身改变 inode，比较写入后的证据以限制相同故障重试。
+                recovery_identity = progress_observation_recovery_identity(progress_file)
+            next_observation = time.monotonic() + 1
         try:
-            return process.wait(timeout=min(0.2, max(0.001, deadline - time.monotonic())) if deadline else 0.2)
+            returncode = process.wait(timeout=min(0.2, max(0.001, deadline - time.monotonic())) if deadline else 0.2)
+            if ownership_observation_deferred_until_process_exit:
+                observe_owned_process_group_descendants(run_directory, process.pid)
+            if progress_file is not None:
+                record_owned_process_wait_observation(progress_file, process.pid)
+            return returncode
         except subprocess.TimeoutExpired:
             if deadline and time.monotonic() >= deadline:
                 raise
 
 
-def observe_owned_process_group_descendants(run_directory: Path, group_id: int) -> None:
+def observe_owned_process_group_descendants(run_directory: Path, group_id: int) -> bool:
+    path = run_directory / 'owned-processes.json'
+    recovery_file = run_directory / f'owned-process-observation-{group_id}.json'
     try:
-        table = subprocess.run(["ps", "-axo", "pid=,pgid=,lstart=,command="], capture_output=True, text=True, timeout=5)
-        if table.returncode:
-            return
+        records = read_json(path).get('processes', []) if path.exists() else []
+        root = next((item for item in reversed(records) if item['pid'] == group_id
+            and item.get('owns_process_group') and item.get('is_active_registration')), None)
+        if root is None:
+            return True
+        if not root.get('native_identity'):
+            raise RuntimeError('所属进程缺少已登记的原生启动身份')
+        previous = {item['pid']: item['native_identity'] for item in records
+            if item.get('ownership_root_pid') == group_id and item.get('native_identity')}
+        observation_error = None
+        try:
+            snapshot = owned_process_snapshot(group_id, previous, supervisor_native_identity=root['native_identity'])
+        except (OSError, RuntimeError) as error:
+            snapshot = getattr(error, 'observed_owned_processes', {})
+            observation_error = error
         descendants = []
-        for line in table.stdout.splitlines():
-            fields = line.split(None, 7)
-            if len(fields) == 8 and fields[1] == str(group_id) and fields[0] != str(group_id):
-                descendants.append({"pid": int(fields[0]), "start_and_command": " ".join([*fields[2:7], fields[1], *fields[7].split()]),
-                                    "purpose": "owned_process_group_descendant", "owns_process_group": False,
-                                    "registered_at": time.time(), "is_active_registration": True})
-        if not descendants:
-            return
+        for pid, native_identity in snapshot.items():
+            try:
+                identity = process_start_identity(pid)
+            except (OSError, subprocess.SubprocessError, RuntimeError):
+                identity = None
+            descendants.append({**(identity or {'pid': pid, 'start_and_command': None}),
+                'native_identity': native_identity, 'ownership_root_pid': group_id,
+                'purpose': 'owned_process_group_descendant', 'owns_process_group': False,
+                'registered_at': time.time(), 'is_active_registration': True})
         with exclusive_lock(run_directory / "owned-processes.lock"):
-            path = run_directory / "owned-processes.json"
             records = read_json(path).get("processes", []) if path.exists() else []
-            known = {(item["pid"], item["start_and_command"]) for item in records}
-            added = [item for item in descendants if (item["pid"], item["start_and_command"]) not in known]
+            known = {(item['pid'], json.dumps((item.get('native_identity') or {}).get('start_identity'))) for item in records}
+            added = [item for item in descendants if (item['pid'], json.dumps(item['native_identity']['start_identity'])) not in known]
             if added:
                 write_json(path, {"processes": [*records, *added]})
-    except (OSError, subprocess.SubprocessError):
-        return
+        if observation_error:
+            raise observation_error
+        if recovery_file.exists():
+            write_json(recovery_file, {'status': 'recovered', 'observed_at': time.time()})
+        return True
+    except (OSError, subprocess.SubprocessError, RuntimeError) as error:
+        write_json(recovery_file, {'status': 'unknown', 'error': str(error), 'observed_at': time.time(),
+            'recovery_condition': 'owned_process_identity_or_native_observation_changed', 'maximum_unchanged_retries': 1})
+        return False
 
 
 def append_stage_event(run_directory: Path, event: str, **facts) -> None:
@@ -276,13 +427,39 @@ def review_closeout(record: dict, run_directory: Path) -> dict:
 
 
 def publish_business_result(run_directory: Path, result: dict) -> dict:
+    from .main_agent_context_supplements import (
+        pending_main_agent_context_supplements, publish_context_supplements_pending,
+        MainAgentContextEvidenceUnavailable, reconcile_interrupted_context_registration_locked,
+    )
+    with exclusive_lock(run_directory / "main-agent-context-supplements.lock"):
+        reconcile_interrupted_context_registration_locked(run_directory)
+        try:
+            if not execution_is_revoked(run_directory) and pending_main_agent_context_supplements(run_directory):
+                if result["status"] in {"ready_to_commit", "completed", "context_supplements_pending"}:
+                    return publish_context_supplements_pending(run_directory)
+        except MainAgentContextEvidenceUnavailable as error:
+            record = read_json(run_directory / "run.json")
+            record.update({"status": "machine_evidence_pending", "recovery": {"missing_evidence": str(error),
+                "equivalent_sources": ["registered_supplement_identity", "sha256_bound_original"],
+                "trigger": "context_supplement_original_evidence_changed", "action": "resume_same_run", "maximum_unchanged_retries": 0}})
+            write_json(run_directory / "run.json", record)
+            result = {"status": "machine_evidence_pending", "run_directory": str(run_directory)}
+            manifest_file = run_directory / "agent-continuation-notices.json"
+            if manifest_file.exists():
+                write_json(manifest_file, {"notices": [n for n in read_json(manifest_file)["notices"] if n["stage"] != "final_agent_review"]})
+        return _publish_business_result_under_context_lock(run_directory, result)
+
+
+def _publish_business_result_under_context_lock(run_directory: Path, result: dict) -> dict:
     record = read_json(run_directory / "run.json")
     closeout = review_closeout(record, run_directory)
     if execution_is_revoked(run_directory):
         disposition = "cancelled"
+        result = {**result, "status": "cancelled"}
+        if record["status"] != "cancelled":
+            record["status"] = "cancelled"
+            write_json(run_directory / "run.json", record)
     elif (record.get("repair_budget_exhausted")
-          or any(read_json(path).get("recovery", {}).get("category") == "deadline_exhausted" for path in [
-              *run_directory.glob("*/attempt-*/outcome.json"), *run_directory.glob("*/deadline-exhausted.json")])
           or any(item.get("elevation_impact") in {"rollback", "broad_rewrite"} for item in closeout["elevations"])):
         disposition = "agent_judgment_required"
     elif result["status"] in {"ready_to_commit", "completed"}:
@@ -297,7 +474,44 @@ def publish_business_result(run_directory: Path, result: dict) -> dict:
         paths = [str(path.parent / "outcome.json") for path in attempts]
         paths.extend(str(path.parent / filename) for path in attempts for filename in
                      ("stdout.txt", "stderr.txt", "model-invocation.json", "progress.json"))
+        paths.extend(str(path) for path in run_directory.glob("*/progress.json"))
         machine_retry_times = []
+        eligibility_recovery_limits = [0] if result['status'] == 'review_incomplete' else []
+        pending_reviewer_directories = set()
+        pending_harness_constraints = set()
+        if result['status'] == 'review_incomplete':
+            from .workflow import _role_result
+            for index, constraint in enumerate(record.get('reviewer_harness_constraints',
+                    ['any_external_cli'] * record['reviewer_count'])):
+                role_directory = run_directory / f'reviewer-{index + 1}'
+                if _role_result(role_directory) is None:
+                    pending_reviewer_directories.add(role_directory)
+                    pending_harness_constraints.add(constraint)
+        eligibility_files = ([run_directory / 'reviewer-candidate-eligibility.json',
+                              *run_directory.glob('reviewer-*/reviewer-eligibility.json')]
+                             if result['status'] == 'review_incomplete' else
+                             [run_directory / 'fixer/reviewer-eligibility.json'] if result['status'] == 'fix_incomplete' else [])
+        for eligibility_file in eligibility_files:
+            if not eligibility_file.exists():
+                continue
+            paths.append(str(eligibility_file))
+            payload = read_json(eligibility_file)
+            for eligibility in payload.get('observations', [payload]):
+                paths.extend(eligibility.get('credential_evidence_paths', []))
+                paths.extend(eligibility.get('configuration_evidence_paths', []))
+                if eligibility.get('evidence_path'):
+                    paths.append(eligibility['evidence_path'])
+                if eligibility.get('account_status_evidence_path'):
+                    paths.append(eligibility['account_status_evidence_path'])
+                applicable_to_pending_role = (result['status'] != 'review_incomplete'
+                    or eligibility_file.parent in pending_reviewer_directories
+                    or eligibility_file.name == 'reviewer-candidate-eligibility.json'
+                        and pending_harness_constraints.intersection(eligibility.get('reviewer_harness_constraints', [])))
+                if applicable_to_pending_role and eligibility.get('can_dispatch') is False:
+                    recovery = eligibility.get('recovery', {})
+                    eligibility_recovery_limits.append(recovery.get('maximum_unchanged_retries', 0))
+                    if recovery.get('maximum_unchanged_retries', 0) > 0 and recovery.get('retry_not_before_epoch_ms'):
+                        machine_retry_times.append(recovery['retry_not_before_epoch_ms'])
         for intent in run_directory.glob("incomplete-fixer-machine-validation/round-*/collection-intent.json"):
             paths.extend([str(intent), str(intent.parent / "evidence.json")])
             collection = read_json(intent)
@@ -307,14 +521,58 @@ def publish_business_result(run_directory: Path, result: dict) -> dict:
         configurations = [read_json(path).get("config", {}).get("configuration_file_path") for path in attempts]
         paths.extend(str(Path(evidence).expanduser()) for path in attempts for evidence in read_json(path).get("config", {}).get("credential_evidence_paths", []))
         paths.extend(path for path in configurations if path)
+        paths.extend(str(path) for path in run_directory.glob("main-agent-context-originals-by-sha256/*.md"))
+        paths.extend(str(run_directory / name) for name in ("main-agent-context-supplements", "main-agent-context-originals-by-sha256", "reviewer-findings.json"))
         paths.extend(str(run_directory / filename) for filename in ("reviewer-configurations.json", "fixer-configuration.json", "context-response-originals-by-sha256"))
         latest_attempts = {path.parent.parent: path.parent for path in attempts}
-        failures = [read_json(attempt / "outcome.json") for attempt in latest_attempts.values() if (attempt / "outcome.json").exists()]
+        failures = [read_json(attempt / "outcome.json") for role_directory, attempt in latest_attempts.items()
+                    if (attempt / "outcome.json").exists()
+                    and (result['status'] != 'review_incomplete' or role_directory in pending_reviewer_directories)]
         retry_times = machine_retry_times + [item["retry_not_before"] * 1000 for item in failures if item.get("retry_not_before") and
-                       item.get("recovery", {}).get("category") in {"authentication", "usage_limit", "workspace_preparation"}]
+                       item.get("recovery", {}).get("category") == "workspace_preparation"]
+        if retry_times:
+            eligibility_recovery_limits.append(1)
         result["recovery"] = {**record.get("recovery", {"missing_evidence": result["status"],
             "equivalent_sources": ["role_native_output", "registered_configuration", "validation_command_logs"],
             "trigger": "evidence_or_configuration_changed", "action": "resume_same_run", "maximum_unchanged_retries": 1}),
+            **({'maximum_unchanged_retries': max(eligibility_recovery_limits)} if eligibility_recovery_limits else {}),
             "evidence_paths": sorted(set(paths)), **({"retry_not_before_epoch_ms": min(retry_times)} if retry_times else {})}
+        if result['status'] == 'review_incomplete' and not retry_times:
+            result['recovery'].pop('retry_not_before_epoch_ms', None)
+    from .reviewer_machine_evidence_recovery import pending_reviewer_machine_evidence_requests
+    from .agent_review_summary_artifacts import publish_machine_evidence_wait_notices
+    pending_machine_requests = pending_reviewer_machine_evidence_requests(run_directory) if disposition == "machine_evidence_pending" else []
+    if disposition == "machine_evidence_pending" and pending_machine_requests:
+        result["recovery"]["pending_machine_requests"] = pending_machine_requests
+        retry_times = [item["retry_not_before_epoch_ms"] for item in pending_machine_requests if item.get("retry_not_before_epoch_ms")]
+        if retry_times:
+            result["recovery"].update({"retry_not_before_epoch_ms": min(retry_times), "maximum_unchanged_retries": 1})
+        else:
+            result["recovery"]["maximum_unchanged_retries"] = 0
+    if disposition != "cancelled" and not execution_is_revoked(run_directory):
+        publish_machine_evidence_wait_notices(run_directory, record, pending_machine_requests)
+    if disposition in {"agent_review_ready", "agent_judgment_required"} and not execution_is_revoked(run_directory):
+        from .agent_review_summary_artifacts import publish_agent_review_summary
+        notice = publish_agent_review_summary(run_directory, record, result)
+        if notice and not execution_is_revoked(run_directory):
+            result["agentContinuationNotice"] = notice
+        else:
+            disposition = "cancelled"
+            result.pop("agentContinuationNotice", None)
+    if "agentContinuationNotice" not in result or disposition == "cancelled" or execution_is_revoked(run_directory):
+        result.pop("agentContinuationNotice", None)
+        if execution_is_revoked(run_directory):
+            disposition = "cancelled"
+        manifest_file = run_directory / "agent-continuation-notices.json"
+        if manifest_file.exists():
+            notices = read_json(manifest_file)["notices"]
+            write_json(manifest_file, {"notices": [] if disposition == "cancelled" else [n for n in notices if n["stage"] != "final_agent_review"]})
+    if disposition == "cancelled":
+        result = {**result, "status": "cancelled", "disposition": "cancelled"}
+        if isinstance(result.get("closeout"), dict):
+            result["closeout"] = {**result["closeout"], "automatic_commit_allowed": False}
+        if record.get("status") != "cancelled":
+            record["status"] = "cancelled"
+            write_json(run_directory / "run.json", record)
     write_json(run_directory / "business-result.json", result)
     return result

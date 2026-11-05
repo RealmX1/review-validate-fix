@@ -62,7 +62,7 @@ def fake_config(tmp_path, *, findings=None, fail_first=False, malformed=False, f
            "if not marker.exists():\n marker.write_text('failed'); print('transient failure',file=sys.stderr); sys.exit(7)\n" if fail_first else "")
         + ("print('malformed result')\n" if malformed else "print(json.dumps(result,ensure_ascii=False))\n")
     )
-    config = {"command": [sys.executable, str(script)], "output_format": "text", "timeout_seconds": 20}
+    config = {"command": [sys.executable, str(script)], "output_format": "text"}
     return config
 
 
@@ -247,7 +247,7 @@ def test_context_response_only_resumes_missing_legs_and_preserves_their_prior_fi
     assert len(list((run/'reviewer-1').glob('attempt-*')))==2
 
 
-def test_explicit_process_stop_cancels_owned_roles_but_retains_restart_materials(repository,tmp_path):
+def test_explicit_cancel_command_cancels_owned_roles_but_retains_restart_materials(repository,tmp_path):
     run=prepare(repository,tmp_path)
     config=fake_config(tmp_path)
     script=Path(config['command'][1]);script.write_text('import time\ntime.sleep(20)\n'+script.read_text())
@@ -260,14 +260,16 @@ def test_explicit_process_stop_cancels_owned_roles_but_retains_restart_materials
     while len(list(run.glob('reviewer-*/attempt-*/model-invocation.json')))<2:
         assert time.monotonic()<deadline
         time.sleep(0.03)
-    process.terminate()
+    cancelled = subprocess.run([sys.executable, str(entry), 'cancel-task-review', '--run-dir', str(run), '--reason', '明确撤销此 RVF'], capture_output=True, text=True, timeout=15)
+    assert cancelled.returncode == 0, cancelled.stderr
     stdout,stderr=process.communicate(timeout=15)
-    assert process.returncode==130,(stdout,stderr)
+    assert process.returncode==0,(stdout,stderr)
     assert read_json(run/'run.json')['status']=='cancelled'
     assert all(read_json(path)['status']=='cancelled' for path in run.glob('reviewer-*/attempt-*/outcome.json'))
     assert canary(repository)==before
     config=fake_config(tmp_path)
     assert resume_review(run,reviewer_configs=[config,config])['status']=='cancelled'
+    assert read_json(run/'execution-revocation.json')['source']=='rvf_cancel_task_review_command'
 
 
 def test_changed_main_worktree_blocks_only_patch_application_and_retains_fixer_result(repository, tmp_path):
@@ -289,7 +291,7 @@ def test_changed_main_worktree_blocks_only_patch_application_and_retains_fixer_r
 def plain_reviewer_config(tmp_path, name="plain-reviewer.py"):
     script = tmp_path / name
     script.write_text("import json\nprint(json.dumps({'status':'completed','findings':[],'audit_summary':'已检查'}))\n")
-    return {"command": [sys.executable, str(script)], "output_format": "text", "timeout_seconds": 20}
+    return {"command": [sys.executable, str(script)], "output_format": "text"}
 
 
 def test_deleted_scoped_file_survives_snapshot_validation_and_completion(repository, tmp_path):
@@ -438,7 +440,7 @@ def test_validation_failure_can_be_fixed_and_revalidated_in_the_same_run(reposit
     assert len(list((run / "fixer").glob("attempt-*"))) == 2
 
 
-def test_stopping_final_validation_reaps_its_process_before_unlocking(repository, tmp_path):
+def test_explicit_cancel_of_final_validation_reaps_its_process_before_unlocking(repository, tmp_path):
     run = prepare(repository, tmp_path)
     config = plain_reviewer_config(tmp_path)
     resume_review(run, reviewer_configs=[config, config])
@@ -454,9 +456,10 @@ def test_stopping_final_validation_reaps_its_process_before_unlocking(repository
         assert time.monotonic() < deadline
         time.sleep(0.03)
     child_pid = int(pid_file.read_text())
-    process.terminate()
+    cancelled = subprocess.run([sys.executable, str(entry), 'cancel-task-review', '--run-dir', str(run)], capture_output=True, text=True, timeout=15)
+    assert cancelled.returncode == 0, cancelled.stderr
     stdout, stderr = process.communicate(timeout=15)
-    assert process.returncode == 130, (stdout, stderr)
+    assert process.returncode == 0, (stdout, stderr)
     with pytest.raises(ProcessLookupError):
         os.kill(child_pid, 0)
     assert not marker.exists()

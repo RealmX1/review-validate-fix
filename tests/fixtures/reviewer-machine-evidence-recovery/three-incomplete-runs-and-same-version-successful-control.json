@@ -1,0 +1,753 @@
+{
+  "schema_version": 1,
+  "purpose": "仅用于可移植恢复契约回归；不是生产执行目录，不可据此恢复或统计为新 run",
+  "cases": [
+    {
+      "source_task_id": "dd6f5",
+      "source_project": "my-ai-setup",
+      "candidate_commit": "be743a2abaf6ceaa914f3ffbb63fabdd25deccf1",
+      "candidate_tree": "4931898fc3b5c7d0ab938e9258a9298bc2dccd03",
+      "source_version": {
+        "plugin_version": "0.1.0-dev.555+g3d9aee9993e2",
+        "source_files_sha256": {
+          "core/task_snapshot_review/__init__.py": "5e9b654837649890174d065a78f9abdb5b6db9532c097f599c7332b7caab6ff1",
+          "core/task_snapshot_review/active_run_observation.py": "b6b2afb76d4777bd17355476fb7bde8aea6be6e2635f204ec563c2ea41d06161",
+          "core/task_snapshot_review/execution_lifecycle.py": "ceb131fefe521655c213190a94ad967c1d1f090aae24b9b06e8a2e61840d9199",
+          "core/task_snapshot_review/github_issue_observations.py": "fcb073c2319189056c7829f82ae3bfc07f04105cbd475b81f3b9918570e365dd",
+          "core/task_snapshot_review/harness_cli_adapters.py": "8f8c1257695d685d2b617f81779fcb8723b16d2dc5bc026237f6814ad48ec7bd",
+          "core/task_snapshot_review/hook_entrypoint.py": "bda6c5064313fa5f8cabdd624c98af35adf03c42c2fd361c8e8f41811bee5de0",
+          "core/task_snapshot_review/kimi_latest_stable_model_selection.py": "57051ced2e29b32283fe058e2d8ad0be140722fd2073fd547c3f05d4cd5b7ac6",
+          "core/task_snapshot_review/machine_evidence.py": "f2d3d6c447d68506535df1eacb6b5d36fb4c19cd9586a333fe8fc9d1f31b823f",
+          "core/task_snapshot_review/native_owned_process_observation.py": "719ca06d3ce386d6bfe344f7f91b74700a939fd2905c7dd6b4b9673b2bf98a1b",
+          "core/task_snapshot_review/persistent_artifacts.py": "26d3dc826329deef55540b10be78033cb5f389689e15b31a2287f4e532ffc779",
+          "core/task_snapshot_review/retained_command_supervisor.py": "1af35d940898989b97678f613d679c09caf152e80110949565beb18152425b24",
+          "core/task_snapshot_review/reviewer_account_eligibility.py": "819dd1a0fca1bc0f895c933cb0e11539848d5071ca8bd30b0d784e95383d94ae",
+          "core/task_snapshot_review/role_failure_recovery.py": "2a897e36f6453be60722fc342e40434ab6ad06ce790ca476ee6c7d00c2856d89",
+          "core/task_snapshot_review/role_process_execution.py": "0c16c44bc29b04112bdf50f9e3c5cb60a60c57757d7fef425ae91ab10ff0eb87",
+          "core/task_snapshot_review/task_snapshot.py": "91a41ec945ea4e4b519904087f4558b4e968633c2f04c77c56e4c4485bad37c6",
+          "core/task_snapshot_review/trajectory_analysis.py": "bd952d667b6e3ee21a3815fe73b73142860e9d6cc557a50f552aff49b8b5069b",
+          "core/task_snapshot_review/workflow.py": "4038d9d10dee4b9380980ef0e61ae4adc687eaba29c023d27d7beaa75291a936",
+          "skills/review-validate-fix/prompts/reviewer.md": "e0c0ed439d038c7ef751d1ed26b433c9b7e06653d58272de0520c8fc543f61af",
+          "skills/review-validate-fix/prompts/validate-fix.md": "95bbb1bc5f02890cc3033c93f184ecc852898e4602b75f84cf8f11e0779a05fb"
+        },
+        "git_commit": null
+      },
+      "historical_run_status": "review_incomplete",
+      "historical_revoked": true,
+      "decision_facts_sha256_was_missing": true,
+      "frozen_execution_plan": {
+        "fix": true,
+        "validation_commands": [
+          [
+            "/Users/bominzhang/.local/bin/python3.12",
+            "-B",
+            "-m",
+            "pytest",
+            "-q",
+            "skills/base-branch-sync/tests/test_durable_base_branch_sync.py",
+            "skills/base-branch-sync/tests/test_durable_synchronization_operation_audit.py",
+            "skills/base-branch-sync/tests/test_node_workflow_environment_preflight.py"
+          ],
+          [
+            "/Users/bominzhang/.local/bin/python3.12",
+            "-B",
+            "-c",
+            "import os,sys,subprocess;from pathlib import Path;environment={**os.environ,'BASE_BRANCH_SYNC_PYTHON_EXECUTABLE':sys.executable,'PATH':str(Path(sys.executable).resolve().parent)+os.pathsep+os.environ['PATH']};raise SystemExit(subprocess.run(['bash',sys.argv[1]],env=environment).returncode)",
+            "skills/base-branch-sync/tests/test-protect-and-restore-task-worktree-wip-stash.sh"
+          ],
+          [
+            "/Users/bominzhang/.local/bin/python3.12",
+            "-B",
+            "-c",
+            "import os,sys,subprocess;from pathlib import Path;environment={**os.environ,'BASE_BRANCH_SYNC_PYTHON_EXECUTABLE':sys.executable,'PATH':str(Path(sys.executable).resolve().parent)+os.pathsep+os.environ['PATH']};raise SystemExit(subprocess.run(['bash',sys.argv[1]],env=environment).returncode)",
+            "skills/base-branch-sync/tests/test-evidence-aware-optimistic-handback.sh"
+          ],
+          [
+            "/Users/bominzhang/.local/bin/python3.12",
+            "-B",
+            "-c",
+            "import os,sys,subprocess;from pathlib import Path;environment={**os.environ,'BASE_BRANCH_SYNC_PYTHON_EXECUTABLE':sys.executable,'PATH':str(Path(sys.executable).resolve().parent)+os.pathsep+os.environ['PATH']};raise SystemExit(subprocess.run(['bash',sys.argv[1]],env=environment).returncode)",
+            "skills/base-branch-sync/tests/test-base-branch-sync-document-contracts.sh"
+          ],
+          [
+            "git",
+            "diff",
+            "--check"
+          ]
+        ],
+        "preparation_commands": [],
+        "machine_evidence_commands": [],
+        "maximum_semantic_repair_rounds": 3,
+        "machine_context": {
+          "taskId": "dd6f5",
+          "sourceManifest": "/Users/bominzhang/.cline/kanban/cross-task-handoff-artifacts/my-ai-setup/dd6f5/first-batch-final-source-manifest.json",
+          "verificationResult": "/Users/bominzhang/.cline/kanban/cross-task-handoff-artifacts/my-ai-setup/dd6f5/first-batch-implementation-verification-result.json",
+          "verificationReport": "/Users/bominzhang/.cline/kanban/cross-task-handoff-artifacts/my-ai-setup/dd6f5/first-batch-implementation-and-verification-report.zh-CN.md",
+          "roadmap": "/Users/bominzhang/.cline/kanban/cross-task-handoff-artifacts/my-ai-setup/dd6f5/base-branch-sync-improvement-roadmap-20261031/base-branch-sync-improvement-roadmap-and-resumption-guide.zh-CN.md",
+          "fixedProducerSnapshotIdentity": "/Users/bominzhang/.cline/kanban/cross-task-handoff-artifacts/my-ai-setup/dd6f5/fixed-rvf-producer-snapshot-identity.json",
+          "runtimePython": "/Users/bominzhang/.local/bin/python3.12",
+          "scopeBoundary": "first_batch_R1_R2_R3_only",
+          "forbiddenActions": [
+            "base_sync",
+            "installation",
+            "push",
+            "deployment",
+            "background_sibling_mutation"
+          ],
+          "reviewBaseline": "b4936c73af0eb332a794ebfbd8856f8b789369b8",
+          "requirementsFileSha256": "9804e7368ba0a88d407b9810220c6eca4274fa95b97c4ef87ea1f1fbd9504bd9"
+        },
+        "implementation_plan": [
+          "R1：新入口默认 JSON ≤8 KiB，完整 stdout/stderr/退出码/哈希持久保存，记录阶段区间与锁占用，保留旧 CLI 文本和位置参数。",
+          "R2：run/inspect/resume 复用原受控 Git helper 与 reviewed executor，绑定身份与当前授权；保护 staged/unstaged/untracked WIP、二进制与权限，未知结果先按 refs/tree/父关系/保护 ref/预演对账；重启保留有界预算和待收尾义务，避免重复 Git 动作。",
+          "R3：absorption/WIP boundary 后锁外预检 Node、依赖标识、native 加载；不放宽仓库要求、不静默退回不合格解释器；按当前权限在任务私有环境有界恢复并补验，保留原失败，禁止修改共享依赖。"
+        ]
+      },
+      "original_incomplete_result": {
+        "status": "incomplete",
+        "audit_summary": "已独立读取需求、完整 2707 行 diff、13 个改动文件及主要调用，核对候选 be743a2abaf6ceaa914f3ffbb63fabdd25deccf1、完整树 4931898fc3b5c7d0ab938e9258a9298bc2dccd03；13 个文件的 SHA-256 与既有验收清单一致。实际运行 53 项测试，21 项通过，32 项流程测试受沙箱禁止读取 kern.bootsessionuuid 阻断，未将其判为产品回归，也未重复运行同类受限命令。另以真实隔离 Git 仓库、直接调用生产方法复现验证复用与 native 恢复问题；push 检查仅捕获 helper 调用，未执行 push。源码未修改、未提交，未读取其他 reviewer 或 fixer 结果。指定 machine-evidence 目录缺失，既有 53 passed 原件缺少可核对的完整树及命令环境绑定，宿主流程验证仍待补证。",
+        "findings": [
+          {
+            "problem_key": "validation-record-published-before-content-stability-check",
+            "path": "skills/base-branch-sync/scripts/perform-base-branch-sync-with-durable-continuation.py",
+            "line": 539,
+            "message": "验证结果在核对验证前后内容是否一致之前，就以 passed 写入并加入可复用记录。若测试修改候选文件后成功退出，本次虽在后续检查中被拒绝，但恢复原内容再 resume 时会直接复用这份记录，放行并未在稳定原树上完成的验证。应在内容稳定性检查通过后才发布可复用的成功记录，或持久标记其无效。",
+            "severity": "high",
+            "evidence": "independent-boundary-probes.py 的 validation_change_probe 直接调用 ensure_validation：首次返回“验证期间候选内容发生变化”，还原 task.txt 后第二次通过，验证执行计数仍为 1。原件见本 attempt 的 independent-boundary-probe-results.json.validationContentChange；记录消费分支第 491–509 行不会检查该运行此前已因内容变化而被拒绝。",
+            "scope_relation": "in_task_scope"
+          },
+          {
+            "problem_key": "task-push-not-bound-to-landed-candidate-tip",
+            "path": "skills/base-branch-sync/scripts/perform-base-branch-sync-with-durable-continuation.py",
+            "line": 795,
+            "message": "push 只核对当前授权和分支名称，未核对当前 HEAD 是否为本操作已验证、已落地的 task tip。若 A 已落地但尚未 push，同一 task 分支随后提交未验证、未落地的 B，再恢复原操作，reconcile_landing 仍因历史 A 成功而进入 finish，最终 helper 推送的是分支当前 B。历史落地事实不构成新提交的 push 资格；push 前须绑定并重新核验 landedTaskTip。相等 refs 的初始 no-op 也会进入同一 push 分支。",
+            "severity": "high",
+            "evidence": "independent-push-qualification-probe.py 中真实 Git refs 为 base=A、task=B，reconcile_landing 返回 true，finish 随即调用 push-confirmed-task-specific-branch.sh，捕获的 currentTaskTip 为 B。原件见本 attempt 的 independent-push-qualification-probe-results.json；该 helper 使用当前分支 refspec，未校验固定候选 OID。本复现替换了 helper 调用端用于记录参数，实际 push 未执行。",
+            "scope_relation": "in_task_scope"
+          },
+          {
+            "problem_key": "native-only-drift-recovery-ignores-private-dependencies",
+            "path": "skills/base-branch-sync/scripts/node_workflow_environment_preflight.py",
+            "line": 167,
+            "message": "只有依赖元数据为 DRIFT/UNKNOWN 时才采用 privateDependencyDirectory。依赖版本全部匹配、仅 native ABI 加载失败时，私有 npm-ci 即使成功，递归预检仍忽略私有目录并再次加载共享目录的坏模块，持续返回 DRIFT，无法进入隔离补验。选择私有依赖时也必须覆盖 native-only 故障。",
+            "severity": "medium",
+            "evidence": "independent-boundary-probes.py 的 native_recovery_probe 保持锁文件与安装标识一致，让共享 better-sqlite3 加载失败，并用隔离安装夹具生成可加载模块。私有安装退出码为 0、私有模块独立加载退出码为 0，但 prepare_node_workflow_environment 最终仍为 DRIFT/native loaded=false；见本 attempt 的 independent-boundary-probe-results.json.nativeOnlyRecovery。",
+            "scope_relation": "in_task_scope"
+          }
+        ],
+        "requests": [
+          {
+            "kind": "machine_evidence",
+            "request": "由宿主在固定候选完整树上执行 execution-plan.json 的预登记验证，持久提供 argv、cwd、解释器/Git/Node 版本、环境归属、完整 stdout/stderr 与退出码。优先复用已有绑定相同完整树和环境的宿主原件；不要在当前沙箱重复被内核权限阻断的流程测试。",
+            "recovery_condition": "machine-evidence 中出现绑定候选 be743a2abaf6ceaa914f3ffbb63fabdd25deccf1、tree 4931898fc3b5c7d0ab938e9258a9298bc2dccd03 的可核对原件后，自动补核验并收口完成状态。",
+            "evidence": "/Users/bominzhang/.cline/kanban/cross-task-handoff-artifacts/my-ai-setup/dd6f5/first-batch-rvf-review-20261031/run/reviewer-3/attempt-001/isolated-acceptance-tests.log"
+          }
+        ]
+      },
+      "original_outcome": {
+        "status": "incomplete",
+        "started_at": 1793484926.8742888,
+        "returncode": 0,
+        "native_session_ids": [
+          "01a19408-331c-7323-8906-a658a1c0ffc6"
+        ],
+        "actual_models": null,
+        "native_usage": [
+          {
+            "input_tokens": 3310271,
+            "cached_input_tokens": 3153920,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 18079,
+            "reasoning_output_tokens": 7931
+          }
+        ],
+        "result_file": "/Users/bominzhang/.cline/kanban/cross-task-handoff-artifacts/my-ai-setup/dd6f5/first-batch-rvf-review-20261031/run/reviewer-3/attempt-001/result.json",
+        "retryable": false,
+        "finished_at": 1793485347.622466
+      },
+      "registered_command_references": [
+        {
+          "command_collection": "validation_commands",
+          "command_index": 0
+        },
+        {
+          "command_collection": "validation_commands",
+          "command_index": 1
+        },
+        {
+          "command_collection": "validation_commands",
+          "command_index": 2
+        },
+        {
+          "command_collection": "validation_commands",
+          "command_index": 3
+        },
+        {
+          "command_collection": "validation_commands",
+          "command_index": 4
+        }
+      ],
+      "originals_sha256": {
+        "run.json": "a297ff592738af60e2eb09133b86b5414965b695d5c70ce18cf34fe533a5b40d",
+        "execution-plan.json": "aead79d5fe9347b3c68d52b4b9a8842102e39ed6dd1db4e3dd8f46792be3083e",
+        "reviewer-3-attempt-001-result.json": "a3d25f30367204493a82a9cf8f4d6e96db6975c4a4f492f98128203fb5012240",
+        "reviewer-3-attempt-001-outcome.json": "423c56244cf60e821555b3fbb2245a7cc1eccc92841ef45063bdb1921e5402f7"
+      }
+    },
+    {
+      "source_task_id": "82e07",
+      "source_project": "cline-kanban",
+      "candidate_commit": "34331b1646bad0891888715969eafdfe926dbcb4",
+      "candidate_tree": "d4ae6be96793e6f44fd1f430e9aef79305ebb4eb",
+      "source_version": {
+        "plugin_version": "0.1.0-dev.555+g3d9aee9993e2",
+        "source_files_sha256": {
+          "core/task_snapshot_review/__init__.py": "5e9b654837649890174d065a78f9abdb5b6db9532c097f599c7332b7caab6ff1",
+          "core/task_snapshot_review/active_run_observation.py": "b6b2afb76d4777bd17355476fb7bde8aea6be6e2635f204ec563c2ea41d06161",
+          "core/task_snapshot_review/execution_lifecycle.py": "ceb131fefe521655c213190a94ad967c1d1f090aae24b9b06e8a2e61840d9199",
+          "core/task_snapshot_review/github_issue_observations.py": "fcb073c2319189056c7829f82ae3bfc07f04105cbd475b81f3b9918570e365dd",
+          "core/task_snapshot_review/harness_cli_adapters.py": "8f8c1257695d685d2b617f81779fcb8723b16d2dc5bc026237f6814ad48ec7bd",
+          "core/task_snapshot_review/hook_entrypoint.py": "bda6c5064313fa5f8cabdd624c98af35adf03c42c2fd361c8e8f41811bee5de0",
+          "core/task_snapshot_review/kimi_latest_stable_model_selection.py": "57051ced2e29b32283fe058e2d8ad0be140722fd2073fd547c3f05d4cd5b7ac6",
+          "core/task_snapshot_review/machine_evidence.py": "f2d3d6c447d68506535df1eacb6b5d36fb4c19cd9586a333fe8fc9d1f31b823f",
+          "core/task_snapshot_review/native_owned_process_observation.py": "719ca06d3ce386d6bfe344f7f91b74700a939fd2905c7dd6b4b9673b2bf98a1b",
+          "core/task_snapshot_review/persistent_artifacts.py": "26d3dc826329deef55540b10be78033cb5f389689e15b31a2287f4e532ffc779",
+          "core/task_snapshot_review/retained_command_supervisor.py": "1af35d940898989b97678f613d679c09caf152e80110949565beb18152425b24",
+          "core/task_snapshot_review/reviewer_account_eligibility.py": "819dd1a0fca1bc0f895c933cb0e11539848d5071ca8bd30b0d784e95383d94ae",
+          "core/task_snapshot_review/role_failure_recovery.py": "2a897e36f6453be60722fc342e40434ab6ad06ce790ca476ee6c7d00c2856d89",
+          "core/task_snapshot_review/role_process_execution.py": "0c16c44bc29b04112bdf50f9e3c5cb60a60c57757d7fef425ae91ab10ff0eb87",
+          "core/task_snapshot_review/task_snapshot.py": "91a41ec945ea4e4b519904087f4558b4e968633c2f04c77c56e4c4485bad37c6",
+          "core/task_snapshot_review/trajectory_analysis.py": "bd952d667b6e3ee21a3815fe73b73142860e9d6cc557a50f552aff49b8b5069b",
+          "core/task_snapshot_review/workflow.py": "4038d9d10dee4b9380980ef0e61ae4adc687eaba29c023d27d7beaa75291a936",
+          "skills/review-validate-fix/prompts/reviewer.md": "e0c0ed439d038c7ef751d1ed26b433c9b7e06653d58272de0520c8fc543f61af",
+          "skills/review-validate-fix/prompts/validate-fix.md": "95bbb1bc5f02890cc3033c93f184ecc852898e4602b75f84cf8f11e0779a05fb"
+        },
+        "git_commit": null
+      },
+      "historical_run_status": "review_incomplete",
+      "historical_revoked": true,
+      "decision_facts_sha256_was_missing": true,
+      "frozen_execution_plan": {
+        "fix": true,
+        "validation_commands": [
+          [
+            "/Users/bominzhang/.nvm/versions/node/v24.12.0/bin/node",
+            "/Users/bominzhang/.nvm/versions/node/v24.12.0/lib/node_modules/npm/bin/npm-cli.js",
+            "run",
+            "typecheck"
+          ],
+          [
+            "/Users/bominzhang/.nvm/versions/node/v24.12.0/bin/node",
+            "/Users/bominzhang/.nvm/versions/node/v24.12.0/lib/node_modules/npm/bin/npm-cli.js",
+            "run",
+            "web:typecheck"
+          ],
+          [
+            "/Users/bominzhang/.nvm/versions/node/v24.12.0/bin/node",
+            "/Users/bominzhang/.nvm/versions/node/v24.12.0/lib/node_modules/npm/bin/npm-cli.js",
+            "run",
+            "web:test",
+            "--",
+            "src/components/board-card.test.tsx",
+            "src/components/board-card-render-isolation.test.tsx",
+            "src/components/task-card-body.render-role.test.tsx",
+            "src/components/task-card-body.visual-density.test.tsx",
+            "src/components/task-card-body.elapsed-pills.test.tsx",
+            "src/components/task-activity-elapsed-time-pills.test.tsx",
+            "src/components/primary-action-button-with-additional-action-menu.test.tsx",
+            "src/components/task-related-tasks-preview-button.test.tsx",
+            "src/components/related-task-preview-full-task-card.git-metadata-identity.test.tsx",
+            "src/components/post-deploy-verification/post-deploy-verification-entry-navigation-button.test.tsx",
+            "src/components/post-deploy-verification/post-deploy-verification-task-entry-wrapping-real-task-card.test.tsx",
+            "src/components/board-scope-all-projects-home-page-cross-project-task-switcher-section-columns-board.test.tsx",
+            "src/components/ui/task-commit-coverage-in-current-deployment-indicator.test.tsx",
+            "src/components/detail-panels/cross-project-recently-active-task-switcher-panel.test.tsx",
+            "src/hooks/use-cross-project-task-switcher-hover-floating-card-viewport-position.test.tsx",
+            "src/components/task-card-resource-usage-pill.test.tsx"
+          ],
+          [
+            "/Users/bominzhang/.nvm/versions/node/v24.12.0/bin/node",
+            "/Users/bominzhang/.nvm/versions/node/v24.12.0/lib/node_modules/npm/bin/npm-cli.js",
+            "--prefix",
+            "web-ui",
+            "run",
+            "e2e",
+            "--",
+            "tests/task-card-status-corners-and-metadata-layout.spec.ts",
+            "tests/task-card-hover-floating-expansion.spec.ts",
+            "tests/task-card-quick-actions.spec.ts",
+            "tests/task-card-git-metadata-group-alignment.spec.ts",
+            "tests/relations-task-card-preview.spec.ts",
+            "tests/task-directory-copy-browser-contract.spec.ts",
+            "tests/mobile-focused-task-card-header.spec.ts",
+            "--workers=2"
+          ],
+          [
+            "/Users/bominzhang/.nvm/versions/node/v24.12.0/bin/node",
+            "/Users/bominzhang/.cline/kanban/cross-task-handoff-artifacts/cline-kanban/task-82e07-card-layout-implementation/rvf-build-isolated-task-card-candidate.mjs"
+          ]
+        ],
+        "preparation_commands": [
+          [
+            "/Users/bominzhang/.nvm/versions/node/v24.12.0/bin/node",
+            "/Users/bominzhang/.cline/kanban/cross-task-handoff-artifacts/cline-kanban/task-82e07-card-layout-implementation/rvf-prepare-isolated-task-card-review-workspace.mjs"
+          ]
+        ],
+        "machine_evidence_commands": [],
+        "maximum_semantic_repair_rounds": 3,
+        "machine_context": {
+          "taskId": "82e07",
+          "implementationWorkspace": "/Users/bominzhang/.cline/worktrees/82e07/cline-kanban",
+          "fixedBaseCommit": "c9440e3921de8ef30e6da992f5aa747f060f0687",
+          "existingVerificationReport": "/Users/bominzhang/.cline/kanban/cross-task-handoff-artifacts/cline-kanban/task-82e07-card-layout-implementation/implementation-and-verification-report.md",
+          "scopeManifest": "/Users/bominzhang/.cline/kanban/cross-task-handoff-artifacts/cline-kanban/task-82e07-card-layout-implementation/task-card-layout-source-file-sha256-manifest.json",
+          "dependencyPreparation": "本任务根 node_modules 为私有目录，thread-graph 按原锁定提交构建，better-sqlite3 为 Node 24 的私有 ABI 编译。隔离评审树只复用依赖，不修改共享依赖。",
+          "restrictions": [
+            "不得提交",
+            "不得同步",
+            "不得 push",
+            "不得部署",
+            "不得移列"
+          ]
+        },
+        "implementation_plan": [
+          "摘要位于 Agent 与标题之前，状态提示、当前阶段目标和当前行动依序在下方；跨项目三态复用摘要且保持懒加载和展开实例复用。",
+          "Prompt 与结案无独立箭头，轻点主动作，悬停或方向键附加菜单，触屏 500ms 长按及 8px 取消，保留终端重启入口。",
+          "阶段操作颜色符合方案，保留 gate、加载状态和动作回调。",
+          "PDV 与关联任务位于外缘纵排，三态留白固定，视口边界和菜单持有展开正确，触屏操作位于卡底且点击区域至少 44px。",
+          "自动化覆盖各宿主、只读角色、关联与 PDV 导航、四种宽度、长信息与未知 Git，以及轻点长按取消和再次点击；完成根/web 类型检查和相关回归。",
+          "刷新同文件软重叠，仅修改前端及内部接口，按仓库要求登记真实部署后验证。"
+        ]
+      },
+      "original_incomplete_result": {
+        "status": "incomplete",
+        "audit_summary": "已读取需求和完整 3258 行 diff，核对候选 34331b1646bad0891888715969eafdfe926dbcb4、完整树 d4ae6be96793e6f44fd1f430e9aef79305ebb4eb 及 36 项源码清单，检查主看板、Focus View、All projects、PDV、关联副本、终端重启调用链，以及摘要取数身份、懒加载、实例复用、操作门禁、长按清理和 Portal 事件。根与 Web typecheck 通过，16 文件 265 项相关单测通过；另完成基线与候选的键盘行为对照复现。未修改源码、未提交，工作树干净，未读取其他 reviewer 或 Validate-Fixer 结果。浏览器监听与 Chromium 启动被沙箱拒绝，浏览器控制面不可用；本 run 的 machine-evidence 目录不存在。已检查宿主历史日志、截图及匹配的范围文件清单，但历史材料未声明完整被测树，不能充当当前候选完整树的浏览器通过证据。",
+        "findings": [
+          {
+            "problem_key": "task-card-session-activity-tooltip-hover-only",
+            "path": "web-ui/src/components/task-card-body.tsx",
+            "line": 810,
+            "message": "这里把会话活动详情 Tooltip 也限制为仅在鼠标悬停时挂载。用户不移动鼠标、仅通过 Tab 聚焦“各会话独立活动时间”时，主看板、Focus View 和复用该卡体的副本不再显示各独立会话的活动时间及证据；显示的“活动未知”或主对话时长无法替代这些详情。应保留该可聚焦入口在键盘聚焦时显示详情的能力。",
+            "severity": "medium",
+            "evidence": "TaskActivityElapsedTimePills 在 task-activity-elapsed-time-pills.tsx:72 根据 revealTooltip 把活动详情 content 置为 undefined，ui/tooltip.tsx 对空 content 直接返回裸子节点。独立 DOM 对照用基线 Git 对象中的 TaskCardBody（仅重定位两处相对 import）和候选卡体，在相同依赖中聚焦同一活动入口：基线 focused=true、tooltipState=instant-open、tooltipCount=1；候选 focused=true、tooltipState=null、tooltipCount=0。复现及结果保存在本 reviewer attempt 的 isolated-review-checks/keyboard-session-activity-tooltip.test.tsx 和 keyboard-session-activity-tooltip-results.json。",
+            "scope_relation": "in_task_scope"
+          }
+        ],
+        "requests": [
+          {
+            "request_key": "candidate-full-tree-browser-machine-evidence",
+            "kind": "machine_evidence",
+            "candidate": "34331b1646bad0891888715969eafdfe926dbcb4",
+            "full_tree": "d4ae6be96793e6f44fd1f430e9aef79305ebb4eb",
+            "reason": "仍需核验三态几何、侧栏命中与边界、原生触摸事件和多宿主导航；当前沙箱无法执行浏览器验证，不能把 DOM 单测或历史通过记录当作等价证明。",
+            "command_source": "execution-plan.json 的 validation_commands[3]",
+            "command": [
+              "/Users/bominzhang/.nvm/versions/node/v24.12.0/bin/node",
+              "/Users/bominzhang/.nvm/versions/node/v24.12.0/lib/node_modules/npm/bin/npm-cli.js",
+              "--prefix",
+              "web-ui",
+              "run",
+              "e2e",
+              "--",
+              "tests/task-card-status-corners-and-metadata-layout.spec.ts",
+              "tests/task-card-hover-floating-expansion.spec.ts",
+              "tests/task-card-quick-actions.spec.ts",
+              "tests/task-card-git-metadata-group-alignment.spec.ts",
+              "tests/relations-task-card-preview.spec.ts",
+              "tests/task-directory-copy-browser-contract.spec.ts",
+              "tests/mobile-focused-task-card-header.spec.ts",
+              "--workers=2"
+            ],
+            "required_evidence": "由具备浏览器权限的宿主在隔离资源中执行，保存原始日志、退出码、cwd、完整被测树、Node/浏览器/依赖环境及相关截图。",
+            "equivalent_evidence": "如果已有明确绑定上述完整树和环境的宿主采集原件，直接提供即可，无需重复执行；只有 36 项任务范围文件相同的历史材料不足以绑定完整树。",
+            "recovery_condition": "对应持久机器证据可读且完整树、命令及环境归属核对一致后，继续审阅浏览器结果并完成本席；无须新增人工授权，也无须在同一受限沙箱重复启动。"
+          }
+        ]
+      },
+      "original_outcome": {
+        "status": "incomplete",
+        "started_at": 1793484690.169417,
+        "returncode": 0,
+        "native_session_ids": [
+          "01a19404-9dc1-7a10-8ffa-61848c8c51fc"
+        ],
+        "actual_models": null,
+        "native_usage": [
+          {
+            "input_tokens": 7292298,
+            "cached_input_tokens": 7048832,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 24863,
+            "reasoning_output_tokens": 12744
+          }
+        ],
+        "result_file": "/Users/bominzhang/.cline/kanban/cross-task-handoff-artifacts/cline-kanban/task-82e07-card-layout-implementation/rvf-task-card-layout-fixed-snapshot-review/reviewer-3/attempt-001/result.json",
+        "retryable": false,
+        "finished_at": 1793485353.4605272
+      },
+      "registered_command_references": [
+        {
+          "command_collection": "validation_commands",
+          "command_index": 3
+        }
+      ],
+      "originals_sha256": {
+        "run.json": "6f271c89350f5b448762d034309eadfc5ac2d7f71ccabdd67b5d3eb3778723eb",
+        "execution-plan.json": "571d4a0d6e3a28dab967abe3c04f4b562bc6a77d0bd30b4ea6110dd7844e8ea8",
+        "reviewer-3-attempt-001-result.json": "5e6efd275e9691a037b51ad9f47e9825a9660d4a2086f07a0d4f2850dbc41308",
+        "reviewer-3-attempt-001-outcome.json": "122e752ebcf6ca4fc05ee46fed06bb07c6b9a252d2768ce24b0e35d1707bdaf9"
+      }
+    },
+    {
+      "source_task_id": "11d06",
+      "source_project": "cline-kanban",
+      "candidate_commit": "790e3df2fb1c0499bebb1b1ae90df9595aeb3df0",
+      "candidate_tree": "4a7cfa45dc5f8b6d7c0dd6d4743d2eb64f86f2fe",
+      "source_version": {
+        "plugin_version": "0.1.0-dev.555+g3d9aee9993e2",
+        "source_files_sha256": {
+          "core/task_snapshot_review/__init__.py": "5e9b654837649890174d065a78f9abdb5b6db9532c097f599c7332b7caab6ff1",
+          "core/task_snapshot_review/active_run_observation.py": "b6b2afb76d4777bd17355476fb7bde8aea6be6e2635f204ec563c2ea41d06161",
+          "core/task_snapshot_review/execution_lifecycle.py": "ceb131fefe521655c213190a94ad967c1d1f090aae24b9b06e8a2e61840d9199",
+          "core/task_snapshot_review/github_issue_observations.py": "fcb073c2319189056c7829f82ae3bfc07f04105cbd475b81f3b9918570e365dd",
+          "core/task_snapshot_review/harness_cli_adapters.py": "8f8c1257695d685d2b617f81779fcb8723b16d2dc5bc026237f6814ad48ec7bd",
+          "core/task_snapshot_review/hook_entrypoint.py": "bda6c5064313fa5f8cabdd624c98af35adf03c42c2fd361c8e8f41811bee5de0",
+          "core/task_snapshot_review/kimi_latest_stable_model_selection.py": "57051ced2e29b32283fe058e2d8ad0be140722fd2073fd547c3f05d4cd5b7ac6",
+          "core/task_snapshot_review/machine_evidence.py": "f2d3d6c447d68506535df1eacb6b5d36fb4c19cd9586a333fe8fc9d1f31b823f",
+          "core/task_snapshot_review/native_owned_process_observation.py": "719ca06d3ce386d6bfe344f7f91b74700a939fd2905c7dd6b4b9673b2bf98a1b",
+          "core/task_snapshot_review/persistent_artifacts.py": "26d3dc826329deef55540b10be78033cb5f389689e15b31a2287f4e532ffc779",
+          "core/task_snapshot_review/retained_command_supervisor.py": "1af35d940898989b97678f613d679c09caf152e80110949565beb18152425b24",
+          "core/task_snapshot_review/reviewer_account_eligibility.py": "819dd1a0fca1bc0f895c933cb0e11539848d5071ca8bd30b0d784e95383d94ae",
+          "core/task_snapshot_review/role_failure_recovery.py": "2a897e36f6453be60722fc342e40434ab6ad06ce790ca476ee6c7d00c2856d89",
+          "core/task_snapshot_review/role_process_execution.py": "0c16c44bc29b04112bdf50f9e3c5cb60a60c57757d7fef425ae91ab10ff0eb87",
+          "core/task_snapshot_review/task_snapshot.py": "91a41ec945ea4e4b519904087f4558b4e968633c2f04c77c56e4c4485bad37c6",
+          "core/task_snapshot_review/trajectory_analysis.py": "bd952d667b6e3ee21a3815fe73b73142860e9d6cc557a50f552aff49b8b5069b",
+          "core/task_snapshot_review/workflow.py": "4038d9d10dee4b9380980ef0e61ae4adc687eaba29c023d27d7beaa75291a936",
+          "skills/review-validate-fix/prompts/reviewer.md": "e0c0ed439d038c7ef751d1ed26b433c9b7e06653d58272de0520c8fc543f61af",
+          "skills/review-validate-fix/prompts/validate-fix.md": "95bbb1bc5f02890cc3033c93f184ecc852898e4602b75f84cf8f11e0779a05fb"
+        },
+        "git_commit": null
+      },
+      "historical_run_status": "review_incomplete",
+      "historical_revoked": false,
+      "decision_facts_sha256_was_missing": true,
+      "frozen_execution_plan": {
+        "fix": true,
+        "validation_commands": [
+          [
+            "npm",
+            "run",
+            "typecheck"
+          ],
+          [
+            "npm",
+            "run",
+            "web:typecheck"
+          ],
+          [
+            "node",
+            "node_modules/@biomejs/biome/bin/biome",
+            "check",
+            "src/acp-client-session/acp-client-connection-runtime.ts",
+            "src/acp-client-session/acp-task-session-service.ts",
+            "src/commands/task-conversation-session.ts",
+            "src/commands/task-create-effective-settings-resolution.ts",
+            "src/commands/task.ts",
+            "src/config/user-interface-preferences-shared-across-browser-origins.ts",
+            "src/core/api-contract.ts",
+            "src/core/task-board-mutations.ts",
+            "src/core/task-editor-creation-submission-contract.ts",
+            "src/core/task-initial-prompt-authoring-and-startup-settings-guidance.ts",
+            "src/server/runtime-server.ts",
+            "src/state/workspace-state.ts",
+            "src/task-conversation-sessions/task-conversation-session-operation-store.ts",
+            "src/task-conversation-sessions/task-conversation-session-service.ts",
+            "src/task-editor-creation/task-editor-creation-submission-service.ts",
+            "src/task-name-suggestion/suggest-task-names-from-task-description.ts",
+            "src/terminal/agent-session-adapters.ts",
+            "src/terminal/session-manager.ts",
+            "src/terminal/terminal-agent-model-selection.ts",
+            "src/trpc/app-router.ts",
+            "src/trpc/kanban-cli-task-board-mutation-api.ts",
+            "src/trpc/runtime-api.ts",
+            "test/integration/cli-async-command-error-propagation-packaged.integration.test.ts",
+            "test/integration/codex-draft-stash-real-browser.integration.test.ts",
+            "test/integration/cross-project-task-switcher-server-card-actions-real-browser.integration.test.ts",
+            "test/integration/independent-task-creation-real-browser.integration.test.ts",
+            "test/integration/managed-task-prompt-delivery-real-runtime.integration.test.ts",
+            "test/integration/owned-command-execution-packaged-runtime.integration.test.ts",
+            "test/integration/prompt-draft-usage-and-commands-real-browser.integration.test.ts",
+            "test/integration/task-collaboration-sessions-real-browser.integration.test.ts",
+            "test/integration/task-command-exit.integration.test.ts",
+            "test/integration/task-main-session-handover-real-browser.integration.test.ts",
+            "test/integration/task-visualization-artifacts-real-browser.integration.test.ts",
+            "test/runtime/commands/task-cli-write-verbs-delegate-to-task-card-action-procedures.test.ts",
+            "test/runtime/task-conversation-sessions/task-conversation-session-service.test.ts",
+            "test/runtime/task-editor-creation-submission-service.test.ts",
+            "test/runtime/terminal/agent-session-adapters.test.ts",
+            "web-ui/src/App.tsx",
+            "web-ui/src/components/detail-panels/task-conversation-sessions-panel.test.tsx",
+            "web-ui/src/components/detail-panels/task-conversation-sessions-panel.tsx",
+            "web-ui/src/components/task-agent-model-picker.tsx",
+            "web-ui/src/components/task-editor-dialog.tsx",
+            "web-ui/src/components/task-name-input-with-ai-suggestions.tsx",
+            "web-ui/src/hooks/use-task-editor.test.tsx",
+            "web-ui/src/hooks/use-task-editor.ts",
+            "web-ui/src/hooks/use-task-sessions.ts",
+            "web-ui/src/runtime/task-name-suggestion-query.ts",
+            "web-ui/src/runtime/use-user-interface-preferences-shared-across-browser-origins.ts",
+            "web-ui/src/runtime/user-interface-preferences-shared-across-browser-origins-store.ts",
+            "web-ui/src/state/board-state.test.ts",
+            "web-ui/src/state/board-state.ts",
+            "web-ui/src/storage/local-storage-store.ts",
+            "web-ui/src/types/board.ts",
+            "web-ui/tests/task-editor-floating-window-browser-harness.tsx",
+            "web-ui/tests/task-editor-floating-window.spec.ts",
+            "src/core/creation-startup-settings.ts",
+            "src/core/task-name-version.ts",
+            "src/task-name-suggestion/automatic-task-name-backfill.ts",
+            "src/terminal/creation-agent-default-model.ts",
+            "test/runtime/automatic-task-name-backfill.test.ts",
+            "test/runtime/commands/task-conversation-session-startup-settings.test.ts",
+            "test/runtime/core/creation-startup-settings.test.ts",
+            "test/runtime/core/task-name-version.test.ts",
+            "test/runtime/terminal/creation-agent-default-model.test.ts",
+            "web-ui/src/components/conversation-session-name-editor.tsx",
+            "web-ui/src/components/creation-workbench-startup-settings.tsx",
+            "web-ui/src/components/side-session-creation-workbench.test.tsx",
+            "web-ui/src/components/side-session-creation-workbench.tsx",
+            "web-ui/src/runtime/task-conversation-session-creation-query.ts",
+            "web-ui/src/state/side-session-creation-workbench-store.ts"
+          ],
+          [
+            "npm",
+            "run",
+            "test:guarded",
+            "--",
+            "--project",
+            "precommit-safe",
+            "test/runtime/commands/task-conversation-session-startup-settings.test.ts",
+            "test/runtime/commands/task-cli-write-verbs-delegate-to-task-card-action-procedures.test.ts",
+            "test/runtime/core/creation-startup-settings.test.ts",
+            "test/runtime/core/task-name-version.test.ts",
+            "test/runtime/automatic-task-name-backfill.test.ts",
+            "test/runtime/task-conversation-sessions/task-conversation-session-service.test.ts",
+            "test/runtime/terminal/agent-session-adapters.test.ts",
+            "test/runtime/task-name-suggestion.test.ts",
+            "test/runtime/task-editor-creation-submission-service.test.ts",
+            "test/runtime/config/user-interface-preferences-shared-across-browser-origins.test.ts",
+            "test/runtime/terminal/terminal-agent-model-selection.test.ts",
+            "test/runtime/terminal/creation-agent-default-model.test.ts",
+            "test/runtime/terminal/session-manager-empty-side-session-native-identity-recovery.test.ts"
+          ],
+          [
+            "npm",
+            "run",
+            "web:test",
+            "--",
+            "src/hooks/use-task-editor.test.tsx",
+            "src/hooks/use-task-sessions.test.tsx",
+            "src/runtime/user-interface-preferences-shared-across-browser-origins-store.test.ts",
+            "src/components/task-editor-dialog.interaction.test.tsx",
+            "src/components/side-session-creation-workbench.test.tsx",
+            "src/components/detail-panels/task-conversation-sessions-panel.test.tsx",
+            "src/state/board-state.test.ts"
+          ],
+          [
+            "npm",
+            "run",
+            "test:guarded",
+            "--",
+            "--project",
+            "runtime-integration",
+            "test/integration/task-command-exit.integration.test.ts"
+          ],
+          [
+            "node",
+            "-e",
+            "const net=require(\"node:net\"); const {spawn}=require(\"node:child_process\"); const reservation=net.createServer(); reservation.listen(0,\"127.0.0.1\",()=>{ const port=reservation.address().port; reservation.close(()=>{ const child=spawn(\"npm\",[\"--prefix\",\"web-ui\",\"run\",\"e2e\",\"--\",\"--config\",\"playwright.task-editor-isolated.config.ts\"],{stdio:\"inherit\",env:{...process.env,PLAYWRIGHT_BROWSERS_PATH:\"/Users/bominzhang/Library/Caches/ms-playwright\",KANBAN_TASK_EDITOR_BROWSER_TEST_PORT:String(port)}}); child.on(\"error\",error=>{process.stderr.write(String(error));process.exitCode=1;}); child.on(\"exit\",code=>{process.exitCode=code??1;}); }); });"
+          ],
+          [
+            "/usr/bin/env",
+            "KANBAN_BUILD_DISTRIBUTION_OUTPUT_DIRECTORY=dist",
+            "npm",
+            "run",
+            "build"
+          ],
+          [
+            "node",
+            "-e",
+            "const {spawnSync}=require(\"node:child_process\"); const path=require(\"node:path\"); const crypto=require(\"node:crypto\"); const suffix=crypto.createHash(\"sha256\").update(process.cwd()).digest(\"hex\").slice(0,16); const result=spawnSync(\"npm\",[\"run\",\"test:guarded\",\"--\",\"--project\",\"runtime-integration\",\"test/integration/task-collaboration-sessions-real-browser.integration.test.ts\"],{stdio:\"inherit\",env:{...process.env,PLAYWRIGHT_BROWSERS_PATH:\"/Users/bominzhang/Library/Caches/ms-playwright\",KANBAN_COLLABORATION_SESSION_PACKAGED_CLI_PATH:path.resolve(\"dist/cli.js\"),KANBAN_COLLABORATION_SESSION_BROWSER_EVIDENCE_DIRECTORY:path.join(\"/Users/bominzhang/.cline/kanban/cross-task-handoff-artifacts/cline-kanban/11d06/unified-creation-workbench/rvf-validation-harness-evidence\",suffix)}}); if(result.error) process.stderr.write(String(result.error)); process.exitCode=result.status??1;"
+          ]
+        ],
+        "preparation_commands": [
+          [
+            "node",
+            "-e",
+            "const fs = require(\"node:fs\"); const path = require(\"node:path\");\nconst links = [[\"node_modules\", \"/Users/bominzhang/.cline/kanban/cross-task-handoff-artifacts/cline-kanban/11d06/unified-creation-workbench/isolated-runtime-validation-dependencies\"], [\"web-ui/node_modules\", \"/Users/bominzhang/Documents/GitHub/cline-kanban/web-ui/node_modules\"]];\nfor (const [relative, target] of links) { const destination = path.resolve(relative); if (fs.existsSync(destination)) { if (fs.realpathSync(destination) !== fs.realpathSync(target)) throw new Error(\"依赖目录归属不一致：\" + relative); } else { fs.symlinkSync(target, destination, \"dir\"); } }\nfor (const relative of [\"dist\", \"web-ui/dist\"]) { const destination = path.resolve(relative); if (fs.existsSync(destination) && fs.lstatSync(destination).isSymbolicLink()) throw new Error(\"构建产物不可指向共享软链：\" + relative); }\n"
+          ]
+        ],
+        "machine_evidence_commands": [],
+        "maximum_semantic_repair_rounds": 3,
+        "machine_context": {
+          "task_id": "11d06",
+          "repo": "/Users/bominzhang/.cline/worktrees/11d06/cline-kanban",
+          "base_commit": "c9440e3921de8ef30e6da992f5aa747f060f0687",
+          "scope": [
+            "."
+          ],
+          "prior_evidence_directory": "/Users/bominzhang/.cline/kanban/cross-task-handoff-artifacts/cline-kanban/11d06/unified-creation-workbench",
+          "prior_evidence_qualification": "先前通过是历史证据，最终候选仍需完整验证，不得把模拟 Harness 当成真实第三方 CLI 已验。",
+          "constraints": [
+            "保留背景 WIP；无普通 Task commit、同步、push 或部署授权",
+            "不得修改 canonical checkout 或共享依赖；使用冻结准备命令连接隔离验证依赖",
+            "测试子进程隔离 HOME、CODEX_HOME、CODEX_SQLITE_HOME 与继承的 KANBAN_* 运行上下文和真实 provider 凭据"
+          ]
+        },
+        "implementation_plan": [
+          "共享 Task 新建、Backlog 编辑、Peer 与 By the way 非模态创建工作台，并按实体及角色裁剪能力",
+          "独立持久保存 Peer／By the way Plan 偏好，默认权限、profile 与模型来源正确，By the way 始终只读",
+          "共用启动设置契约，CLI 显式 Plan 缺参零副作用，侧会话无业务副作用预览及冻结来源回执",
+          "fresh／fork 上下文与模型独立，Claude、Codex、OMP TUI／ACP 首轮实际应用选择，恢复使用自身快照",
+          "运行时持有独立会话主题名、首次真实输入命名、手改版本保护及未知结果补证，避免重复付费",
+          "持久草稿与在途提交按完整身份隔离，响应丢失核对原结果，恢复不重复启动／首发／Plan 且尊重 Stop",
+          "完成自动化桌面／手机、根与 Web 类型及 guarded 测试、隔离构建并注册真实 Harness 的 PDV；不实现独立探索、全局检索或完整 orchestration"
+        ]
+      },
+      "original_incomplete_result": {
+        "status": "incomplete",
+        "audit_summary": "已独立读取冻结需求、完整 7373 行 diff、74 个变更文件及创建设置、CLI、启动适配、命名持久化、草稿恢复和 UI 的主要调用链。候选 790e3df2fb1c0499bebb1b1ae90df9595aeb3df0，完整树 4a7cfa45dc5f8b6d7c0dd6d4743d2eb64f86f2fe。根 typecheck 与 web:typecheck 均通过；esbuild 静态图检查未发现 CLI 提前加载服务端栈。使用实际工作台、草稿 store、偏好 store 和 TaskPromptComposer 的隔离 DOM 复现两项缺陷，外围展示、网络及终端尺寸依赖被替换，不把该复现当作完整浏览器或真实 Harness 验证。未修改源码、未提交，结束时工作树干净。guarded 测试在 tsx 创建 IPC socket 时被沙箱 EPERM 阻止，未进入用例；本 run 的 machine-evidence 目录不存在，故保留这项验证缺口。",
+        "findings": [
+          {
+            "problem_key": "side_session_delayed_image_callback_crosses_draft_identity",
+            "path": "web-ui/src/components/side-session-creation-workbench.tsx",
+            "line": 230,
+            "message": "图片异步读取结果未绑定发起时的草稿身份。Peer 中选择图片后，在 FileReader 完成前切换到 By the way，迟到的 onImagesChange 会通过 update() 读取 latestDraft.current，把 Peer 图片写入并持久保存到 By the way 草稿；提交侧问会发送错误附件，原 Peer 草稿则丢失该图片。反向切换同样受影响，违反按创建类型和草稿身份隔离的要求。",
+            "severity": "medium",
+            "evidence": "TaskPromptComposer 的 handleFileInputChange 等待 fileToTaskImage 后调用 appendImages；本工作台切换角色时复用同一 composer，onImagesChange 调用的 update() 在第 111 行始终合并当前 latestDraft，而不核验发起 draftId。隔离复现延迟 FileReader，在 Peer 选择 peer-reference.png 后切换 By the way，再完成读取并提交，实际请求为 sessionRole=by_the_way 且 images[0].name=peer-reference.png。复现脚本及原始输出位于 ../reviewer-independent-machine-evidence/reproduce-workbench-boundaries.cjs 和 workbench-boundary-reproduction.log。",
+            "scope_relation": "in_task_scope"
+          },
+          {
+            "problem_key": "side_session_plan_preference_is_frozen_before_server_hydration",
+            "path": "web-ui/src/components/side-session-creation-workbench.tsx",
+            "line": 62,
+            "message": "新草稿只在 useState 初始化时复制 Plan 偏好，未处理服务端偏好稍后到达的情况。用户已持久设置 Peer 或 By the way 的 Plan=true、当前类型尚无草稿时，若在全局偏好加载完成前打开工作台，草稿会冻结 fallback=false；即使偏好加载成功并触发重渲染，提交仍使用 false，从而跳过用户记住的 Plan 起步。应在偏好就绪后初始化新草稿，或仅对尚未被用户编辑、尚未提交的新草稿补入真实偏好。",
+            "severity": "medium",
+            "evidence": "main.tsx 第 24 行异步加载全局偏好；新增加的两个 Plan 字段没有浏览器镜像。useSideSessionStartInPlanModePreference 在尚无服务端值时返回 false，而 initialDraftRecovery 与 draft 均只初始化一次，没有随偏好就绪补齐的路径。隔离复现挂起 fetchRuntimeConfig，打开工作台后再返回 newPeerSessionStartInPlanMode=true，输出为“服务端 Peer 偏好=true，草稿 Plan=false”。原始输出同见 ../reviewer-independent-machine-evidence/workbench-boundary-reproduction.log。",
+            "scope_relation": "in_task_scope"
+          }
+        ],
+        "requests": [
+          {
+            "request_key": "candidate_bound_guarded_and_frontend_regression_evidence",
+            "reason": "当前沙箱禁止 tsx 的 IPC socket；已尝试的 guarded 命令在 test:policy 启动时退出，不能据此判断运行时测试通过或失败。没有可复用的本 run 宿主机器原件。",
+            "candidate_commit": "790e3df2fb1c0499bebb1b1ae90df9595aeb3df0",
+            "complete_tree": "4a7cfa45dc5f8b6d7c0dd6d4743d2eb64f86f2fe",
+            "commands": [
+              [
+                "npm",
+                "run",
+                "test:guarded",
+                "--",
+                "--project",
+                "precommit-safe",
+                "test/runtime/task-conversation-sessions/task-conversation-session-service.test.ts",
+                "test/runtime/core/creation-startup-settings.test.ts",
+                "test/runtime/core/task-name-version.test.ts",
+                "test/runtime/terminal/creation-agent-default-model.test.ts",
+                "test/runtime/commands/task-conversation-session-startup-settings.test.ts",
+                "test/runtime/automatic-task-name-backfill.test.ts"
+              ],
+              [
+                "npm",
+                "run",
+                "web:test",
+                "--",
+                "src/components/side-session-creation-workbench.test.tsx",
+                "src/hooks/use-task-editor.test.tsx",
+                "src/components/detail-panels/task-conversation-sessions-panel.test.tsx"
+              ]
+            ],
+            "equivalent_evidence": "可复用共享机器采集的同完整树、同命令日志和退出码，并附 Node 版本、依赖 realpath、隔离 HOME/CODEX_HOME/CODEX_SQLITE_HOME 及继承 KANBAN/provider 环境清除记录；无需重复已被权限阻止的沙箱命令。",
+            "resume_condition": "本 run machine-evidence 中出现上述候选绑定的宿主原始记录后，核对归属并继续判读；失败记录保留，不用旧树的通过记录替代。"
+          }
+        ]
+      },
+      "original_outcome": {
+        "status": "incomplete",
+        "started_at": 1793490014.7853582,
+        "returncode": 0,
+        "native_session_ids": [
+          "01a19455-d9bf-7df3-b370-81fd496f176a"
+        ],
+        "actual_models": null,
+        "native_usage": [
+          {
+            "input_tokens": 7140428,
+            "cached_input_tokens": 6913664,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 19824,
+            "reasoning_output_tokens": 9059
+          }
+        ],
+        "result_file": "/Users/bominzhang/.cline/kanban/cross-task-handoff-artifacts/cline-kanban/11d06/unified-creation-workbench/rvf-task-snapshot-review/reviewer-3/attempt-001/result.json",
+        "retryable": false,
+        "finished_at": 1793490381.917322
+      },
+      "registered_command_references": [
+        {
+          "command_collection": "validation_commands",
+          "command_index": 3
+        },
+        {
+          "command_collection": "validation_commands",
+          "command_index": 4
+        }
+      ],
+      "originals_sha256": {
+        "run.json": "1cfcaec9702c93114ed1b8ad01b70ea2c1e9a941afa36bc97c012bb281c71380",
+        "execution-plan.json": "be23a81f8ed4ff14c92670d9d71bc55634483305c7f67604a0dd792f794b5de7",
+        "reviewer-3-attempt-001-result.json": "a7b046bcc96597040341160296eab5f1905c356accd7b481e5c6aaea4de9c128",
+        "reviewer-3-attempt-001-outcome.json": "34950e96a1808bec957134710805366ed674043293a3e508da4de3437e67c93b"
+      }
+    }
+  ],
+  "successful_control": {
+    "source_task_id": "bd273",
+    "source_project": "cline-kanban",
+    "source_version": {
+      "plugin_version": "0.1.0-dev.555+g3d9aee9993e2",
+      "source_files_sha256": {
+        "core/task_snapshot_review/__init__.py": "5e9b654837649890174d065a78f9abdb5b6db9532c097f599c7332b7caab6ff1",
+        "core/task_snapshot_review/active_run_observation.py": "b6b2afb76d4777bd17355476fb7bde8aea6be6e2635f204ec563c2ea41d06161",
+        "core/task_snapshot_review/execution_lifecycle.py": "ceb131fefe521655c213190a94ad967c1d1f090aae24b9b06e8a2e61840d9199",
+        "core/task_snapshot_review/github_issue_observations.py": "fcb073c2319189056c7829f82ae3bfc07f04105cbd475b81f3b9918570e365dd",
+        "core/task_snapshot_review/harness_cli_adapters.py": "8f8c1257695d685d2b617f81779fcb8723b16d2dc5bc026237f6814ad48ec7bd",
+        "core/task_snapshot_review/hook_entrypoint.py": "bda6c5064313fa5f8cabdd624c98af35adf03c42c2fd361c8e8f41811bee5de0",
+        "core/task_snapshot_review/kimi_latest_stable_model_selection.py": "57051ced2e29b32283fe058e2d8ad0be140722fd2073fd547c3f05d4cd5b7ac6",
+        "core/task_snapshot_review/machine_evidence.py": "f2d3d6c447d68506535df1eacb6b5d36fb4c19cd9586a333fe8fc9d1f31b823f",
+        "core/task_snapshot_review/native_owned_process_observation.py": "719ca06d3ce386d6bfe344f7f91b74700a939fd2905c7dd6b4b9673b2bf98a1b",
+        "core/task_snapshot_review/persistent_artifacts.py": "26d3dc826329deef55540b10be78033cb5f389689e15b31a2287f4e532ffc779",
+        "core/task_snapshot_review/retained_command_supervisor.py": "1af35d940898989b97678f613d679c09caf152e80110949565beb18152425b24",
+        "core/task_snapshot_review/reviewer_account_eligibility.py": "819dd1a0fca1bc0f895c933cb0e11539848d5071ca8bd30b0d784e95383d94ae",
+        "core/task_snapshot_review/role_failure_recovery.py": "2a897e36f6453be60722fc342e40434ab6ad06ce790ca476ee6c7d00c2856d89",
+        "core/task_snapshot_review/role_process_execution.py": "0c16c44bc29b04112bdf50f9e3c5cb60a60c57757d7fef425ae91ab10ff0eb87",
+        "core/task_snapshot_review/task_snapshot.py": "91a41ec945ea4e4b519904087f4558b4e968633c2f04c77c56e4c4485bad37c6",
+        "core/task_snapshot_review/trajectory_analysis.py": "bd952d667b6e3ee21a3815fe73b73142860e9d6cc557a50f552aff49b8b5069b",
+        "core/task_snapshot_review/workflow.py": "4038d9d10dee4b9380980ef0e61ae4adc687eaba29c023d27d7beaa75291a936",
+        "skills/review-validate-fix/prompts/reviewer.md": "e0c0ed439d038c7ef751d1ed26b433c9b7e06653d58272de0520c8fc543f61af",
+        "skills/review-validate-fix/prompts/validate-fix.md": "95bbb1bc5f02890cc3033c93f184ecc852898e4602b75f84cf8f11e0779a05fb"
+      },
+      "git_commit": null
+    },
+    "historical_run_status": "ready_to_commit",
+    "last_reviewer_result_status": "completed",
+    "last_reviewer_audit_summary": "已读取需求、全部 40 个文件的完整 diff，并追踪草稿、冻结创建提交、批量创建、三态补丁、水合、启动参数、writer 局部例外及反馈登记和审批链路。候选 HEAD 为 a1cb891c9bf313eabdf1f3401da9d1e6c935120f，完整树为 abdd43b7fa2babd20722af7c4e8003137a36b533，候选源码与 Git 状态未改动。共享 machine-evidence 目录不存在；自行完成双类型检查、根相关测试 460 项通过、Web UI 测试 239 项通过、真实隔离 Codex 配置读取 2 项通过及重连边界复现 1 项通过。根测试另有 1 项目录身份文案断言在固定基线 d8df3b08ecaf6083dc6402e7c770796191f8e4a2 上同样失败，未计为新增发现。测试保留原安全策略检查与 mutation canary，采用 node --import tsx 和 runner 配置加载避开沙箱 IPC 与共享依赖写入限制。未执行完整构建、Playwright 或部署验收。",
+    "shared_machine_command_count": 0,
+    "originals_sha256": {
+      "run.json": "556b6612ae3a5687064dc2bb3cc0cbb79094e8c451dd83aeb320a102f6ebd490",
+      "execution-plan.json": "5c696757b76039094969d2352cd46bf668133af52a1287a6b05e6a348e8ee4eb",
+      "reviewer-result.json": "b6b74e131c109bfbd34c905cb88e0d529494b0f49b5c05174e18289117f96b24"
+    }
+  }
+}

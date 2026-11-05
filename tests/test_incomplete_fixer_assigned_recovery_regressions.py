@@ -27,7 +27,7 @@ def test_changed_frozen_plan_cannot_authorize_host_command(repository, tmp_path)
     plan['validation_commands'] = [command]
     write_json(run / 'execution-plan.json', plan)
     with pytest.raises(ValueError, match='冻结启动材料摘要'):
-        collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'], time.time() + 10)
+        collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'])
     with pytest.raises(ValueError, match='冻结启动材料摘要'):
         execute_registered_commands(run, repository, [command], run / 'replaced-command', 'incomplete_fixer_machine_validation')
     assert not marker.exists()
@@ -36,7 +36,7 @@ def test_changed_frozen_plan_cannot_authorize_host_command(repository, tmp_path)
 def test_independent_supervisor_cleans_late_orphan_and_releases_inherited_lock(tmp_path):
     import fcntl
     from core.task_snapshot_review import retained_command_supervisor
-    run = tmp_path / 'independent-deadline-supervision'
+    run = tmp_path / 'independent-cancellable-supervision'
     run.mkdir()
     write_json(run / 'run.json', {})
     artifacts = run / 'retained-command'
@@ -51,12 +51,13 @@ def test_independent_supervisor_cleans_late_orphan_and_releases_inherited_lock(t
         fcntl.flock(lock, fcntl.LOCK_EX)
         deadline = time.time() + 1.5
         process = subprocess.Popen([sys.executable, retained_command_supervisor.__file__, str(run), str(artifacts),
-            str(deadline), str([lock.fileno()]), __import__('json').dumps(command)],
+            str([lock.fileno()]), __import__('json').dumps(command)],
             start_new_session=True, pass_fds=(lock.fileno(),))
         try:
             while not child_marker.exists() and time.time() < deadline:
                 time.sleep(0.01)
             assert child_marker.exists()
+            process.send_signal(signal.SIGTERM)
             process.wait(timeout=2)
             assert process.returncode == -signal.SIGKILL
             assert time.time() < deadline + 0.8
@@ -89,7 +90,7 @@ def test_each_validation_command_is_bound_to_actual_source_tree(repository, tmp_
     record = create_snapshot(repository, base_ref='HEAD', scope_paths=['task.py'], requirements=b'validate exact source', run_directory=run,
         execution_plan={'fix': True, 'validation_commands': [rewrite, restore]})
     record['semantic_repair_rounds_used'] = 1
-    evidence = read_json(collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'], time.time() + 10))
+    evidence = read_json(collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit']))
     assert evidence['status'] == 'candidate_changed'
     assert len(evidence['commands']) == 1
     assert evidence['commands'][0]['source_tree_before'] == evidence['tested_tree']
@@ -108,72 +109,50 @@ def test_analyze_includes_incomplete_fixer_machine_validation(repository, tmp_pa
     assert before == {str(path): path.read_bytes() for path in run.rglob('*') if path.is_file()}
 
 
-@pytest.mark.parametrize('revoke', [False, True])
-def test_restarted_collection_obeys_original_deadline_and_revocation(repository, tmp_path, revoke):
+def test_restarted_collection_waits_for_live_command_until_persistent_stop(repository, tmp_path):
     run = tmp_path / 'interrupted-machine-collection'
     marker = tmp_path / 'retained-validation-process-id'
     command = [sys.executable, '-c', f'import os,time; from pathlib import Path; Path({str(marker)!r}).write_text(str(os.getpid())); time.sleep(30)']
-    record = create_snapshot(repository, base_ref='HEAD', scope_paths=['task.py'], requirements=b'bounded recovery', run_directory=run,
+    record = create_snapshot(repository, base_ref='HEAD', scope_paths=['task.py'], requirements=b'cancellable recovery', run_directory=run,
         execution_plan={'fix': True, 'validation_commands': [command]})
     record['semantic_repair_rounds_used'] = 1
     write_json(run / 'run.json', record)
-    deadline = time.time() + 4
     script = ('import json,sys; from pathlib import Path; '
               'from core.task_snapshot_review.machine_evidence import collect_incomplete_fixer_machine_validation; '
               'r=Path(sys.argv[1]); record=json.loads((r/"run.json").read_text()); '
-              'collect_incomplete_fixer_machine_validation(r,record,record["candidate_commit"],float(sys.argv[2]))')
-    controller = subprocess.Popen([sys.executable, '-c', script, str(run), str(deadline)])
-    child_pid = None
+              'collect_incomplete_fixer_machine_validation(r,record,record["candidate_commit"])')
+    controller = subprocess.Popen([sys.executable, '-c', script, str(run)])
+    restarted = None
     try:
-        while not marker.exists() and controller.poll() is None and time.time() < deadline:
-            time.sleep(0.02)
-        assert marker.exists()
-        child_pid = int(marker.read_text())
-        # 等待启动身份写入，精确复现完成登记后的 controller 崩溃。
+        limit = time.monotonic() + 5
         execution = run / 'incomplete-fixer-machine-validation/round-001/attempt-001/commands/command-001/execution.json'
-        while not ({'process_identity', 'process_identity_error'} & read_json(execution).keys()) and time.time() < deadline - 1:
+        while not (marker.exists() and execution.exists() and 'process_identity' in read_json(execution)):
+            assert time.monotonic() < limit
             time.sleep(0.02)
         controller.kill()
-        controller.wait(timeout=1)
-        if revoke:
-            write_json(run / 'execution-revocation.json', {'reason': '测试持久撤销'})
-        restarted = subprocess.Popen([sys.executable, '-c', script, str(run), str(deadline)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        try:
-            stdout, stderr = restarted.communicate(timeout=max(0.1, deadline - time.time()) + 0.8)
-        except subprocess.TimeoutExpired:
-            restarted.kill()
-            restarted.wait()
-            pytest.fail('接续阻塞超过原角色期限')
-        assert time.time() < deadline + 0.8
-        assert restarted.returncode == (1 if revoke else 0), (stdout, stderr)
-        observations = read_json(run / 'incomplete-fixer-machine-validation/round-001/collection-recovery.json')
-        assert observations['reason'] == ('execution_revoked' if revoke else 'original_deadline_exhausted')
-        assert observations['processes']
-        assert all(item['status'] in {'termination_requested', 'process_group_exit_unproven', 'identity_changed_no_signal', 'unknown'}
-                   for item in observations['processes'])
-        # 独立监督者可能已先终止进程；锁释放证明实际后代不再持有本次执行。
+        controller.wait(timeout=2)
+        restarted = subprocess.Popen([sys.executable, '-c', script, str(run)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.3)
+        assert restarted.poll() is None
+        assert len(list(run.glob('incomplete-fixer-machine-validation/round-*/attempt-*'))) == 1
+        write_json(run / 'execution-revocation.json', {'reason': '测试持久撤销'})
+        assert restarted.wait(timeout=3) == 1
         import fcntl
         with (run / 'incomplete-fixer-machine-validation/round-001/collection.lock').open('a+') as lock:
-            released = False
-            lock_deadline = time.monotonic() + 2
-            while time.monotonic() < lock_deadline:
+            limit = time.monotonic() + 3
+            while True:
                 try:
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    released = True
-                    fcntl.flock(lock, fcntl.LOCK_UN)
                     break
                 except BlockingIOError:
+                    assert time.monotonic() < limit
                     time.sleep(0.02)
-            assert released
     finally:
-        if controller.poll() is None:
-            controller.kill()
-            controller.wait()
-        if child_pid:
-            try:
-                os.killpg(child_pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+        write_json(run / 'execution-revocation.json', {'reason': '测试清理'})
+        for process in (controller, restarted):
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait()
 
 
 @pytest.mark.parametrize('identity_matches', [True, False])
@@ -185,23 +164,21 @@ def test_retained_command_is_signalled_only_with_matching_start_identity(tmp_pat
     monkeypatch.setattr(machine_evidence, 'process_start_identity', lambda pid, **kwargs: identity if identity_matches else {**identity, 'start_and_command': 'Wed Oct 28 12:00:01 2026 12345 reused-worker'})
     signals = []
     monkeypatch.setattr(machine_evidence.os, 'killpg', lambda pid, selected_signal: signals.append((pid, selected_signal)))
-    machine_evidence._terminate_retained_collection_commands(directory, 'original_deadline_exhausted')
+    machine_evidence._terminate_retained_collection_commands(directory, 'execution_revoked')
     assert signals == ([(12345, signal.SIGKILL)] if identity_matches else [])
     assert read_json(directory / 'collection-recovery.json')['processes'][0]['status'] == (
         'termination_requested' if identity_matches else 'identity_changed_no_signal')
 
 
-def test_collection_timeout_does_not_add_a_new_process_grace_period(repository, tmp_path):
-    run = tmp_path / 'original-deadline-command-cleanup'
-    command = [sys.executable, '-c', 'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)']
-    record = create_snapshot(repository, base_ref='HEAD', scope_paths=['task.py'], requirements=b'preserve original deadline', run_directory=run,
+def test_collection_waits_for_healthy_command_without_total_deadline(repository, tmp_path):
+    run = tmp_path / 'unlimited-machine-validation'
+    command = [sys.executable, '-c', 'import time; time.sleep(0.6)']
+    record = create_snapshot(repository, base_ref='HEAD', scope_paths=['task.py'], requirements=b'complete registered validation', run_directory=run,
         execution_plan={'fix': True, 'validation_commands': [command]})
     record['semantic_repair_rounds_used'] = 1
-    started = time.time()
-    evidence = read_json(collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'], started + 0.5))
-    assert evidence['status'] == 'failed'
-    assert evidence['commands'][0]['returncode'] == 124
-    assert time.time() - started < 1.5
+    evidence = read_json(collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit']))
+    assert evidence['status'] == 'passed'
+    assert evidence['commands'][0]['returncode'] == 0
 
 
 def test_command_launch_rejects_tree_drift_after_collection_snapshot(repository, tmp_path, monkeypatch):
@@ -220,40 +197,27 @@ def test_command_launch_rejects_tree_drift_after_collection_snapshot(repository,
             (workspace / 'task.py').write_text('value = 99\n')
         return capture(workspace, scope, artifacts, **kwargs)
     monkeypatch.setattr(machine_evidence, 'capture_worktree_tree', drift_at_command_boundary)
-    evidence = read_json(collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'], time.time() + 10))
+    evidence = read_json(collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit']))
     assert evidence['status'] == 'candidate_changed'
     assert evidence['commands'][0]['execution_started'] is False
     assert not marker.exists()
 
 
-@pytest.mark.parametrize('revoked', [True, False])
-def test_command_dispatch_rechecks_revocation_and_deadline_after_snapshot(repository, tmp_path, monkeypatch, revoked):
+def test_command_dispatch_rechecks_revocation_after_snapshot(repository, tmp_path, monkeypatch):
     from core.task_snapshot_review import machine_evidence
     from core.task_snapshot_review.execution_lifecycle import ExecutionRevoked
     run, _ = review_with_registered_validation(repository, tmp_path)
-    record = read_json(run / 'run.json')
     command = read_json(run / 'execution-plan.json')['validation_commands'][0]
     capture = machine_evidence.capture_worktree_tree
-    deadline = time.time() + 0.05
-    def change_eligibility(*arguments, **kwargs):
+    def revoke_after_snapshot(*arguments, **kwargs):
         tree = capture(*arguments, **kwargs)
-        if revoked:
-            write_json(run / 'execution-revocation.json', {'reason': '快照期间撤销'})
-        else:
-            time.sleep(max(0, deadline - time.time()) + 0.01)
+        write_json(run / 'execution-revocation.json', {'reason': '快照期间撤销'})
         return tree
-    monkeypatch.setattr(machine_evidence, 'capture_worktree_tree', change_eligibility)
-    original_popen = subprocess.Popen
-    dispatched = []
-    def observe_launch(argv, *arguments, **kwargs):
-        if argv == command:
-            dispatched.append(argv)
-        return original_popen(argv, *arguments, **kwargs)
-    monkeypatch.setattr(subprocess, 'Popen', observe_launch)
-    with pytest.raises(ExecutionRevoked if revoked else subprocess.TimeoutExpired):
-        execute_registered_commands(run, repository, [command], run / 'dispatch', 'shared_machine_evidence',
-            deadline_at=deadline)
-    assert dispatched == []
+    monkeypatch.setattr(machine_evidence, 'capture_worktree_tree', revoke_after_snapshot)
+    with pytest.raises(ExecutionRevoked):
+        execute_registered_commands(run, repository, [command], run / 'dispatch', 'shared_machine_evidence')
+    assert 'process_identity' not in read_json(run / 'dispatch/command-001/execution.json')
+    assert not (run / 'owned-processes.json').exists()
 
 
 def test_corrected_incomplete_fixer_tree_gets_next_bounded_validation_round(repository, tmp_path):
@@ -282,11 +246,11 @@ def test_interrupted_collection_preserves_each_attempt_and_analysis_count(reposi
         original_write(path, value)
     monkeypatch.setattr(machine_evidence, 'write_json', crash_before_accepting_evidence)
     with pytest.raises(RuntimeError, match='索引未提交'):
-        collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'], time.time() + 10)
+        collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'])
     originals = {path: path.read_bytes() for path in run.glob('incomplete-fixer-machine-validation/round-*/attempt-*/**/*') if path.is_file()}
     assert originals
     monkeypatch.setattr(machine_evidence, 'write_json', original_write)
-    collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'], time.time() + 10)
+    collect_incomplete_fixer_machine_validation(run, record, record['candidate_commit'])
     assert all(path.read_bytes() == content for path, content in originals.items())
     analysis = analyze_runs([run])
     assert analysis['metrics']['machine_evidence_collections'] == 2

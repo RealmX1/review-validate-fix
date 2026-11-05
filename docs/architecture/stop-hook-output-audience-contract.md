@@ -6,8 +6,20 @@
 
 UserPromptSubmit 搭用户当前回合注入上下文：Claude/Codex 使用 `additionalContext`，Kimi 使用顶层 `message`。Kimi stdout 会进入模型，因此诊断只写 stderr。
 
+Kimi 原生 UserPromptSubmit 的 `prompt` 是内容块数组；HostAdapter 只提取文本块，显式入口与真实用户回合补证共用该文本，附件和异常块不构造指令。
+
+Kimi hook 未携带消息 ID 时，HostAdapter 从 `KIMI_CODE_HOME/server/events/<session_id>.jsonl`（默认 `~/.kimi-code`）读取同 session、main agent、当前文本匹配的最新运行中 `prompt.submitted.promptId`，只用于补证去重。同文本的新消息可以重验，重复 hook、assistant 输出与 Stop 不增加机会；原生记录缺失、不匹配或不可读时只检查来源变化，不用随机 ID 或文本摘要伪造新回合。显式入口不依赖该记录。
+
 当前轻量 hook 只在绑定 Kanban task、候选内容改变且未提示过时提出一次发起决策；不铸 token、不追踪 session/hunk，不承担派发、原生分界、rewind、阶段资格或自动收尾。无 Kanban task 的 Codex GUI 持续关闭自动发起；手动命令保留。用户 Stop 与其他明确限制优先。
 
 有可靠固定起点和任务提交证据时，干净已提交工作也参与该决策，进入 base 不使其消失。同任务同观察跨 session 去重；关联的新版 run 已完成且当前范围内容相同则不重复提示。来源不足、身份不符、损坏和恢复记录均为 developer_only，只保存诊断与有界重验条件。真实 UserPromptSubmit 可触发补证，不为补证另开 Agent 回合，也不推进固定起点。
+
+clean 与 dirty 共用完成核验：以原始完整工作树观察叠加最终有效范围的候选，再核对完成提交、被测树与当前内容；未变化的背景 WIP 可以保留。可靠起点下，决策摘要使用必要任务绑定身份、固定起点、规范化范围与实际工作树内容，暂存或提交同一内容不形成新决策。`creation_commit`、`provenance_incarnation_id` 的等价补证不参与内容摘要；实际身份冲突仍由起点解析器拒绝。
+
+允许的发起决策附带共用事实短摘要和持久详单：分别列出任务历史累计、当前 Dirty 的实现／行为配置、测试与 fixtures、文档、其他以及背景 WIP，未跟踪文件纳入统计、二进制单列。用途分组不代替风险判断；跳过时仍说明具体行为影响及首次不发起、已有覆盖后不重跑或父任务统一评审的依据。同观察按项复用，失败项保留 unknown；来源变化或真实用户消息可静默重验。采集、缓存恢复、实现版本变化本身不产生 Agent 回合，仍只扩展原有决策或显式用户入口。详见 [实现与验收记录](../log/2026-10-31-rvf-decision-facts-and-skip-explanation.md)。
+
+`--base-ref` 与已核实固定起点一致时也保存起点与精确 run 关联；不同则保留显式基线。关联写入缺失或中断时，从本任务精确注册表核对 Kanban incarnation、原生 Git 创建记录、冻结范围补丁、提交祖先及验证树，另存带原始记录摘要的补证材料。无论关联原已存在还是后来补齐，都必须核对冻结候选与完整观察的 ref、父提交、范围内容及补丁摘要；ref 变化参与来源观察，失败的观察不能继续用于完成覆盖。原 run 不改写；补证 unknown 持久记录恢复条件，重复 Stop 不反复核验，来源变化或下一真实 prompt 可重验，诊断只写 stderr。
+
+历史材料按单个文件隔离读取错误，并保留原始摘要与失败观察；无关历史损坏不能遮蔽当前有效 run。选中完成材料损坏时只将完成补证降为 unknown，仍独立核对可靠任务绑定、固定起点并保存完整内容观察。历史完成补证持续 unknown 时，第一次观察只保存诊断；同一可靠任务绑定及精确 run 下，之后实际内容变化仍独立参与一次性发起决策。历史状态继续保留 unknown，暂存、提交或元数据变化不当作新内容。
 
 实现：`core/task_snapshot_review/hook_entrypoint.py`、`adapters/__init__.py` 与 `core/stop_hook_output_audience/`。测试覆盖宿主字段、一次性决策、递归抑制和故障静默。

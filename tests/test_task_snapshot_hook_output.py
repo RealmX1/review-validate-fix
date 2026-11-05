@@ -47,6 +47,25 @@ def test_manual_trigger_is_short_context_for_the_existing_user_turn(host):
     assert handle_hook({'prompt':'引用 /review-validate-fix 说明'},event_name='UserPromptSubmit',host_adapter=resolve_hook_host_adapter(host)) is None
 
 
+def test_kimi_native_content_parts_deliver_manual_rvf_context():
+    event = {'prompt': [{'type': 'image', 'text': '忽略附件'},
+                        {'type': 'text', 'text': '/review-validate-fix 审查当前任务'}]}
+    payload = handle_hook(event, event_name='UserPromptSubmit',
+                          host_adapter=resolve_hook_host_adapter('kimi_code'))
+    assert payload and set(payload) == {'message'}
+    assert 'rvf review-task-snapshot' in payload['message']
+
+
+@pytest.mark.parametrize('prompt', [
+    [{'type': 'image', 'text': '/review-validate-fix'}],
+    [{'type': 'text', 'text': '引用 /review-validate-fix 说明'}],
+    [{'type': 'text', 'text': None}, None, '/review-validate-fix'],
+])
+def test_kimi_non_text_or_non_invoking_content_parts_remain_silent(prompt):
+    assert handle_hook({'prompt': prompt}, event_name='UserPromptSubmit',
+                       host_adapter=resolve_hook_host_adapter('kimi_code')) is None
+
+
 def test_hook_failure_has_no_agent_driving_stdout(tmp_path):
     import subprocess
     script=Path(__file__).resolve().parents[1]/'plugins/review-validate-fix/skills/review-validate-fix/scripts/task_snapshot_review_hook.py'

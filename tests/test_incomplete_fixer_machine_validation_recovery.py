@@ -29,7 +29,7 @@ def machine_blocked_fixer(tmp_path, mode="machine", final_value=3):
         "if status=='incomplete' and mode!='semantic':payload['completion_blocker']='registered_machine_validation'\n"
         "print(json.dumps(payload))\n"
     )
-    return {"command": [sys.executable, str(script)], "output_format": "text", "timeout_seconds": 30}
+    return {"command": [sys.executable, str(script)], "output_format": "text"}
 
 
 def review_with_registered_validation(repository, tmp_path, expected_value=3):
@@ -67,14 +67,13 @@ def test_machine_validation_recovery_is_bounded_across_resume(repository, tmp_pa
     run, reviewer = review_with_registered_validation(repository, tmp_path)
     fixer = machine_blocked_fixer(tmp_path, mode="always_machine")
     result = resume_review(run, reviewer_configs=[reviewer, reviewer], fixer_config=fixer)
-    deadline = read_json(run / "fixer/role-deadline.json")
     for _ in range(2):
         assert result["status"] == "fix_incomplete"
         result = resume_review(run)
     assert len(list(run.glob("fixer/attempt-*/request.json"))) == 4
     assert len(list(run.glob("incomplete-fixer-machine-validation/round-*/attempt-*/evidence.json"))) == 3
     assert read_json(run / "run.json")["semantic_repair_rounds_used"] == 1
-    assert read_json(run / "fixer/role-deadline.json") == deadline
+    assert not (run / "fixer/role-deadline.json").exists()
     assert any(path.endswith("incomplete-fixer-machine-validation/round-001/evidence.json") for path in result["recovery"]["evidence_paths"])
 
 

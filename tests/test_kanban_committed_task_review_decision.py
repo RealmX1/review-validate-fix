@@ -49,11 +49,12 @@ def test_clean_base_only_absorption_has_no_decision(kanban_task):
     assert stop(task) is None
 
 
-def test_real_prompt_rechecks_evidence_without_adding_diagnostic_context(kanban_task):
+@pytest.mark.parametrize('prompt', ['继续实现', [{'type': 'text', 'text': '继续实现'}]])
+def test_real_prompt_rechecks_evidence_without_adding_diagnostic_context(kanban_task, prompt):
     task = kanban_task
     (task['workspace'] / 'task-commit-integration-provenance.json').write_text('{broken')
     first = resolve(task)
-    event = {'cwd': str(task['repo']), 'prompt': '继续实现', 'turn_id': 'real-turn'}
+    event = {'cwd': str(task['repo']), 'prompt': prompt, 'turn_id': 'real-turn'}
     assert handle_hook(event, event_name='UserPromptSubmit', host_adapter=resolve_hook_host_adapter('kimi_code')) is None
     after = resolve(task)
     assert after['resolution_attempt_count'] == first['resolution_attempt_count'] + 1
