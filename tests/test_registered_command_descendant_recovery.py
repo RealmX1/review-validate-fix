@@ -226,7 +226,7 @@ def test_workflow_resumes_original_fixer_after_same_tree_environment_recovery(re
     monkeypatch.setenv('RVF_TEST_SERVICE_AVAILABLE', 'no')
     assert resume_review(run, reviewer_configs=[reviewer, reviewer], fixer_config=fixer)['status'] == 'fix_incomplete'
     monkeypatch.setenv('RVF_TEST_SERVICE_AVAILABLE', 'yes')
-    assert resume_review(run)['status'] == 'ready_to_commit'
+    assert resume_review(run)['status'] == 'review_and_validation_completed'
     assert not (run / 'fixer/role-deadline.json').exists()
     assert len(list(run.glob('reviewer-*/attempt-*/request.json'))) == 2
     assert len(list(run.glob('fixer/attempt-*/request.json'))) == 3

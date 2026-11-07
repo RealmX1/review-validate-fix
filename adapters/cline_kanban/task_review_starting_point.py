@@ -17,6 +17,9 @@ from core.task_snapshot_review.task_snapshot import capture_worktree_tree, norma
 from core.task_snapshot_review.active_run_observation import expected_run_worktree_tree, registered_task_run_directories
 
 
+_REVIEW_AND_VALIDATION_COMPLETED_RUN_STATUSES = {"ready_to_commit", "completed"}
+
+
 def _digest(value: object) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
@@ -375,24 +378,46 @@ def _associated_run_starting_point(record: dict, run_directory: Path, binding: d
     return {}
 
 
-def _completed_run_baseline(repo: Path, run_directory: Path, binding: dict, scopes: list[str], original: str,
-                            *, starting_point_evidence: dict | None = None) -> tuple[str, str]:
+def _reviewed_and_validated_run_content_commit(repo: Path, run_directory: Path, binding: dict, original: str,
+                                              *, starting_point_evidence: dict | None = None) -> str:
     record = read_json(run_directory / 'run.json')
     evidence = starting_point_evidence or _associated_run_starting_point(record, run_directory, binding)
     if (any(record.get(key) != binding[key] for key in ('repo', 'git_directory', 'git_common_directory'))
-            or not _same_binding(evidence.get('binding', {}), binding) or record.get('status') != 'completed'
+            or not _same_binding(evidence.get('binding', {}), binding)
+            or record.get('status') not in _REVIEW_AND_VALIDATION_COMPLETED_RUN_STATUSES
             or evidence.get('original_start_commit') != original or evidence.get('base_commit') != record.get('base_commit')):
-        raise ValueError('增量起点必须来自同任务、同工作树的已完成新版 run')
+        raise ValueError('质量覆盖必须来自同任务、同工作树的评审及验证已完成 run')
+    from core.task_snapshot_review.execution_lifecycle import execution_is_revoked
+    if execution_is_revoked(run_directory):
+        raise ValueError('已撤销 run 不能证明当前质量覆盖')
     validation = read_json(run_directory / 'validation.json')
-    commit = _commit(repo, record['commit'])
+    if record['status'] == 'completed':
+        commit = _commit(repo, record['commit'])
+        ancestry_head = commit
+    else:
+        commit = _commit(repo, validation['tested_commit'])
+        ancestry_head = _commit(repo, validation['tested_head'])
+        if git_text(repo, 'show', '-s', '--format=%P', commit) != ancestry_head:
+            raise ValueError('质量覆盖的完整被测快照与验证时 HEAD 不匹配')
     if (validation.get('status') != 'passed' or validation.get('tested_tree') != git_text(repo, 'rev-parse', f'{commit}^{{tree}}')
-            or not _is_ancestor(repo, record['original_head'], commit) or not _is_ancestor(repo, commit, 'HEAD')):
-        raise ValueError('增量 run 缺少当前可核对的完整树验证和已发生提交')
+            or not _is_ancestor(repo, record['original_head'], ancestry_head) or not _is_ancestor(repo, ancestry_head, 'HEAD')):
+        raise ValueError('质量覆盖缺少当前可核对的完整树验证和提交祖先证据')
     covered = normalized_scope_paths(record.get('effective_scope_paths', record['scope_paths']))
     candidate = record.get('validated_candidate_commit', record['candidate_commit'])
     if ((validation.get('candidate_commit') and validation['candidate_commit'] != candidate)
             or git(repo, 'diff', '--name-only', candidate, commit, '--', *covered)):
         raise ValueError('完成 run 的最终候选与被测提交不一致')
+    return commit
+
+
+def _completed_run_baseline(repo: Path, run_directory: Path, binding: dict, scopes: list[str], original: str,
+                            *, starting_point_evidence: dict | None = None) -> tuple[str, str]:
+    record = read_json(run_directory / 'run.json')
+    if record.get('status') != 'completed':
+        raise ValueError('增量起点必须来自同任务、同工作树的已完成新版 run')
+    commit = _reviewed_and_validated_run_content_commit(repo, run_directory, binding, original,
+                                                       starting_point_evidence=starting_point_evidence)
+    covered = normalized_scope_paths(record.get('effective_scope_paths', record['scope_paths']))
     if not _scope_is_covered(scopes, covered):
         return original, 'expanded_scope_original_start'
     return commit, 'explicit_completed_run_increment'
@@ -432,7 +457,7 @@ def _recover_completed_run_association(repo: Path, run_directory: Path, record: 
     evidence = {'status': 'verified', 'binding': binding, 'original_start_commit': original,
                 'base_commit': original, 'observed_head': record['original_head'], 'scope_paths': scopes,
                 'source': 'registered_run_and_native_kanban_git_evidence'}
-    commit, _ = _completed_run_baseline(repo, run_directory, binding, [], original, starting_point_evidence=evidence)
+    commit = _reviewed_and_validated_run_content_commit(repo, run_directory, binding, original, starting_point_evidence=evidence)
     current_binding, _ = _task_binding(repo, binding['task_id'], repository_identity(repo),
                                        _source_observations(binding['task_id']), _reflog(repo))
     if (not _same_binding(binding, current_binding) or (run_directory / 'run.json').read_bytes() != original_run_bytes
@@ -444,7 +469,7 @@ def _recover_completed_run_association(repo: Path, run_directory: Path, record: 
         'validation_sha256': hashlib.sha256(original_validation_bytes).hexdigest(),
         'starting_point_evidence': evidence, 'equivalent_evidence': {
             'worktree_creation_reflog_entry': entries[0], 'run_created_at': created,
-            'snapshot_reference': reference, 'patch_sha256': record['patch_sha256'], 'completed_commit': commit}})
+            'snapshot_reference': reference, 'patch_sha256': record['patch_sha256'], 'reviewed_and_validated_content_commit': commit}})
     return association_path
 
 
@@ -576,7 +601,7 @@ def resolve_task_review_starting_point(repo: Path, task_id: str, *, scope_paths:
             run_path = incremental_after_run or (Path(starting['fixed_run_directory']) if starting and starting.get('fixed_run_directory') else None)
             if not incremental_after_run:
                 completed = [(path, observed) for path, observed in registered_runs.items()
-                             if (observed['run'] or {}).get('status') == 'completed']
+                             if (observed['run'] or {}).get('status') in _REVIEW_AND_VALIDATION_COMPLETED_RUN_STATUSES]
                 if completed:
                     newest_path, newest_observation = max(completed, key=lambda item: item[1]['run'].get('created_at', 0))
                     attached = (registered_runs.get(str(run_path)) or _run_material_observation(run_path))['run'] if run_path else None
@@ -636,7 +661,7 @@ def resolve_task_review_starting_point(repo: Path, task_id: str, *, scope_paths:
                 baseline, source = _completed_run_baseline(repo, incremental_after_run.resolve(), binding, scopes, original)
             elif run_observation:
                 record = run_observation['run']
-                if record is None or record.get('status') == 'completed':
+                if record is None or record.get('status') in _REVIEW_AND_VALIDATION_COMPLETED_RUN_STATUSES:
                     try:
                         if record is None:
                             raise ValueError(run_observation['artifacts']['run']['error'])
@@ -663,13 +688,13 @@ def resolve_task_review_starting_point(repo: Path, task_id: str, *, scope_paths:
             reviewed = False
             result['completion_evidence_status'] = 'absent'
             unproven_or_completed_run = bool(run_path and run_observation
-                and (run_observation['run'] is None or run_observation['run'].get('status') == 'completed'))
+                and (run_observation['run'] is None or run_observation['run'].get('status') in _REVIEW_AND_VALIDATION_COMPLETED_RUN_STATUSES))
             if unproven_or_completed_run:
                 try:
                     if completion_error:
                         raise ValueError(completion_error)
                     # 提醒比较实际净变化；自动默认的全库范围不要求窄范围 run 评审未变化路径。
-                    completed_base, _ = _completed_run_baseline(repo, run_path, binding, [], original)
+                    completed_base = _reviewed_and_validated_run_content_commit(repo, run_path, binding, original)
                     coverage_paths = [path for path in git(repo, 'diff', '--no-renames', '--name-only', '-z',
                                                           baseline, completed_base, '--', *scopes).decode().split('\0') if path]
                     if scope_paths or (starting or {}).get('scope_paths'):
@@ -684,7 +709,7 @@ def resolve_task_review_starting_point(repo: Path, task_id: str, *, scope_paths:
                 starting = {'binding': binding, 'base_commit': original, 'scope_paths': scope_paths, 'source': source}
                 write_json(starting_path, starting)
                 observation['starting'] = starting
-            if (run_path and run_observation and (run_observation['run'] or {}).get('status') == 'completed'
+            if (run_path and run_observation and (run_observation['run'] or {}).get('status') in _REVIEW_AND_VALIDATION_COMPLETED_RUN_STATUSES
                     and result['completion_evidence_status'] == 'verified' and starting.get('fixed_run_directory') != str(run_path.resolve())
                     and not incremental_after_run):
                 starting = {**starting, 'fixed_run_directory': str(run_path.resolve())}

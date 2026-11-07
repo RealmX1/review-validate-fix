@@ -2,12 +2,12 @@
 
 本文件落实 cdd62 中用户批准的「RVF 工作流解耦、Prompt 精简与 GitHub Issue 收集」计划。
 
-RVF 的流程为：一次固定材料启动 → 两路独立 reviewer → 来源匿名的合并 validate/fix → 完整被测树最终验证 → 一次结果交回 → 主 Agent 审阅、提交并立即展示计划完成情况与 recap。base 同步按既有授权另行执行。
+RVF 的流程为：一次固定材料启动 → 两路独立 reviewer → 来源匿名的合并 validate/fix → 完整被测树最终验证 → 将评审事实交回所属工作流。提交、PR、合并、部署、计划进展与结案由所属工作流处理。
 
 ## 组件接口
 
 - `rvf review-task-snapshot --repo <工作树> --base-ref <固定基线或本地 ref> --scope <相对路径> ... --requirements-file <需求文件>` 创建持久快照并启动独立评审，默认两路，`--reviewer-count 3` 可指定三路。数量在创建时保存，接续必须完成全部分配腿；ref 只解析一次，范围必须显式给出。`--prepare-only` 只准备输入。
-- `rvf resume-task-review --run-dir <持久目录>` 接续原 run，只执行未完成部分。可附 `--fix` 执行一个合并 fixer，`--validation-commands <JSON 文件>` 执行最终验证。主会话使用普通 Git 提交；该入口也可核对已发生的提交。
+- `rvf resume-task-review --run-dir <持久目录>` 接续原 run，只执行未完成部分。可附 `--fix` 执行一个合并 fixer，`--validation-commands <JSON 文件>` 执行最终验证。该入口也可核对已发生的提交，结果不授予新的交付权限。
 - `rvf collect-issues --report <JSON 文件>` 由主 Agent 统一收集问题。`rvf collect-issues --flush` 接续持久待补写材料。失败不阻断评审、提交或同步。
 - `rvf analyze --run-dir <目录>` 按需读取结果生成复盘材料，无自动启动、归档门禁或写源码权限。
 
@@ -21,7 +21,7 @@ RVF 的流程为：一次固定材料启动 → 两路独立 reviewer → 来源
 
 同一 run 的角色工作树通过 `worktree-registration.lock` 串行登记，避免并发 `git worktree add` 读取尚未写完的同名工作树 `commondir`。登记子进程继承该锁，worker 意外退出也不能提前释放登记资格；等待锁后再次核验持久撤销。锁仅覆盖工作树登记，角色准备和模型执行仍可并行。
 
-自动推进入口在 `review-task-snapshot` 同时接受 `--fix`、`--validation-commands`、`--preparation-commands`、`--machine-context-file`、`--machine-evidence-commands` 和 `--implementation-plan-file`。材料按摘要冻结到 `execution-plan.json`，后续只接续精确 run。默认最多三轮语义修复（包含首次 finding 修复），CLI 传输重试另计；语义修复预算持久保存，角色运行不设总时限。完成 reviewer 的上下文与判断不共享，仅共享绑定完整树、cwd、命令、工具链和依赖身份的机器事实。依赖身份缺证时重新采集。
+自动推进入口在 `review-task-snapshot` 同时接受 `--fix`、`--validation-commands`、`--preparation-commands`、`--machine-context-file` 和 `--machine-evidence-commands`。材料按摘要冻结到 `execution-plan.json`，后续只接续精确 run。默认最多三轮语义修复（包含首次 finding 修复），CLI 传输重试另计；语义修复预算持久保存，角色运行不设总时限。完成 reviewer 的上下文与判断不共享，仅共享绑定完整树、cwd、命令、工具链和依赖身份的机器事实。依赖身份缺证时重新采集。
 
 `findings=[]` 的最终验证失败也会进入 validation repair；fixer request 包含原失败命令、日志和真实 `tested_commit`，补丁从该被测基线计算。隔离准备命令不能改写候选源码，其生成物不混入任务修复。安全的外部 HEAD 前移自动合并已评审任务补丁并重验；新的未评审 hunk 或不能安全合并的内容保留原件并形成具体处置。
 
@@ -47,7 +47,9 @@ Stop 同样合并追加对账中的已证明身份，逐个核对当前原生启
 
 使用 `--kanban-task-id` 与 `--kanban-project-path` 将同一 run 委托给通用 `kanban task command-execution`。执行记录先冻结 incarnation、主会话、工作树、材料、恢复动作及稳定结果 ID，宿主负责等待与原生接受补证。`cancel-task-review` 先写持久撤销，再仅取消匹配启动身份的所属进程；原生共享宿主取消证据未知时保留 unknown。Stop 后不能以自动恢复再次派发。
 
-本工作流默认在 RVF 顺利完成且主 Agent 最终审阅通过后自主 commit 收尾；明确只读、不得提交等限制继续优先。`elevated` 处置必须注明 `elevation_impact: none|rollback|broad_rewrite`；普通 elevation 不单独阻止提交，后两类形成具体判断请求。主 Agent 提交后以 `--closeout-report` 保存逐项计划状态、证据与工作 recap，原 run 核实真实提交并立即输出收尾，先于任何 base-branch-sync。未提供实施证据时计划完成情况是 unknown，而非从 RVF 成功推定。
+`task_snapshot_review_result_facts` 保存有效候选、范围、发现和处置原件、补丁、验证及重大处置依据。`elevated` 处置继续注明 `elevation_impact: none|rollback|broad_rewrite`，后两类形成具体判断请求。公开成功状态为 `review_and_validation_completed`；`run.json` 内部的既有状态、候选和已发生提交观察保持原义，不成为提交资格。取消会收回当前通知并发布 cancelled，历史修订和消费回执保留原件。
+
+RVF 不接收整份实施计划的收尾报告，也不决定提交、PR、合并、部署、任务结案或 recap。旧 Run 的冻结材料仍按原字节摘要核验后接续，不改写旧计划、角色结果或撤销记录；其中旧的总体计划字段不再参与收尾判断。所属工作流按当前阶段和已有授权处理评审结果。
 
 Analyze 支持重复 `--run-dir`，纯读取原始 outcome 与持久 reconciliation，分别展示 raw/effective 状态及原件指针，不调用会写补证的执行状态读取器。全部 attempt 与独立 reviewer 保留，缺失版本、原生 usage 或主 Agent 往返指标保持 unknown。
 
@@ -55,7 +57,7 @@ run 中保留需求原文、固定基线、候选 Git 对象、显式范围、�
 
 Stop、显式入口与创建快照共用 `task_review_decision_facts`：优先复用已核验绑定、起点、完整工作树与精确 run 观察，补采 Dirty numstat 与缺失的精确提交统计。正式 run 的 `decision-facts.json` 同时绑定原始完整观察和候选，摘要进入 `review-input.md`，原件摘要进入 `run.json`，所有角色收到同一材料路径。接续前核验原件完整性；修复后的候选不继承原始覆盖。显式 `--base-ref` 与任务起点不同时仍保留身份与历史事实，但命令提示沿用显式基线，不伪造任务起点关联。CLI 参数保持原样。
 
-最终验证在独立工作树执行：当前 HEAD 的已提交内容叠加已评审的任务路径，不带入范围外 staged/unstaged/untracked WIP。`validation.json` 保存完整 `tested_tree`、实际 `tested_commit`、工作树与命令；依赖随 HEAD 漂移时自动重跑原验证命令，不重跑已完成 reviewer。只在实际提交的完整树与已通过验证的树一致时登记完成。同一树的中断验证保留原工作树和构建产物；依赖身份无法证明时完整重验，不复用旧通过记录或命令前缀。
+最终验证在独立工作树执行：当前 HEAD 的已提交内容叠加已评审的任务路径，不带入范围外 staged/unstaged/untracked WIP。`validation.json` 保存完整 `tested_tree`、实际 `tested_commit`、工作树与命令；依赖随 HEAD 漂移时自动重跑原验证命令，不重跑已完成 reviewer。候选与完整被测树一致且验证通过即可交回评审结果；已发生提交的内部观察仍要求其整树与验证一致。同一树的中断验证保留原工作树和构建产物；依赖身份无法证明时完整重验，不复用旧通过记录或命令前缀。
 
 Validate-Fixer 返回 `incomplete` 仍保留新发现、处置、隔离修复快照与补丁；下次输入包含先前结果，工作树接续已保存修复。新范围内发现先并入匿名分配，未解决时不能进入最终验证；未完成修复不提前覆盖主工作树。明确停止在初始角色派发及等待阶段均取消并回收当前流程拥有的 worker。
 

@@ -142,7 +142,7 @@ def test_changed_shared_facts_resume_only_the_incomplete_reviewer(repository, tm
     config = {"command": [sys.executable, str(script)], "output_format": "text"}
     assert resume_review(run, reviewer_configs=[config, config])["status"] == "review_incomplete"
     marker.touch()
-    assert resume_review(run)["status"] == "ready_to_commit"
+    assert resume_review(run)["status"] == "review_and_validation_completed"
     assert len(list((run / "reviewer-1").glob("attempt-*"))) == 1
     assert len(list((run / "reviewer-2").glob("attempt-*"))) == 2
 
@@ -154,7 +154,7 @@ def test_missing_process_identity_preserves_unknown_without_aborting_authorized_
     monkeypatch.setattr(execution_lifecycle, "process_start_identity", unavailable)
     run = automatic_snapshot(repository, tmp_path, commands=[[sys.executable, "-c", "pass"]])
     result = resume_review(run, reviewer_configs=[fake_config(tmp_path), fake_config(tmp_path)])
-    assert result["status"] == "ready_to_commit"
+    assert result["status"] == "review_and_validation_completed"
     controller = next(item for item in read_json(run / "owned-processes.json")["processes"] if item["purpose"] == "workflow_controller")
     assert controller["start_and_command"] is None
     assert controller["identity_evidence_unavailable"]
@@ -170,7 +170,7 @@ def test_failed_shared_preparation_resumes_in_new_attempt_after_dependency_recov
     config = fake_config(tmp_path)
     assert resume_review(run, reviewer_configs=[config, config])["disposition"] == "machine_evidence_pending"
     marker.touch()
-    assert resume_review(run)["status"] == "ready_to_commit"
+    assert resume_review(run)["status"] == "review_and_validation_completed"
     assert (run / "machine-evidence/attempt-002/evidence.json").exists()
 
 
@@ -179,10 +179,10 @@ def test_same_tested_tree_is_revalidated_without_dependency_identity_proof(repos
     command = [sys.executable, "-c", f"from pathlib import Path; p=Path({str(counter)!r}); p.write_text(p.read_text()+'x' if p.exists() else 'x')"]
     run = automatic_snapshot(repository, tmp_path, commands=[command])
     config = fake_config(tmp_path)
-    assert resume_review(run, reviewer_configs=[config, config])["status"] == "ready_to_commit"
+    assert resume_review(run, reviewer_configs=[config, config])["status"] == "review_and_validation_completed"
     git(repository, "commit", "--only", "-qm", "fix: 核验提交后收尾", "--", "task.py")
-    assert resume_review(run)["status"] == "completed"
-    assert resume_review(run)["status"] == "completed"
+    assert resume_review(run)["status"] == "review_and_validation_completed"
+    assert resume_review(run)["status"] == "review_and_validation_completed"
     # 相同源码不能证明外部依赖未变；每次执行资格检查保留独立的当前验证。
     assert counter.read_text() == "xxx"
     assert len(list(run.glob("final-validation/attempt-*"))) == 3
@@ -196,7 +196,7 @@ def test_validation_repair_resumes_incomplete_tree_instead_of_original_red_tree(
     assert resume_review(run, reviewer_configs=[config, config], fixer_config={"command": [sys.executable, str(partial)], "output_format": "text"})["status"] == "fix_incomplete"
     complete = tmp_path / "complete-validation-repair.py"
     complete.write_text("from pathlib import Path\nimport json\nassert Path('task.py').read_text() == 'value = 3\\n'\nPath('task.py').write_text('value = 4\\n')\nprint(json.dumps({'status':'completed','dispositions':[]}))\n")
-    assert resume_review(run, fixer_config={"command": [sys.executable, str(complete)], "output_format": "text"})["status"] == "ready_to_commit"
+    assert resume_review(run, fixer_config={"command": [sys.executable, str(complete)], "output_format": "text"})["status"] == "review_and_validation_completed"
     assert (repository / "task.py").read_text() == "value = 4\n"
 
 
@@ -222,5 +222,5 @@ def test_safe_external_head_hunk_is_preserved_before_fix_application(repository,
     config = fake_config(tmp_path, findings=[{"message": "首行需要修复", "path": "task.py"}])
     reviewer = tmp_path / "reviewer.py"
     reviewer.write_text(reviewer.read_text().replace(".read_text() == 'value = 2\\n'", ".read_text().startswith('value = 2\\n')"))
-    assert resume_review(run, reviewer_configs=[config, config], fixer_config={"command": [sys.executable, str(fixer)], "output_format": "text"})["status"] == "ready_to_commit"
+    assert resume_review(run, reviewer_configs=[config, config], fixer_config={"command": [sys.executable, str(fixer)], "output_format": "text"})["status"] == "review_and_validation_completed"
     assert path.read_text().startswith("value = 3\n") and path.read_text().endswith("external_value = 2\n")

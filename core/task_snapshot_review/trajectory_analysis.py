@@ -11,6 +11,8 @@ def analyze_runs(run_directories: list[Path]) -> dict:
     runs = []
     for run in dict.fromkeys(path.expanduser().resolve() for path in run_directories):
         record = read_json(run / "run.json")
+        business_result_file = run / "business-result.json"
+        business_result = read_json(business_result_file) if business_result_file.exists() else {}
         attempts = []
         for request_file in sorted(run.glob("*/attempt-*/request.json")):
             directory = request_file.parent
@@ -46,7 +48,8 @@ def analyze_runs(run_directories: list[Path]) -> dict:
             "shared_evidence": evidence, "incomplete_fixer_machine_validations": incomplete_fixer_machine_validations,
             "commit": record.get("commit"),
             "stage_events": read_json(run / "stage-events.json").get("events", []) if (run / "stage-events.json").exists() else None,
-            "closeout": read_json(run / "business-result.json").get("closeout") if (run / "business-result.json").exists() else None})
+            "task_snapshot_review_result_facts": business_result.get("task_snapshot_review_result_facts"),
+            "historical_closeout": business_result.get("closeout")})
     attempts = [attempt for run in runs for attempt in run["attempts"]]
     usages = [attempt["native_usage"] for attempt in attempts if attempt["native_usage"] is not None]
     return {"runs": runs, "analysis_required_for_completion": False,

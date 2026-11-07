@@ -45,7 +45,7 @@ def test_registered_reviewer_request_collects_host_evidence_and_only_resumes_mis
     before = canary(repository)
     config = machine_request_reviewer(tmp_path)
     result = resume_review(run, reviewer_configs=[config, config])
-    assert result["status"] == "ready_to_commit"
+    assert result["status"] == "review_and_validation_completed"
     assert len(list((run / "reviewer-1").glob("attempt-*"))) == 1
     assert len(list((run / "reviewer-2").glob("attempt-*"))) == 2
     assert read_json(run / "reviewer-2/attempt-001/result.json")["status"] == "incomplete"
@@ -53,7 +53,7 @@ def test_registered_reviewer_request_collects_host_evidence_and_only_resumes_mis
     evidence = list(run.glob("reviewer-machine-evidence-requests/*/attempt-*/evidence.json"))
     assert len(evidence) == 1
     assert read_json(evidence[0])["commands"][0]["stdout_sha256"] == hashlib.sha256(b"machine proof\n").hexdigest()
-    assert resume_review(run)["status"] == "ready_to_commit"
+    assert resume_review(run)["status"] == "review_and_validation_completed"
     assert len(list(run.glob("reviewer-*/attempt-*"))) == 3
 
 
@@ -127,7 +127,7 @@ def test_legacy_request_is_appended_idempotently_and_cannot_revive_revocation(re
         "source_request_index": 0, "request": registered_request(run)}
     registration = register_reviewer_machine_evidence_request(run, **args)
     assert register_reviewer_machine_evidence_request(run, **args) == registration
-    assert resume_review(run)["status"] == "ready_to_commit"
+    assert resume_review(run)["status"] == "review_and_validation_completed"
     assert source.read_bytes() == original
     assert len(list((run / "reviewer-1").glob("attempt-*"))) == 1
     write_json(run / "execution-revocation.json", {"reason": "用户 Stop"})
@@ -669,7 +669,7 @@ def test_incomplete_machine_request_is_consumed_while_another_reviewer_runs(repo
         finally:
             release.touch()
         result = future.result(timeout=30)
-    assert result["status"] == "ready_to_commit"
+    assert result["status"] == "review_and_validation_completed"
     assert marker.read_text() == "done"
 
 
@@ -729,7 +729,7 @@ def test_other_reviewer_finishes_while_machine_collection_is_still_running(repos
             gate.touch()
             release.touch()
         result = future.result(timeout=40)
-    assert result["status"] == "ready_to_commit"
+    assert result["status"] == "review_and_validation_completed"
     assert done.read_text() == "done"
     assert len(list((run / "reviewer-1").glob("attempt-*"))) == 1
     assert len(list(run.glob("reviewer-machine-evidence-requests/*/attempt-*/evidence.json"))) == 1

@@ -75,7 +75,7 @@ def test_explicit_context_is_imported_once_before_automatic_machine_resume(repos
     context = tmp_path / 'explicit-context-response.md'
     context.write_text('补证：仅修复当前已授权任务。')
     result = resume_review(run, reviewer_configs=[reviewer, reviewer], fixer_config=machine_blocked_fixer(tmp_path), context_response_file=context)
-    assert result['status'] == 'ready_to_commit'
+    assert result['status'] == 'review_and_validation_completed'
     requests = [read_json(path) for path in sorted(run.glob('fixer/attempt-*/request.json'))]
     assert len(requests) == 2
     assert requests[0]['context_response_sha256'] != requests[1]['context_response_sha256']
@@ -100,7 +100,7 @@ def test_each_validation_command_is_bound_to_actual_source_tree(repository, tmp_
 
 def test_analyze_includes_incomplete_fixer_machine_validation(repository, tmp_path):
     run, reviewer = review_with_registered_validation(repository, tmp_path)
-    assert resume_review(run, reviewer_configs=[reviewer, reviewer], fixer_config=machine_blocked_fixer(tmp_path))['status'] == 'ready_to_commit'
+    assert resume_review(run, reviewer_configs=[reviewer, reviewer], fixer_config=machine_blocked_fixer(tmp_path))['status'] == 'review_and_validation_completed'
     before = {str(path): path.read_bytes() for path in run.rglob('*') if path.is_file()}
     result = analyze_runs([run])
     assert result['metrics']['machine_evidence_collections'] == 1
@@ -229,7 +229,7 @@ def test_corrected_incomplete_fixer_tree_gets_next_bounded_validation_round(repo
         "assert pathlib.Path(proof['workspace']).joinpath('task.py').read_text() in ('value = 3\\n','value = 4\\n')"
     ).replace("status='incomplete' if mode=='always_machine' else 'completed'",
               "status='completed' if proof['status']=='passed' else 'incomplete'"))
-    assert resume_review(run, reviewer_configs=[reviewer, reviewer], fixer_config=fixer)['status'] == 'ready_to_commit'
+    assert resume_review(run, reviewer_configs=[reviewer, reviewer], fixer_config=fixer)['status'] == 'review_and_validation_completed'
     assert read_json(run / 'run.json')['semantic_repair_rounds_used'] == 2
     assert len(list(run.glob('fixer/attempt-*/request.json'))) == 3
 

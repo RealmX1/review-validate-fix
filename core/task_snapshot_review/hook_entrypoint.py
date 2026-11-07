@@ -59,7 +59,7 @@ def handle_hook(event: dict, *, event_name: str, host_adapter) -> dict | None:
         context = packet['summary'] if packet else '共用事实暂不可用，按需核验；不能把缺证解释为无改动或已通过。'
         return host_adapter.user_prompt_context_payload(
             "本次用户明确调用 RVF。读取 review-validate-fix skill，使用固定任务基线和显式范围运行 "
-            "rvf review-task-snapshot；复用已有精确 run 时使用 rvf resume-task-review。主会话直接验证与提交。\n" + context)
+            "rvf review-task-snapshot；复用已有精确 run 时使用 rvf resume-task-review。由所属工作流依据评审事实及已有授权处置结果。\n" + context)
     if event_name != "Stop" or not (os.environ.get("KANBAN_TASK_ID") or os.environ.get("CLINE_KANBAN_TASK_ID")):
         return None
     repo = Path(event.get("cwd") or os.getcwd())

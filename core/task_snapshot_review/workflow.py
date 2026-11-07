@@ -688,23 +688,24 @@ def _validate(run_directory: Path, record: dict, commands: list[list[str]], lock
             write_json(logs / 'execution.json', command_record)
             break
         with (logs / "stdout.txt").open("wb") as stdout, (logs / "stderr.txt").open("wb") as stderr:
-            with exclusive_lock(run_directory / 'execution-revocation.lock'):
-                ensure_execution_not_revoked(run_directory)
-                register_supervised_command_directory(run_directory, logs)
-                launch_command = [sys.executable, str(Path(__file__).with_name('retained_command_supervisor.py')),
-                    str(run_directory), str(logs), json.dumps([lock_handle.fileno()]), json.dumps(commands[i])]
-                try:
-                    process = subprocess.Popen(launch_command, cwd=workspace, stdout=stdout, stderr=stderr, pass_fds=(lock_handle.fileno(),), start_new_session=True)
-                except OSError as error:
-                    command_record.update({'status': 'launch_failed', 'execution_started': False, 'finished_at': time.time(),
-                        'native_launch_error': {'type': type(error).__name__, 'errno': error.errno, 'message': str(error)}})
-                    write_json(logs / 'execution.json', command_record)
-                    validation['status'] = 'launch_failed'
-                    save_validation()
-                    error.original_evidence_paths = [str(logs / 'execution.json')]
-                    raise
-                register_owned_process(run_directory, process.pid, "final_validation", owns_process_group=True)
+            process = None
             try:
+                with exclusive_lock(run_directory / 'execution-revocation.lock'):
+                    ensure_execution_not_revoked(run_directory)
+                    register_supervised_command_directory(run_directory, logs)
+                    launch_command = [sys.executable, str(Path(__file__).with_name('retained_command_supervisor.py')),
+                        str(run_directory), str(logs), json.dumps([lock_handle.fileno()]), json.dumps(commands[i])]
+                    try:
+                        process = subprocess.Popen(launch_command, cwd=workspace, stdout=stdout, stderr=stderr, pass_fds=(lock_handle.fileno(),), start_new_session=True)
+                    except OSError as error:
+                        command_record.update({'status': 'launch_failed', 'execution_started': False, 'finished_at': time.time(),
+                            'native_launch_error': {'type': type(error).__name__, 'errno': error.errno, 'message': str(error)}})
+                        write_json(logs / 'execution.json', command_record)
+                        validation['status'] = 'launch_failed'
+                        save_validation()
+                        error.original_evidence_paths = [str(logs / 'execution.json')]
+                        raise
+                    register_owned_process(run_directory, process.pid, "final_validation", owns_process_group=True)
                 from .execution_lifecycle import wait_for_owned_process
                 returncode = wait_for_owned_process(process, run_directory)
             except (KeyboardInterrupt, ExecutionRevoked) as interruption:
@@ -715,12 +716,18 @@ def _validate(run_directory: Path, record: dict, commands: list[list[str]], lock
                     write_json(run_directory / "run.json", record)
                     # 监督命令独立存活，后续控制器先核对退出证据，不重复并发执行。
                     raise
-                if process.poll() is None:
-                    os.killpg(process.pid, signal.SIGTERM)
+                if process is not None and process.poll() is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
                     try:
                         process.wait(timeout=8)
                     except subprocess.TimeoutExpired:
-                        os.killpg(process.pid, signal.SIGKILL)
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
                         process.wait()
                 validation["status"] = "interrupted"
                 save_validation()
@@ -925,7 +932,6 @@ def _resume_review_iteration(run_directory: Path, *, reviewer_configs: list[dict
         next_actions={
             'ready_for_fix':f'rvf resume-task-review --run-dir {run_directory} --fix',
             'ready_for_validation':f'rvf resume-task-review --run-dir {run_directory} --validation-commands <验证 argv JSON 文件>',
-            'ready_to_commit':'主会话依据授权精确暂存并提交，再接续原 run 核对实际提交',
             'fix_application_pending':f'读取 {run_directory/"fixer.patch"} 并核对目标文件的并发改动；原补丁保留',
         }
         return {"run_directory": str(run_directory), "status": record["status"], "reviewer_count": reviewer_count,
@@ -937,10 +943,11 @@ def _resume_review_iteration(run_directory: Path, *, reviewer_configs: list[dict
 def resume_review(run_directory: Path, *, reviewer_configs: list[dict] | None = None,
                   fix: bool = False, fixer_config: dict | None = None,
                   validation_commands: list[list[str]] | None = None,
-                  context_response_file: Path | None = None, closeout_report_file: Path | None = None) -> dict:
+                  context_response_file: Path | None = None) -> dict:
     run_directory = run_directory.expanduser().resolve()
     with exclusive_lock(run_directory / "controller.lock", blocking=False):
         record = read_json(run_directory / "run.json")
+        execution_status_before_resume = record["status"]
         if os.environ.get("KANBAN_COMMAND_EXECUTION_REVOCATION_FILE"):
             previous_revocation = record.get("command_execution_revocation_file")
             if previous_revocation and previous_revocation != os.environ["KANBAN_COMMAND_EXECUTION_REVOCATION_FILE"]:
@@ -970,9 +977,6 @@ def resume_review(run_directory: Path, *, reviewer_configs: list[dict] | None = 
             verified_context_response_original_path(run_directory, record.get("context_response_sha256"))
             record["preparation_recovery_cycle"] = record.get("preparation_recovery_cycle", 0) + 1
             write_json(run_directory / "run.json", record)
-        if closeout_report_file is not None:
-            from .execution_lifecycle import record_closeout_report
-            record_closeout_report(run_directory, record, plan, closeout_report_file)
         if reviewer_configs is not None:
             if len(reviewer_configs) < 2:
                 raise ValueError("需要两路独立 reviewer 配置")
@@ -1032,10 +1036,10 @@ def resume_review(run_directory: Path, *, reviewer_configs: list[dict] | None = 
                 validation_file = run_directory / "validation.json"
                 validation = read_json(validation_file) if validation_file.exists() else "unknown"
                 if (current.get("disposition") in {"agent_review_ready", "agent_judgment_required"}
-                        and current.get("closeout", {}).get("validation") == validation):
+                        and current.get("task_snapshot_review_result_facts", {}).get("validation") == validation):
                     record = read_json(run_directory / "run.json")
                     if record.get("status") == "interrupted" and current.get("status"):
-                        record["status"] = current["status"]
+                        record["status"] = execution_status_before_resume
                         write_json(run_directory / "run.json", record)
                     # 尚未产生新验证证据的前台打断保留原通知；新验证开始后不能恢复旧通过资格。
                     raise

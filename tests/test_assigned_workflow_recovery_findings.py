@@ -109,7 +109,7 @@ def test_role_only_preparation_failure_recovers_without_configuration_change(rep
     assert len(list(run.glob("reviewer-*/attempt-*/request.json"))) == 4
     assert repeated["recovery"]["retry_not_before_epoch_ms"] > time.time() * 1000
     marker.touch()
-    assert workflow.resume_review(run)["status"] == "ready_to_commit"
+    assert workflow.resume_review(run)["status"] == "review_and_validation_completed"
     assert len(list(run.glob("reviewer-*/attempt-*/request.json"))) == 6
     assert not list(run.glob("reviewer-*/role-deadline.json"))
 

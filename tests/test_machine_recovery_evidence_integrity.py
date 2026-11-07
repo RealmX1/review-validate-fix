@@ -35,7 +35,7 @@ def test_successful_machine_output_change_resumes_incomplete_role(repository, tm
     assert resume_review(run, reviewer_configs=[config, config])["status"] == "review_incomplete"
     original_digest = read_json(run / "run.json")["shared_machine_evidence_recovery_sha256"]
     marker.write_text("ready")
-    assert resume_review(run)["status"] == "ready_to_commit"
+    assert resume_review(run)["status"] == "review_and_validation_completed"
     assert read_json(run / "run.json")["shared_machine_evidence_recovery_sha256"] != original_digest
     assert len(list(run.glob("reviewer-*/attempt-*/request.json"))) == 4
 
@@ -109,7 +109,7 @@ def test_passed_validation_requires_current_environment_evidence(repository, tmp
     command = [sys.executable, "-c", f"import os; from pathlib import Path; assert os.environ['REQUIRED_SERVICE_STATE']=='ready'; assert Path({str(marker)!r}).read_text()=='ready'"]
     run = automatic_snapshot(repository, tmp_path, commands=[command])
     config = fake_config(tmp_path)
-    assert resume_review(run, reviewer_configs=[config, config])["status"] == "ready_to_commit"
+    assert resume_review(run, reviewer_configs=[config, config])["status"] == "review_and_validation_completed"
     if drift_kind == "environment":
         monkeypatch.setenv("REQUIRED_SERVICE_STATE", "unavailable")
     else:
@@ -125,13 +125,14 @@ def test_changed_environment_revokes_commit_eligibility_and_enters_validation_re
     command = [sys.executable, "-c", "import os; assert os.environ['REQUIRED_SERVICE_STATE']=='ready'"]
     run = automatic_snapshot(repository, tmp_path, commands=[command])
     config = fake_config(tmp_path)
-    assert resume_review(run, reviewer_configs=[config, config])["closeout"]["automatic_commit_allowed"]
+    assert resume_review(run, reviewer_configs=[config, config])["task_snapshot_review_result_facts"]["validation"]["status"] == "passed"
     fixer = tmp_path / "pending-validation-repair.py"
     fixer.write_text("import json,os\nfrom pathlib import Path\nr=json.loads(Path(os.environ['RVF_ROLE_INPUT']).read_text())\nassert r['candidate_commit']==r['validation_failure']['tested_commit']\nprint(json.dumps({'status':'incomplete','dispositions':[]}))\n")
     monkeypatch.setenv("REQUIRED_SERVICE_STATE", "unavailable")
     result = resume_review(run, fixer_config={"command": [sys.executable, str(fixer)], "output_format": "text"})
     assert result["status"] == "fix_incomplete"
-    assert not result["closeout"]["automatic_commit_allowed"]
+    assert result["disposition"] == "machine_evidence_pending"
+    assert result["task_snapshot_review_result_facts"]["validation"]["status"] == "failed"
     assert read_json(run / "validation.json")["status"] == "failed"
 
 
@@ -150,12 +151,12 @@ def test_historical_timeout_does_not_override_current_success(repository, tmp_pa
         for path in (attempt / "outcome.json", attempt.parent / "deadline-exhausted.json"):
             history[path] = path.read_bytes()
     result = resume_review(run, reviewer_configs=[config, config])
-    assert result["status"] == "ready_to_commit"
+    assert result["status"] == "review_and_validation_completed"
     assert result["disposition"] == "agent_review_ready"
-    assert result["closeout"]["automatic_commit_allowed"]
+    assert result["task_snapshot_review_result_facts"]["validation"]["status"] == "passed"
     assert all(path.read_bytes() == content for path, content in history.items())
     assert len(list(run.glob("reviewer-*/attempt-*"))) == 4
-    assert resume_review(run)["status"] == "ready_to_commit"
+    assert resume_review(run)["status"] == "review_and_validation_completed"
     assert len(list(run.glob("reviewer-*/attempt-*"))) == 4
 
 

@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "review-validate-fix",
-      "description": "Run the RVF post-work double-review, validate/fix, handoff, and Cline Kanban follow-up workflow from Claude Code.",
+      "description": "冻结任务快照，执行独立双审、匿名验证修复，并向所属工作流交回质量事实。",
       "author": {
         "name": "Bomin Zhang",
         "email": "30303853+RealmX1@users.noreply.github.com",

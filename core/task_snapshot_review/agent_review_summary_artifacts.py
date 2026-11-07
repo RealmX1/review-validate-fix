@@ -146,7 +146,7 @@ def publish_reviewer_findings_for_parallel_review(run_directory: Path, record: d
 def publish_agent_review_summary(run_directory: Path, record: dict, result: dict) -> dict | None:
     """调用方持有补充登记锁；结果资格与已登记补充在同一边界确定。"""
     ensure_execution_not_revoked(run_directory)
-    validation = result["closeout"]["validation"]
+    validation = result["task_snapshot_review_result_facts"]["validation"]
     validation = validation if isinstance(validation, dict) else {}
     completed = int(validation.get("completed_commands", 0))
     total = len(validation.get("commands", []))
@@ -165,7 +165,8 @@ def publish_agent_review_summary(run_directory: Path, record: dict, result: dict
     findings = {item["finding_id"]: item for item in read_json(findings_file).get("findings", [])} if findings_file.exists() else {}
     disposition_ids = {item["finding_id"] for item in dispositions}
     undispositioned = [findings[item_id] for item_id in sorted(findings) if item_id not in disposition_ids]
-    material = {"disposition": result["disposition"], "tested_tree": validation.get("tested_tree"),
+    material = {"disposition": result["disposition"], "review_result_status": result["status"],
+                "tested_tree": validation.get("tested_tree"),
                 "requires_current_result_notice_match": True,
                 "candidate_commit": record.get("validated_candidate_commit", record["candidate_commit"]),
                 "dispositions": dispositions, "context_supplement_responses": responses, "supplements": supplements,

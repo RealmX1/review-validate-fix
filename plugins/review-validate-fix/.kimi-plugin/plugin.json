@@ -1,6 +1,6 @@
 {
   "name": "review-validate-fix",
-  "description": "固定任务快照、独立双审与匿名验证修复；主会话直接收尾。",
+  "description": "固定任务快照、独立双审与匿名验证修复；向所属工作流交回质量事实。",
   "skills": [
     "./skills/"
   ],

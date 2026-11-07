@@ -1,6 +1,6 @@
 # Review Validate Fix
 
-一次启动固定任务快照，两路独立评审、匿名修复和完整树验证自动推进，一次结果交回主 Agent 审阅与提交。
+一次启动固定任务快照，两路独立评审、匿名修复和完整树验证自动推进，将评审事实交回所属工作流。
 
 **临时策略：2026-11-02 00:00 America/New_York（UTC 05:00）前创建的 run 最低三路：普通席及全部 fallback 排除 Codex CLI，额外一席必选外部 `codex exec`。** oh-my-pi 仍正常参与普通席选择。`--reviewer-count` 表示总席数，更大数量中仍只有一席固定 Codex。prepare-only 和 Kanban 托管同样在创建时冻结数量及约束；到期后的新 run 恢复双路选取，在途 run 完成全部原分配席。主会话使用 Codex 也会启动独立外部 Codex；缺 CLI、认证或额度失败保留未完成及恢复条件，其他两席继续执行。全部报告按发现综合并去重，不使用多数票。
 
@@ -8,17 +8,16 @@
 rvf review-task-snapshot --repo /path/to/worktree --base-ref main \
   --scope src --scope tests --requirements-file /persistent/task-requirements.md \
   --run-directory /persistent/exact-run-directory --fix \
-  --validation-commands /persistent/final-validation-commands.json \
-  --implementation-plan-file /persistent/implementation-plan-items.json
+  --validation-commands /persistent/final-validation-commands.json
 ```
 
 `--base-ref` 只解析一次；`--scope` 明确声明任务改动，背景 staged/unstaged/untracked WIP 保持原样。需求文件保留用户原话、有效授权及必要实现上下文。运行材料默认写入 `~/.rvf/user-local-data/task-snapshot-reviews/`；重启接续同一 run。两位 reviewer 各使用独立新进程与工作树，一个 fixer 合并处理匿名发现。每个 CLI 最多原路重试一次，再使用其他可用配置；未完成和真实红测不会计为成功。
 
 外部 CLI 只为实际派发命令选模，不执行额外的健康探针。用户配置 `~/.rvf/alternative-reviewer-config-overrides/<reviewer-id>.json` 保留 `schema_version: 1`、对应的 `reviewer_label`，只允许通过 `env_set` 覆盖环境变量；旧的 `health_command`、`pre_run_health`、`health_timeout_seconds` 已删除，需从配置中移除。
 
-最终验证的 JSON 是 argv 数组列表，例如 `[["python3","-m","pytest","-q","tests"]]`；实施计划是条目字符串列表。准备命令、机器上下文和 Kanban 托管选项也在启动时登记，详见 [skill](plugins/review-validate-fix/skills/review-validate-fix/SKILL.md)。无 finding 的红测仍自动进入修复，默认最多三轮语义修复；重启用 `rvf resume-task-review --run-dir <精确目录>` 接续已冻结材料，已完成 reviewer 不重跑。
+最终验证的 JSON 是 argv 数组列表，例如 `[["python3","-m","pytest","-q","tests"]]`。准备命令、机器上下文和 Kanban 托管选项也在启动时登记，详见 [skill](plugins/review-validate-fix/skills/review-validate-fix/SKILL.md)。无 finding 的红测仍自动进入修复，默认最多三轮语义修复；重启用 `rvf resume-task-review --run-dir <精确目录>` 接续已冻结材料，已完成 reviewer 不重跑。
 
-RVF 顺利完成并经主 Agent 最终审阅后，默认自主精确暂存并 commit；用户明确的不得提交等限制优先。普通 elevation 不阻止提交，涉及回滚或大范围重写的 elevation 才交具体判断。提交后用 `resume-task-review --run-dir <精确目录> --closeout-report <JSON>` 核对实际提交，立即展示计划 implementation 完成度、工作 recap、验证、commit 和遗留，先于 base-branch-sync。RVF 不 rewind、不创建独立 land 会话；同步根据实际 Git 状态及既有授权独立运行。
+评审、必要修复及最终验证完成后，公开状态为 `review_and_validation_completed`，`task_snapshot_review_result_facts` 绑定实际候选、范围、处置原件、补丁和验证事实；具体缺口继续以业务处置和恢复条件交回。涉及回滚或大范围重写的 elevation 交所属阶段判断。提交、PR、合并、部署、计划完成度和任务结案由所属工作流依据已有授权处理，RVF 不授予这些权限，也不要求提交后再次接续才能完成评审。已发生提交仍可在精确 run 内核对为历史事实。
 
 主 Agent 通过 `rvf collect-issues` 统一收集问题，同根因沿用一个 Issue，新观察追加评论，匹配开放与关闭的问题。断网和未知写入结果保留原始材料，`--flush` 查询实际远端结果后接续；问题收集不阻断评审、提交或同步。格式见[问题观察报告](plugins/review-validate-fix/skills/review-validate-fix/references/github-issue-observation-report.md)。
 

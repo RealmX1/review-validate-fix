@@ -63,14 +63,14 @@ def test_background_dependency_cannot_hide_a_red_candidate(repository, tmp_path)
 def test_head_tree_drift_revalidates_without_rerunning_reviewers(repository, tmp_path, dependency_value):
     run = dependency_task(repository, tmp_path)
     command = [sys.executable, '-B', 'task.py']
-    assert resume_after_native_process_ownership_evidence_recovers(run, validation_commands=[command])['status'] == 'ready_to_commit'
+    assert resume_after_native_process_ownership_evidence_recovers(run, validation_commands=[command])['status'] == 'review_and_validation_completed'
     original_validation = read_json(run / 'validation.json')
     reviewer_attempts = sorted(run.glob('reviewer-*/attempt-*/outcome.json'))
     (repository / 'dependency.py').write_text(f'value = {dependency_value}\n# base 漂移\n')
     git(repository, 'commit', '--only', '-qm', 'test: 提交依赖漂移', '--', 'dependency.py')
     git(repository, 'commit', '--only', '-qm', 'test: 提交任务', '--', 'task.py')
     result = resume_after_native_process_ownership_evidence_recovers(run)
-    assert result['status'] == ('validation_failed' if dependency_value == 0 else 'completed')
+    assert result['status'] == ('validation_failed' if dependency_value == 0 else 'review_and_validation_completed')
     validation = read_json(run / 'validation.json')
     assert validation['tested_tree'] != original_validation['tested_tree']
     assert validation['tested_tree'] == git_text(repository, 'rev-parse', 'HEAD^{tree}')
@@ -130,7 +130,7 @@ def test_incomplete_fixer_preserves_new_findings_dispositions_and_repairs(reposi
     )
     result = resume_review(run, fix=True, fixer_config={'command': [sys.executable, str(third)], 'output_format': 'text'},
                            validation_commands=[[sys.executable, '-c', "from task import value; assert value == 4"]])
-    assert result['status'] == 'ready_to_commit'
+    assert result['status'] == 'review_and_validation_completed'
     assert (repository / 'task.py').read_text() == 'value = 4\n'
     assert (repository / 'background.txt').read_text() == 'unstaged background\n'
     assert git_text(repository, 'diff', '--cached', '--name-only') == 'background.txt'
@@ -238,7 +238,7 @@ def test_interrupted_validation_rechecks_build_without_dependency_identity_proof
     # 初次启动的补证也可能重做构建；中断后必须至少再构建一次。
     build_invocations_before_resume = counter.read_text()
     proceed.touch()
-    assert resume_after_native_process_ownership_evidence_recovers(run)['status'] == 'ready_to_commit'
+    assert resume_after_native_process_ownership_evidence_recovers(run)['status'] == 'review_and_validation_completed'
     assert counter.read_text().startswith(build_invocations_before_resume + 'x')
     assert read_json(run / 'validation.json')['completed_commands'] == 2
     assert read_json(Path(before['attempt_directory']) / 'validation.json')['status'] == 'running'

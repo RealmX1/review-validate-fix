@@ -10,13 +10,13 @@
 {"status":"completed","dispositions":[{"finding_id":"分配的发现 ID","status":"fixed|false_positive|unresolved|out_of_scope|elevated","reason":"复现、补丁及验证依据"}],"new_findings":[]}
 ```
 
-每个发现须有一个处置。`elevated` 必须附 `elevation_impact: none|rollback|broad_rewrite`，说明是否会导致相关工作回滚或大范围重写；普通 elevation 不阻止顺利完成后的提交。仍需实际修复的问题不能用 elevation 伪装完成。
+每个发现须有一个处置。`elevated` 必须附 `elevation_impact: none|rollback|broad_rewrite`，说明是否会导致相关工作回滚或大范围重写；普通 elevation 不单独阻止评审完成，回滚或大范围重写交所属阶段判断。仍需实际修复的问题不能用 elevation 伪装完成。
 
 `request.main_agent_context_supplements` 是主会话提供的事实主张。逐份读取 `context_file`，核对候选与 finding 绑定并独立验真；可以反证，不把主会话意见当成已接受结论或新增授权。返回 `context_supplement_responses: [{supplement_id, status: confirmed|refuted|not_applicable|unresolved, reason}]`，每份补充都有可复核依据。未解决的补充不能当成已经覆盖。迟到补充在保留此前修复的工作树中针对性补验，已完成 reviewer 不重跑。
 
 若 request 包含 `validation_failure`，即使匿名发现为空，也须读取失败命令、完整日志和真实 `tested_commit`，从当前被测树修复验证失败；不要伪造 reviewer finding。机器上下文、预登记准备命令和共享证据均有完整树及环境归属，不把其他候选的成功当成本次通过。
 
-工作未完成时使用 `status: incomplete` 并保留实际进度。修复写入当前工作树，由脚本保存真实增量、核对主工作树前后像并应用；并发冲突保留原补丁。执行器自动重验，主 Agent 保留最终审阅和按授权提交。
+工作未完成时使用 `status: incomplete` 并保留实际进度。修复写入当前工作树，由脚本保存真实增量、核对主工作树前后像并应用；并发冲突保留原补丁。执行器自动重验，再将质量事实交回所属工作流审阅；评审结果不授予提交、发布或结案权限。
 
 `status: completed` 表示分配发现的语义处置及必要的针对性验证已完成，不表示最终验证已经通过。若已有充分证据独立判断各项处置，应正常返回 completed，让执行器应用补丁并统一运行冻结的完整最终验证；不要仅因这套最终命令尚未执行而返回 incomplete。最终验证失败仍由工具从真实被测树进入修复，不得省略、伪造或预先宣称通过。
 

@@ -256,7 +256,7 @@ def completed_scoped_run(task, tmp_path):
     attach_task_review_run(task['repo'], 'task-1', run)
     resume_review(run, reviewer_configs=[fake_config(tmp_path), fake_config(tmp_path)])
     result = resume_review(run, validation_commands=[[sys.executable, '-c', 'pass']])
-    assert result['status'] == 'completed'
+    assert result['status'] == 'review_and_validation_completed'
     return run
 
 

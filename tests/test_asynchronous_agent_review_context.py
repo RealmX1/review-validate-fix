@@ -47,7 +47,7 @@ def submit(run, tmp_path, *, supplement_id="fact-1", **overrides):
 def test_late_context_is_independently_refuted_without_repeating_reviewers(repository, tmp_path):
     run, reviewers, fixer = prepared_review(repository, tmp_path)
     first = resume_review(run, reviewer_configs=[reviewers, reviewers], fixer_config=fixer)
-    assert first["status"] == "ready_to_commit"
+    assert first["status"] == "review_and_validation_completed"
     first_notice = first["agentContinuationNotice"]
     first_original = (run / "agent-review-summary.md").read_bytes()
     # 登记不取得 controller/workflow 锁，主会话与后台 fixer 不相互等待。
@@ -57,7 +57,7 @@ def test_late_context_is_independently_refuted_without_repeating_reviewers(repos
     assert read_json(run / "business-result.json")["disposition"] == "machine_evidence_pending"
     assert all(n["noticeId"] != first_notice["noticeId"] for n in read_json(run / "agent-continuation-notices.json")["notices"])
     final = resume_review(run)
-    assert final["status"] == "ready_to_commit"
+    assert final["status"] == "review_and_validation_completed"
     assert final["agentContinuationNotice"]["noticeId"] != first_notice["noticeId"]
     assert len(list(run.glob("reviewer-*/attempt-*/request.json"))) == 2
     assert len(list(run.glob("fixer/attempt-*/request.json"))) == 2
@@ -131,7 +131,7 @@ def test_frontend_interrupt_retains_roles_and_resume_reuses_their_results(reposi
         while len(list(run.glob("reviewer-*/attempt-*/outcome.json"))) < 2:
             assert time.monotonic() < deadline
             time.sleep(0.03)
-        assert resume_review(run, fixer_config=fixer)["status"] == "ready_to_commit"
+        assert resume_review(run, fixer_config=fixer)["status"] == "review_and_validation_completed"
         assert len(list(run.glob("reviewer-*/attempt-*/request.json"))) == 2
     finally:
         if process.poll() is None:
@@ -156,7 +156,7 @@ def test_context_arriving_during_validation_invalidates_final_eligibility(reposi
     assert result["status"] == "context_supplements_pending"
     assert result["disposition"] == "machine_evidence_pending"
     assert not any(n["stage"] == "final_agent_review" for n in read_json(run / "agent-continuation-notices.json")["notices"])
-    assert resume_review(run)["status"] == "ready_to_commit"
+    assert resume_review(run)["status"] == "review_and_validation_completed"
 
 
 def test_context_fixer_cannot_claim_completion_without_independent_response(repository, tmp_path):
@@ -203,7 +203,7 @@ def test_missing_context_original_is_machine_waiting_and_recovers_without_review
     assert pending["disposition"] == "machine_evidence_pending"
     assert pending["recovery"]["trigger"] == "context_supplement_original_evidence_changed"
     original.write_bytes(content)
-    assert resume_review(run)["status"] == "ready_to_commit"
+    assert resume_review(run)["status"] == "review_and_validation_completed"
     assert len(list(run.glob("reviewer-*/attempt-*/request.json"))) == 2
 
 
@@ -215,11 +215,11 @@ def test_late_context_preserves_fixed_tree_patch_and_has_bounded_additional_budg
         "assert pathlib.Path('task.py').read_text() == 'value = 3\\n'\n"
         "print(json.dumps({'status':'completed','dispositions':[{'finding_id':f['finding_id'],'status':'fixed','reason':'原修复保持有效'} for f in r['findings']],"
         "'context_supplement_responses':[{'supplement_id':s['supplement_id'],'status':'refuted','reason':'独立核对当前完整修复树'} for s in r.get('main_agent_context_supplements',[])]}))\n")
-    assert resume_review(run, reviewer_configs=[reviewers, reviewers], fixer_config=fixer)["status"] == "ready_to_commit"
+    assert resume_review(run, reviewer_configs=[reviewers, reviewers], fixer_config=fixer)["status"] == "review_and_validation_completed"
     patch = (run / "fixer.patch").read_bytes()
     assert patch
     submit(run, tmp_path)
-    assert resume_review(run)["status"] == "ready_to_commit"
+    assert resume_review(run)["status"] == "review_and_validation_completed"
     assert (repository / "task.py").read_text() == "value = 3\n"
     assert (run / "fixer.patch").read_bytes() == patch
     record = read_json(run / "run.json")
@@ -248,7 +248,7 @@ def test_summary_does_not_reinject_validation_script_copied_into_fixer_reason(re
     original = fixer_script.read_text()
     original = original.replace("'实际值符合需求'", repr("已独立核对，机器验证原件：" + script))
     fixer_script.write_text(original)
-    assert resume_review(run, reviewer_configs=[reviewers, reviewers], fixer_config=fixer)["status"] == "ready_to_commit"
+    assert resume_review(run, reviewer_configs=[reviewers, reviewers], fixer_config=fixer)["status"] == "review_and_validation_completed"
     summary = (run / "agent-review-summary.md").read_text()
     assert "VALIDATION_SCRIPT_MUST_STAY_IN_ORIGINALS" not in summary
     assert script in read_json(run / "validation.json")["commands"][0]
@@ -260,7 +260,7 @@ def test_short_inline_validation_script_is_not_copied_into_the_summary(repositor
     run, reviewers, fixer = prepared_review(repository, tmp_path, validation_commands=[[sys.executable, "-c", script]])
     fixer_script = Path(fixer["command"][1])
     fixer_script.write_text(fixer_script.read_text().replace("'实际值符合需求'", repr("已独立核对，机器验证原件：" + script)))
-    assert resume_review(run, reviewer_configs=[reviewers, reviewers], fixer_config=fixer)["status"] == "ready_to_commit"
+    assert resume_review(run, reviewer_configs=[reviewers, reviewers], fixer_config=fixer)["status"] == "review_and_validation_completed"
     summary = (run / "agent-review-summary.md").read_text()
     assert script not in summary
     assert "完整验证脚本见机器原件" in summary
@@ -282,9 +282,9 @@ def test_covered_supplement_budget_does_not_replace_the_main_repair_budget(repos
         "else:\n"
         "    status='false_positive'; reason='首轮保留失败以消耗主预算'\n"
         "print(json.dumps({'status':'completed','dispositions':[{'finding_id':f['finding_id'],'status':status,'reason':reason} for f in r['findings']],'context_supplement_responses':responses}))\n")
-    assert resume_review(run, reviewer_configs=[reviewers, reviewers], fixer_config=fixer)["status"] == "ready_to_commit"
+    assert resume_review(run, reviewer_configs=[reviewers, reviewers], fixer_config=fixer)["status"] == "review_and_validation_completed"
     submit(run, tmp_path)
-    assert resume_review(run)["status"] == "ready_to_commit"
+    assert resume_review(run)["status"] == "review_and_validation_completed"
     record = read_json(run / "run.json")
     assert record["semantic_repair_rounds_used"] == 2
     assert list(record["context_supplement_repair_rounds_used"].values()) == [1]
@@ -295,7 +295,7 @@ def test_covered_supplement_budget_does_not_replace_the_main_repair_budget(repos
     blocked = resume_review(run)
     assert len(list(run.glob("fixer/attempt-*/request.json"))) == 3
     assert blocked["disposition"] == "agent_judgment_required"
-    assert blocked["closeout"]["automatic_commit_allowed"] is False
+    assert blocked["task_snapshot_review_result_facts"]["validation"]["status"] == "failed"
     assert read_json(run / "run.json")["repair_budget_exhausted"] is True
 
 
@@ -315,9 +315,9 @@ def test_main_budget_remains_available_after_supplement_coverage(repository, tmp
         "    pathlib.Path('task.py').write_text('value = 3\\n')\n"
         "    responses=[]\n"
         "print(json.dumps({'status':'completed','dispositions':[{'finding_id':f['finding_id'],'status':'fixed','reason':'主修复保持有效'} for f in r['findings']],'context_supplement_responses':responses}))\n")
-    assert resume_review(run, reviewer_configs=[reviewers, reviewers], fixer_config=fixer)["status"] == "ready_to_commit"
+    assert resume_review(run, reviewer_configs=[reviewers, reviewers], fixer_config=fixer)["status"] == "review_and_validation_completed"
     submit(run, tmp_path)
-    assert resume_review(run)["status"] == "ready_to_commit"
+    assert resume_review(run)["status"] == "review_and_validation_completed"
     record = read_json(run / "run.json")
     assert record["semantic_repair_rounds_used"] == 1
     assert list(record["context_supplement_repair_rounds_used"].values()) == [3]
@@ -326,7 +326,7 @@ def test_main_budget_remains_available_after_supplement_coverage(repository, tmp
     validation["status"] = "failed"
     write_json(run / "validation.json", validation)
     resumed = resume_review(run)
-    assert resumed["status"] == "ready_to_commit"
+    assert resumed["status"] == "review_and_validation_completed"
     assert len(list(run.glob("fixer/attempt-*/request.json"))) == 5
     assert read_json(run / "run.json")["semantic_repair_rounds_used"] == 2
 
@@ -338,7 +338,7 @@ def test_budget_exhausted_judgment_with_pending_supplement_can_be_acknowledged(r
         "r=json.loads(pathlib.Path(os.environ['RVF_ROLE_INPUT']).read_text())\n"
         "print(json.dumps({'status':'completed','dispositions':[{'finding_id':f['finding_id'],'status':'false_positive','reason':'finding 已核对'} for f in r['findings']],"
         "'context_supplement_responses':[{'supplement_id':s['supplement_id'],'status':'unresolved','reason':'补充仍缺独立证据'} for s in r.get('main_agent_context_supplements',[])]}))\n")
-    assert resume_review(run, reviewer_configs=[reviewers, reviewers], fixer_config=fixer)["status"] == "ready_to_commit"
+    assert resume_review(run, reviewer_configs=[reviewers, reviewers], fixer_config=fixer)["status"] == "review_and_validation_completed"
     submit(run, tmp_path)
     result = resume_review(run)
     assert result["status"] == "fix_incomplete"
@@ -361,7 +361,8 @@ def test_explicit_cancel_withdraws_current_delivery_without_rewriting_history(re
     assert business["status"] == "cancelled"
     assert business["disposition"] == "cancelled"
     assert "agentContinuationNotice" not in business
-    assert business["closeout"]["automatic_commit_allowed"] is False
+    assert "closeout" not in business
+    assert business["task_snapshot_review_result_facts"]["candidate_commit"] == result["task_snapshot_review_result_facts"]["candidate_commit"]
     assert read_json(run / "agent-continuation-notices.json")["notices"] == []
     assert read_json(run / "run.json")["status"] == "cancelled"
     assert (run / "execution-revocation.json").exists()
@@ -386,9 +387,32 @@ def test_revocation_during_final_publication_cannot_leave_a_ready_notice(reposit
     finally:
         artifacts.registered_main_agent_context_supplements = original
     assert cancelled["disposition"] == "cancelled"
-    assert cancelled["closeout"]["automatic_commit_allowed"] is False
+    assert "closeout" not in cancelled
+    assert cancelled["status"] == "cancelled"
     assert "验真修复及最终验证已完成" not in json.dumps(read_json(run / "agent-continuation-notices.json"), ensure_ascii=False)
     assert all(path.read_bytes() == content for path, content in originals.items())
+
+
+@pytest.mark.parametrize("quality_original", ["validation.json", "fixer/attempt-001/result.json"])
+def test_cancel_and_cancelled_resume_do_not_require_readable_quality_originals(repository, tmp_path, monkeypatch, quality_original):
+    from core.task_snapshot_review.execution_lifecycle import revoke_execution
+    import core.task_snapshot_review.retained_command_supervisor as supervision
+    run, reviewers, fixer = prepared_review(repository, tmp_path)
+    resume_review(run, reviewer_configs=[reviewers, reviewers], fixer_config=fixer)
+    damaged_original = run / quality_original
+    damaged_original.write_text("{原始损坏材料")
+    observed_command_directories = []
+    def observe_cancellation(directory):
+        observed_command_directories.append(directory)
+        return []
+    monkeypatch.setattr(supervision, "terminate_supervised_command_descendants", observe_cancellation)
+    assert revoke_execution(run, "明确停止")['status'] == 'cancelled'
+    assert observed_command_directories
+    assert read_json(run / "business-result.json")["disposition"] == "cancelled"
+    assert read_json(run / "agent-continuation-notices.json")["notices"] == []
+    assert resume_review(run)["disposition"] == "cancelled"
+    assert "task_snapshot_review_result_facts" not in read_json(run / "business-result.json")
+    assert damaged_original.read_text() == "{原始损坏材料"
 
 
 def test_frontend_interrupt_keeps_the_published_final_notice(repository, tmp_path, monkeypatch):
@@ -397,14 +421,18 @@ def test_frontend_interrupt_keeps_the_published_final_notice(repository, tmp_pat
     result = resume_review(run, reviewer_configs=[reviewers, reviewers], fixer_config=fixer)
     notice_id = result["agentContinuationNotice"]["noticeId"]
     def interrupt(*args, **kwargs):
+        record = read_json(run / "run.json")
+        record["status"] = "interrupted"
+        write_json(run / "run.json", record)
         raise KeyboardInterrupt
     monkeypatch.setattr(workflow, "_validate", interrupt)
     with pytest.raises(KeyboardInterrupt):
         resume_review(run)
     business = read_json(run / "business-result.json")
     assert business["disposition"] == "agent_review_ready"
-    assert business["status"] == "ready_to_commit"
+    assert business["status"] == "review_and_validation_completed"
     assert business["agentContinuationNotice"]["noticeId"] == notice_id
+    assert read_json(run / "run.json")["status"] == "ready_to_commit"
     assert any(item["noticeId"] == notice_id for item in read_json(run / "agent-continuation-notices.json")["notices"])
     assert not (run / "execution-revocation.json").exists()
 
@@ -426,7 +454,7 @@ def test_interrupt_after_new_validation_starts_preserves_history_without_current
     assert read_json(run / "validation.json")["status"] == "interrupted"
     current = read_json(run / "business-result.json")
     assert current["disposition"] == "machine_evidence_pending"
-    assert current["closeout"]["automatic_commit_allowed"] is False
+    assert current["task_snapshot_review_result_facts"]["validation"]["status"] == "interrupted"
     assert notice not in read_json(run / "agent-continuation-notices.json")["notices"]
     assert all(path.read_bytes() == content for path, content in originals.items())
     assert not (run / "execution-revocation.json").exists()
@@ -436,7 +464,7 @@ def test_interrupt_after_new_validation_starts_preserves_history_without_current
     while not supervision.exists() or read_json(supervision).get("status") == "running":
         assert time.monotonic() < deadline
         time.sleep(0.03)
-    assert resume_review(run)["status"] == "ready_to_commit"
+    assert resume_review(run)["status"] == "review_and_validation_completed"
     assert len(list(run.glob("reviewer-*/attempt-*/request.json"))) == 2
     assert len(list(run.glob("fixer/attempt-*/request.json"))) == 1
 
@@ -460,14 +488,14 @@ def test_registration_crash_before_manifest_withdrawal_invalidates_final_via_cur
     assert "agentContinuationNotice" not in current
     assert notice.get("requiresCurrentResultNoticeMatch") is True
     assert current["pending_context_registration"]["supplement_id"] == "fact-1"
-    assert resume_review(run)["status"] == "ready_to_commit"
+    assert resume_review(run)["status"] == "review_and_validation_completed"
     assert len(list(run.glob("reviewer-*/attempt-*/request.json"))) == 2
 
 
 def test_interrupted_registration_is_replayed_and_old_final_notice_withdrawn(repository, tmp_path, monkeypatch):
     import core.task_snapshot_review.main_agent_context_supplements as supplements
     run, reviewers, fixer = prepared_review(repository, tmp_path)
-    assert resume_review(run, reviewer_configs=[reviewers, reviewers], fixer_config=fixer)["status"] == "ready_to_commit"
+    assert resume_review(run, reviewer_configs=[reviewers, reviewers], fixer_config=fixer)["status"] == "review_and_validation_completed"
     original = supplements.write_json
     def crash_before_registration(path, content):
         if Path(path).parent.name == "main-agent-context-supplements":
@@ -482,7 +510,7 @@ def test_interrupted_registration_is_replayed_and_old_final_notice_withdrawn(rep
     assert staged["disposition"] == "machine_evidence_pending"
     assert staged["pending_context_registration"]["supplement_id"] == "fact-1"
     assert not any(item["stage"] == "final_agent_review" for item in read_json(run / "agent-continuation-notices.json")["notices"])
-    assert resume_review(run)["status"] == "ready_to_commit"
+    assert resume_review(run)["status"] == "review_and_validation_completed"
     assert (run / "main-agent-context-supplements" / "fact-1.json").exists()
     assert read_json(run / "main-agent-context-continuation-request.json")["supplement_ids"] == ["fact-1"]
 

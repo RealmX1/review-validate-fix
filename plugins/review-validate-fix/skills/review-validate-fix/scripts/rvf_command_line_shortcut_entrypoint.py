@@ -51,7 +51,6 @@ def main(argv=None) -> int:
     review.add_argument("--preparation-commands", type=Path, help="冻结隔离工作树准备 argv 数组列表 JSON")
     review.add_argument("--machine-evidence-commands", type=Path, help="冻结共享机器事实采集 argv 数组列表 JSON")
     review.add_argument("--machine-context-file", type=Path, help="冻结机器上下文 JSON")
-    review.add_argument("--implementation-plan-file", type=Path, help="冻结计划实施条目字符串列表 JSON")
     review.add_argument("--maximum-semantic-repair-rounds", type=int, default=3)
     review.add_argument("--kanban-task-id", help="使用 Kanban 通用所属执行托管本 run")
     review.add_argument("--kanban-project-path", type=Path)
@@ -68,7 +67,6 @@ def main(argv=None) -> int:
     resume.add_argument("--fixer-config", type=Path)
     resume.add_argument("--validation-commands", type=Path, help="最终验证 argv 数组列表 JSON")
     resume.add_argument('--context-response-file',type=Path,help='为缺失席补充通用机器证据，保持各路独立')
-    resume.add_argument('--closeout-report', type=Path, help='主 Agent 最终审阅的计划实施、recap 与遗留事项 JSON')
     observation = commands.add_parser("observe-task-review-recovery-evidence", help="只读返回精确 run 的实质恢复摘要，缺证保留 unknown")
     observation.add_argument("--run-dir", type=Path, required=True)
     machine_request = commands.add_parser("register-reviewer-machine-evidence-request", help="追加与原始缺证请求绑定的冻结命令引用，不改 reviewer 原件")
@@ -145,8 +143,7 @@ def main(argv=None) -> int:
                                          "preparation_commands": json.loads(arguments.preparation_commands.read_text()) if arguments.preparation_commands else [],
                                          "machine_evidence_commands": json.loads(arguments.machine_evidence_commands.read_text()) if arguments.machine_evidence_commands else [],
                                          "maximum_semantic_repair_rounds": arguments.maximum_semantic_repair_rounds,
-                                         **({"machine_context": json.loads(arguments.machine_context_file.read_text())} if arguments.machine_context_file else {}),
-                                         **({"implementation_plan": json.loads(arguments.implementation_plan_file.read_text())} if arguments.implementation_plan_file else {})})
+                                         **({"machine_context": json.loads(arguments.machine_context_file.read_text())} if arguments.machine_context_file else {})})
             if evidence:
                 attach_task_review_run(arguments.repo, review_task_id, run)
             result = {"status":record["status"],"run_directory":str(run.resolve()),"reviewer_count":record["reviewer_count"]}
@@ -182,7 +179,7 @@ def main(argv=None) -> int:
             active_run_directory = arguments.run_dir.expanduser().resolve()
             binding_file = active_run_directory / "kanban-command-execution-binding.json"
             receipt_file = active_run_directory / "kanban-command-execution-start-receipt.json"
-            if binding_file.exists() and not os.environ.get("KANBAN_COMMAND_EXECUTION_ID") and not arguments.closeout_report:
+            if binding_file.exists() and not os.environ.get("KANBAN_COMMAND_EXECUTION_ID"):
                 receipt = read_json(receipt_file) if receipt_file.exists() else {}
                 try:
                     accepted = receipt.get("returncode") == 0 and json.loads(receipt.get("stdout", "{}")).get("ok") is True
@@ -199,8 +196,7 @@ def main(argv=None) -> int:
             result = resume_review(arguments.run_dir,
                                    reviewer_configs=[load_reviewer_configuration(path) for path in arguments.reviewer_config] if arguments.reviewer_config else None,
                                    fix=arguments.fix, fixer_config=load_reviewer_configuration(arguments.fixer_config) if arguments.fixer_config else None,
-                                   validation_commands=validations,context_response_file=arguments.context_response_file,
-                                   closeout_report_file=arguments.closeout_report)
+                                   validation_commands=validations,context_response_file=arguments.context_response_file)
         elif arguments.command == "acknowledge-review-notice":
             result = acknowledge_agent_review_notice(arguments.run_dir, arguments.notice_id)
         elif arguments.command == "submit-review-context":
@@ -229,7 +225,7 @@ def main(argv=None) -> int:
             result = analyze_runs(arguments.run_dir)
         response = result
         if "agentContinuationNotice" in result:
-            response = {key: value for key, value in result.items() if key != "closeout"}
+            response = {key: value for key, value in result.items() if key != "task_snapshot_review_result_facts"}
             response["agent_review_summary_file"] = str(active_run_directory / "agent-review-summary.md")
         print(json.dumps(response, ensure_ascii=False))
         if result.get('status') == 'unknown':

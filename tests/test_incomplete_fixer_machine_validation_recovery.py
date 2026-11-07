@@ -50,7 +50,7 @@ def test_incomplete_machine_validation_is_collected_and_fixer_resumes_in_one_cal
     (repository / "background.txt").write_text("背景 unstaged\n")
     result = resume_review(run, reviewer_configs=[reviewer, reviewer],
         fixer_config=machine_blocked_fixer(tmp_path, final_value=expected_value))
-    assert result["status"] == "ready_to_commit"
+    assert result["status"] == "review_and_validation_completed"
     assert len(list(run.glob("reviewer-*/attempt-*/request.json"))) == 2
     assert len(list(run.glob("fixer/attempt-*/request.json"))) == 2
     assert read_json(run / "fixer/attempt-001/outcome.json")["status"] == "incomplete"

@@ -65,6 +65,7 @@ def test_final_validation_native_launch_failure_can_resume(repository, tmp_path,
         configuration = {'command': [sys.executable, '-c', 'pass']}
         result = workflow._resume_review_iteration(run, reviewer_configs=[configuration, configuration])
         assert result['status'] == 'ready_to_commit'
+        assert read_json(run / 'run.json')['status'] == 'ready_to_commit'
     assert read_json(run / 'validation.json')['status'] == 'passed'
     assert read_json(first / 'descendant-exit-reconciliation.json')['status'] == 'not_started'
     assert len(list((run / 'final-validation').glob('attempt-*'))) == 2

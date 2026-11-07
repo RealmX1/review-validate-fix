@@ -12,7 +12,7 @@ import sys
 import time
 from pathlib import Path
 
-from .persistent_artifacts import exclusive_lock, read_json, write_json
+from .persistent_artifacts import exclusive_lock, read_json, write_bytes, write_json
 from .native_owned_process_observation import native_process_identity, native_process_start_identity_matches, owned_process_snapshot
 
 
@@ -22,7 +22,7 @@ class ExecutionRevoked(InterruptedError):
 
 def normalized_execution_plan(plan: dict) -> dict:
     allowed = {"fix", "validation_commands", "preparation_commands", "machine_evidence_commands",
-               "maximum_semantic_repair_rounds", "machine_context", "implementation_plan"}
+               "maximum_semantic_repair_rounds", "machine_context"}
     if not isinstance(plan, dict) or set(plan) - allowed:
         raise ValueError("启动材料包含未知字段")
     result = {"fix": False, "validation_commands": [], "preparation_commands": [], "machine_evidence_commands": [],
@@ -33,9 +33,6 @@ def normalized_execution_plan(plan: dict) -> dict:
         if not isinstance(result[key], list) or any(not isinstance(command, list) or not command or
                 not all(isinstance(argument, str) and "\0" not in argument for argument in command) for command in result[key]):
             raise ValueError(f"{key} 必须是 argv 数组列表")
-    if "implementation_plan" in result and (not isinstance(result["implementation_plan"], list) or
-            not all(isinstance(item, str) and item.strip() for item in result["implementation_plan"])):
-        raise ValueError("implementation_plan 必须是非空字符串条目列表")
     return json.loads(json.dumps(result))
 
 
@@ -128,32 +125,45 @@ def register_supervised_command_directory(run_directory: Path, command_directory
             write_json(registry, {'command_directories': [*directories, str(directory)]})
 
 
-def withdraw_current_continuation_delivery(run_directory: Path) -> None:
+def withdraw_current_continuation_delivery(run_directory: Path) -> list[dict]:
     """明确撤销后收回当前投递资格。历史修订目录与消费回执保持原样。"""
-    manifest_file = run_directory / "agent-continuation-notices.json"
-    if manifest_file.exists():
-        manifest = read_json(manifest_file)
-        if manifest.get("notices"):
-            write_json(manifest_file, {"notices": []})
-    business_file = run_directory / "business-result.json"
-    if business_file.exists():
-        result = read_json(business_file)
-        closeout = result.get("closeout")
-        changed = result.get("disposition") != "cancelled" or "agentContinuationNotice" in result or (
-            isinstance(closeout, dict) and closeout.get("automatic_commit_allowed") is not False)
-        if changed:
-            result["status"] = "cancelled"
-            result["disposition"] = "cancelled"
-            result.pop("agentContinuationNotice", None)
-            if isinstance(closeout, dict):
-                result["closeout"] = {**closeout, "automatic_commit_allowed": False}
-            write_json(business_file, result)
-    record_file = run_directory / "run.json"
-    if record_file.exists():
-        record = read_json(record_file)
-        if record.get("status") != "cancelled":
-            record["status"] = "cancelled"
-            write_json(record_file, record)
+    observations = []
+    for filename in ("agent-continuation-notices.json", "business-result.json", "run.json"):
+        path = run_directory / filename
+        recovery_observation = None
+        try:
+            if not path.exists():
+                continue
+            try:
+                result = read_json(path)
+            except ValueError as error:
+                if filename == "run.json":
+                    raise
+                original = path.read_bytes()
+                preserved = run_directory / "corrupted-continuation-delivery-originals" / f"{filename}.{hashlib.sha256(original).hexdigest()}.original"
+                write_bytes(preserved, original)
+                recovery_observation = {"path": str(path), "status": "unknown", "error": str(error),
+                                        "preserved_original": str(preserved)}
+                observations.append(recovery_observation)
+                result = {}
+            if filename == "agent-continuation-notices.json":
+                if result.get("notices") != []:
+                    write_json(path, {"notices": []})
+            else:
+                withdrawn_keys = {"agentContinuationNotice", "closeout", "commit", "next_action"} if filename == "business-result.json" else set()
+                if (result.get("status") != "cancelled" or any(key in result for key in withdrawn_keys)
+                        or filename == "business-result.json" and result.get("disposition") != "cancelled"):
+                    result = {key: value for key, value in result.items() if key not in withdrawn_keys}
+                    result["status"] = "cancelled"
+                    if filename == "business-result.json":
+                        result["disposition"] = "cancelled"
+                    write_json(path, result)
+            if recovery_observation is not None:
+                recovery_observation["status"] = "recovered"
+        except (OSError, ValueError, TypeError) as error:
+            # 投递材料的读写故障不能阻断已持久撤销执行的进程回收。
+            observations.append({"path": str(path), "status": "unknown", "error": str(error)})
+    return observations
 
 
 def revoke_execution(run_directory: Path, reason: str, *, source: str = "execution_revocation_observation",
@@ -161,7 +171,7 @@ def revoke_execution(run_directory: Path, reason: str, *, source: str = "executi
     # 与结果发布共用补充锁，避免撤销落在最后一次检查和清单写回之间。
     with exclusive_lock(run_directory / "main-agent-context-supplements.lock"):
         persist_execution_revocation(run_directory, reason, source=source, request_basis=request_basis)
-        withdraw_current_continuation_delivery(run_directory)
+        withdrawal_observations = withdraw_current_continuation_delivery(run_directory)
     # 监督者已退出也不能丢弃跨 session 后代；原生启动身份重新核验后才发送信号。
     from .retained_command_supervisor import terminate_supervised_command_descendants
     supervised_descendants = []
@@ -229,6 +239,7 @@ def revoke_execution(run_directory: Path, reason: str, *, source: str = "executi
             time.sleep(0.05)
     evidence = {"status": "cancelled", "disposition": "cancelled", "processes": observations,
                 "supervised_descendants": supervised_descendants,
+                "continuation_delivery_withdrawal_observations": withdrawal_observations,
                 "recovery": {"trigger": "owned_process_identity_or_native_receipt_changed", "action": "reconcile_cancellation",
                              "maximum_unchanged_retries": 1}, "observed_at": time.time()}
     write_json(run_directory / "cancellation-observations.json", evidence)
@@ -388,42 +399,19 @@ def runtime_environment_identity() -> dict:
             "environment_sha256": hashlib.sha256(json.dumps(dict(os.environ), sort_keys=True).encode()).hexdigest()}
 
 
-def record_closeout_report(run_directory: Path, record: dict, plan: dict, report_file: Path) -> None:
-    report = read_json(report_file)
-    items = report.get("implementation_items", [])
-    if not isinstance(items, list) or any(not isinstance(item, dict) or not isinstance(item.get("description"), str)
-            or item.get("status") not in {"completed", "deferred", "not_completed"} or not item.get("evidence") for item in items):
-        raise ValueError("收尾报告需要逐项 implementation 状态与证据")
-    if not isinstance(report.get("work_recap"), str) or not report["work_recap"].strip():
-        raise ValueError("收尾报告需要具体工作 recap")
-    expected = plan.get("implementation_plan")
-    supplied = [item["description"] for item in items]
-    if len(supplied) != len(set(supplied)) or (expected is not None and set(supplied) != set(expected)):
-        raise ValueError("收尾报告必须覆盖冻结计划的全部条目，且不能重复")
-    digest = hashlib.sha256(report_file.read_bytes()).hexdigest()
-    original = run_directory / "closeout-report-originals-by-sha256" / f"{digest}.json"
-    write_json(original, report)
-    record["implementation_plan_completion"] = ("complete" if all(item["status"] == "completed" for item in items) else "partial") if items else "unknown"
-    record["implementation_plan_evidence"] = items
-    record["work_recap"] = report["work_recap"]
-    record["closeout_report_original"] = str(original)
-    write_json(run_directory / "run.json", record)
-
-
-def review_closeout(record: dict, run_directory: Path) -> dict:
+def collect_task_snapshot_review_result_facts(record: dict, run_directory: Path) -> dict:
     result_files = sorted((run_directory / "fixer").glob("attempt-*/result.json"))
     dispositions = read_json(result_files[-1]).get("dispositions", []) if result_files else []
     elevations = [item for item in dispositions if item.get("status") == "elevated"]
-    disruptive = any(item.get("elevation_impact") in {"rollback", "broad_rewrite"} for item in elevations)
-    successful = record["status"] in {"ready_to_commit", "completed"}
-    return {"automatic_commit_allowed": successful and not disruptive and not execution_is_revoked(run_directory), "elevations": elevations,
-            "implementation_plan_completion": record.get("implementation_plan_completion", "unknown"),
-            "implementation_plan_evidence": record.get("implementation_plan_evidence", []),
-            "work_recap": {"summary": record.get("work_recap"), "scope_paths": record.get("effective_scope_paths", record["scope_paths"]),
-                           "finding_count": record.get("finding_count", 0),
-                           "semantic_repair_rounds_used": record.get("semantic_repair_rounds_used", 0)},
-            "validation": read_json(run_directory / "validation.json") if (run_directory / "validation.json").exists() else "unknown",
-            "commit": record.get("commit"), "base_sync": "not_requested"}
+    return {"candidate_commit": record.get("validated_candidate_commit", record["candidate_commit"]),
+            "scope_paths": record.get("effective_scope_paths", record["scope_paths"]),
+            "finding_count": record.get("finding_count", 0),
+            "semantic_repair_rounds_used": record.get("semantic_repair_rounds_used", 0),
+            "findings_file": str(run_directory / "findings.json") if (run_directory / "findings.json").exists() else None,
+            "finding_dispositions_file": str(result_files[-1]) if result_files else None,
+            "fixer_patch_file": str(run_directory / "fixer.patch") if (run_directory / "fixer.patch").exists() else None,
+            "elevations": elevations,
+            "validation": read_json(run_directory / "validation.json") if (run_directory / "validation.json").exists() else "unknown"}
 
 
 def publish_business_result(run_directory: Path, result: dict) -> dict:
@@ -433,6 +421,8 @@ def publish_business_result(run_directory: Path, result: dict) -> dict:
     )
     with exclusive_lock(run_directory / "main-agent-context-supplements.lock"):
         reconcile_interrupted_context_registration_locked(run_directory)
+        if result["status"] == "review_and_validation_completed":
+            result = {**result, "status": read_json(run_directory / "run.json")["status"]}
         try:
             if not execution_is_revoked(run_directory) and pending_main_agent_context_supplements(run_directory):
                 if result["status"] in {"ready_to_commit", "completed", "context_supplements_pending"}:
@@ -452,15 +442,16 @@ def publish_business_result(run_directory: Path, result: dict) -> dict:
 
 def _publish_business_result_under_context_lock(run_directory: Path, result: dict) -> dict:
     record = read_json(run_directory / "run.json")
-    closeout = review_closeout(record, run_directory)
-    if execution_is_revoked(run_directory):
+    execution_revoked = execution_is_revoked(run_directory)
+    review_facts = None if execution_revoked else collect_task_snapshot_review_result_facts(record, run_directory)
+    if execution_revoked:
         disposition = "cancelled"
         result = {**result, "status": "cancelled"}
         if record["status"] != "cancelled":
             record["status"] = "cancelled"
             write_json(run_directory / "run.json", record)
     elif (record.get("repair_budget_exhausted")
-          or any(item.get("elevation_impact") in {"rollback", "broad_rewrite"} for item in closeout["elevations"])):
+          or any(item.get("elevation_impact") in {"rollback", "broad_rewrite"} for item in review_facts["elevations"])):
         disposition = "agent_judgment_required"
     elif result["status"] in {"ready_to_commit", "completed"}:
         disposition = "agent_review_ready"
@@ -468,7 +459,13 @@ def _publish_business_result_under_context_lock(run_directory: Path, result: dic
         disposition = "agent_judgment_required"
     else:
         disposition = "machine_evidence_pending"
-    result = {**result, "disposition": disposition, "closeout": closeout}
+    result = {key: value for key, value in result.items()
+              if key not in {"closeout", "commit", "task_snapshot_review_result_facts"}}
+    if result["status"] in {"ready_to_commit", "completed"}:
+        result["status"] = "review_and_validation_completed"
+    result["disposition"] = disposition
+    if review_facts is not None:
+        result["task_snapshot_review_result_facts"] = review_facts
     if disposition == "machine_evidence_pending":
         attempts = sorted(run_directory.glob("*/attempt-*/request.json"))
         paths = [str(path.parent / "outcome.json") for path in attempts]
@@ -569,8 +566,6 @@ def _publish_business_result_under_context_lock(run_directory: Path, result: dic
             write_json(manifest_file, {"notices": [] if disposition == "cancelled" else [n for n in notices if n["stage"] != "final_agent_review"]})
     if disposition == "cancelled":
         result = {**result, "status": "cancelled", "disposition": "cancelled"}
-        if isinstance(result.get("closeout"), dict):
-            result["closeout"] = {**result["closeout"], "automatic_commit_allowed": False}
         if record.get("status") != "cancelled":
             record["status"] = "cancelled"
             write_json(run_directory / "run.json", record)

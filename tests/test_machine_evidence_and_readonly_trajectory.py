@@ -21,7 +21,7 @@ def test_workspace_preparation_applies_to_roles_and_final_validation(repository,
     script = tmp_path / "reviewer.py"
     script.write_text("from pathlib import Path\nassert Path('.prepared-environment').is_file()\n" + script.read_text())
     result = resume_review(run, reviewer_configs=[config, config])
-    assert result["status"] == "ready_to_commit"
+    assert result["status"] == "review_and_validation_completed"
     assert not (repository / ".prepared-environment").exists()
     assert len(list(run.glob("machine-evidence/attempt-*/evidence.json"))) == 1
     for request_file in run.glob("reviewer-*/attempt-*/request.json"):

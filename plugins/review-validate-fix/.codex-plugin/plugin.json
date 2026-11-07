@@ -1,7 +1,7 @@
 {
   "name": "review-validate-fix",
   "version": "0.1.0",
-  "description": "固定任务快照、独立双审与匿名验证修复；主会话直接收尾。",
+  "description": "固定任务快照、独立双审与匿名验证修复；向所属工作流交回质量事实。",
   "author": {
     "name": "Bomin Zhang",
     "email": "30303853+RealmX1@users.noreply.github.com",
@@ -24,8 +24,8 @@
   },
   "interface": {
     "displayName": "RVF Plugin Bundle",
-    "shortDescription": "Double-review, validate, fix, and hand off changes",
-    "longDescription": "Adds the review-validate-fix Codex skill as a plugin-packaged workflow for post-work review loops, issue validation, minimal fixes, and handoff generation.",
+    "shortDescription": "独立双审、匿名验修与质量事实交回",
+    "longDescription": "提供固定任务快照的独立评审、发现验真、必要修复与完整树验证，向所属工作流交回质量事实和具体缺口。",
     "developerName": "Bomin Zhang",
     "category": "Coding",
     "capabilities": [
@@ -35,9 +35,7 @@
     ],
     "websiteURL": "https://github.com/RealmX1/review-validate-fix",
     "defaultPrompt": [
-      "Run $review-validate-fix on my current changes",
-      "Run $review-validate-fix skip review",
-      "Run $review-validate-fix no handoff"
+      "按已有任务授权运行 $review-validate-fix，将质量事实交回所属工作流。"
     ],
     "brandColor": "#2F6F6D",
     "screenshots": []

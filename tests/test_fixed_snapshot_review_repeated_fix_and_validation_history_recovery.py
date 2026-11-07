@@ -30,7 +30,7 @@ def test_three_successive_fix_rounds_are_not_limited_by_old_completed_attempts(r
     for expected in (4,5,5):
         command=[sys.executable,'-c',f"from pathlib import Path; assert Path('task.py').read_text() == 'value = {expected}\\n'"]
         result=resume_review(run,fix=True,fixer_config=fixer,validation_commands=[command])
-    assert result['status']=='ready_to_commit'
+    assert result['status']=='review_and_validation_completed'
     assert (repository/'task.py').read_text()=='value = 5\n'
 
 
@@ -55,7 +55,7 @@ def test_successful_revalidation_preserves_the_original_failed_validation_output
     failed=resume_review(run,validation_commands=[[sys.executable,'-c',f"import sys; print('{marker}',file=sys.stderr); raise SystemExit(7)"]])
     assert failed['status']=='validation_failed'
     passed=resume_review(run,validation_commands=[[sys.executable,'-c','pass']])
-    assert passed['status']=='ready_to_commit'
+    assert passed['status']=='review_and_validation_completed'
     assert any(marker in path.read_text(errors='replace') for path in run.rglob('stderr.txt'))
 
 

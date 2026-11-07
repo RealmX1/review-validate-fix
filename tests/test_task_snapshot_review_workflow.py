@@ -125,11 +125,12 @@ def test_anonymous_combined_fixer_safe_apply_validation_and_commit_recovery(repo
     assert (repository / "background-untracked.txt").read_text() == "untracked background\n"
     assert git_text(repository, "diff", "--cached", "--name-only") == "background.txt"
     result = resume_review(run, validation_commands=[[sys.executable,"-c","from pathlib import Path; assert Path('task.py').read_text() == 'value = 3\\n'"]])
-    assert result["status"] == "ready_to_commit"
+    assert result["status"] == "review_and_validation_completed"
     git(repository, "commit", "--only", "-qm", "fix: 修复隔离验收任务", "--", "task.py")
     result = resume_review(run)
-    assert result["status"] == "completed"
-    assert result["commit"] == git_text(repository, "rev-parse", "HEAD")
+    assert result["status"] == "review_and_validation_completed"
+    assert read_json(run / "run.json")["commit"] == git_text(repository, "rev-parse", "HEAD")
+    assert "commit" not in result
 
 
 def test_completed_review_of_already_committed_changes_is_recorded_without_reset(repository, tmp_path):
@@ -139,8 +140,9 @@ def test_completed_review_of_already_committed_changes_is_recorded_without_reset
     second_run = tmp_path/'review-committed-task'
     create_snapshot(repository,base_ref=baseline,scope_paths=['task.py'],requirements=b'committed task',run_directory=second_run)
     result = resume_review(second_run,reviewer_configs=[fake_config(tmp_path),fake_config(tmp_path)],validation_commands=[[sys.executable,'-c','pass']])
-    assert result['status'] == 'completed'
-    assert result['commit'] == git_text(repository,'rev-parse','HEAD')
+    assert result['status'] == 'review_and_validation_completed'
+    assert read_json(second_run / 'run.json')['commit'] == git_text(repository,'rev-parse','HEAD')
+    assert "commit" not in result
     assert git_text(repository,'diff','--cached','--name-only') == 'background.txt'
 
 
@@ -200,7 +202,7 @@ def test_symlinks_deletions_binary_and_untracked_task_files_are_in_fixed_snapsho
     assert canary(repository) == before
 
 
-def test_real_failed_validation_is_not_reported_as_ready_to_commit(repository, tmp_path):
+def test_real_failed_validation_is_not_reported_as_completed_review(repository, tmp_path):
     run = prepare(repository, tmp_path)
     resume_review(run, reviewer_configs=[fake_config(tmp_path), fake_config(tmp_path)])
     result = resume_review(run, validation_commands=[[sys.executable,"-c","raise SystemExit(9)"]])
@@ -301,7 +303,7 @@ def test_deleted_scoped_file_survives_snapshot_validation_and_completion(reposit
     assert record["changed_paths"] == ["task.py"]
     config = plain_reviewer_config(tmp_path)
     result = resume_review(run, reviewer_configs=[config, config], validation_commands=[[sys.executable, "-c", "pass"]])
-    assert result["status"] == "ready_to_commit"
+    assert result["status"] == "review_and_validation_completed"
 
 
 def test_only_an_explicit_ignored_file_is_forced_into_the_snapshot(repository, tmp_path):
@@ -436,11 +438,12 @@ def test_validation_failure_can_be_fixed_and_revalidated_in_the_same_run(reposit
     script = tmp_path / "fix-red-test.py"
     script.write_text("import json,os,pathlib\nr=json.loads(pathlib.Path(os.environ['RVF_ROLE_INPUT']).read_text())\nassert pathlib.Path('task.py').read_text()=='value = 3\\n'\npathlib.Path('task.py').write_text('value = 4\\n')\nprint(json.dumps({'status':'completed','dispositions':[{'finding_id':f['finding_id'],'status':'fixed','reason':'修复红测'} for f in r['findings']]}))\n")
     result = resume_review(run, fix=True, fixer_config={"command": [sys.executable, str(script)], "output_format": "text"}, validation_commands=[[sys.executable, "-c", "from pathlib import Path; assert Path('task.py').read_text() == 'value = 4\\n'"]])
-    assert result["status"] == "ready_to_commit"
+    assert result["status"] == "review_and_validation_completed"
     assert len(list((run / "fixer").glob("attempt-*"))) == 2
 
 
-def test_explicit_cancel_of_final_validation_reaps_its_process_before_unlocking(repository, tmp_path):
+@pytest.mark.parametrize("pause_after_registration_release", [False, True])
+def test_explicit_cancel_of_final_validation_reaps_its_process_before_unlocking(repository, tmp_path, pause_after_registration_release):
     run = prepare(repository, tmp_path)
     config = plain_reviewer_config(tmp_path)
     resume_review(run, reviewer_configs=[config, config])
@@ -450,9 +453,29 @@ def test_explicit_cancel_of_final_validation_reaps_its_process_before_unlocking(
     commands = tmp_path / "validation.json"
     write_json(commands, [validation])
     entry = ROOT / "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_command_line_shortcut_entrypoint.py"
-    process = subprocess.Popen([sys.executable, str(entry), "resume-task-review", "--run-dir", str(run), "--validation-commands", str(commands)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    registration_window = tmp_path / "validation-registration-release-window"
+    controller_command = [sys.executable, str(entry)]
+    if pause_after_registration_release:
+        driver = tmp_path / "pause-after-validation-registration.py"
+        driver.write_text("from contextlib import contextmanager\nimport sys,time\nfrom pathlib import Path\n"
+            f"sys.path.insert(0,{str(entry.parent)!r})\n"
+            "import rvf_command_line_shortcut_entrypoint as cli\n"
+            "from core.task_snapshot_review import workflow\n"
+            "from core.task_snapshot_review.execution_lifecycle import ExecutionRevoked\n"
+            "original_lock=workflow.exclusive_lock\n"
+            f"run=Path({str(run)!r}); window=Path({str(registration_window)!r})\n"
+            "@contextmanager\ndef pause_after_registration(path,*args,**kwargs):\n"
+            " with original_lock(path,*args,**kwargs) as lock_handle:\n  yield lock_handle\n"
+            " if path.name=='execution-revocation.lock' and (run/'validation.json').exists() and not window.exists():\n"
+            "  window.touch()\n"
+            "  while not (run/'execution-revocation.json').exists(): time.sleep(0.01)\n"
+            "  raise ExecutionRevoked('登记已完成、尚未开始等待时收到明确撤销')\n"
+            "workflow.exclusive_lock=pause_after_registration\n"
+            "raise SystemExit(cli.main(sys.argv[1:]))\n")
+        controller_command = [sys.executable, str(driver)]
+    process = subprocess.Popen([*controller_command, "resume-task-review", "--run-dir", str(run), "--validation-commands", str(commands)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     deadline = time.monotonic() + 10
-    while not pid_file.exists():
+    while not pid_file.exists() or pause_after_registration_release and not registration_window.exists():
         assert time.monotonic() < deadline
         time.sleep(0.03)
     child_pid = int(pid_file.read_text())
