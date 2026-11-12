@@ -325,7 +325,7 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
                     process = subprocess.Popen(launch_command, stdin=stdin, stdout=stdout, stderr=stderr, cwd=workspace,
                                                env=environment, start_new_session=True, pass_fds=(execution_lock.fileno(),))
                     active_process=process
-                register_owned_process(run_directory, process.pid, "role_command_supervisor", owns_process_group=True)
+                register_owned_process(run_directory, process.pid, "role_command_supervisor")
                 if cancellation_requested:
                     cancel_role(signal.SIGTERM,None)
                 progress = {}
@@ -403,14 +403,15 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
             signal.signal(signal.SIGINT, signal.SIG_IGN)
             if active_process is not None and active_process.poll() is None:
                 try:
-                    os.killpg(active_process.pid,signal.SIGTERM)
+                    # 先通知监督者；进程组信号会先杀 CLI，切断尚未登记后代的归属父链。
+                    active_process.terminate()
                 except ProcessLookupError:
                     pass
                 try:
                     active_process.wait(timeout=8)
                 except subprocess.TimeoutExpired:
                     try:
-                        os.killpg(active_process.pid,signal.SIGKILL)
+                        active_process.kill()
                     except ProcessLookupError:
                         pass
                     active_process.wait()

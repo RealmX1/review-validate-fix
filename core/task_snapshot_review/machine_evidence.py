@@ -83,6 +83,17 @@ def ensure_previous_supervised_commands_exited(run_directory: Path, collection_d
             if not isinstance(execution_token, str) or not execution_token:
                 raise RuntimeError('缺少有效的已登记命令 execution_token')
             observation['execution_token'] = execution_token
+            if facts.get('ownership_observation_coverage_status') == 'unknown':
+                from .registered_command_owner_exit_receipt import observe_registered_command_owner_exit_receipt
+                observation['ownership_observation_coverage_status'] = 'unknown'
+                if facts.get('ownership_observation_gap_started_at') is not None:
+                    observation['ownership_observation_gap_started_at'] = facts['ownership_observation_gap_started_at']
+                owner_receipt = observe_registered_command_owner_exit_receipt(run_directory, facts)
+                observation['owner_exit_receipt'] = owner_receipt
+                if owner_receipt['status'] == 'exited':
+                    observation.update(status='exited', source=owner_receipt['source'], owned_processes=[])
+                    write_json(reconciliation_file, observation)
+                    continue
             if facts.get('host_boot_identity') and facts['host_boot_identity'] != native_host_boot_identity():
                 observation.update(status='exited', source='host_boot_changed')
                 write_json(reconciliation_file, observation)

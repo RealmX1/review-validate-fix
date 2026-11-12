@@ -5,6 +5,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -27,7 +28,8 @@ def wait_until(predicate, timeout=8):
 
 
 def create_role_with_detached_service(repository, directory, *, returncode=0, wait_for_release=False,
-                                       output_format='text', role='reviewer', ignore_service_sigterm=False):
+                                       output_format='text', role='reviewer', ignore_service_sigterm=False,
+                                       service_start_gate=None):
     run = directory / 'isolated-review'
     create_snapshot(repository, base_ref='HEAD', scope_paths=['task.py'], requirements=b'owned resources', run_directory=run)
     marker = directory / 'service-native-identity.json'
@@ -51,6 +53,8 @@ def create_role_with_detached_service(repository, directory, *, returncode=0, wa
         output = (f'print(json.dumps({{"type":"item.completed","item":{{"type":"agent_message","text":json.dumps({payload!r})}}}}))\n'
             + 'print(json.dumps({"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}))\n')
     program = ('import json,subprocess,sys,time\nfrom pathlib import Path\n'
+        + (f'while not Path({str(service_start_gate)!r}).exists(): time.sleep(0.01)\n' if service_start_gate else '')
+        +
         f'subprocess.Popen([sys.executable,"-B","-c",{service!r}],start_new_session=True,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n'
         f'while not Path({str(marker)!r}).exists(): time.sleep(0.01)\n'
         + (f'while not Path({str(release)!r}).exists(): time.sleep(0.01)\n' if wait_for_release else 'time.sleep(0.4)\n')
@@ -130,6 +134,46 @@ def test_explicit_stop_cleans_role_service_and_preserves_cancelled_result(reposi
         assert read_json(attempt / 'outcome.json')['status'] == 'cancelled'
         assert not (attempt / 'result.json').exists()
     finally:
+        release.touch()
+        if worker.poll() is None:
+            worker.kill()
+            worker.wait(timeout=5)
+        safely_clean_service(marker)
+
+
+def test_stop_preserves_cli_ancestry_until_supervisor_can_discover_new_service(repository, tmp_path):
+    service_start_gate = tmp_path / 'allow-service-start'
+    run, attempt, marker, release, worker = create_role_with_detached_service(repository, tmp_path,
+        wait_for_release=True, service_start_gate=service_start_gate)
+    supervision_file = attempt / 'command-supervision.json'
+    supervisor_identity = None
+    resume_supervisor = None
+    try:
+        wait_until(lambda: supervision_file.exists()
+            and bool(read_json(supervision_file).get('command_native_identity')))
+        supervisor_identity = read_json(supervision_file)['supervisor_native_identity']
+        assert native_process_start_identity_matches(native_process_identity(supervisor_identity['pid']), supervisor_identity)
+        os.kill(supervisor_identity['pid'], signal.SIGSTOP)
+        service_start_gate.touch()
+        wait_until(marker.exists)
+        service_identity = read_json(marker)
+        assert service_identity['pid'] not in {item['pid'] for item in read_json(supervision_file).get('owned_processes', [])}
+        # 暂停观测，确保 Stop 落在脱离会话的服务尚未登记的窗口。
+        resume_supervisor = threading.Timer(0.4, os.kill, args=(supervisor_identity['pid'], signal.SIGCONT))
+        resume_supervisor.start()
+        execution_lifecycle.revoke_execution(run, '验证 Stop 不提前切断新服务的归属父链')
+        worker.wait(timeout=12)
+        wait_until(lambda: not native_process_start_identity_matches(native_process_identity(service_identity['pid']), service_identity))
+        assert read_json(attempt / 'role-owned-process-cleanup.json')['status'] == 'exited'
+        assert read_json(attempt / 'outcome.json')['status'] == 'cancelled'
+    finally:
+        if resume_supervisor:
+            resume_supervisor.cancel()
+            resume_supervisor.join()
+        if supervisor_identity and native_process_start_identity_matches(
+                native_process_identity(supervisor_identity['pid']), supervisor_identity):
+            os.kill(supervisor_identity['pid'], signal.SIGCONT)
+        service_start_gate.touch()
         release.touch()
         if worker.poll() is None:
             worker.kill()

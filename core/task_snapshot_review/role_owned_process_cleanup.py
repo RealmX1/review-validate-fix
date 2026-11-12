@@ -68,6 +68,18 @@ def cleanup_role_owned_processes(attempt_directory: Path, *, direct_command: sub
             'equivalent_sources': ['registered_native_descendant_identities', 'native_host_boot_identity'],
             'observed_at': time.time()}
         try:
+            if facts.get('ownership_observation_coverage_status') == 'unknown':
+                from .registered_command_owner_exit_receipt import observe_registered_command_owner_exit_receipt
+                observation['ownership_observation_coverage_status'] = 'unknown'
+                if facts.get('ownership_observation_gap_started_at') is not None:
+                    observation['ownership_observation_gap_started_at'] = facts['ownership_observation_gap_started_at']
+                owner_receipt = observe_registered_command_owner_exit_receipt(run_directory=attempt_directory.parents[1], facts=facts)
+                observation['owner_exit_receipt'] = owner_receipt
+                if owner_receipt['status'] == 'exited':
+                    observation.update(status='exited', source=owner_receipt['source'], owned_processes=[],
+                        ownership_observation_coverage_status='unknown')
+                    write_json(cleanup_file, observation)
+                    return observation
             boot_identity = native_host_boot_identity()
             if not facts.get('host_boot_identity'):
                 raise RuntimeError('缺少角色派发时的系统启动世代')

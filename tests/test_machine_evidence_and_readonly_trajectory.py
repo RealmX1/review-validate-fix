@@ -99,3 +99,46 @@ def test_cleanup_recovery_observation_detects_boot_change_without_writing_or_rep
     assert len(list(run.glob('reviewer-*/attempt-*/model-invocation.json'))) == 2
     assert resume_review(run)['agentContinuationNotice']['noticeId'] == original_notice_id
     assert len(list(run.glob('reviewer-*/attempt-*/model-invocation.json'))) == 2
+
+
+def test_owner_exit_receipt_is_readonly_recovery_input_without_model_redispatch(repository, tmp_path, monkeypatch):
+    from core.task_snapshot_review import review_recovery_evidence_observation as recovery
+    run = automatic_snapshot(repository, tmp_path, commands=[[sys.executable, '-c', 'pass']])
+    resume_review(run, reviewer_configs=[fake_config(tmp_path), fake_config(tmp_path)])
+    supervision_file = next(run.glob('final-validation/attempt-*/command-*/command-supervision.json'))
+    supervision = read_json(supervision_file)
+    write_json(supervision_file, {**supervision, 'status': 'descendant_exit_unproven',
+        'ownership_observation_coverage_status': 'unknown'})
+    receipt = [{'status': 'unknown', 'source': 'registered_owner_exit_receipt',
+        'reason': 'coverage_unproven', 'evidence_sha256': 'weak-receipt'}]
+    monkeypatch.setattr(recovery, 'native_host_boot_identity', lambda: supervision['host_boot_identity'])
+    monkeypatch.setattr(recovery, 'observe_registered_command_owner_exit_receipt',
+        lambda *_args: receipt[0])
+    model_invocations = sorted(run.glob('reviewer-*/attempt-*/model-invocation.json'))
+
+    first = recovery.observe_task_review_recovery_evidence(run)
+    before = {str(path): path.read_bytes() for path in run.rglob('*') if path.is_file()}
+    assert first['status'] == 'known'
+    assert recovery.observe_task_review_recovery_evidence(run) == first
+    receipt[0] = {'status': 'exited', 'source': 'linux_kernel_child_subreaper_exit_receipt',
+        'evidence_sha256': 'closed-native-receipt'}
+    changed = recovery.observe_task_review_recovery_evidence(run)
+
+    assert changed['status'] == 'known'
+    assert changed['evidenceSha256'] != first['evidenceSha256']
+    assert recovery.observe_task_review_recovery_evidence(run) == changed
+    assert {str(path): path.read_bytes() for path in run.rglob('*') if path.is_file()} == before
+    assert sorted(run.glob('reviewer-*/attempt-*/model-invocation.json')) == model_invocations
+
+    from core.task_snapshot_review import registered_command_owner_exit_receipt as owner_receipt
+    monkeypatch.setattr(owner_receipt, 'observe_registered_command_owner_exit_receipt', lambda *_args: receipt[0])
+    record = read_json(run / 'run.json')
+    write_json(run / 'run.json', {**record, 'status': 'ready_for_validation'})
+    validation = read_json(run / 'validation.json')
+    write_json(run / 'validation.json', {**validation, 'status': 'machine_evidence_pending'})
+
+    resumed = resume_review(run)
+
+    assert resumed['status'] == 'review_and_validation_completed'
+    assert read_json(supervision_file.parent / 'descendant-exit-reconciliation.json')['status'] == 'exited'
+    assert sorted(run.glob('reviewer-*/attempt-*/model-invocation.json')) == model_invocations

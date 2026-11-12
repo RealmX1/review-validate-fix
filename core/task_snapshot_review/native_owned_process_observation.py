@@ -66,25 +66,31 @@ def native_process_identity(pid: int) -> dict | None:
     if sys.platform == 'darwin':
         library = ctypes.CDLL('/usr/lib/libproc.dylib', use_errno=True)
         library.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
-        info = BsdProcessInfo()
-        ctypes.set_errno(0)
-        if library.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info)) != ctypes.sizeof(info):
-            observed_errno = ctypes.get_errno()
-            if observed_errno in {errno.ESRCH, errno.ENOENT}:
+        for attempt in range(2):
+            info = BsdProcessInfo()
+            ctypes.set_errno(0)
+            if library.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info)) != ctypes.sizeof(info):
+                observed_errno = ctypes.get_errno()
+                if observed_errno in {errno.ESRCH, errno.ENOENT}:
+                    return None
+                if observed_errno == 0 and attempt == 0:
+                    continue
+                raise RuntimeError(f'原生进程启动身份不可用：pid={pid}, errno={observed_errno}')
+            if info.process_status == 5:
                 return None
-            raise RuntimeError(f'原生进程启动身份不可用：pid={pid}, errno={observed_errno}')
-        if info.process_status == 5:
-            return None
-        unique = BsdUniqueProcessInfo()
-        ctypes.set_errno(0)
-        if library.proc_pidinfo(pid, 17, 0, ctypes.byref(unique), ctypes.sizeof(unique)) != ctypes.sizeof(unique):
-            observed_errno = ctypes.get_errno()
-            if observed_errno in {errno.ESRCH, errno.ENOENT}:
-                return None
-            raise RuntimeError(f'原生进程唯一身份不可用：pid={pid}, errno={observed_errno}')
-        return {'pid': pid, 'start_identity': [info.start_seconds, info.start_microseconds],
-                'unique_process_id': unique.unique_process_id,
-                'parent_pid': info.parent_process_id, 'process_group_id': info.process_group_id}
+            unique = BsdUniqueProcessInfo()
+            ctypes.set_errno(0)
+            if library.proc_pidinfo(pid, 17, 0, ctypes.byref(unique), ctypes.sizeof(unique)) != ctypes.sizeof(unique):
+                observed_errno = ctypes.get_errno()
+                if observed_errno in {errno.ESRCH, errno.ENOENT}:
+                    return None
+                # 空结果没有说明退出；重采完整身份，避免跨 PID 世代拼接两段信息。
+                if observed_errno == 0 and attempt == 0:
+                    continue
+                raise RuntimeError(f'原生进程唯一身份不可用：pid={pid}, errno={observed_errno}')
+            return {'pid': pid, 'start_identity': [info.start_seconds, info.start_microseconds],
+                    'unique_process_id': unique.unique_process_id,
+                    'parent_pid': info.parent_process_id, 'process_group_id': info.process_group_id}
     if sys.platform.startswith('linux'):
         try:
             fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()

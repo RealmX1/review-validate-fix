@@ -16,6 +16,7 @@ from .native_owned_process_observation import (
     native_host_boot_identity, native_process_identity, native_process_start_identity_matches,
     recorded_native_process_identity_is_valid, ROLE_COMMAND_PROCESS_LIFETIME_CONTRACT,
 )
+from .registered_command_owner_exit_receipt import observe_registered_command_owner_exit_receipt
 
 
 def canonical_json_material_sha256(value: object) -> str:
@@ -180,8 +181,14 @@ def observe_task_review_recovery_evidence(run_directory: Path) -> dict:
                 if original.exists():
                     supervision = read_json(original)
                     if supervision.get('ownership_observation_coverage_status') == 'unknown':
-                        resource_cleanup_facts.append({'command_directory': str(original.parent),
-                            'host_boot_identity': native_host_boot_identity()})
+                        material = {'command_directory': str(original.parent)}
+                        try:
+                            material['host_boot_identity'] = native_host_boot_identity()
+                        except (OSError, RuntimeError) as error:
+                            material['host_boot_identity'] = {'status': 'unknown', 'error': str(error)}
+                        material['owner_exit_receipt'] = observe_registered_command_owner_exit_receipt(
+                            run_directory, supervision)
+                        resource_cleanup_facts.append(material)
                     if supervision.get('command_process_lifetime_contract') == ROLE_COMMAND_PROCESS_LIFETIME_CONTRACT:
                         from .role_owned_process_cleanup import role_owned_process_cleanup_observation
                         cleanup = role_owned_process_cleanup_observation(original.parent)

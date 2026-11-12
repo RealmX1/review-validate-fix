@@ -1,5 +1,6 @@
 """进程表父链消失、最终验证未派发与角色准备重试的独立回归。"""
 import errno
+import json
 import os
 from pathlib import Path
 import sys
@@ -292,3 +293,212 @@ def test_interrupted_launch_boot_reconciliation_preserves_registration_identity_
     with pytest.raises(machine_evidence.WorkspacePreparationFailed):
         machine_evidence.ensure_previous_supervised_commands_exited(run_directory, collection_directory)
     assert read_json(command_directory / 'descendant-exit-reconciliation.json')['status'] == 'unknown'
+
+
+def write_bound_owner_exit_receipt(tmp_path):
+    run = tmp_path / 'owner-receipt-run'
+    repository = tmp_path / 'owner-repository'
+    repository.mkdir()
+    owner = tmp_path / 'owner-execution'
+    owner.mkdir()
+    execution_id = 'execution-1'
+    nonce = '11111111-2222-4333-8444-555555555555'
+    boot = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    revocation = owner / 'execution-revocation.json'
+    collection = run / 'final-validation/attempt-001/commands'
+    command_directory = collection / 'command-001'
+    write_json(run / 'run.json', {
+        'run_id': run.name, 'repo': str(repository),
+        'command_execution_identity': {'execution_id': execution_id, 'revocation_file': str(revocation)},
+        'command_execution_revocation_file': str(revocation),
+    })
+    write_json(run / 'kanban-command-execution-binding.json', {'task_id': 'task-1'})
+    write_json(run / 'kanban-command-execution-start-receipt.json', {
+        'returncode': 0,
+        'stdout': json.dumps({'ok': True, 'execution': {
+            'executionId': execution_id, 'taskId': 'task-1', 'revocationFile': str(revocation),
+            'launchAttemptCount': 1, 'previousLaunchNonces': [], 'launchNonce': nonce,
+        }}),
+    })
+    write_json(owner / f'launch-materials-{nonce}.json', {
+        'directory': str(owner), 'executionId': execution_id, 'launchNonce': nonce,
+        'revocationFile': str(revocation), 'workingDirectory': str(repository),
+        'command': ['python', 'rvf', 'resume-task-review', '--run-dir', str(run)],
+        'systemBootIdentity': boot.upper(), 'superviseProcessGroup': True,
+        'linuxKernelChildSubreaperContainmentRequired': True,
+    })
+    write_json(owner / f'supervisor-identity-{nonce}.json', {
+        'pid': 700, 'launchNonce': nonce, 'nativeProcessGenerationIdentity': 'linux:70',
+    })
+    write_json(owner / f'kernel-child-subreaper-containment-{nonce}.json', {
+        'pid': 700, 'launchNonce': nonce, 'systemBootIdentity': boot,
+        'pidNamespaceIdentity': 'pid:[4026531836]',
+        'mode': 'linux_child_subreaper_established_before_script_dispatch',
+        'nativeProcessGenerationIdentity': 'linux:70', 'verifiedAtEpochMs': 1000,
+    })
+    write_json(owner / f'supervisor-progress-{nonce}.json', {
+        'launchNonce': nonce, 'status': 'exited', 'returncode': 0,
+        'kernelChildExitObservation': 0, 'linuxKernelContainmentVerified': True,
+        'linuxKernelContainmentContinuityLost': False, 'nativeOwnershipUnproven': False,
+        'unprovenOwnershipProcesses': [], 'ownedProcesses': [
+            {'pid': 800601, 'nativeProcessGenerationIdentity': 'linux:101'},
+            {'pid': 800602, 'nativeProcessGenerationIdentity': 'linux:102'},
+        ],
+    })
+    facts = {
+        'run_directory': str(run), 'command_directory': str(command_directory),
+        'execution_token': 'owner-receipt-command', 'supervisor_pid': 800601,
+        'supervisor_native_identity': {'pid': 800601, 'start_identity': '101'},
+        'command_pid': 800602, 'command_native_identity': {'pid': 800602, 'start_identity': '102'},
+        'command_returncode': 0, 'host_boot_identity': 'linux:' + boot,
+        'process_ownership_scope': observation.REGISTERED_COMMAND_PROCESS_OWNERSHIP_SCOPE,
+        'command_process_lifetime_contract': observation.REGISTERED_COMMAND_PROCESS_LIFETIME_CONTRACT,
+        'status': 'descendant_exit_unproven', 'ownership_observation_coverage_status': 'unknown',
+        'ownership_observation_gap_started_at': 123.5, 'owned_processes': [],
+    }
+    write_json(command_directory / 'command-supervision.json', facts)
+    register_supervised_command_directory(run, command_directory)
+    return run, collection, command_directory, owner, nonce
+
+
+def test_closed_native_owner_receipt_recovers_historical_gap_idempotently(tmp_path, monkeypatch):
+    run, collection, command_directory, owner, nonce = write_bound_owner_exit_receipt(tmp_path)
+    supervision_file = command_directory / 'command-supervision.json'
+    original_supervision = supervision_file.read_bytes()
+    monkeypatch.setattr(observation, 'native_host_boot_identity',
+        lambda: pytest.fail('可信回执不应依赖当前 boot 查询可用'))
+    monkeypatch.setattr(observation, 'native_process_identity',
+        lambda *_args: pytest.fail('封闭内核退出回执足够，不应查询历史 PID'))
+    monkeypatch.setattr(observation, 'owned_process_snapshot',
+        lambda *_args, **_kwargs: pytest.fail('封闭内核退出回执足够，不应扫描后代'))
+    monkeypatch.setattr(observation.os, 'kill',
+        lambda *_args: pytest.fail('只读退出对账不能发送信号'))
+
+    machine_evidence.ensure_previous_supervised_commands_exited(run, collection)
+
+    reconciliation_file = command_directory / 'descendant-exit-reconciliation.json'
+    reconciliation = read_json(reconciliation_file)
+    assert reconciliation['status'] == 'exited'
+    assert reconciliation['source'] == 'linux_kernel_child_subreaper_exit_receipt'
+    assert reconciliation['ownership_observation_coverage_status'] == 'unknown'
+    assert reconciliation['ownership_observation_gap_started_at'] == 123.5
+    assert reconciliation['owner_exit_receipt']['launch_nonce'] == nonce
+    assert supervision_file.read_bytes() == original_supervision
+    first = reconciliation_file.read_bytes()
+    machine_evidence.ensure_previous_supervised_commands_exited(run, collection)
+    assert reconciliation_file.read_bytes() == first
+    assert not (owner / 'execution-revocation.json').exists()
+
+
+@pytest.mark.parametrize('source_name,field,value', [
+    ('launch-materials', 'linuxKernelChildSubreaperContainmentRequired', False),
+    ('launch-materials', 'superviseProcessGroup', False),
+    ('launch-materials', 'systemBootIdentity', 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'),
+    ('supervisor-identity', 'nativeProcessGenerationIdentity', 'linux:different'),
+    ('kernel-child-subreaper-containment', 'mode', 'linux_child_subreaper_established_after_script_dispatch'),
+    ('supervisor-progress', 'status', 'running'),
+    ('supervisor-progress', 'kernelChildExitObservation', 1),
+    ('supervisor-progress', 'linuxKernelContainmentContinuityLost', True),
+    ('supervisor-progress', 'nativeOwnershipUnproven', True),
+])
+def test_unproven_owner_receipt_never_clears_historical_gap(
+        tmp_path, monkeypatch, source_name, field, value):
+    run, collection, command_directory, owner, nonce = write_bound_owner_exit_receipt(tmp_path)
+    source = owner / f'{source_name}-{nonce}.json'
+    write_json(source, {**read_json(source), field: value})
+    supervision_file = command_directory / 'command-supervision.json'
+    original_supervision = supervision_file.read_bytes()
+    monkeypatch.setattr(observation, 'native_host_boot_identity',
+        lambda: read_json(supervision_file)['host_boot_identity'])
+    monkeypatch.setattr(observation, 'native_process_identity', lambda _pid: None)
+    monkeypatch.setattr(observation, 'owned_process_snapshot', lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(observation.os, 'kill',
+        lambda *_args: pytest.fail('缺证恢复不能发送信号'))
+
+    with pytest.raises(machine_evidence.WorkspacePreparationFailed):
+        machine_evidence.ensure_previous_supervised_commands_exited(run, collection)
+
+    reconciliation = read_json(command_directory / 'descendant-exit-reconciliation.json')
+    assert reconciliation['status'] == 'unknown'
+    assert reconciliation['ownership_observation_coverage_status'] == 'unknown'
+    assert reconciliation['ownership_observation_gap_started_at'] == 123.5
+    assert reconciliation['owner_exit_receipt']['status'] == 'unknown'
+    assert reconciliation['owner_exit_receipt']['reason']
+    assert supervision_file.read_bytes() == original_supervision
+
+
+def test_owner_receipt_rejects_duplicate_inner_process_identity(tmp_path, monkeypatch):
+    run, collection, command_directory, owner, nonce = write_bound_owner_exit_receipt(tmp_path)
+    progress_file = owner / f'supervisor-progress-{nonce}.json'
+    progress = read_json(progress_file)
+    progress['ownedProcesses'].append(progress['ownedProcesses'][0])
+    write_json(progress_file, progress)
+    monkeypatch.setattr(observation, 'native_host_boot_identity',
+        lambda: read_json(command_directory / 'command-supervision.json')['host_boot_identity'])
+    monkeypatch.setattr(observation, 'native_process_identity', lambda _pid: None)
+    monkeypatch.setattr(observation, 'owned_process_snapshot', lambda *_args, **_kwargs: {})
+
+    with pytest.raises(machine_evidence.WorkspacePreparationFailed):
+        machine_evidence.ensure_previous_supervised_commands_exited(run, collection)
+
+    reconciliation = read_json(command_directory / 'descendant-exit-reconciliation.json')
+    assert reconciliation['status'] == 'unknown'
+    assert '未唯一绑定' in reconciliation['owner_exit_receipt']['reason']
+
+
+@pytest.mark.parametrize('missing_evidence', ['supervisor_pid', 'command_pid', 'task_identity', 'platform', 'owner_generation'])
+def test_owner_receipt_rejects_incomplete_dispatch_binding(tmp_path, missing_evidence):
+    from core.task_snapshot_review.registered_command_owner_exit_receipt import observe_registered_command_owner_exit_receipt
+    run, _collection, command_directory, owner, nonce = write_bound_owner_exit_receipt(tmp_path)
+    facts = read_json(command_directory / 'command-supervision.json')
+    if missing_evidence in {'supervisor_pid', 'command_pid'}:
+        facts.pop(missing_evidence)
+    elif missing_evidence == 'platform':
+        facts['host_boot_identity'] = facts['host_boot_identity'].replace('linux:', 'darwin:')
+    elif missing_evidence == 'task_identity':
+        write_json(run / 'kanban-command-execution-binding.json', {})
+        receipt_file = run / 'kanban-command-execution-start-receipt.json'
+        receipt = read_json(receipt_file)
+        payload = json.loads(receipt['stdout'])
+        payload['execution'].pop('taskId')
+        receipt['stdout'] = json.dumps(payload)
+        write_json(receipt_file, receipt)
+    else:
+        for kind in ('supervisor-identity', 'kernel-child-subreaper-containment'):
+            path = owner / f'{kind}-{nonce}.json'
+            write_json(path, {**read_json(path), 'nativeProcessGenerationIdentity': 'invalid-generation'})
+    result = observe_registered_command_owner_exit_receipt(run, facts)
+    assert result['status'] == 'unknown'
+    assert result['reason']
+
+
+def test_owner_control_directory_can_have_a_workspace_named_ancestor(tmp_path):
+    from core.task_snapshot_review.registered_command_owner_exit_receipt import observe_registered_command_owner_exit_receipt
+    parent = tmp_path / 'workspace'
+    parent.mkdir()
+    run, _collection, command_directory, _owner, _nonce = write_bound_owner_exit_receipt(parent)
+    assert observe_registered_command_owner_exit_receipt(run,
+        read_json(command_directory / 'command-supervision.json'))['status'] == 'exited'
+
+
+def test_closed_owner_receipt_recovers_role_cleanup_without_signals(tmp_path, monkeypatch):
+    from core.task_snapshot_review import role_owned_process_cleanup as role_cleanup
+    run, _collection, command_directory, _owner, _nonce = write_bound_owner_exit_receipt(tmp_path)
+    attempt = run / 'reviewer-1/attempt-001'
+    facts = {**read_json(command_directory / 'command-supervision.json'),
+        'command_directory': str(attempt),
+        'command_process_lifetime_contract': observation.ROLE_COMMAND_PROCESS_LIFETIME_CONTRACT}
+    write_json(attempt / 'command-supervision.json', facts)
+    monkeypatch.setattr(role_cleanup, 'native_host_boot_identity', lambda: facts['host_boot_identity'])
+    monkeypatch.setattr(role_cleanup, 'native_process_identity',
+        lambda *_args: pytest.fail('封闭内核退出回执足够，不应查询角色历史 PID'))
+    monkeypatch.setattr(role_cleanup.os, 'kill',
+        lambda *_args: pytest.fail('等价退出证明不能触发角色资源信号'))
+
+    cleanup = role_cleanup.cleanup_role_owned_processes(attempt)
+
+    assert cleanup['status'] == 'exited'
+    assert cleanup['source'] == 'linux_kernel_child_subreaper_exit_receipt'
+    assert cleanup['ownership_observation_coverage_status'] == 'unknown'
+    assert cleanup['ownership_observation_gap_started_at'] == 123.5
+    assert role_cleanup.cleanup_role_owned_processes(attempt) == cleanup
