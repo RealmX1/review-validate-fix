@@ -442,8 +442,10 @@ def test_validation_failure_can_be_fixed_and_revalidated_in_the_same_run(reposit
     assert len(list((run / "fixer").glob("attempt-*"))) == 2
 
 
-@pytest.mark.parametrize("pause_after_registration_release", [False, True])
-def test_explicit_cancel_of_final_validation_reaps_its_process_before_unlocking(repository, tmp_path, pause_after_registration_release):
+@pytest.mark.parametrize(("pause_after_registration_release", "signal_during_interrupted_validation_write"),
+                         [(False, False), (True, False), (True, True)])
+def test_explicit_cancel_of_final_validation_reaps_its_process_before_unlocking(repository, tmp_path, pause_after_registration_release,
+                                                                             signal_during_interrupted_validation_write):
     run = prepare(repository, tmp_path)
     config = plain_reviewer_config(tmp_path)
     resume_review(run, reviewer_configs=[config, config])
@@ -457,7 +459,7 @@ def test_explicit_cancel_of_final_validation_reaps_its_process_before_unlocking(
     controller_command = [sys.executable, str(entry)]
     if pause_after_registration_release:
         driver = tmp_path / "pause-after-validation-registration.py"
-        driver.write_text("from contextlib import contextmanager\nimport sys,time\nfrom pathlib import Path\n"
+        driver.write_text("from contextlib import contextmanager\nimport os,signal,sys,time\nfrom pathlib import Path\n"
             f"sys.path.insert(0,{str(entry.parent)!r})\n"
             "import rvf_command_line_shortcut_entrypoint as cli\n"
             "from core.task_snapshot_review import workflow\n"
@@ -471,7 +473,15 @@ def test_explicit_cancel_of_final_validation_reaps_its_process_before_unlocking(
             "  while not (run/'execution-revocation.json').exists(): time.sleep(0.01)\n"
             "  raise ExecutionRevoked('登记已完成、尚未开始等待时收到明确撤销')\n"
             "workflow.exclusive_lock=pause_after_registration\n"
-            "raise SystemExit(cli.main(sys.argv[1:]))\n")
+            + ("original_write=workflow.write_json\nsignal_injected=False\n"
+               "def interrupt_during_status_write(path,payload):\n"
+               " global signal_injected\n"
+               " if path.name=='validation.json' and payload.get('status')=='interrupted' and not signal_injected:\n"
+               "  signal_injected=True\n"
+               "  os.kill(os.getpid(),signal.SIGTERM)\n"
+               " return original_write(path,payload)\n"
+               "workflow.write_json=interrupt_during_status_write\n" if signal_during_interrupted_validation_write else "")
+            + "raise SystemExit(cli.main(sys.argv[1:]))\n")
         controller_command = [sys.executable, str(driver)]
     process = subprocess.Popen([*controller_command, "resume-task-review", "--run-dir", str(run), "--validation-commands", str(commands)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     deadline = time.monotonic() + 10
@@ -492,6 +502,40 @@ def test_explicit_cancel_of_final_validation_reaps_its_process_before_unlocking(
     assert len(attempts) == 1
     assert read_json(attempts[0] / "validation.json")["status"] == "interrupted"
     assert "interrupted-validation-marker" in (attempts[0] / "command-001" / "stdout.txt").read_text()
+
+
+
+def test_frontend_sigterm_during_final_validation_preserves_running_command(repository, tmp_path):
+    run = prepare(repository, tmp_path)
+    config = plain_reviewer_config(tmp_path)
+    resume_review(run, reviewer_configs=[config, config])
+    pid_file = tmp_path / "foreground-validation.pid"
+    finished = tmp_path / "foreground-validation-finished"
+    validation = [sys.executable, "-c", f"import os,pathlib,time; pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid())); time.sleep(2); pathlib.Path({str(finished)!r}).touch()"]
+    commands = tmp_path / "foreground-validation-commands.json"
+    write_json(commands, [validation])
+    entry = ROOT / "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_command_line_shortcut_entrypoint.py"
+    process = subprocess.Popen([sys.executable, str(entry), "resume-task-review", "--run-dir", str(run),
+        "--validation-commands", str(commands)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        deadline = time.monotonic() + 10
+        while not pid_file.exists():
+            assert time.monotonic() < deadline
+            time.sleep(0.03)
+        process.terminate()
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 130, (stdout, stderr)
+        assert not (run / "execution-revocation.json").exists()
+        assert read_json(run / "validation.json")["status"] == "interrupted"
+        supervision = run / "final-validation/attempt-001/command-001/command-supervision.json"
+        while not finished.exists() or read_json(supervision).get("status") != "completed":
+            assert time.monotonic() < deadline
+            time.sleep(0.03)
+        assert len(list((run / "final-validation").glob("attempt-*"))) == 1
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate(timeout=5)
 
 
 def test_failed_leg_fallback_starts_before_the_healthy_leg_finishes(repository, tmp_path):
