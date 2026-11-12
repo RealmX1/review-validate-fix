@@ -235,3 +235,29 @@ def test_invalid_reviewer_problem_key_uses_available_alternative(role_repository
     assert sum(outcome["status"] == "completed" for outcome in outcomes) == 2
     assert any(outcome["status"] == "failed" for outcome in outcomes)
     assert resume_review(run)["status"] == "ready_for_validation"
+
+
+def test_unknown_native_cli_completion_waits_across_configurations_until_original_result_is_reconciled(tmp_path, monkeypatch):
+    from core.task_snapshot_review import workflow
+
+    run_directory = tmp_path / 'unknown-native-cli-completion'
+    role_directory = run_directory / 'reviewer-1'
+    attempt_directory = role_directory / 'attempt-001'
+    write_json(run_directory / 'run.json', {'status': 'review_pending'})
+    write_json(attempt_directory / 'request.json', {'role': 'reviewer'})
+    write_json(attempt_directory / 'outcome.json', {
+        'status': 'unknown', 'returncode': None, 'supervisor_returncode': -9, 'retryable': False,
+        'recovery': {'category': 'native_cli_completion_unknown'},
+    })
+    monkeypatch.setattr(workflow, 'reconcile_completed_role_attempt', lambda _attempt: None)
+    monkeypatch.setattr(workflow, 'reviewer_eligibility',
+        lambda *_arguments, **_keywords: pytest.fail('CLI 原生完成缺证时不能切换配置重新派发'))
+    alternative_configuration = {'command': ['alternative-model-cli'], 'output_format': 'text'}
+    assert workflow._start_role(run_directory, {}, role_directory, 'reviewer', [alternative_configuration], []) == (None, None)
+
+    payload = {'status': 'completed', 'audit_summary': '原 CLI 已原生完成并补证', 'findings': []}
+    write_json(attempt_directory / 'result.json', payload)
+    write_json(attempt_directory / 'reconciled-native-completion.json', {'status': 'completed'})
+    completed, replacement = workflow._start_role(run_directory, {}, role_directory, 'reviewer', [alternative_configuration], [])
+    assert completed['result'] == payload
+    assert replacement is None

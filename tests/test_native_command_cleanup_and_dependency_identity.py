@@ -93,16 +93,18 @@ def test_stop_during_native_observation_outage_does_not_abandon_known_detached_c
                 pass
 
 
-def test_stop_reconciles_detached_child_after_supervisor_exit(tmp_path):
+def test_stop_reconciles_detached_child_after_supervisor_exit(tmp_path, monkeypatch):
     run = tmp_path / 'cancel-after-supervisor-exit'
     run.mkdir()
     write_json(run / 'run.json', {})
     child = subprocess.Popen([sys.executable, '-B', '-c', 'import time; time.sleep(30)'], start_new_session=True)
     try:
         identity = native_owned_process_observation.native_process_identity(child.pid)
+        monkeypatch.setattr(retained_command_supervisor, 'native_host_boot_identity', lambda: 'controlled-host-boot')
         execution_lifecycle.register_supervised_command_directory(run, run / 'commands/command-001')
         write_json(run / 'commands/command-001/command-supervision.json', {
             'execution_token': 'persisted-owned-execution', 'supervisor_pid': 99999999,
+            'host_boot_identity': 'controlled-host-boot',
             'status': 'descendant_exit_unproven', 'owned_processes': [identity]})
         evidence = execution_lifecycle.revoke_execution(run, '监督者退出后补齐持久撤销')
         assert child.wait(timeout=1) == -signal.SIGKILL

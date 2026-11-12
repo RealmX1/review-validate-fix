@@ -43,10 +43,8 @@ def exclusive_lock(path: Path, *, blocking: bool = True, inherited_descriptor: i
                 fcntl.flock(handle, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
             except BlockingIOError:
                 raise RuntimeError(f"另一个进程正在处理：{path}") from None
-        try:
-            yield handle
-        finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
+        # 只关闭本持有者的描述符，继承同一打开描述的 CLI 退出前仍须持锁。
+        yield handle
 
 
 def git(repo: Path, *arguments: str, input_bytes: bytes | None = None, environment: dict | None = None, pass_fds: tuple[int, ...] = ()) -> bytes:

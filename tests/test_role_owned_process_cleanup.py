@@ -9,9 +9,12 @@ import time
 
 import pytest
 
-from core.task_snapshot_review import execution_lifecycle, role_process_execution, workflow
+from core.task_snapshot_review import (
+    execution_lifecycle, native_owned_process_observation, role_owned_process_cleanup,
+    role_process_execution, workflow,
+)
 from core.task_snapshot_review.native_owned_process_observation import native_process_identity, native_process_start_identity_matches
-from core.task_snapshot_review.persistent_artifacts import read_json
+from core.task_snapshot_review.persistent_artifacts import exclusive_lock, read_json
 from core.task_snapshot_review.task_snapshot import create_snapshot
 from test_task_snapshot_review_workflow import repository
 
@@ -251,3 +254,121 @@ def test_invalid_role_resource_identity_never_reaches_native_query_or_signal(tmp
     first = cleanup.cleanup_role_owned_processes(attempt)
     assert first['status'] == 'unknown'
     assert cleanup.cleanup_role_owned_processes(attempt) == first
+
+
+@pytest.fixture
+def isolated_role_supervisor_host_boot_identity(tmp_path, monkeypatch):
+    try:
+        return native_owned_process_observation.native_host_boot_identity()
+    except (OSError, RuntimeError):
+        # 沙箱禁读 boot UUID 时只替换该机器事实，仍保留真实进程身份与信号。
+        boot_identity = 'darwin:00000000-0000-0000-0000-000000000001'
+        bootstrap_directory = tmp_path / 'isolated-host-boot-identity-bootstrap'
+        bootstrap_directory.mkdir()
+        (bootstrap_directory / 'sitecustomize.py').write_text(
+            'from core.task_snapshot_review import native_owned_process_observation\n'
+            f'native_owned_process_observation.native_host_boot_identity = lambda: {boot_identity!r}\n')
+        import_directories = [str(bootstrap_directory), str(Path(__file__).resolve().parents[1])]
+        if os.environ.get('PYTHONPATH'):
+            import_directories.append(os.environ['PYTHONPATH'])
+        monkeypatch.setenv('PYTHONPATH', os.pathsep.join(import_directories))
+        for module in (execution_lifecycle, native_owned_process_observation, role_owned_process_cleanup):
+            monkeypatch.setattr(module, 'native_host_boot_identity', lambda: boot_identity)
+        return boot_identity
+
+
+def test_execution_lock_context_exit_preserves_duplicated_inherited_descriptor(tmp_path):
+    attempt_directory = tmp_path / 'reviewer-1' / 'attempt-001'
+    duplicated_inherited_descriptor = None
+    try:
+        with exclusive_lock(attempt_directory / 'execution.lock') as execution_lock:
+            duplicated_inherited_descriptor = os.dup(execution_lock.fileno())
+        # 同一打开描述仍属于 CLI；worker 关闭自身描述符不能主动解锁它。
+        assert role_process_execution.process_lock_is_held(attempt_directory)
+    finally:
+        if duplicated_inherited_descriptor is not None:
+            os.close(duplicated_inherited_descriptor)
+        assert not role_process_execution.process_lock_is_held(attempt_directory)
+
+
+@pytest.mark.parametrize('output_format', ['codex_json', 'kimi_stream_json'])
+def test_supervisor_only_crash_preserves_live_cli_and_recovers_native_completion(
+        repository, tmp_path, monkeypatch, output_format, isolated_role_supervisor_host_boot_identity):
+    run, attempt, service_marker, release_cli, worker = create_role_with_detached_service(
+        repository, tmp_path, wait_for_release=True, output_format=output_format)
+    supervision_file = attempt / 'command-supervision.json'
+    replacement_dispatches = []
+
+    def record_replacement_dispatch(attempt_directory, **kwargs):
+        replacement_dispatches.append(str(attempt_directory))
+        return None
+
+    monkeypatch.setattr(workflow, 'launch_role', record_replacement_dispatch)
+    try:
+        wait_until(service_marker.exists)
+        service_identity = read_json(service_marker)
+        wait_until(lambda: read_json(supervision_file).get('command_native_identity') and any(
+            identity['pid'] == service_identity['pid']
+            for identity in read_json(supervision_file)['owned_processes']))
+        supervision = read_json(supervision_file)
+        assert supervision['host_boot_identity'] == isolated_role_supervisor_host_boot_identity
+        supervisor_identity = supervision['supervisor_native_identity']
+        command_identity = supervision['command_native_identity']
+        assert worker.poll() is None
+        assert native_process_start_identity_matches(
+            native_process_identity(command_identity['pid']), command_identity)
+
+        # 仅杀监督器，保留 worker 和原 CLI，覆盖两者同时崩溃测试未触及的路径。
+        os.kill(supervisor_identity['pid'], signal.SIGKILL)
+        wait_until(lambda: not native_process_start_identity_matches(
+            native_process_identity(supervisor_identity['pid']), supervisor_identity))
+        assert worker.wait(timeout=15) == 0
+        outcome = read_json(attempt / 'outcome.json')
+        assert outcome['status'] == 'unknown'
+        assert outcome['supervisor_returncode'] == -signal.SIGKILL
+        assert outcome.get('returncode') is None
+        assert outcome.get('retryable') is False
+        assert native_process_start_identity_matches(
+            native_process_identity(command_identity['pid']), command_identity)
+        assert native_process_start_identity_matches(
+            native_process_identity(service_identity['pid']), service_identity)
+        assert role_process_execution.process_lock_is_held(attempt)
+        config = read_json(attempt / 'request.json')['config']
+        record = read_json(run / 'run.json')
+        assert workflow._start_role(run, record, attempt.parent, 'reviewer', [config], []) == (None, None)
+        assert replacement_dispatches == []
+        assert len(list(attempt.parent.glob('attempt-*'))) == 1
+
+        release_cli.touch()
+        wait_until(lambda: not role_process_execution.process_lock_is_held(attempt))
+        completed, replacement = workflow._start_role(
+            run, record, attempt.parent, 'reviewer', [config], [])
+        assert completed['result']['status'] == 'completed'
+        assert completed['result']['audit_summary'] == '已完成审计'
+        assert completed['result']['findings'] == []
+        assert replacement is None
+        assert replacement_dispatches == []
+        assert len(list(attempt.parent.glob('attempt-*'))) == 1
+        assert read_json(attempt / 'reconciled-native-completion.json')['status'] == 'completed'
+        assert not native_process_start_identity_matches(
+            native_process_identity(command_identity['pid']), command_identity)
+        assert not native_process_start_identity_matches(
+            native_process_identity(service_identity['pid']), service_identity)
+    finally:
+        release_cli.touch()
+        try:
+            worker.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            worker.kill()
+            worker.wait(timeout=5)
+        if supervision_file.exists():
+            supervision = read_json(supervision_file)
+            for identity in (supervision.get('command_native_identity'),
+                             supervision.get('supervisor_native_identity')):
+                if identity and native_process_start_identity_matches(
+                        native_process_identity(identity['pid']), identity):
+                    os.kill(identity['pid'], signal.SIGKILL)
+                    wait_until(lambda: not native_process_start_identity_matches(
+                        native_process_identity(identity['pid']), identity))
+        safely_clean_service(service_marker)
+        wait_until(lambda: not role_process_execution.process_lock_is_held(attempt))

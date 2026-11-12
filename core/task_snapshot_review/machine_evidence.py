@@ -79,14 +79,17 @@ def ensure_previous_supervised_commands_exited(run_directory: Path, collection_d
                 observation.update({'status': 'not_started', 'native_launch_error': facts['command_native_launch_error']})
                 write_json(reconciliation_file, observation)
                 continue
-            if (facts.get('command_launch_intent_recorded') and not facts.get('command_pid')
-                    and facts.get('command_returncode') is None):
-                raise RuntimeError('命令派发登记中断，缺少直接命令身份或退出事实')
-            observation['execution_token'] = facts['execution_token']
+            execution_token = facts.get('execution_token')
+            if not isinstance(execution_token, str) or not execution_token:
+                raise RuntimeError('缺少有效的已登记命令 execution_token')
+            observation['execution_token'] = execution_token
             if facts.get('host_boot_identity') and facts['host_boot_identity'] != native_host_boot_identity():
                 observation.update(status='exited', source='host_boot_changed')
                 write_json(reconciliation_file, observation)
                 continue
+            if (facts.get('command_launch_intent_recorded') and not facts.get('command_pid')
+                    and facts.get('command_returncode') is None):
+                raise RuntimeError('命令派发登记中断，缺少直接命令身份或退出事实')
             current = native_process_identity(facts['supervisor_pid'])
             identity = facts.get('supervisor_native_identity')
             if not identity:

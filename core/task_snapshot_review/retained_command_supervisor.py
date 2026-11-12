@@ -38,6 +38,20 @@ def terminate_supervised_command_descendants(command_directory: Path) -> list[di
         if cleanup['status'] not in {'pending', 'exited'}:
             observations = [*observations, {'cancellation_status': 'unknown', 'error': cleanup.get('error', '角色资源退出尚未证明')}]
         return observations
+    boot_generation_cancellation_observation = None
+    try:
+        if not facts.get('host_boot_identity'):
+            raise RuntimeError('缺少登记命令派发时的系统启动世代')
+        if facts['host_boot_identity'] != native_host_boot_identity():
+            boot_generation_cancellation_observation = {'cancellation_status': 'exited', 'exit_evidence': 'host_boot_changed'}
+    except (OSError, RuntimeError) as error:
+        boot_generation_cancellation_observation = {'cancellation_status': 'unknown', 'error': str(error)}
+    if boot_generation_cancellation_observation:
+        observations = [boot_generation_cancellation_observation]
+        write_json(command_directory / 'descendant-cancellation-observations.json', {
+            'execution_token': facts['execution_token'], 'processes': observations, 'observed_at': time.time(),
+            'recovery_condition': 'registered_host_boot_identity_and_current_native_boot_observation_available'})
+        return observations
     recorded = {item['pid']: item for item in facts.get('owned_processes', [])}
     if facts.get('command_native_identity'):
         recorded.setdefault(facts['command_pid'], facts['command_native_identity'])

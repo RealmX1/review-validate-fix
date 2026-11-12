@@ -16,7 +16,10 @@ from .execution_lifecycle import (
     ExecutionRevoked, ensure_execution_not_revoked, register_owned_process, register_supervised_command_directory,
     finish_owned_process_registration, wait_for_owned_process, process_start_identity, persist_role_progress_observation,
 )
-from .native_owned_process_observation import ROLE_COMMAND_PROCESS_LIFETIME_CONTRACT
+from .native_owned_process_observation import (
+    REGISTERED_COMMAND_PROCESS_OWNERSHIP_SCOPE, ROLE_COMMAND_PROCESS_LIFETIME_CONTRACT,
+    recorded_native_process_identity_is_valid,
+)
 from .role_owned_process_cleanup import cleanup_role_owned_processes
 from .review_recovery_evidence_observation import file_sha256
 from .role_failure_recovery import classify_role_failure, native_invocation_facts
@@ -331,11 +334,31 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
                 except (OSError, subprocess.SubprocessError, RuntimeError) as error:
                     progress["identity_observation_error"] = str(error)
                 persist_role_progress_observation(attempt_directory / "progress.json", progress)
-                returncode = wait_for_owned_process(process, run_directory, timeout=None,
+                supervisor_returncode = wait_for_owned_process(process, run_directory, timeout=None,
                     progress_file=attempt_directory / "progress.json", observe_registered_process_descendants=False)
+            # 监督者退出不证明 CLI 退出，缺失业务事实时保留原派发并等待原生补证。
+            outcome.update(status='unknown', supervisor_returncode=supervisor_returncode, returncode=None, retryable=False,
+                recovery={'category': 'native_cli_completion_unknown', 'action': 'reconcile_original_native_completion',
+                    'recovery_condition': 'inherited_execution_lock_released_and_original_native_completion_available',
+                    'equivalent_sources': ['registered_cli_returncode', 'original_structured_stdout']})
+            supervision = read_json(attempt_directory / 'command-supervision.json')
+            supervisor_identity = supervision.get('supervisor_native_identity')
+            if (supervision.get('command_process_lifetime_contract') != ROLE_COMMAND_PROCESS_LIFETIME_CONTRACT
+                    or supervision.get('process_ownership_scope') != REGISTERED_COMMAND_PROCESS_OWNERSHIP_SCOPE
+                    or not supervision.get('execution_token')
+                    or supervision.get('run_directory') != str(run_directory.resolve())
+                    or supervision.get('command_directory') != str(attempt_directory.resolve())
+                    or supervision.get('supervisor_pid') != process.pid
+                    or not recorded_native_process_identity_is_valid(supervisor_identity)
+                    or supervisor_identity['pid'] != process.pid or supervision.get('argv') != command):
+                raise ValueError('监督者退出后缺少同一次 CLI 派发的原生事实，等待原件补证')
+            returncode = supervision.get('command_returncode')
+            if type(returncode) is not int:
+                raise ValueError('监督者已退出但 CLI 退出码未知，保留原生结果与继承锁待恢复')
+            outcome.update(status='failed', returncode=returncode)
+            outcome.pop('recovery', None)
             raw_output = (attempt_directory / "stdout.txt").read_text(errors="replace")
             raw_error = (attempt_directory / "stderr.txt").read_text(errors="replace")
-            outcome["returncode"] = returncode
             failure = classify_role_failure(raw_output, raw_error, returncode, output_format)
             if output_format != "text":
                 outcome.update(native_invocation_facts(raw_output))
@@ -403,7 +426,9 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
             finish_owned_process_registration(run_directory, os.getpid(), 'role_worker')
             redactions = _role_redactions(request, environment)
             try:
-                _redact_role_artifacts(attempt_directory, request, redactions)
+                # CLI 仍可能写原输出，延至继承锁释放后的对账，避免替换活跃输出 inode。
+                if outcome.get('recovery', {}).get('category') != 'native_cli_completion_unknown':
+                    _redact_role_artifacts(attempt_directory, request, redactions)
             except (OSError, ValueError) as error:
                 outcome.update({"status": "failed", "error": str(error), "retryable": False})
             if "error" in outcome:

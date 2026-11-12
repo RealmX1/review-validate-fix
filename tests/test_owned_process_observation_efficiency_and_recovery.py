@@ -5,6 +5,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+from unittest.mock import Mock
 
 import pytest
 
@@ -14,6 +15,106 @@ from core.task_snapshot_review.native_owned_process_observation import (
     native_process_identity, native_process_start_identity_matches,
 )
 from core.task_snapshot_review.persistent_artifacts import read_json, write_json
+
+
+@pytest.fixture
+def pending_registered_role_recovery_observation(tmp_path, monkeypatch):
+    from core.task_snapshot_review import review_recovery_evidence_observation as recovery
+    run = tmp_path / 'pending-role-readonly-recovery'
+    attempt = run / 'reviewer-1/attempt-001'
+    supervisor_identity = {'pid': 800601, 'start_identity': [100, 0], 'unique_process_id': 100}
+    command_identity = {'pid': 800602, 'start_identity': [101, 0], 'unique_process_id': 101}
+    facts = {'execution_token': 'pending-role-recovery-token', 'command_directory': str(attempt.resolve()),
+        'command_process_lifetime_contract': ROLE_COMMAND_PROCESS_LIFETIME_CONTRACT,
+        'host_boot_identity': 'registered-host-boot', 'status': 'running',
+        'ownership_observation_coverage_status': 'complete',
+        'supervisor_pid': supervisor_identity['pid'], 'supervisor_native_identity': supervisor_identity,
+        'command_pid': command_identity['pid'], 'command_native_identity': command_identity}
+    write_json(run / 'run.json', {key + '_sha256': 'frozen-input-digest'
+        for key in ('requirements', 'patch', 'review_input', 'decision_facts')})
+    write_json(attempt / 'command-supervision.json', facts)
+    write_json(attempt / 'outcome.json', {'status': 'unknown', 'cli_exit_proven': False})
+    execution_lifecycle.register_supervised_command_directory(run, attempt)
+    monkeypatch.setattr(recovery, 'verify_repository_identity', lambda record: None)
+    monkeypatch.setattr(recovery, 'verified_execution_plan', lambda *args: {'fix': True})
+    monkeypatch.setattr(recovery, 'machine_evidence_request_binding', lambda *args: {'run_id': 'pending-role-recovery'})
+    monkeypatch.setattr(recovery, 'registered_host_recovery_inputs', lambda *args: {})
+    monkeypatch.setattr(recovery, 'file_sha256', lambda path: 'frozen-input-digest')
+    return recovery, run, attempt, facts
+
+
+@pytest.mark.parametrize('exited_process', ['supervisor', 'command'])
+def test_pending_cleanup_readonly_recovery_evidence_changes_when_registered_process_exits(
+        pending_registered_role_recovery_observation, monkeypatch, exited_process):
+    recovery, run, attempt, facts = pending_registered_role_recovery_observation
+    supervisor_identity = facts['supervisor_native_identity']
+    command_identity = facts['command_native_identity']
+    current_identities = {supervisor_identity['pid']: supervisor_identity if exited_process == 'supervisor' else None,
+        command_identity['pid']: command_identity}
+    identity_queries = Mock(side_effect=lambda pid: current_identities[pid])
+    monkeypatch.setattr(recovery, 'native_host_boot_identity', lambda: facts['host_boot_identity'])
+    monkeypatch.setattr(recovery, 'native_process_identity', identity_queries)
+    signal_request = Mock()
+    monkeypatch.setattr(os, 'kill', signal_request)
+    monkeypatch.setattr(os, 'killpg', signal_request)
+    original_path_open = Path.open
+    def readonly_path_open(path, mode='r', *args, **kwargs):
+        assert not any(marker in mode for marker in ('w', 'a', 'x', '+')), '只读恢复观测不能打开写入文件'
+        return original_path_open(path, mode, *args, **kwargs)
+    monkeypatch.setattr(Path, 'open', readonly_path_open)
+    originals = {path: path.read_bytes() for path in run.rglob('*') if path.is_file()}
+
+    live = recovery.observe_task_review_recovery_evidence(run)
+    assert live['status'] == 'known'
+    assert recovery.observe_task_review_recovery_evidence(run) == live
+    current_identities[facts[exited_process + '_native_identity']['pid']] = None
+    exited = recovery.observe_task_review_recovery_evidence(run)
+
+    assert exited['status'] == 'known'
+    assert exited['evidenceSha256'] != live['evidenceSha256']
+    assert recovery.observe_task_review_recovery_evidence(run) == exited
+    assert [call.args[0] for call in identity_queries.call_args_list] == [supervisor_identity['pid'], command_identity['pid']] * 4
+    assert originals == {path: path.read_bytes() for path in run.rglob('*') if path.is_file()}
+    signal_request.assert_not_called()
+
+
+@pytest.mark.parametrize('invalid_identity', [None, {'start_identity': [100, 0]},
+    {'pid': 800601}, {'pid': 800604, 'start_identity': [100, 0]},
+    {'pid': 2**32 + 800601, 'start_identity': [100, 0]}])
+def test_pending_cleanup_readonly_recovery_skips_missing_or_invalid_registered_identities(
+        pending_registered_role_recovery_observation, monkeypatch, invalid_identity):
+    recovery, run, attempt, facts = pending_registered_role_recovery_observation
+    write_json(attempt / 'command-supervision.json', {**facts,
+        'supervisor_native_identity': invalid_identity, 'command_native_identity': invalid_identity})
+    identity_queries = Mock()
+    monkeypatch.setattr(recovery, 'native_host_boot_identity', lambda: facts['host_boot_identity'])
+    monkeypatch.setattr(recovery, 'native_process_identity', identity_queries)
+
+    first = recovery.observe_task_review_recovery_evidence(run)
+
+    assert first['status'] == 'known'
+    assert recovery.observe_task_review_recovery_evidence(run) == first
+    identity_queries.assert_not_called()
+
+
+def test_pending_cleanup_readonly_recovery_detects_boot_change_without_querying_old_process_ids(
+        pending_registered_role_recovery_observation, monkeypatch):
+    recovery, run, attempt, facts = pending_registered_role_recovery_observation
+    current_boot = [facts['host_boot_identity']]
+    identity_queries = Mock(side_effect=lambda pid: facts['supervisor_native_identity']
+        if pid == facts['supervisor_pid'] else facts['command_native_identity'])
+    monkeypatch.setattr(recovery, 'native_host_boot_identity', lambda: current_boot[0])
+    monkeypatch.setattr(recovery, 'native_process_identity', identity_queries)
+    first = recovery.observe_task_review_recovery_evidence(run)
+    identity_queries.reset_mock()
+    current_boot[0] = 'current-host-boot'
+
+    changed = recovery.observe_task_review_recovery_evidence(run)
+
+    assert changed['status'] == 'known'
+    assert changed['evidenceSha256'] != first['evidenceSha256']
+    assert recovery.observe_task_review_recovery_evidence(run) == changed
+    identity_queries.assert_not_called()
 
 
 @pytest.mark.parametrize('boot_uuid', [b'12345678-1234-5678-1234-567812345678', b''])

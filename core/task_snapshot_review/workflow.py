@@ -23,7 +23,7 @@ from .execution_lifecycle import (
 from .machine_evidence import (WorkspacePreparationFailed, collect_shared_machine_evidence, collect_incomplete_fixer_machine_validation,
     prepare_isolated_workspace, verified_execution_plan, ensure_previous_supervised_commands_exited)
 from .reviewer_machine_evidence_recovery import collect_reviewer_machine_evidence_requests, verified_reviewer_machine_evidence_for_role
-from .review_recovery_evidence_observation import machine_evidence_request_binding
+from .review_recovery_evidence_observation import file_sha256, machine_evidence_request_binding
 from .reviewer_account_eligibility import (
     reviewer_eligibility, reviewer_credential_evidence_paths, reviewer_execution_environment,
 )
@@ -127,7 +127,7 @@ def persistent_configuration(config: dict) -> dict:
 
 def configuration_digest(config: dict) -> str:
     executable = shutil.which(config["command"][0])
-    executable_identity = hashlib.sha256(Path(executable).read_bytes()).hexdigest() if executable else None
+    executable_identity = file_sha256(Path(executable)) if executable else None
     return hashlib.sha256(json.dumps({"configuration": persistent_configuration(config), "executable_sha256": executable_identity}, sort_keys=True).encode()).hexdigest()
 
 
@@ -208,6 +208,10 @@ def _start_role(run_directory: Path, record: dict, role_directory: Path, role: s
     attempts = sorted(role_directory.glob("attempt-*"))
     context_supplements = registered_main_agent_context_supplements(run_directory) if role == "fixer" else []
     if any(process_lock_is_held(attempt) for attempt in attempts):
+        return None, None
+    if any((attempt / 'outcome.json').exists()
+            and read_json(attempt / 'outcome.json').get('recovery', {}).get('category') == 'native_cli_completion_unknown'
+            and not (attempt / 'reconciled-native-completion.json').exists() for attempt in attempts):
         return None, None
     for attempt in attempts:
         if (attempt/'request.json').exists() and not (attempt/'outcome.json').exists():

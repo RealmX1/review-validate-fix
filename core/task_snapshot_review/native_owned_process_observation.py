@@ -98,11 +98,16 @@ def native_process_identity(pid: int) -> dict | None:
 def terminate_observed_owned_processes(processes: dict[int, dict]) -> list[dict]:
     observations = []
     for pid, recorded in processes.items():
+        if not recorded_native_process_identity_is_valid(recorded) or recorded['pid'] != pid:
+            observations.append({**(recorded if isinstance(recorded, dict) else {'pid': pid}), 'cancellation_status': 'unknown'})
+            continue
         try:
             current = native_process_identity(pid)
             if current is None:
                 status = 'exited'
-            elif current['start_identity'] != recorded['start_identity']:
+            elif not recorded_native_process_identity_is_valid(current):
+                status = 'unknown'
+            elif not native_process_start_identity_matches(current, recorded):
                 status = 'identity_changed_no_signal'
             elif pid == os.getpid():
                 status = 'unknown'

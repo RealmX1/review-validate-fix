@@ -197,7 +197,9 @@ def test_outer_partial_observation_survives_query_failure(tmp_path, monkeypatch,
 
 def test_stop_uses_saved_direct_identity_when_descendant_list_was_not_persisted(tmp_path, monkeypatch):
     child = {'pid': 800602, 'start_identity': [101, 0]}
+    monkeypatch.setattr(retained_command_supervisor, 'native_host_boot_identity', lambda: 'controlled-host-boot')
     write_json(tmp_path / 'command-supervision.json', {'execution_token': 'registered-command',
+        'host_boot_identity': 'controlled-host-boot',
         'supervisor_pid': 800601, 'supervisor_native_identity': {'pid': 800601, 'start_identity': [100, 0]},
         'command_pid': child['pid'], 'command_native_identity': child, 'owned_processes': []})
     def unavailable_snapshot(*args, **kwargs):

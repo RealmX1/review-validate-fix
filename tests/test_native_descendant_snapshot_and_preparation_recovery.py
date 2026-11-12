@@ -201,3 +201,94 @@ def test_reconciliation_retains_discovered_child_after_parent_exit_and_query_fai
     assert read_json(reconciliation_file)['status'] == 'exited'
     assert state.unrelated_pid not in state.inspected
     assert supervision_file.read_bytes() == original
+
+
+@pytest.mark.parametrize('collection_path', [
+    'reviewer-1/attempt-001/preparation',
+    'machine-evidence/attempt-001/commands',
+    'final-validation/attempt-001/commands',
+])
+def test_interrupted_registered_launch_reconciles_after_native_host_boot_changes(
+        tmp_path, monkeypatch, collection_path):
+    run_directory = tmp_path / 'interrupted-launch-recovery'
+    collection_directory = run_directory / collection_path
+    command_directory = collection_directory / 'command-001'
+    register_supervised_command_directory(run_directory, command_directory)
+    supervision_file = command_directory / 'command-supervision.json'
+    write_json(supervision_file, {
+        'execution_token': 'interrupted-registered-execution',
+        'supervisor_pid': 800601,
+        'supervisor_native_identity': {'pid': 800601, 'start_identity': [100, 0], 'unique_process_id': 1001},
+        'process_ownership_scope': observation.REGISTERED_COMMAND_PROCESS_OWNERSHIP_SCOPE,
+        'command_process_lifetime_contract': observation.REGISTERED_COMMAND_PROCESS_LIFETIME_CONTRACT,
+        'host_boot_identity': 'previous-native-boot',
+        'status': 'running',
+        'command_launch_intent_recorded': True,
+        'ownership_observation_coverage_status': 'unknown',
+    })
+    original_supervision = supervision_file.read_bytes()
+    boot_observations = []
+    current_boot = ['previous-native-boot']
+
+    def observe_native_boot():
+        boot_observations.append(current_boot[0])
+        return current_boot[0]
+
+    monkeypatch.setattr(observation, 'native_host_boot_identity', observe_native_boot)
+    monkeypatch.setattr(observation, 'native_process_identity',
+        lambda *_arguments, **_keywords: pytest.fail('派发中断及重启补证均不应查询旧 PID'))
+    monkeypatch.setattr(observation, 'owned_process_snapshot',
+        lambda *_arguments, **_keywords: pytest.fail('重启证据足够，不应扫描后代'))
+    monkeypatch.setattr(observation.os, 'kill',
+        lambda *_arguments, **_keywords: pytest.fail('恢复对账不能发送信号'))
+
+    with pytest.raises(machine_evidence.WorkspacePreparationFailed):
+        machine_evidence.ensure_previous_supervised_commands_exited(run_directory, collection_directory)
+    reconciliation_file = command_directory / 'descendant-exit-reconciliation.json'
+    assert read_json(reconciliation_file)['status'] == 'unknown'
+
+    current_boot[0] = 'current-native-boot'
+    machine_evidence.ensure_previous_supervised_commands_exited(run_directory, collection_directory)
+    reconciliation = read_json(reconciliation_file)
+    assert reconciliation['status'] == 'exited'
+    assert reconciliation['source'] == 'host_boot_changed'
+    assert reconciliation['execution_token'] == 'interrupted-registered-execution'
+    assert supervision_file.read_bytes() == original_supervision
+    assert boot_observations == ['previous-native-boot', 'current-native-boot']
+
+    original_reconciliation = reconciliation_file.read_bytes()
+    machine_evidence.ensure_previous_supervised_commands_exited(run_directory, collection_directory)
+    assert reconciliation_file.read_bytes() == original_reconciliation
+    assert boot_observations == ['previous-native-boot', 'current-native-boot']
+
+
+@pytest.mark.parametrize('registration_field_to_remove,invalid_execution_token', [
+    ('process_ownership_scope', None), ('command_process_lifetime_contract', None),
+    ('execution_token', None), (None, ''), (None, None),
+])
+def test_interrupted_launch_boot_reconciliation_preserves_registration_identity_gates(
+        tmp_path, monkeypatch, registration_field_to_remove, invalid_execution_token):
+    run_directory = tmp_path / 'unproven-interrupted-launch'
+    collection_directory = run_directory / 'machine-evidence'
+    command_directory = collection_directory / 'command-001'
+    register_supervised_command_directory(run_directory, command_directory)
+    facts = {
+        'execution_token': 'interrupted-registered-execution',
+        'supervisor_pid': 800601,
+        'supervisor_native_identity': {'pid': 800601, 'start_identity': [100, 0]},
+        'process_ownership_scope': observation.REGISTERED_COMMAND_PROCESS_OWNERSHIP_SCOPE,
+        'command_process_lifetime_contract': observation.REGISTERED_COMMAND_PROCESS_LIFETIME_CONTRACT,
+        'host_boot_identity': 'previous-native-boot',
+        'status': 'running',
+        'command_launch_intent_recorded': True,
+    }
+    if registration_field_to_remove:
+        del facts[registration_field_to_remove]
+    else:
+        facts['execution_token'] = invalid_execution_token
+    write_json(command_directory / 'command-supervision.json', facts)
+    monkeypatch.setattr(observation, 'native_host_boot_identity',
+        lambda: pytest.fail('归属登记不完整时不能使用重启证据'))
+    with pytest.raises(machine_evidence.WorkspacePreparationFailed):
+        machine_evidence.ensure_previous_supervised_commands_exited(run_directory, collection_directory)
+    assert read_json(command_directory / 'descendant-exit-reconciliation.json')['status'] == 'unknown'

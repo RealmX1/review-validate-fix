@@ -12,7 +12,10 @@ from pathlib import Path
 
 from .machine_evidence import verified_execution_plan, prepared_workspace_dependency_identity
 from .persistent_artifacts import git_text, read_json, verify_repository_identity
-from .native_owned_process_observation import native_host_boot_identity, native_process_identity, ROLE_COMMAND_PROCESS_LIFETIME_CONTRACT
+from .native_owned_process_observation import (
+    native_host_boot_identity, native_process_identity, native_process_start_identity_matches,
+    recorded_native_process_identity_is_valid, ROLE_COMMAND_PROCESS_LIFETIME_CONTRACT,
+)
 
 
 def canonical_json_material_sha256(value: object) -> str:
@@ -188,6 +191,17 @@ def observe_task_review_recovery_evidence(run_directory: Path) -> dict:
                                 owned_processes=[native_process_identity(item['pid']) for item in cleanup.get('owned_processes', [])],
                                 bounded_retry_due=cleanup.get('unchanged_recovery_attempt_count', 0) < 3
                                     and time.time() >= cleanup.get('retry_not_before', float('inf')))
+                        elif cleanup['status'] == 'pending' and supervision.get('host_boot_identity'):
+                            material['host_boot_identity'] = native_host_boot_identity()
+                            if material['host_boot_identity'] == supervision['host_boot_identity']:
+                                registered_supervisor_and_command_native_identity_matches = {}
+                                for process_kind in ('supervisor', 'command'):
+                                    registered_identity = supervision.get(process_kind + '_native_identity')
+                                    if (recorded_native_process_identity_is_valid(registered_identity)
+                                            and registered_identity['pid'] == supervision.get(process_kind + '_pid')):
+                                        registered_supervisor_and_command_native_identity_matches[process_kind] = native_process_start_identity_matches(
+                                            native_process_identity(registered_identity['pid']), registered_identity)
+                                material['registered_supervisor_and_command_native_identity_matches'] = registered_supervisor_and_command_native_identity_matches
                         resource_cleanup_facts.append(material)
                     native_command_facts.add(canonical_json_material_sha256({
                         key: supervision.get(key) for key in ("argv", "status", "returncode", "source_tree_after", "stdout_sha256", "stderr_sha256")
