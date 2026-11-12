@@ -159,7 +159,7 @@ def test_missing_contract_or_interrupted_registration_never_becomes_exit_proof(t
     assert read_json(command_directory / 'descendant-exit-reconciliation.json')['status'] == 'unknown'
 
 
-def test_outer_wait_defers_unchanged_query_failure_until_direct_exit(tmp_path, monkeypatch):
+def test_outer_wait_bounds_unchanged_query_failure_and_rechecks_direct_exit(tmp_path, monkeypatch):
     write_json(tmp_path / 'run.json', {})
     observations = []
     monkeypatch.setattr(execution_lifecycle, 'observe_owned_process_group_descendants',

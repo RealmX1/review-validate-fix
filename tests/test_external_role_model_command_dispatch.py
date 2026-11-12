@@ -41,7 +41,7 @@ def test_unused_health_command_does_not_prevent_actual_role_dispatch(tmp_path, r
         "print(json.dumps({'role':'meta','type':'session.resume_hint','content':'isolated-test-session'}))\n"
     )
     executable.chmod(0o755)
-    run = attempt / "execution-lifecycle"
+    run = tmp_path
     write_json(run / "run.json", {"status": "review_pending"})
     write_json(attempt / "request.json", {
         "run_directory": str(run), "role": role, "repository": str(repository),

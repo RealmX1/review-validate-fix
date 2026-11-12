@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import hashlib
 import fcntl
 import os
 import signal
@@ -13,7 +12,13 @@ from pathlib import Path
 
 from . import harness_cli_adapters as cli
 from .persistent_artifacts import exclusive_lock, git, git_text, read_json, write_bytes, write_json
-from .execution_lifecycle import ExecutionRevoked, ensure_execution_not_revoked, register_owned_process, wait_for_owned_process, process_start_identity, persist_role_progress_observation
+from .execution_lifecycle import (
+    ExecutionRevoked, ensure_execution_not_revoked, register_owned_process, register_supervised_command_directory,
+    finish_owned_process_registration, wait_for_owned_process, process_start_identity, persist_role_progress_observation,
+)
+from .native_owned_process_observation import ROLE_COMMAND_PROCESS_LIFETIME_CONTRACT
+from .role_owned_process_cleanup import cleanup_role_owned_processes
+from .review_recovery_evidence_observation import file_sha256
 from .role_failure_recovery import classify_role_failure, native_invocation_facts
 from .machine_evidence import WorkspacePreparationFailed, prepare_isolated_workspace
 from .reviewer_account_eligibility import reviewer_execution_environment, reviewer_eligibility, record_formal_invocation_result
@@ -43,6 +48,7 @@ def _redact_role_artifacts(attempt_directory: Path, request: dict, redactions: d
     # 成功、失败及恢复都清理同一组原始文件，不能只脱敏 stdout。
     paths = {attempt_directory / "stdout.txt", attempt_directory / "stderr.txt",
              attempt_directory / "result.json", attempt_directory / "model-invocation.json", Path(request["result_file"]),
+             attempt_directory / 'command-supervision.json', attempt_directory / 'role-owned-process-cleanup.json',
              *attempt_directory.glob("preparation/command-*/stdout.txt"), *attempt_directory.glob("preparation/command-*/stderr.txt")}
     for path in paths:
         if path.exists():
@@ -183,6 +189,9 @@ def reconcile_completed_role_attempt(attempt_directory: Path) -> None:
         return
     request = read_json(request_file)
     try:
+        supervision_file = attempt_directory / 'command-supervision.json'
+        if supervision_file.exists() and read_json(supervision_file).get('command_process_lifetime_contract') == ROLE_COMMAND_PROCESS_LIFETIME_CONTRACT:
+            cleanup_role_owned_processes(attempt_directory)
         reconcile_formal_invocation_availability(attempt_directory, request)
         redactions = _role_redactions(request, role_environment(request))
         _redact_role_artifacts(attempt_directory, request, redactions)
@@ -300,14 +309,20 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
             invocation_started_at = time.time()
             write_json(attempt_directory/'model-invocation.json',{'started_at':invocation_started_at, "command": command,
                        "cli_version": cli_version, "cli_executable": executable,
-                       "cli_executable_sha256": hashlib.sha256(Path(executable).read_bytes()).hexdigest() if executable else None,
+                       "cli_executable_sha256": file_sha256(Path(executable)) if executable else None,
                        "output_format": output_format})
             with (attempt_directory / "stdin.txt").open("rb") as stdin, (attempt_directory / "stdout.txt").open("wb") as stdout, (attempt_directory / "stderr.txt").open("wb") as stderr:
-                # harness 继承同一把锁；worker 意外退出时，恢复方先等待真实子进程结束。
-                process = subprocess.Popen(command, stdin=stdin, stdout=stdout, stderr=stderr, cwd=workspace,
-                                           env=environment, start_new_session=True, pass_fds=(execution_lock.fileno(),))
-                active_process=process
-                register_owned_process(run_directory, process.pid, "role_cli", owns_process_group=True)
+                # 监督者与 harness 继承同一把锁；worker 崩溃后仍完成资源回收。
+                with exclusive_lock(run_directory / 'execution-revocation.lock'):
+                    ensure_execution_not_revoked(run_directory)
+                    register_supervised_command_directory(run_directory, attempt_directory)
+                    launch_command = [sys.executable, str(Path(__file__).with_name('retained_command_supervisor.py')),
+                        str(run_directory), str(attempt_directory), json.dumps([execution_lock.fileno()]), str(attempt_directory / 'model-invocation.json'),
+                        ROLE_COMMAND_PROCESS_LIFETIME_CONTRACT]
+                    process = subprocess.Popen(launch_command, stdin=stdin, stdout=stdout, stderr=stderr, cwd=workspace,
+                                               env=environment, start_new_session=True, pass_fds=(execution_lock.fileno(),))
+                    active_process=process
+                register_owned_process(run_directory, process.pid, "role_command_supervisor", owns_process_group=True)
                 if cancellation_requested:
                     cancel_role(signal.SIGTERM,None)
                 progress = {}
@@ -317,7 +332,7 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
                     progress["identity_observation_error"] = str(error)
                 persist_role_progress_observation(attempt_directory / "progress.json", progress)
                 returncode = wait_for_owned_process(process, run_directory, timeout=None,
-                    progress_file=attempt_directory / "progress.json")
+                    progress_file=attempt_directory / "progress.json", observe_registered_process_descendants=False)
             raw_output = (attempt_directory / "stdout.txt").read_text(errors="replace")
             raw_error = (attempt_directory / "stderr.txt").read_text(errors="replace")
             outcome["returncode"] = returncode
@@ -361,13 +376,31 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
             outcome["error"] = str(error)
             outcome.setdefault("retryable", False)
         finally:
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
             if active_process is not None and active_process.poll() is None:
-                os.killpg(active_process.pid,signal.SIGTERM)
                 try:
-                    active_process.wait(timeout=5)
+                    os.killpg(active_process.pid,signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    active_process.wait(timeout=8)
                 except subprocess.TimeoutExpired:
-                    os.killpg(active_process.pid,signal.SIGKILL)
+                    try:
+                        os.killpg(active_process.pid,signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
                     active_process.wait()
+            if active_process is not None:
+                finish_owned_process_registration(run_directory, active_process.pid, 'role_command_supervisor')
+                try:
+                    cleanup = cleanup_role_owned_processes(attempt_directory)
+                    outcome['role_owned_process_cleanup_status'] = cleanup['status']
+                except (OSError, RuntimeError, ValueError) as error:
+                    outcome.update(role_owned_process_cleanup_status='unknown', role_owned_process_cleanup_error=str(error))
+            else:
+                outcome['role_owned_process_cleanup_status'] = 'exited'
+            finish_owned_process_registration(run_directory, os.getpid(), 'role_worker')
             redactions = _role_redactions(request, environment)
             try:
                 _redact_role_artifacts(attempt_directory, request, redactions)
@@ -378,7 +411,8 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
             outcome["finished_at"] = time.time()
             write_json(attempt_directory / "outcome.json", cli.redact_configured_environment_variable_values_in_json_value(outcome, redactions))
             persist_role_progress_observation(attempt_directory / "progress.json", {
-                "status": outcome["status"], "last_observed_at": outcome["finished_at"], "waiting_reason": None})
+                "status": outcome["status"], "last_observed_at": outcome["finished_at"], "waiting_reason": None,
+                'role_owned_process_cleanup_status': outcome.get('role_owned_process_cleanup_status', 'unknown')})
 
 
 def launch_role(attempt_directory: Path, *, environment_overrides: dict | None = None) -> subprocess.Popen:

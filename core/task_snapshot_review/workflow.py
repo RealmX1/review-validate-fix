@@ -180,7 +180,9 @@ def _role_result(role_directory: Path, *, latest: bool = False, include_incomple
             result = read_json(attempt / "result.json")
             if not latest and "findings" in result:
                 result["findings"] = partial_findings + result["findings"]
-            return {"attempt_directory": str(attempt), "result": result}
+            from .role_owned_process_cleanup import role_owned_process_cleanup_observation
+            return {"attempt_directory": str(attempt), "result": result,
+                'role_owned_process_cleanup_status': role_owned_process_cleanup_observation(attempt)['status']}
         if latest and not include_incomplete:
             return None
         if (attempt / "result.json").exists():
@@ -707,7 +709,7 @@ def _validate(run_directory: Path, record: dict, commands: list[list[str]], lock
                         raise
                     register_owned_process(run_directory, process.pid, "final_validation", owns_process_group=True)
                 from .execution_lifecycle import wait_for_owned_process
-                returncode = wait_for_owned_process(process, run_directory)
+                returncode = wait_for_owned_process(process, run_directory, observe_registered_process_descendants=False)
             except (KeyboardInterrupt, ExecutionRevoked) as interruption:
                 if isinstance(interruption, KeyboardInterrupt) and not execution_is_revoked(run_directory):
                     validation["status"] = "interrupted"
@@ -947,6 +949,8 @@ def resume_review(run_directory: Path, *, reviewer_configs: list[dict] | None = 
     run_directory = run_directory.expanduser().resolve()
     with exclusive_lock(run_directory / "controller.lock", blocking=False):
         record = read_json(run_directory / "run.json")
+        from .role_owned_process_cleanup import reconcile_registered_role_owned_process_cleanup
+        reconcile_registered_role_owned_process_cleanup(run_directory)
         execution_status_before_resume = record["status"]
         if os.environ.get("KANBAN_COMMAND_EXECUTION_REVOCATION_FILE"):
             previous_revocation = record.get("command_execution_revocation_file")

@@ -35,7 +35,7 @@ def role_repository(tmp_path):
 
 def _request(attempt, repo, program, *, role="reviewer", output_format="text", env=None):
     attempt.mkdir()
-    run_directory = attempt / "execution-lifecycle"
+    run_directory = attempt.parent
     write_json(run_directory / "run.json", {"status": "review_pending"})
     request = {
         "run_directory": str(run_directory),
@@ -67,6 +67,14 @@ def _assert_no_secret(directory):
     for path in directory.rglob("*"):
         if path.is_file() and "workspace" not in path.relative_to(directory).parts:
             assert SECRET.encode() not in path.read_bytes(), str(path)
+
+
+def test_large_role_argv_is_loaded_from_registered_invocation_file(role_repository, tmp_path):
+    attempt = tmp_path / 'large-role-argument'
+    program = 'unused_large_argument = ' + repr('é' * 60_000) + '\n'
+    program += "import json; print(json.dumps({'status':'completed','audit_summary':'大参数未因监督层转义膨胀而失败','findings':[]}))"
+    _request(attempt, role_repository, program)
+    assert _launch(attempt)['status'] == 'completed'
 
 
 def test_finished_native_output_survives_missing_worker_outcome_without_invented_exit_code(role_repository, tmp_path):

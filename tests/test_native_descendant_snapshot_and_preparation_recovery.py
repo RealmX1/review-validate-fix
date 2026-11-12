@@ -139,6 +139,7 @@ def test_reconciliation_retains_discovered_child_after_parent_exit_and_query_fai
     parent_identity = observation.native_process_identity(state.child_pid)
     supervision_file = command_directory / 'command-supervision.json'
     write_json(supervision_file, {
+        'execution_token': 'reconciliation-owned-child-execution',
         'process_ownership_scope': observation.REGISTERED_COMMAND_PROCESS_OWNERSHIP_SCOPE,
         'command_process_lifetime_contract': observation.REGISTERED_COMMAND_PROCESS_LIFETIME_CONTRACT,
         'status': 'running', 'supervisor_pid': state.supervisor_pid,

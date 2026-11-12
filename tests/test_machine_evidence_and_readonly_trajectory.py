@@ -72,3 +72,30 @@ def test_historical_native_usage_can_be_proven_from_original_stream_without_writ
     assert result["runs"][0]["attempts"][0]["native_usage"] == [{"input_tokens": 12, "output_tokens": 3}]
     assert result["runs"][0]["attempts"][0]["native_facts_evidence"].endswith("stdout.txt")
     assert before == {str(path): path.read_bytes() for path in run.rglob("*") if path.is_file()}
+
+
+def test_cleanup_recovery_observation_detects_boot_change_without_writing_or_repeating_model(repository, tmp_path, monkeypatch):
+    from core.task_snapshot_review import review_recovery_evidence_observation as recovery
+    from core.task_snapshot_review.role_owned_process_cleanup import reconcile_registered_role_owned_process_cleanup
+    run = automatic_snapshot(repository, tmp_path, commands=[[sys.executable, '-c', 'pass']])
+    resume_review(run, reviewer_configs=[fake_config(tmp_path), fake_config(tmp_path)])
+    attempt = run / 'reviewer-1/attempt-001'
+    original_notice_id = read_json(run / 'business-result.json')['agentContinuationNotice']['noticeId']
+    cleanup_file = attempt / 'role-owned-process-cleanup.json'
+    write_json(cleanup_file, {**read_json(cleanup_file), 'status': 'unknown', 'owned_processes': [],
+        'retry_not_before': 2**40, 'unchanged_recovery_attempt_count': 3})
+    before = {str(path): path.read_bytes() for path in run.rglob('*') if path.is_file()}
+    first = recovery.observe_task_review_recovery_evidence(run)
+    assert first['status'] == 'known'
+    monkeypatch.setattr(recovery, 'native_host_boot_identity', lambda: 'different-boot-generation')
+    second = recovery.observe_task_review_recovery_evidence(run)
+    assert second['status'] == 'known'
+    assert first['evidenceSha256'] != second['evidenceSha256']
+    assert before == {str(path): path.read_bytes() for path in run.rglob('*') if path.is_file()}
+    from core.task_snapshot_review import role_owned_process_cleanup as cleanup
+    monkeypatch.setattr(cleanup, 'native_host_boot_identity', lambda: 'different-boot-generation')
+    reconcile_registered_role_owned_process_cleanup(run)
+    assert read_json(cleanup_file)['status'] == 'exited'
+    assert len(list(run.glob('reviewer-*/attempt-*/model-invocation.json'))) == 2
+    assert resume_review(run)['agentContinuationNotice']['noticeId'] == original_notice_id
+    assert len(list(run.glob('reviewer-*/attempt-*/model-invocation.json'))) == 2

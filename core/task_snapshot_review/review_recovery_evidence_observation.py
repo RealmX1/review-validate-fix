@@ -12,6 +12,7 @@ from pathlib import Path
 
 from .machine_evidence import verified_execution_plan, prepared_workspace_dependency_identity
 from .persistent_artifacts import git_text, read_json, verify_repository_identity
+from .native_owned_process_observation import native_host_boot_identity, native_process_identity, ROLE_COMMAND_PROCESS_LIFETIME_CONTRACT
 
 
 def canonical_json_material_sha256(value: object) -> str:
@@ -168,16 +169,31 @@ def observe_task_review_recovery_evidence(run_directory: Path) -> dict:
                 originals[str(path.relative_to(run_directory)) + ":bounded_retry_due"] = True
         registry = run_directory / "registered-supervised-command-directories.json"
         native_command_facts = set()
+        resource_cleanup_facts = []
         if registry.exists():
             for directory in read_json(registry)["command_directories"]:
                 original = Path(directory).resolve() / "command-supervision.json"
                 original.relative_to(run_directory)
                 if original.exists():
                     supervision = read_json(original)
+                    if supervision.get('ownership_observation_coverage_status') == 'unknown':
+                        resource_cleanup_facts.append({'command_directory': str(original.parent),
+                            'host_boot_identity': native_host_boot_identity()})
+                    if supervision.get('command_process_lifetime_contract') == ROLE_COMMAND_PROCESS_LIFETIME_CONTRACT:
+                        from .role_owned_process_cleanup import role_owned_process_cleanup_observation
+                        cleanup = role_owned_process_cleanup_observation(original.parent)
+                        material = {'command_directory': str(original.parent), 'status': cleanup['status']}
+                        if cleanup['status'] == 'unknown':
+                            material.update(host_boot_identity=native_host_boot_identity(),
+                                owned_processes=[native_process_identity(item['pid']) for item in cleanup.get('owned_processes', [])],
+                                bounded_retry_due=cleanup.get('unchanged_recovery_attempt_count', 0) < 3
+                                    and time.time() >= cleanup.get('retry_not_before', float('inf')))
+                        resource_cleanup_facts.append(material)
                     native_command_facts.add(canonical_json_material_sha256({
                         key: supervision.get(key) for key in ("argv", "status", "returncode", "source_tree_after", "stdout_sha256", "stderr_sha256")
                     } if supervision.get("status") == "completed" else {"argv": supervision.get("argv"), "status": "command_result_not_proven"}))
         originals["native_registered_command_result_materials"] = sorted(native_command_facts)
+        originals['role_owned_resource_cleanup_materials'] = resource_cleanup_facts
         for request_file in sorted(run_directory.glob("*/attempt-*/request.json")):
             config = read_json(request_file).get("config", {})
             for source in [config.get("configuration_file_path"), *config.get("credential_evidence_paths", [])]:
