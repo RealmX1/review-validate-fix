@@ -18,6 +18,9 @@ from core.task_snapshot_review.task_snapshot import create_snapshot, reviewer_al
 from core.task_snapshot_review.task_review_decision_facts import collect_task_review_decision_facts
 from core.task_snapshot_review.workflow import resume_review, load_reviewer_configuration
 from core.task_snapshot_review.execution_lifecycle import revoke_execution
+from core.plan_material_review import (
+    cancel_plan_material_review, create_plan_material_review, observe_plan_material_review, resume_plan_material_review,
+)
 from core.task_snapshot_review.main_agent_context_supplements import register_main_agent_context_supplement
 from core.task_snapshot_review.agent_review_summary_artifacts import acknowledge_agent_review_notice
 from core.task_snapshot_review.trajectory_analysis import analyze_runs
@@ -95,6 +98,21 @@ def main(argv=None) -> int:
     collect.add_argument("--list-repository", help="匹配旧人工 Issue 前读取开放与关闭问题")
     analyze = commands.add_parser("analyze", help="按需汇总原始运行事实，不产生完成门禁")
     analyze.add_argument("--run-dir", type=Path, required=True, action="append")
+    plan_review = commands.add_parser("review-plan-materials", help="冻结显式计划、需求与范围并运行独立材料评审")
+    plan_review.add_argument("--repo", type=Path, required=True, help="只读代码上下文仓库；冻结当前 HEAD")
+    plan_review.add_argument("--material-file", type=Path, action="append", required=True)
+    plan_review.add_argument("--requirements-file", type=Path, required=True)
+    plan_review.add_argument("--scope-file", type=Path, required=True)
+    plan_review.add_argument("--run-directory", type=Path, required=True)
+    plan_review.add_argument("--reviewer-config", type=Path)
+    plan_review.add_argument("--prepare-only", action="store_true")
+    for command, help_text in (("resume-plan-material-review", "接续原计划材料评审，不重复已有执行"),
+                               ("observe-plan-material-review", "只读观察精确计划材料评审，不派发模型"),
+                               ("cancel-plan-material-review", "持久撤销精确计划材料评审及所属进程")):
+        plan_command = commands.add_parser(command, help=help_text)
+        plan_command.add_argument("--run-dir", type=Path, required=True)
+        if command == "cancel-plan-material-review":
+            plan_command.add_argument("--reason", required=True)
     arguments = parser.parse_args(argv)
     root = resolved_rvf_user_local_data_paths().user_local_data_root
     if arguments.command in ('review-task-snapshot','resume-task-review'):
@@ -103,7 +121,20 @@ def main(argv=None) -> int:
         except (OSError,ValueError,RuntimeError):
             pass
     try:
-        if arguments.command == "review-task-snapshot":
+        if arguments.command == "review-plan-materials":
+            result = create_plan_material_review(repo=arguments.repo, material_files=arguments.material_file,
+                requirements_file=arguments.requirements_file, scope_file=arguments.scope_file,
+                run_directory=arguments.run_directory,
+                reviewer_config=load_reviewer_configuration(arguments.reviewer_config) if arguments.reviewer_config else None)
+            if not arguments.prepare_only:
+                result = resume_plan_material_review(arguments.run_directory)
+        elif arguments.command == "resume-plan-material-review":
+            result = resume_plan_material_review(arguments.run_dir)
+        elif arguments.command == "observe-plan-material-review":
+            result = observe_plan_material_review(arguments.run_dir)
+        elif arguments.command == "cancel-plan-material-review":
+            result = cancel_plan_material_review(arguments.run_dir, arguments.reason)
+        elif arguments.command == "review-task-snapshot":
             evidence = None
             decision_fact_evidence = None
             review_task_id = arguments.base_from_kanban_task or os.environ.get('KANBAN_TASK_ID') or os.environ.get('CLINE_KANBAN_TASK_ID') or arguments.kanban_task_id

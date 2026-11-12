@@ -1,5 +1,7 @@
 # Plan/Doc Review Routing Scaffold
 
+2026-11-12 更新：已新增显式 `review-plan-materials` 兄弟 lane，合同见[计划材料审阅](../plugins/review-validate-fix/skills/review-validate-fix/references/plan-material-review-contract.md)。以下保留 Stop Hook 自动路由草案的边界；Hook 仍不自动启动计划 reviewer。
+
 ## 背景
 
 RVF 的完整 review-validate-fix lane 面向实现改动：reviewer 找 bug，validate/fix

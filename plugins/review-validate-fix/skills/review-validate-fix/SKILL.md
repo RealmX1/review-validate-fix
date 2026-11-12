@@ -1,9 +1,11 @@
 ---
 name: review-validate-fix
-description: 用户明确调用 RVF，或主会话依据任务授权选择执行任务快照双审时使用。
+description: 用户明确调用 RVF，或主会话依据任务授权选择执行任务快照双审或显式计划材料审阅时使用。
 ---
 
 # 任务快照评审
+
+需要审阅计划本身时，使用独立的[显式计划材料 lane](references/plan-material-review-contract.md)：冻结计划、需求和范围，运行独立 reviewer，返回质量事实。它不从 Stop Hook 自动触发，不复用代码快照通过，不授予计划批准。
 
 一次冻结材料启动 → 匿名发现同时供主会话与独立 Validate-Fixer 核对 → 必要修复及完整树验证 → 简短后台结果交回 → 所属工作流审阅并处置结果。保留 SANTA-method 与角色独立上下文；默认一个逻辑匿名 fixer，普通修复最多三轮。
 
@@ -24,7 +26,7 @@ description: 用户明确调用 RVF，或主会话依据任务授权选择执行
 
    若主会话已通过工具读到某阶段结果，按摘要中的 `rvf acknowledge-review-notice --run-dir <精确目录> --notice-id <精确通知ID>` 登记消费，后台不再补发同阶段同修订。最终消费再次检查全部补充覆盖及最新修订，历史消费回执不授予新结果的资格，不新增提交或部署权限。
 
-   RVF 不验收整份实施计划或接管任务 recap；所属工作流保存计划进展、发布与结案事实。已发生提交可在原 run 内核对，评审完成不以提交或再次接续为前提。用户的只读、不得提交等明确限制继续有效。
+   代码快照 lane 不验收整份实施计划的执行完成度或接管任务 recap；所属工作流保存计划进展、发布与结案事实。已发生提交可在原 run 内核对，评审完成不以提交或再次接续为前提。用户的只读、不得提交等明确限制继续有效。
 
 主 Agent 统一收集 reviewers、fixer 与自己发现的有价值问题。显式要求或既有问题收集授权适用时，用 `rvf collect-issues --list-repository <owner/repo>` 查询开放和关闭问题，匹配稳定 `problem_key` 后 `rvf collect-issues --report <JSON>`；格式按需读 `references/github-issue-observation-report.md`。失败保留持久材料，不阻断提交或同步。
 
