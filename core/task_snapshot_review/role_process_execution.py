@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import hashlib
 import fcntl
 import os
 import signal
@@ -13,7 +12,16 @@ from pathlib import Path
 
 from . import harness_cli_adapters as cli
 from .persistent_artifacts import exclusive_lock, git, git_text, read_json, write_bytes, write_json
-from .execution_lifecycle import ExecutionRevoked, ensure_execution_not_revoked, register_owned_process, wait_for_owned_process, process_start_identity, persist_role_progress_observation
+from .execution_lifecycle import (
+    ExecutionRevoked, ensure_execution_not_revoked, register_owned_process, register_supervised_command_directory,
+    finish_owned_process_registration, wait_for_owned_process, process_start_identity, persist_role_progress_observation,
+)
+from .native_owned_process_observation import (
+    REGISTERED_COMMAND_PROCESS_OWNERSHIP_SCOPE, ROLE_COMMAND_PROCESS_LIFETIME_CONTRACT,
+    recorded_native_process_identity_is_valid,
+)
+from .role_owned_process_cleanup import cleanup_role_owned_processes
+from .review_recovery_evidence_observation import file_sha256
 from .role_failure_recovery import classify_role_failure, native_invocation_facts
 from .machine_evidence import WorkspacePreparationFailed, prepare_isolated_workspace
 from .reviewer_account_eligibility import reviewer_execution_environment, reviewer_eligibility, record_formal_invocation_result
@@ -43,6 +51,7 @@ def _redact_role_artifacts(attempt_directory: Path, request: dict, redactions: d
     # 成功、失败及恢复都清理同一组原始文件，不能只脱敏 stdout。
     paths = {attempt_directory / "stdout.txt", attempt_directory / "stderr.txt",
              attempt_directory / "result.json", attempt_directory / "model-invocation.json", Path(request["result_file"]),
+             attempt_directory / 'command-supervision.json', attempt_directory / 'role-owned-process-cleanup.json',
              *attempt_directory.glob("preparation/command-*/stdout.txt"), *attempt_directory.glob("preparation/command-*/stderr.txt")}
     for path in paths:
         if path.exists():
@@ -183,6 +192,9 @@ def reconcile_completed_role_attempt(attempt_directory: Path) -> None:
         return
     request = read_json(request_file)
     try:
+        supervision_file = attempt_directory / 'command-supervision.json'
+        if supervision_file.exists() and read_json(supervision_file).get('command_process_lifetime_contract') == ROLE_COMMAND_PROCESS_LIFETIME_CONTRACT:
+            cleanup_role_owned_processes(attempt_directory)
         reconcile_formal_invocation_availability(attempt_directory, request)
         redactions = _role_redactions(request, role_environment(request))
         _redact_role_artifacts(attempt_directory, request, redactions)
@@ -300,14 +312,20 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
             invocation_started_at = time.time()
             write_json(attempt_directory/'model-invocation.json',{'started_at':invocation_started_at, "command": command,
                        "cli_version": cli_version, "cli_executable": executable,
-                       "cli_executable_sha256": hashlib.sha256(Path(executable).read_bytes()).hexdigest() if executable else None,
+                       "cli_executable_sha256": file_sha256(Path(executable)) if executable else None,
                        "output_format": output_format})
             with (attempt_directory / "stdin.txt").open("rb") as stdin, (attempt_directory / "stdout.txt").open("wb") as stdout, (attempt_directory / "stderr.txt").open("wb") as stderr:
-                # harness 继承同一把锁；worker 意外退出时，恢复方先等待真实子进程结束。
-                process = subprocess.Popen(command, stdin=stdin, stdout=stdout, stderr=stderr, cwd=workspace,
-                                           env=environment, start_new_session=True, pass_fds=(execution_lock.fileno(),))
-                active_process=process
-                register_owned_process(run_directory, process.pid, "role_cli", owns_process_group=True)
+                # 监督者与 harness 继承同一把锁；worker 崩溃后仍完成资源回收。
+                with exclusive_lock(run_directory / 'execution-revocation.lock'):
+                    ensure_execution_not_revoked(run_directory)
+                    register_supervised_command_directory(run_directory, attempt_directory)
+                    launch_command = [sys.executable, str(Path(__file__).with_name('retained_command_supervisor.py')),
+                        str(run_directory), str(attempt_directory), json.dumps([execution_lock.fileno()]), str(attempt_directory / 'model-invocation.json'),
+                        ROLE_COMMAND_PROCESS_LIFETIME_CONTRACT]
+                    process = subprocess.Popen(launch_command, stdin=stdin, stdout=stdout, stderr=stderr, cwd=workspace,
+                                               env=environment, start_new_session=True, pass_fds=(execution_lock.fileno(),))
+                    active_process=process
+                register_owned_process(run_directory, process.pid, "role_command_supervisor")
                 if cancellation_requested:
                     cancel_role(signal.SIGTERM,None)
                 progress = {}
@@ -316,11 +334,31 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
                 except (OSError, subprocess.SubprocessError, RuntimeError) as error:
                     progress["identity_observation_error"] = str(error)
                 persist_role_progress_observation(attempt_directory / "progress.json", progress)
-                returncode = wait_for_owned_process(process, run_directory, timeout=None,
-                    progress_file=attempt_directory / "progress.json")
+                supervisor_returncode = wait_for_owned_process(process, run_directory, timeout=None,
+                    progress_file=attempt_directory / "progress.json", observe_registered_process_descendants=False)
+            # 监督者退出不证明 CLI 退出，缺失业务事实时保留原派发并等待原生补证。
+            outcome.update(status='unknown', supervisor_returncode=supervisor_returncode, returncode=None, retryable=False,
+                recovery={'category': 'native_cli_completion_unknown', 'action': 'reconcile_original_native_completion',
+                    'recovery_condition': 'inherited_execution_lock_released_and_original_native_completion_available',
+                    'equivalent_sources': ['registered_cli_returncode', 'original_structured_stdout']})
+            supervision = read_json(attempt_directory / 'command-supervision.json')
+            supervisor_identity = supervision.get('supervisor_native_identity')
+            if (supervision.get('command_process_lifetime_contract') != ROLE_COMMAND_PROCESS_LIFETIME_CONTRACT
+                    or supervision.get('process_ownership_scope') != REGISTERED_COMMAND_PROCESS_OWNERSHIP_SCOPE
+                    or not supervision.get('execution_token')
+                    or supervision.get('run_directory') != str(run_directory.resolve())
+                    or supervision.get('command_directory') != str(attempt_directory.resolve())
+                    or supervision.get('supervisor_pid') != process.pid
+                    or not recorded_native_process_identity_is_valid(supervisor_identity)
+                    or supervisor_identity['pid'] != process.pid or supervision.get('argv') != command):
+                raise ValueError('监督者退出后缺少同一次 CLI 派发的原生事实，等待原件补证')
+            returncode = supervision.get('command_returncode')
+            if type(returncode) is not int:
+                raise ValueError('监督者已退出但 CLI 退出码未知，保留原生结果与继承锁待恢复')
+            outcome.update(status='failed', returncode=returncode)
+            outcome.pop('recovery', None)
             raw_output = (attempt_directory / "stdout.txt").read_text(errors="replace")
             raw_error = (attempt_directory / "stderr.txt").read_text(errors="replace")
-            outcome["returncode"] = returncode
             failure = classify_role_failure(raw_output, raw_error, returncode, output_format)
             if output_format != "text":
                 outcome.update(native_invocation_facts(raw_output))
@@ -361,16 +399,37 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
             outcome["error"] = str(error)
             outcome.setdefault("retryable", False)
         finally:
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
             if active_process is not None and active_process.poll() is None:
-                os.killpg(active_process.pid,signal.SIGTERM)
                 try:
-                    active_process.wait(timeout=5)
+                    # 先通知监督者；进程组信号会先杀 CLI，切断尚未登记后代的归属父链。
+                    active_process.terminate()
+                except ProcessLookupError:
+                    pass
+                try:
+                    active_process.wait(timeout=8)
                 except subprocess.TimeoutExpired:
-                    os.killpg(active_process.pid,signal.SIGKILL)
+                    try:
+                        active_process.kill()
+                    except ProcessLookupError:
+                        pass
                     active_process.wait()
+            if active_process is not None:
+                finish_owned_process_registration(run_directory, active_process.pid, 'role_command_supervisor')
+                try:
+                    cleanup = cleanup_role_owned_processes(attempt_directory)
+                    outcome['role_owned_process_cleanup_status'] = cleanup['status']
+                except (OSError, RuntimeError, ValueError) as error:
+                    outcome.update(role_owned_process_cleanup_status='unknown', role_owned_process_cleanup_error=str(error))
+            else:
+                outcome['role_owned_process_cleanup_status'] = 'exited'
+            finish_owned_process_registration(run_directory, os.getpid(), 'role_worker')
             redactions = _role_redactions(request, environment)
             try:
-                _redact_role_artifacts(attempt_directory, request, redactions)
+                # CLI 仍可能写原输出，延至继承锁释放后的对账，避免替换活跃输出 inode。
+                if outcome.get('recovery', {}).get('category') != 'native_cli_completion_unknown':
+                    _redact_role_artifacts(attempt_directory, request, redactions)
             except (OSError, ValueError) as error:
                 outcome.update({"status": "failed", "error": str(error), "retryable": False})
             if "error" in outcome:
@@ -378,7 +437,8 @@ def execute_role(attempt_directory: Path, *, inherited_lock_descriptor: int | No
             outcome["finished_at"] = time.time()
             write_json(attempt_directory / "outcome.json", cli.redact_configured_environment_variable_values_in_json_value(outcome, redactions))
             persist_role_progress_observation(attempt_directory / "progress.json", {
-                "status": outcome["status"], "last_observed_at": outcome["finished_at"], "waiting_reason": None})
+                "status": outcome["status"], "last_observed_at": outcome["finished_at"], "waiting_reason": None,
+                'role_owned_process_cleanup_status': outcome.get('role_owned_process_cleanup_status', 'unknown')})
 
 
 def launch_role(attempt_directory: Path, *, environment_overrides: dict | None = None) -> subprocess.Popen:

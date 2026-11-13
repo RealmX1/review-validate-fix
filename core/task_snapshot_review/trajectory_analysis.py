@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .persistent_artifacts import read_json
 from .role_failure_recovery import native_invocation_facts
+from .role_owned_process_cleanup import collect_role_owned_process_cleanup_facts, role_owned_process_cleanup_observation
 
 
 def analyze_runs(run_directories: list[Path]) -> dict:
@@ -30,6 +31,7 @@ def analyze_runs(run_directories: list[Path]) -> dict:
                 facts = native_invocation_facts(stdout_file.read_text(errors="replace"))
                 facts_evidence = str(stdout_file)
             attempts.append({"role": directory.parent.name, "attempt_directory": str(directory),
+                'role_owned_process_cleanup': role_owned_process_cleanup_observation(directory),
                 "raw_status": raw.get("status"), "effective_status": reconciliation.get("status", raw.get("status")),
                 "effective_status_evidence": str(reconciliation_file) if reconciliation else str(outcome_file) if raw else None,
                 "raw_outcome": raw, "request": request, "model_invocation": invocation,
@@ -45,6 +47,7 @@ def analyze_runs(run_directories: list[Path]) -> dict:
         runs.append({"run_directory": str(run), "status": record["status"], "base_commit": record.get("base_commit"),
             "candidate_commit": record.get("candidate_commit"), "source_version": record.get("source_version"),
             "runtime_environment": record.get("runtime_environment"), "attempts": attempts, "validations": validations,
+            'role_owned_process_cleanup': collect_role_owned_process_cleanup_facts(run),
             "shared_evidence": evidence, "incomplete_fixer_machine_validations": incomplete_fixer_machine_validations,
             "commit": record.get("commit"),
             "stage_events": read_json(run / "stage-events.json").get("events", []) if (run / "stage-events.json").exists() else None,

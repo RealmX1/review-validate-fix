@@ -41,7 +41,8 @@ def verified_execution_plan(run_directory: Path, record: dict | None = None) -> 
 
 def ensure_previous_supervised_commands_exited(run_directory: Path, collection_directory: Path) -> None:
     from .native_owned_process_observation import (
-        REGISTERED_COMMAND_PROCESS_OWNERSHIP_SCOPE, REGISTERED_COMMAND_PROCESS_LIFETIME_CONTRACT, native_process_identity, owned_process_snapshot,
+        REGISTERED_COMMAND_PROCESS_OWNERSHIP_SCOPE, REGISTERED_COMMAND_PROCESS_LIFETIME_CONTRACT,
+        native_host_boot_identity, native_process_identity, owned_process_snapshot,
     )
     registry = run_directory / 'registered-supervised-command-directories.json'
     for registered_directory in read_json(registry)['command_directories'] if registry.exists() else []:
@@ -69,13 +70,32 @@ def ensure_previous_supervised_commands_exited(run_directory: Path, collection_d
                     write_json(reconciliation_file, observation)
                     continue
             facts = read_json(supervision_file)
-            if facts.get('status') == 'completed':
+            if facts.get('status') == 'completed' and facts.get('ownership_observation_coverage_status') != 'unknown':
                 continue
             if (facts.get('process_ownership_scope') != REGISTERED_COMMAND_PROCESS_OWNERSHIP_SCOPE or
                     facts.get('command_process_lifetime_contract') != REGISTERED_COMMAND_PROCESS_LIFETIME_CONTRACT):
                 raise RuntimeError('历史未完成命令缺少受控进程契约，不能自动补写为已退出')
             if facts.get('command_execution_started') is False and not facts.get('command_pid'):
                 observation.update({'status': 'not_started', 'native_launch_error': facts['command_native_launch_error']})
+                write_json(reconciliation_file, observation)
+                continue
+            execution_token = facts.get('execution_token')
+            if not isinstance(execution_token, str) or not execution_token:
+                raise RuntimeError('缺少有效的已登记命令 execution_token')
+            observation['execution_token'] = execution_token
+            if facts.get('ownership_observation_coverage_status') == 'unknown':
+                from .registered_command_owner_exit_receipt import observe_registered_command_owner_exit_receipt
+                observation['ownership_observation_coverage_status'] = 'unknown'
+                if facts.get('ownership_observation_gap_started_at') is not None:
+                    observation['ownership_observation_gap_started_at'] = facts['ownership_observation_gap_started_at']
+                owner_receipt = observe_registered_command_owner_exit_receipt(run_directory, facts)
+                observation['owner_exit_receipt'] = owner_receipt
+                if owner_receipt['status'] == 'exited':
+                    observation.update(status='exited', source=owner_receipt['source'], owned_processes=[])
+                    write_json(reconciliation_file, observation)
+                    continue
+            if facts.get('host_boot_identity') and facts['host_boot_identity'] != native_host_boot_identity():
+                observation.update(status='exited', source='host_boot_changed')
                 write_json(reconciliation_file, observation)
                 continue
             if (facts.get('command_launch_intent_recorded') and not facts.get('command_pid')
@@ -101,9 +121,12 @@ def ensure_previous_supervised_commands_exited(run_directory: Path, collection_d
                     and current['pid'] == identity['pid'] and current['start_identity'] == identity['start_identity'])
                 observation.update({'owned_processes': list(descendants.values()),
                     'status': 'pending' if supervisor_still_has_recorded_start_identity or descendants else 'exited'})
+            if facts.get('ownership_observation_coverage_status') == 'unknown':
+                observation['recovery_condition'] = 'native_host_boot_changed'
+                raise RuntimeError('原生观测缺口仍未覆盖；当前空快照不构成完整后代退出证据')
         except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
             recorded.update(getattr(error, 'observed_owned_processes', {}))
-            observation.update({'error': str(error), 'owned_processes': list(recorded.values())})
+            observation.update({'status': 'unknown', 'error': str(error), 'owned_processes': list(recorded.values())})
         write_json(reconciliation_file, observation)
         if observation['status'] != 'exited':
             error = WorkspacePreparationFailed(reconciliation_file)
@@ -236,7 +259,8 @@ def execute_registered_commands(run_directory: Path, workspace: Path, commands: 
                 except (OSError, subprocess.SubprocessError, RuntimeError) as error:
                     record["process_identity_error"] = str(error)
                 write_json(command_directory / "execution.json", record)
-                returncode = wait_for_owned_process(process, run_directory, timeout=None)
+                returncode = wait_for_owned_process(process, run_directory, timeout=None,
+                    observe_registered_process_descendants=not bool(inherited_lock_descriptors))
             finally:
                 if process.poll() is None:
                     (os.kill if inherited_lock_descriptors else os.killpg)(process.pid, signal.SIGTERM)

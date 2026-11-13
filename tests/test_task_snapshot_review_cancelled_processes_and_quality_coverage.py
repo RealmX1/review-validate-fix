@@ -120,7 +120,7 @@ def test_cancelled_validation_persists_interruption_when_supervisor_exits_before
         if requested_signal == exited_before_signal:
             raise ProcessLookupError('监督者已响应持久撤销并退出')
 
-    def observe_revocation(*args):
+    def observe_revocation(*args, **kwargs):
         execution_lifecycle.persist_execution_revocation(run, '取消发生在登记与等待之间')
         raise execution_lifecycle.ExecutionRevoked('隔离复现合法退出竞态')
 

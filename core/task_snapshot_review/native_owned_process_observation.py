@@ -3,13 +3,16 @@ from __future__ import annotations
 
 import ctypes
 import errno
+from functools import lru_cache
 import os
 from pathlib import Path
 import signal
 import sys
+import uuid
 
 REGISTERED_COMMAND_PROCESS_OWNERSHIP_SCOPE = 'registered_process_identities_owned_groups_and_descendant_chains'
 REGISTERED_COMMAND_PROCESS_LIFETIME_CONTRACT = 'wait_for_background_work_or_register_separate_supervised_commands'
+ROLE_COMMAND_PROCESS_LIFETIME_CONTRACT = 'terminate_role_owned_processes_after_cli_exit'
 DARWIN_PROCESS_LIST_SELECTION_BY_PROCESS_GROUP_ID = 2
 DARWIN_PROCESS_LIST_SELECTION_BY_PARENT_PROCESS_ID = 6
 
@@ -31,29 +34,63 @@ class BsdUniqueProcessInfo(ctypes.Structure):
         ('reserved_three', ctypes.c_uint64)]
 
 
+@lru_cache(maxsize=1)
+def native_host_boot_identity() -> str:
+    if sys.platform.startswith('linux'):
+        return 'linux:' + str(uuid.UUID(Path('/proc/sys/kernel/random/boot_id').read_text().strip()))
+    if sys.platform == 'darwin':
+        boot = ctypes.create_string_buffer(128)
+        size = ctypes.c_size_t(ctypes.sizeof(boot))
+        library = ctypes.CDLL(None, use_errno=True)
+        if library.sysctlbyname(b'kern.bootsessionuuid', boot, ctypes.byref(size), None, 0):
+            raise RuntimeError('原生系统启动世代不可用')
+        try:
+            return 'darwin:' + str(uuid.UUID(boot.value.decode('ascii')))
+        except (ValueError, UnicodeDecodeError) as error:
+            raise RuntimeError('原生系统启动 UUID 无效') from error
+    raise RuntimeError('当前平台没有可用的原生系统启动世代')
+
+
+def recorded_native_process_identity_is_valid(identity: object) -> bool:
+    # pid_t 超范围会被 ctypes 截断，不能让损坏的持久证据变成其他 PID。
+    if (not isinstance(identity, dict) or type(identity.get('pid')) is not int
+            or not 1 < identity['pid'] <= 2**31 - 1):
+        return False
+    start = identity.get('start_identity')
+    return (isinstance(start, str) and start.isascii() and start.isdigit()
+        or isinstance(start, list) and len(start) == 2
+        and all(type(value) is int and value >= 0 for value in start) and start[1] < 1_000_000)
+
+
 def native_process_identity(pid: int) -> dict | None:
     if sys.platform == 'darwin':
         library = ctypes.CDLL('/usr/lib/libproc.dylib', use_errno=True)
         library.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
-        info = BsdProcessInfo()
-        ctypes.set_errno(0)
-        if library.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info)) != ctypes.sizeof(info):
-            observed_errno = ctypes.get_errno()
-            if observed_errno in {errno.ESRCH, errno.ENOENT}:
+        for attempt in range(2):
+            info = BsdProcessInfo()
+            ctypes.set_errno(0)
+            if library.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info)) != ctypes.sizeof(info):
+                observed_errno = ctypes.get_errno()
+                if observed_errno in {errno.ESRCH, errno.ENOENT}:
+                    return None
+                if observed_errno == 0 and attempt == 0:
+                    continue
+                raise RuntimeError(f'原生进程启动身份不可用：pid={pid}, errno={observed_errno}')
+            if info.process_status == 5:
                 return None
-            raise RuntimeError(f'原生进程启动身份不可用：pid={pid}, errno={observed_errno}')
-        if info.process_status == 5:
-            return None
-        unique = BsdUniqueProcessInfo()
-        ctypes.set_errno(0)
-        if library.proc_pidinfo(pid, 17, 0, ctypes.byref(unique), ctypes.sizeof(unique)) != ctypes.sizeof(unique):
-            observed_errno = ctypes.get_errno()
-            if observed_errno in {errno.ESRCH, errno.ENOENT}:
-                return None
-            raise RuntimeError(f'原生进程唯一身份不可用：pid={pid}, errno={observed_errno}')
-        return {'pid': pid, 'start_identity': [info.start_seconds, info.start_microseconds],
-                'unique_process_id': unique.unique_process_id,
-                'parent_pid': info.parent_process_id, 'process_group_id': info.process_group_id}
+            unique = BsdUniqueProcessInfo()
+            ctypes.set_errno(0)
+            if library.proc_pidinfo(pid, 17, 0, ctypes.byref(unique), ctypes.sizeof(unique)) != ctypes.sizeof(unique):
+                observed_errno = ctypes.get_errno()
+                if observed_errno in {errno.ESRCH, errno.ENOENT}:
+                    return None
+                # 空结果没有说明退出；重采完整身份，避免跨 PID 世代拼接两段信息。
+                if observed_errno == 0 and attempt == 0:
+                    continue
+                raise RuntimeError(f'原生进程唯一身份不可用：pid={pid}, errno={observed_errno}')
+            return {'pid': pid, 'start_identity': [info.start_seconds, info.start_microseconds],
+                    'unique_process_id': unique.unique_process_id,
+                    'parent_pid': info.parent_process_id, 'process_group_id': info.process_group_id}
     if sys.platform.startswith('linux'):
         try:
             fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
@@ -67,11 +104,16 @@ def native_process_identity(pid: int) -> dict | None:
 def terminate_observed_owned_processes(processes: dict[int, dict]) -> list[dict]:
     observations = []
     for pid, recorded in processes.items():
+        if not recorded_native_process_identity_is_valid(recorded) or recorded['pid'] != pid:
+            observations.append({**(recorded if isinstance(recorded, dict) else {'pid': pid}), 'cancellation_status': 'unknown'})
+            continue
         try:
             current = native_process_identity(pid)
             if current is None:
                 status = 'exited'
-            elif current['start_identity'] != recorded['start_identity']:
+            elif not recorded_native_process_identity_is_valid(current):
+                status = 'unknown'
+            elif not native_process_start_identity_matches(current, recorded):
                 status = 'identity_changed_no_signal'
             elif pid == os.getpid():
                 status = 'unknown'
@@ -125,7 +167,8 @@ def linux_owned_process_child_ids(pid: int) -> list[int]:
 
 
 def native_process_start_identity_matches(current: dict | None, recorded: dict) -> bool:
-    return bool(current and current['pid'] == recorded['pid'] and current['start_identity'] == recorded['start_identity'])
+    return bool(current and current['pid'] == recorded['pid'] and current['start_identity'] == recorded['start_identity']
+        and ('unique_process_id' not in recorded or current.get('unique_process_id') == recorded['unique_process_id']))
 
 
 def native_process_snapshot(supervisor_pid: int, previously_observed_owned_processes: dict[int, dict],

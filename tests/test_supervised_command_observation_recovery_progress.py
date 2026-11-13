@@ -54,7 +54,8 @@ def test_live_registered_command_can_wait_for_reparented_clean_environment_desce
         clean_recorded_child(marker)
 
 
-def test_stop_cancels_direct_child_handle_during_native_query_outage(tmp_path):
+@pytest.mark.parametrize('lifetime_contract', ['wait_for_background_work_or_register_separate_supervised_commands', 'terminate_role_owned_processes_after_cli_exit'])
+def test_stop_cancels_direct_child_handle_during_native_query_outage(tmp_path, lifetime_contract):
     run = tmp_path / 'direct-child-cancellation-with-observation-outage'
     run.mkdir()
     write_json(run / 'run.json', {})
@@ -79,7 +80,7 @@ def test_stop_cancels_direct_child_handle_during_native_query_outage(tmp_path):
         '    if calls==1: return {}\n'
         '    raise RuntimeError("派发后原生观测不可用")\n'
         'with patch.object(supervisor,"owned_process_snapshot",side_effect=unavailable_after_dispatch):\n'
-        f'    raise SystemExit(supervisor.supervise_registered_command(Path({str(run)!r}),Path({str(observations)!r}),(),{command!r}))\n'
+        f'    raise SystemExit(supervisor.supervise_registered_command(Path({str(run)!r}),Path({str(observations)!r}),(),{command!r},command_process_lifetime_contract={lifetime_contract!r}))\n'
     )
     process = subprocess.Popen([sys.executable, '-B', '-c', driver], start_new_session=True)
     try:

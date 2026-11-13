@@ -14,24 +14,44 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from core.task_snapshot_review.execution_lifecycle import ensure_execution_not_revoked, ExecutionRevoked
 from core.task_snapshot_review.native_owned_process_observation import (
     REGISTERED_COMMAND_PROCESS_OWNERSHIP_SCOPE, REGISTERED_COMMAND_PROCESS_LIFETIME_CONTRACT,
+    ROLE_COMMAND_PROCESS_LIFETIME_CONTRACT, native_host_boot_identity,
     native_process_identity, native_process_start_identity_matches, owned_process_snapshot, terminate_observed_owned_processes,
+    recorded_native_process_identity_is_valid,
 )
 from core.task_snapshot_review.persistent_artifacts import exclusive_lock, read_json, write_json
 
 
-def _valid_reconciled_process_identity(identity: object) -> bool:
-    # macOS/Linux pid_t 为有符号 32 位，超范围整数会被 ctypes 截断。
-    if (not isinstance(identity, dict) or type(identity.get('pid')) is not int
-            or not 0 < identity['pid'] <= 2**31 - 1):
-        return False
-    start = identity.get('start_identity')
-    return (isinstance(start, str) and start.isascii() and start.isdigit()
-        or isinstance(start, list) and len(start) == 2
-        and all(type(value) is int and value >= 0 for value in start) and start[1] < 1_000_000)
-
-
 def terminate_supervised_command_descendants(command_directory: Path) -> list[dict]:
     facts = read_json(command_directory / 'command-supervision.json')
+    if facts.get('command_process_lifetime_contract') == ROLE_COMMAND_PROCESS_LIFETIME_CONTRACT:
+        from core.task_snapshot_review.role_owned_process_cleanup import cleanup_role_owned_processes
+        cleanup = cleanup_role_owned_processes(command_directory, cancellation_requested=True)
+        observations = cleanup.get('cancellation_observations', [])
+        supervisor = facts.get('supervisor_native_identity')
+        if (cleanup['status'] == 'pending' and supervisor and facts.get('host_boot_identity') == native_host_boot_identity()
+                and native_process_start_identity_matches(native_process_identity(supervisor['pid']), supervisor)):
+            try:
+                os.kill(supervisor['pid'], signal.SIGTERM)
+                observations = [*observations, {**supervisor, 'cancellation_status': 'termination_requested'}]
+            except ProcessLookupError:
+                pass
+        if cleanup['status'] not in {'pending', 'exited'}:
+            observations = [*observations, {'cancellation_status': 'unknown', 'error': cleanup.get('error', '角色资源退出尚未证明')}]
+        return observations
+    boot_generation_cancellation_observation = None
+    try:
+        if not facts.get('host_boot_identity'):
+            raise RuntimeError('缺少登记命令派发时的系统启动世代')
+        if facts['host_boot_identity'] != native_host_boot_identity():
+            boot_generation_cancellation_observation = {'cancellation_status': 'exited', 'exit_evidence': 'host_boot_changed'}
+    except (OSError, RuntimeError) as error:
+        boot_generation_cancellation_observation = {'cancellation_status': 'unknown', 'error': str(error)}
+    if boot_generation_cancellation_observation:
+        observations = [boot_generation_cancellation_observation]
+        write_json(command_directory / 'descendant-cancellation-observations.json', {
+            'execution_token': facts['execution_token'], 'processes': observations, 'observed_at': time.time(),
+            'recovery_condition': 'registered_host_boot_identity_and_current_native_boot_observation_available'})
+        return observations
     recorded = {item['pid']: item for item in facts.get('owned_processes', [])}
     if facts.get('command_native_identity'):
         recorded.setdefault(facts['command_pid'], facts['command_native_identity'])
@@ -43,7 +63,7 @@ def terminate_supervised_command_descendants(command_directory: Path) -> list[di
             if not isinstance(reconciled, list):
                 raise ValueError('追加对账 owned_processes 必须是身份列表')
             for item in reconciled:
-                if not _valid_reconciled_process_identity(item):
+                if not recorded_native_process_identity_is_valid(item):
                     observation_error = '追加对账包含无效原生进程身份'
                     continue
                 previous = recorded.get(item['pid'])
@@ -77,28 +97,35 @@ def terminate_supervised_command_descendants(command_directory: Path) -> list[di
     return observations
 
 
-def supervise_registered_command(run_directory: Path, command_directory: Path, inherited_descriptors: tuple[int, ...], command: list[str]) -> int:
+def supervise_registered_command(run_directory: Path, command_directory: Path, inherited_descriptors: tuple[int, ...], command: list[str],
+                                 *, command_process_lifetime_contract: str = REGISTERED_COMMAND_PROCESS_LIFETIME_CONTRACT) -> int:
     process_group_id = os.getpgrp()
     if process_group_id != os.getpid():
         raise ValueError('独立监督者必须拥有自己的进程组')
+    if command_process_lifetime_contract not in {REGISTERED_COMMAND_PROCESS_LIFETIME_CONTRACT, ROLE_COMMAND_PROCESS_LIFETIME_CONTRACT}:
+        raise ValueError('未知的命令资源生命周期契约')
     execution_token = os.urandom(24).hex()
     supervision_file = command_directory / 'command-supervision.json'
     facts = {'status': 'starting', 'supervisor_pid': os.getpid(), 'process_group_id': process_group_id,
+             'run_directory': str(run_directory.resolve()), 'command_directory': str(command_directory.resolve()),
              'argv': command, 'execution_token': execution_token,
              'process_ownership_scope': REGISTERED_COMMAND_PROCESS_OWNERSHIP_SCOPE,
-             'command_process_lifetime_contract': REGISTERED_COMMAND_PROCESS_LIFETIME_CONTRACT,
-             'owned_process_exit_status': 'pending'}
+             'command_process_lifetime_contract': command_process_lifetime_contract,
+             'ownership_observation_coverage_status': 'complete', 'owned_process_exit_status': 'pending'}
     write_json(supervision_file, facts)
     child = None
     owned = {}
-    ownership_observation_deferred_until_command_exit = False
+    next_ownership_observation = 0
+    ownership_observation_failures = 0
+    last_checkpoint_material = None
+    next_checkpoint = 0
     termination_requested = False
 
     def observe_owned_processes():
-        for attempt in range(5):
+        for attempt in range(3):
             try:
                 if child is not None and child.poll() is None:
-                    direct_identity = native_process_identity(child.pid)
+                    direct_identity = facts.get('command_native_identity') or native_process_identity(child.pid)
                     if direct_identity is not None:
                         owned[child.pid] = direct_identity
                         facts['command_native_identity'] = direct_identity
@@ -107,7 +134,10 @@ def supervise_registered_command(run_directory: Path, command_directory: Path, i
             except (OSError, RuntimeError) as error:
                 owned.update(getattr(error, 'observed_owned_processes', {}))
                 facts['owned_processes'] = list(owned.values())
-                if attempt == 4:
+                if child is not None:
+                    facts['ownership_observation_coverage_status'] = 'unknown'
+                    facts.setdefault('ownership_observation_gap_started_at', time.time())
+                if attempt == 2:
                     raise
                 time.sleep(0.05)
 
@@ -123,6 +153,14 @@ def supervise_registered_command(run_directory: Path, command_directory: Path, i
 
     def terminate_owned_processes():
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        if command_process_lifetime_contract == ROLE_COMMAND_PROCESS_LIFETIME_CONTRACT:
+            from core.task_snapshot_review.role_owned_process_cleanup import cleanup_role_owned_processes
+            facts['owned_processes'] = list(owned.values())
+            write_json(supervision_file, facts)
+            cleanup = cleanup_role_owned_processes(command_directory, direct_command=child)
+            facts.update(owned_process_exit_status=cleanup['status'], role_owned_process_cleanup_status=cleanup['status'])
+            write_json(supervision_file, facts)
+            return
         try:
             owned.update(owned_process_snapshot(os.getpid(), owned,
                 supervisor_native_identity=facts['supervisor_native_identity']))
@@ -172,6 +210,7 @@ def supervise_registered_command(run_directory: Path, command_directory: Path, i
         ensure_command_not_cancelled()
         # 启动前确认等价原生查询可用，查询失败保存恢复条件。
         facts['supervisor_native_identity'] = native_process_identity(os.getpid())
+        facts['host_boot_identity'] = native_host_boot_identity()
         write_json(supervision_file, facts)
         observe_owned_processes()
         with exclusive_lock(run_directory / 'execution-revocation.lock'):
@@ -189,21 +228,41 @@ def supervise_registered_command(run_directory: Path, command_directory: Path, i
         while True:
             ensure_command_not_cancelled()
             returncode = child.poll()
-            if not ownership_observation_deferred_until_command_exit or returncode is not None:
+            if time.monotonic() >= next_ownership_observation or returncode is not None:
                 try:
                     owned = observe_owned_processes()
-                    ownership_observation_deferred_until_command_exit = False
+                    ownership_observation_failures = 0
+                    facts['ownership_observation_status'] = 'available'
                 except (OSError, RuntimeError) as error:
                     if child.poll() is not None:
                         raise
-                    # 已登记的活跃命令继续执行；子进程退出是重新核验的事实触发条件。
-                    ownership_observation_deferred_until_command_exit = True
+                    ownership_observation_failures = min(4, ownership_observation_failures + 1)
+                    facts['ownership_observation_status'] = 'unknown'
                     facts['last_ownership_observation_error'] = str(error)
+                next_ownership_observation = time.monotonic() + (min(5, 2 ** (ownership_observation_failures - 1)) if ownership_observation_failures else 0.05)
+                if ownership_observation_failures:
+                    facts['ownership_observation_retry_not_before'] = time.time() + min(5, 2 ** (ownership_observation_failures - 1))
+                else:
+                    facts.pop('ownership_observation_retry_not_before', None)
             ensure_command_not_cancelled()
-            facts['ownership_observation_deferred_until_command_exit'] = ownership_observation_deferred_until_command_exit
             facts.update({'command_returncode': returncode, 'owned_processes': list(owned.values())})
-            write_json(supervision_file, facts)
-            if returncode is not None and not ownership_observation_deferred_until_command_exit and not owned:
+            material = json.dumps(facts, sort_keys=True)
+            if material != last_checkpoint_material or time.monotonic() >= next_checkpoint:
+                facts['last_observed_at'] = time.time()
+                write_json(supervision_file, facts)
+                last_checkpoint_material = json.dumps(facts, sort_keys=True)
+                next_checkpoint = time.monotonic() + 1
+            if returncode is not None and command_process_lifetime_contract == ROLE_COMMAND_PROCESS_LIFETIME_CONTRACT:
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                from core.task_snapshot_review.role_owned_process_cleanup import cleanup_role_owned_processes
+                cleanup = cleanup_role_owned_processes(command_directory, direct_command=child)
+                facts.update(status='completed' if cleanup['status'] == 'exited' else 'descendant_exit_unproven',
+                    returncode=returncode, owned_process_exit_status=cleanup['status'], role_owned_process_cleanup_status=cleanup['status'])
+                write_json(supervision_file, facts)
+                return returncode
+            if returncode is not None and not owned:
+                if facts['ownership_observation_coverage_status'] != 'complete':
+                    raise RuntimeError('原生进程观测曾中断；空快照不能证明缺口期间的后代均已退出')
                 execution_file = command_directory / "execution.json"
                 execution = read_json(execution_file) if execution_file.exists() else {}
                 if execution.get("source_tree_before"):
@@ -215,7 +274,8 @@ def supervise_registered_command(run_directory: Path, command_directory: Path, i
                 facts.update({'status': 'completed', 'returncode': returncode, 'owned_process_exit_status': 'exited'})
                 write_json(supervision_file, facts)
                 return returncode
-            time.sleep(0.02)
+            # EXPERIMENT_NODE: 用短寿命跨 session 链路量测 50 毫秒观测间隔的发现率与 CPU 权衡。
+            time.sleep(0.05)
     except ExecutionRevoked:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         facts.update({'status': 'termination_requested', 'command_returncode': child.poll() if child else None})
@@ -231,9 +291,20 @@ def supervise_registered_command(run_directory: Path, command_directory: Path, i
         write_json(supervision_file, facts)
         if child is not None:
             terminate_owned_processes()
+            if command_process_lifetime_contract == ROLE_COMMAND_PROCESS_LIFETIME_CONTRACT and child.poll() is not None:
+                # 资源缺证独立于 CLI 业务结果，不能因此重复调用模型。
+                return child.returncode
         return 125
 
 
 if __name__ == '__main__':
+    lifetime_contract = sys.argv[5] if len(sys.argv) > 5 else REGISTERED_COMMAND_PROCESS_LIFETIME_CONTRACT
+    if lifetime_contract == ROLE_COMMAND_PROCESS_LIFETIME_CONTRACT:
+        invocation_file = Path(sys.argv[4]).resolve()
+        if invocation_file != (Path(sys.argv[2]) / 'model-invocation.json').resolve():
+            raise ValueError('角色命令必须读取同一次尝试的已登记派发原件')
+        command = read_json(invocation_file)['command']
+    else:
+        command = json.loads(sys.argv[4])
     sys.exit(supervise_registered_command(Path(sys.argv[1]), Path(sys.argv[2]),
-        tuple(json.loads(sys.argv[3])), json.loads(sys.argv[4])))
+        tuple(json.loads(sys.argv[3])), command, command_process_lifetime_contract=lifetime_contract))

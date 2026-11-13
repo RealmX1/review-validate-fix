@@ -1,13 +1,15 @@
 """外部角色只校验实际派发的命令，保留选模、恢复及结束证据边界。"""
 from __future__ import annotations
 
+import hashlib
 import json
+from pathlib import Path
 import subprocess
 import sys
 
 import pytest
 
-from core.task_snapshot_review import harness_cli_adapters as cli
+from core.task_snapshot_review import harness_cli_adapters as cli, workflow
 from core.task_snapshot_review.kimi_latest_stable_model_selection import select_latest_kimi_managed_stable_model
 from core.task_snapshot_review.persistent_artifacts import git, git_text, read_json, write_json
 from core.task_snapshot_review.role_process_execution import launch_role
@@ -41,7 +43,7 @@ def test_unused_health_command_does_not_prevent_actual_role_dispatch(tmp_path, r
         "print(json.dumps({'role':'meta','type':'session.resume_hint','content':'isolated-test-session'}))\n"
     )
     executable.chmod(0o755)
-    run = attempt / "execution-lifecycle"
+    run = tmp_path
     write_json(run / "run.json", {"status": "review_pending"})
     write_json(attempt / "request.json", {
         "run_directory": str(run), "role": role, "repository": str(repository),
@@ -160,3 +162,58 @@ def test_user_environment_override_still_reaches_effective_configuration(tmp_pat
     config, receipt = cli.load_effective_alternative_reviewer_config(bundled, user_home=tmp_path)
     assert config["env_set"] == {"ISOLATED_TEST_SETTING": "enabled"}
     assert receipt == {"applied": True, "fields": ["env_set"], "env_set_names": ["ISOLATED_TEST_SETTING"]}
+
+
+@pytest.mark.parametrize('executable_name', ['codex', 'claude', 'kimi'])
+def test_controller_configuration_digest_reads_executable_in_bounded_chunks(
+        tmp_path, monkeypatch, executable_name):
+    executable_file = tmp_path / executable_name
+    executable_bytes = b'bounded-executable-block' * 100000
+    executable_file.write_bytes(executable_bytes)
+    configuration = {'command': [executable_name, '--model', 'test-model'], 'output_format': 'text'}
+    expected_digest = hashlib.sha256(json.dumps({
+        'configuration': configuration,
+        'executable_sha256': hashlib.sha256(executable_bytes).hexdigest(),
+    }, sort_keys=True).encode()).hexdigest()
+    monkeypatch.setattr(workflow.shutil, 'which', lambda _command: str(executable_file))
+    original_read_bytes, original_open = Path.read_bytes, Path.open
+    observed_read_sizes = []
+
+    def reject_whole_executable_read(path):
+        if path == executable_file:
+            pytest.fail('控制器不能一次性加载整个 CLI 可执行文件')
+        return original_read_bytes(path)
+
+    class BoundedExecutableReader:
+        def __init__(self, original):
+            self.original = original
+
+        def __enter__(self):
+            self.original.__enter__()
+            return self
+
+        def __exit__(self, *arguments):
+            return self.original.__exit__(*arguments)
+
+        def read(self, size=-1):
+            assert 0 < size <= 1024 * 1024
+            observed_read_sizes.append(size)
+            return self.original.read(size)
+
+    def observe_executable_open(path, *arguments, **keywords):
+        original = original_open(path, *arguments, **keywords)
+        return BoundedExecutableReader(original) if path == executable_file else original
+
+    monkeypatch.setattr(Path, 'read_bytes', reject_whole_executable_read)
+    monkeypatch.setattr(Path, 'open', observe_executable_open)
+    assert workflow.configuration_digest(configuration) == expected_digest
+    assert len(observed_read_sizes) >= 4
+
+
+def test_controller_configuration_digest_preserves_unavailable_executable_identity(monkeypatch):
+    configuration = {'command': ['unavailable-test-cli']}
+    monkeypatch.setattr(workflow.shutil, 'which', lambda _command: None)
+    expected_digest = hashlib.sha256(json.dumps({
+        'configuration': configuration, 'executable_sha256': None,
+    }, sort_keys=True).encode()).hexdigest()
+    assert workflow.configuration_digest(configuration) == expected_digest

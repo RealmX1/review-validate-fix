@@ -1,13 +1,18 @@
 """Stop 消费追加对账身份，查询失败时仍清理已证明所属的进程。"""
 import signal
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
 from core.task_snapshot_review import execution_lifecycle, native_owned_process_observation as observation
 from core.task_snapshot_review import retained_command_supervisor
-from core.task_snapshot_review.persistent_artifacts import write_json
+from core.task_snapshot_review.persistent_artifacts import read_json, write_json
 from test_owned_command_process_scope import darwin_owned_process_queries
+
+
+@pytest.fixture(autouse=True)
+def registered_command_host_boot_identity(monkeypatch):
+    monkeypatch.setattr(retained_command_supervisor, 'native_host_boot_identity', lambda: 'controlled-host-boot')
 
 
 @pytest.mark.parametrize('child_state', ['live', 'pid_reused', 'identity_unavailable'])
@@ -22,7 +27,7 @@ def test_stop_cancels_reconciled_child_with_identity_and_revocation_guards(tmp_p
     child = {'pid': 800603, 'start_identity': [102, 0] if start_format == 'darwin' else '102'}
     supervision_file = command / 'command-supervision.json'
     reconciliation_file = command / 'descendant-exit-reconciliation.json'
-    write_json(supervision_file, {'execution_token': 'controlled-execution', 'supervisor_pid': 800601,
+    write_json(supervision_file, {'execution_token': 'controlled-execution', 'host_boot_identity': 'controlled-host-boot', 'supervisor_pid': 800601,
         'supervisor_native_identity': {'pid': 800601, 'start_identity': [100, 0]},
         'command_pid': parent['pid'], 'command_native_identity': parent, 'owned_processes': [parent]})
     write_json(reconciliation_file, {'status': 'pending', 'owned_processes': [child]})
@@ -63,7 +68,7 @@ def test_malformed_reconciliation_does_not_prevent_registered_process_cancellati
     command = tmp_path / 'commands/command-001'
     command.mkdir(parents=True)
     child = {'pid': 800603, 'start_identity': [102, 0]}
-    write_json(command / 'command-supervision.json', {'execution_token': 'controlled-execution',
+    write_json(command / 'command-supervision.json', {'execution_token': 'controlled-execution', 'host_boot_identity': 'controlled-host-boot',
         'supervisor_pid': 800601, 'supervisor_native_identity': {'pid': 800601, 'start_identity': [100, 0]},
         'owned_processes': [child]})
     (command / 'descendant-exit-reconciliation.json').write_text(reconciliation_content)
@@ -99,7 +104,7 @@ def test_invalid_reconciled_identity_preserves_registered_and_later_valid_proces
     execution_lifecycle.register_supervised_command_directory(run, command)
     supervision_file = command / 'command-supervision.json'
     reconciliation_file = command / 'descendant-exit-reconciliation.json'
-    write_json(supervision_file, {'execution_token': 'controlled-execution', 'supervisor_pid': state.supervisor_pid,
+    write_json(supervision_file, {'execution_token': 'controlled-execution', 'host_boot_identity': 'controlled-host-boot', 'supervisor_pid': state.supervisor_pid,
         'supervisor_native_identity': state.identity, 'owned_processes': [
             {'pid': state.child_pid, 'start_identity': [101, 0]},
             {'pid': state.orphan_pid, 'start_identity': [102, 0]}]})
@@ -146,7 +151,7 @@ def test_conflicting_reconciled_identity_uses_current_proof_without_losing_other
     execution_lifecycle.register_supervised_command_directory(run, command)
     supervision_file = command / 'command-supervision.json'
     reconciliation_file = command / 'descendant-exit-reconciliation.json'
-    write_json(supervision_file, {'execution_token': 'controlled-execution', 'supervisor_pid': state.supervisor_pid,
+    write_json(supervision_file, {'execution_token': 'controlled-execution', 'host_boot_identity': 'controlled-host-boot', 'supervisor_pid': state.supervisor_pid,
         'supervisor_native_identity': state.identity, 'owned_processes': [
             {'pid': state.child_pid, 'start_identity': [registered_start, 0]},
             {'pid': state.orphan_pid, 'start_identity': [102, 0]}]})
@@ -189,7 +194,7 @@ def test_reconciled_pid_must_fit_signed_pid_t_before_any_native_query(
     execution_lifecycle.register_supervised_command_directory(run, command)
     supervision_file = command / 'command-supervision.json'
     reconciliation_file = command / 'descendant-exit-reconciliation.json'
-    write_json(supervision_file, {'execution_token': 'controlled-execution', 'supervisor_pid': state.supervisor_pid,
+    write_json(supervision_file, {'execution_token': 'controlled-execution', 'host_boot_identity': 'controlled-host-boot', 'supervisor_pid': state.supervisor_pid,
         'supervisor_native_identity': state.identity,
         'owned_processes': [{'pid': state.child_pid, 'start_identity': [101, 0]}]})
     write_json(reconciliation_file, {'status': 'unknown', 'owned_processes': [
@@ -211,3 +216,156 @@ def test_reconciled_pid_must_fit_signed_pid_t_before_any_native_query(
         assert any(item['cancellation_status'] == 'unknown' for item in result['supervised_descendants'])
         assert all(item.get('pid') != reconciled_pid for item in result['supervised_descendants'])
     assert all(path.read_bytes() == original for path, original in originals.items())
+
+
+@pytest.mark.parametrize('boot_state', ['changed', 'missing', 'unavailable'])
+def test_registered_cancellation_boot_gate_precedes_native_discovery_and_signals(tmp_path, monkeypatch, boot_state):
+    registered_identity = {'pid': 800603, 'start_identity': '101'}
+    facts = {'execution_token': 'registered-command-cancellation-token', 'supervisor_pid': 800601,
+        'supervisor_native_identity': {'pid': 800601, 'start_identity': '100'},
+        'owned_processes': [registered_identity]}
+    if boot_state != 'missing':
+        facts['host_boot_identity'] = 'previous-host-boot'
+    supervision_file = tmp_path / 'command-supervision.json'
+    write_json(supervision_file, facts)
+    original_supervision = supervision_file.read_bytes()
+    current_boot_identity = Mock(return_value='current-host-boot')
+    if boot_state == 'unavailable':
+        current_boot_identity.side_effect = RuntimeError('当前系统启动世代暂不可用')
+    monkeypatch.setattr(retained_command_supervisor, 'native_host_boot_identity', current_boot_identity)
+    scoped_discovery = Mock(return_value={registered_identity['pid']: registered_identity})
+    current_process_identity = Mock(return_value=registered_identity)
+    signal_request = Mock()
+    monkeypatch.setattr(retained_command_supervisor, 'owned_process_snapshot', scoped_discovery)
+    monkeypatch.setattr(observation, 'native_process_identity', current_process_identity)
+    monkeypatch.setattr(observation.os, 'kill', signal_request)
+
+    result = retained_command_supervisor.terminate_supervised_command_descendants(tmp_path)
+
+    scoped_discovery.assert_not_called()
+    current_process_identity.assert_not_called()
+    signal_request.assert_not_called()
+    if boot_state == 'changed':
+        current_boot_identity.assert_called_once_with()
+        assert result == [{'cancellation_status': 'exited', 'exit_evidence': 'host_boot_changed'}]
+    else:
+        assert result[0]['cancellation_status'] == 'unknown'
+        assert result[0]['error']
+    persisted = read_json(tmp_path / 'descendant-cancellation-observations.json')
+    assert persisted['execution_token'] == facts['execution_token']
+    assert persisted['processes'] == result
+    assert supervision_file.read_bytes() == original_supervision
+
+
+@pytest.mark.parametrize('identity_source', ['command', 'owned', 'reconciliation'])
+@pytest.mark.parametrize('unique_identity_changed', [False, True])
+def test_registered_cancellation_checks_unique_identity_for_every_record_source(
+        tmp_path, monkeypatch, identity_source, unique_identity_changed):
+    registered_identity = {'pid': 800603, 'start_identity': [101, 0], 'unique_process_id': 101}
+    facts = {'execution_token': 'registered-command-cancellation-token', 'host_boot_identity': 'current-host-boot',
+        'supervisor_pid': 800601, 'supervisor_native_identity': {'pid': 800601, 'start_identity': [100, 0]},
+        'owned_processes': []}
+    if identity_source == 'command':
+        facts.update(command_pid=registered_identity['pid'], command_native_identity=registered_identity)
+    elif identity_source == 'owned':
+        facts['owned_processes'] = [registered_identity]
+    else:
+        write_json(tmp_path / 'descendant-exit-reconciliation.json', {'owned_processes': [registered_identity]})
+    write_json(tmp_path / 'command-supervision.json', facts)
+    current_identity = {**registered_identity, 'unique_process_id': 202 if unique_identity_changed else 101}
+    monkeypatch.setattr(retained_command_supervisor, 'native_host_boot_identity', lambda: 'current-host-boot')
+    monkeypatch.setattr(retained_command_supervisor, 'owned_process_snapshot', lambda *args, **kwargs: {})
+    monkeypatch.setattr(observation, 'native_process_identity', lambda pid: current_identity)
+    signal_requests = []
+    monkeypatch.setattr(observation.os, 'kill', lambda *args: signal_requests.append(args))
+
+    result = retained_command_supervisor.terminate_supervised_command_descendants(tmp_path)
+
+    expected_status = 'identity_changed_no_signal' if unique_identity_changed else 'termination_requested'
+    assert result == [{**registered_identity, 'cancellation_status': expected_status}]
+    assert signal_requests == ([] if unique_identity_changed else [(registered_identity['pid'], signal.SIGKILL)])
+
+
+def test_revoke_execution_cannot_discover_or_signal_registered_processes_from_previous_boot(tmp_path, monkeypatch):
+    command_directory = tmp_path / 'commands/command-001'
+    execution_lifecycle.register_supervised_command_directory(tmp_path, command_directory)
+    write_json(command_directory / 'command-supervision.json', {
+        'execution_token': 'registered-command-cancellation-token', 'host_boot_identity': 'previous-host-boot',
+        'supervisor_pid': 800601, 'supervisor_native_identity': {'pid': 800601, 'start_identity': '100'},
+        'owned_processes': [{'pid': 800603, 'start_identity': '101'}]})
+    monkeypatch.setattr(retained_command_supervisor, 'native_host_boot_identity', lambda: 'current-host-boot')
+    scoped_discovery = Mock()
+    signal_request = Mock()
+    monkeypatch.setattr(retained_command_supervisor, 'owned_process_snapshot', scoped_discovery)
+    monkeypatch.setattr(observation.os, 'kill', signal_request)
+
+    result = execution_lifecycle.revoke_execution(tmp_path, '取消已跨系统启动世代的普通命令')
+
+    assert (tmp_path / 'execution-revocation.json').exists()
+    assert result['supervised_descendants'] == [{'cancellation_status': 'exited', 'exit_evidence': 'host_boot_changed'}]
+    scoped_discovery.assert_not_called()
+    signal_request.assert_not_called()
+
+
+def test_registered_cancellation_rechecks_unique_identity_before_descendant_discovery(tmp_path, monkeypatch):
+    supervisor_identity = {'pid': 800601, 'start_identity': [100, 0], 'unique_process_id': 100}
+    child_identity = {'pid': 800603, 'start_identity': [101, 0], 'unique_process_id': 101}
+    write_json(tmp_path / 'command-supervision.json', {
+        'execution_token': 'registered-command-cancellation-token', 'host_boot_identity': 'current-host-boot',
+        'supervisor_pid': supervisor_identity['pid'], 'supervisor_native_identity': supervisor_identity,
+        'owned_processes': [child_identity]})
+    monkeypatch.setattr(retained_command_supervisor, 'native_host_boot_identity', lambda: 'current-host-boot')
+    registered_identities = {identity['pid']: identity for identity in (supervisor_identity, child_identity)}
+    monkeypatch.setattr(observation, 'native_process_identity',
+        lambda pid: {**registered_identities[pid], 'unique_process_id': registered_identities[pid]['unique_process_id'] + 100})
+    scoped_discovery = Mock()
+    signal_request = Mock()
+    monkeypatch.setattr(observation, 'darwin_scoped_process_ids', scoped_discovery)
+    monkeypatch.setattr(observation, 'linux_owned_process_child_ids', scoped_discovery)
+    monkeypatch.setattr(observation.os, 'kill', signal_request)
+
+    result = retained_command_supervisor.terminate_supervised_command_descendants(tmp_path)
+
+    assert result == [{**child_identity, 'cancellation_status': 'identity_changed_no_signal'}]
+    scoped_discovery.assert_not_called()
+    signal_request.assert_not_called()
+
+
+@pytest.mark.parametrize('registered_pid,registered_identity', [
+    (800603, {'start_identity': [101, 0]}),
+    (800603, {'pid': 800603}),
+    (800603, {'pid': 800603, 'start_identity': None}),
+    (800603, {'pid': 800604, 'start_identity': [101, 0]}),
+    (2**32 + 800603, {'pid': 2**32 + 800603, 'start_identity': [101, 0]}),
+    (800603, None),
+])
+def test_native_cancellation_rejects_invalid_recorded_identity_before_query_or_signal(
+        monkeypatch, registered_pid, registered_identity):
+    current_process_identity = Mock()
+    signal_request = Mock()
+    monkeypatch.setattr(observation, 'native_process_identity', current_process_identity)
+    monkeypatch.setattr(observation.os, 'kill', signal_request)
+
+    result = observation.terminate_observed_owned_processes({registered_pid: registered_identity})
+
+    assert result[0]['cancellation_status'] == 'unknown'
+    current_process_identity.assert_not_called()
+    signal_request.assert_not_called()
+
+
+@pytest.mark.parametrize('invalid_current_identity', [
+    {'start_identity': [101, 0]},
+    {'pid': 800603},
+    {'pid': 800603, 'start_identity': None},
+    [],
+])
+def test_native_cancellation_keeps_invalid_current_identity_unknown(monkeypatch, invalid_current_identity):
+    registered_identity = {'pid': 800603, 'start_identity': [101, 0]}
+    signal_request = Mock()
+    monkeypatch.setattr(observation, 'native_process_identity', lambda pid: invalid_current_identity)
+    monkeypatch.setattr(observation.os, 'kill', signal_request)
+
+    result = observation.terminate_observed_owned_processes({registered_identity['pid']: registered_identity})
+
+    assert result == [{**registered_identity, 'cancellation_status': 'unknown'}]
+    signal_request.assert_not_called()

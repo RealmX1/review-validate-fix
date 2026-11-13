@@ -153,7 +153,9 @@ def test_unknown_ownership_preserves_proven_owned_descendants_for_cancellation(t
     identity = observation.native_process_identity(child.pid)
     error = RuntimeError('已登记后代的原生查询失败')
     error.observed_owned_processes = {child.pid: identity}
+    monkeypatch.setattr(retained_command_supervisor, 'native_host_boot_identity', lambda: 'controlled-host-boot')
     write_json(tmp_path / 'command-supervision.json', {'execution_token': 'owned-execution',
+        'host_boot_identity': 'controlled-host-boot',
         'supervisor_pid': 99999999, 'supervisor_native_identity': {'pid': 99999999, 'start_identity': [1, 0]},
         'owned_processes': []})
     def unavailable_observation(*args, **kwargs):
