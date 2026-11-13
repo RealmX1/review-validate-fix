@@ -257,8 +257,10 @@ def _wait_for_status(run, status):
 
 
 def test_cancel_persists_when_frozen_material_and_result_are_unreadable(plan_review_fixture):
-    import os
     import subprocess
+    from core.task_snapshot_review.native_owned_process_observation import (
+        native_process_identity, native_process_start_identity_matches,
+    )
     arguments, _, _ = plan_review_fixture
     parent = arguments["run_directory"].parent
     pid_file = parent / "reviewer.pid"
@@ -270,25 +272,25 @@ def test_cancel_persists_when_frozen_material_and_result_are_unreadable(plan_rev
     )
     arguments["reviewer_config"] = {**arguments["reviewer_config"], "command": [sys.executable, str(script)]}
     create_plan_material_review(**arguments)
-    resume_plan_material_review(arguments["run_directory"])
-    deadline = time.monotonic() + 10
-    pid = None
-    while time.monotonic() < deadline:
-        if pid_file.exists():
-            pid = int(pid_file.read_text())
-            owned = arguments["run_directory"] / "owned-processes.json"
-            if owned.exists() and any(item.get("pid") == pid and item.get("is_active_registration") is True
-                                       for item in read_json(owned).get("processes", [])):
-                break
-        time.sleep(0.05)
-    else:
-        pytest.fail("隔离 reviewer 尚未登记为所属进程")
-    record = read_json(arguments["run_directory"] / "run.json")
-    Path(record["frozenMaterialManifest"][0]["snapshotPath"]).write_text("损坏冻结原件")
     attempt = arguments["run_directory"] / "independent-plan-reviewer" / "attempt-001"
-    (attempt / "result.json").write_text("{")
     entrypoint = Path(__file__).resolve().parents[1] / "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_command_line_shortcut_entrypoint.py"
     try:
+        resume_plan_material_review(arguments["run_directory"])
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            supervision_file = attempt / "command-supervision.json"
+            if pid_file.exists() and supervision_file.exists():
+                pid = int(pid_file.read_text())
+                identity = read_json(supervision_file).get("command_native_identity")
+                if identity and identity["pid"] == pid and native_process_start_identity_matches(
+                        native_process_identity(pid), identity):
+                    break
+            time.sleep(0.05)
+        else:
+            pytest.fail("隔离 reviewer 尚未取得所属监督命令的原生身份")
+        record = read_json(arguments["run_directory"] / "run.json")
+        Path(record["frozenMaterialManifest"][0]["snapshotPath"]).write_text("损坏冻结原件")
+        (attempt / "result.json").write_text("{")
         cancelled = subprocess.run([sys.executable, str(entrypoint), "cancel-plan-material-review",
             "--run-dir", str(arguments["run_directory"]), "--reason", "材料损坏后仍须停止。"],
             capture_output=True, text=True, timeout=15)
@@ -297,18 +299,13 @@ def test_cancel_persists_when_frozen_material_and_result_are_unreadable(plan_rev
         assert (arguments["run_directory"] / "execution-revocation.json").is_file()
         gone = time.monotonic() + 5
         while time.monotonic() < gone:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
+            if not native_process_start_identity_matches(native_process_identity(pid), identity):
                 break
             time.sleep(0.05)
         else:
             pytest.fail("损坏材料后的取消没有回收原 reviewer")
     finally:
-        try:
-            os.kill(pid, 15)
-        except (ProcessLookupError, TypeError):
-            pass
+        revoke_execution(arguments["run_directory"], "回收隔离计划取消测试的所属执行。")
 
 
 def test_credential_change_uses_remaining_dispatch_budget(plan_review_fixture):
