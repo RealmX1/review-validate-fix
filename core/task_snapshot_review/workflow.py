@@ -8,6 +8,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -623,6 +624,29 @@ def _merge_fixer_findings(run_directory: Path, findings: list[dict]) -> None:
 
 
 def _validate(run_directory: Path, record: dict, commands: list[list[str]], lock_handle) -> dict:
+    if threading.current_thread() is not threading.main_thread():
+        return _validate_in_isolated_workspace(run_directory, record, commands, lock_handle)
+    previous_termination_handler = signal.getsignal(signal.SIGTERM)
+    def finish_persistent_revocation_before_termination(signum, frame):
+        try:
+            # 只在最终验证内延后已持久撤销的信号，让回收及 interrupted 快照完整收口。
+            if execution_is_revoked(run_directory):
+                return
+        except (OSError, ValueError, KeyError):
+            pass
+        if callable(previous_termination_handler):
+            previous_termination_handler(signum, frame)
+        elif previous_termination_handler == signal.SIG_DFL:
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+    signal.signal(signal.SIGTERM, finish_persistent_revocation_before_termination)
+    try:
+        return _validate_in_isolated_workspace(run_directory, record, commands, lock_handle)
+    finally:
+        signal.signal(signal.SIGTERM, previous_termination_handler)
+
+
+def _validate_in_isolated_workspace(run_directory: Path, record: dict, commands: list[list[str]], lock_handle) -> dict:
     if not commands or any(not isinstance(command, list) or not command or not all(isinstance(value, str) for value in command) for command in commands):
         raise ValueError("最终验证命令必须是非空 argv 数组列表")
     repo = Path(record["repo"])
@@ -714,6 +738,7 @@ def _validate(run_directory: Path, record: dict, commands: list[list[str]], lock
                     register_owned_process(run_directory, process.pid, "final_validation", owns_process_group=True)
                 from .execution_lifecycle import wait_for_owned_process
                 returncode = wait_for_owned_process(process, run_directory, observe_registered_process_descendants=False)
+                ensure_execution_not_revoked(run_directory)
             except (KeyboardInterrupt, ExecutionRevoked) as interruption:
                 if isinstance(interruption, KeyboardInterrupt) and not execution_is_revoked(run_directory):
                     validation["status"] = "interrupted"
